@@ -173,9 +173,7 @@ export function createPoller(deps: PollerDeps) {
 
   // ── One cycle ──────────────────────────────────────────────────────────────
 
-  async function notify(events: DecodedEvent[]): Promise<void> {
-    let sentThisCycle = 0;
-
+  async function notify(events: DecodedEvent[], delivery: { sent: number }): Promise<void> {
     for (const event of events) {
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
@@ -192,7 +190,7 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
-      if (sentThisCycle >= config.maxNotificationsPerCycle) {
+      if (delivery.sent >= config.maxNotificationsPerCycle) {
         status.eventsSkipped += 1;
         console.warn(
           `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
@@ -204,7 +202,7 @@ export function createPoller(deps: PollerDeps) {
       try {
         await send(text);
         status.notificationsSent += 1;
-        sentThisCycle += 1;
+        delivery.sent += 1;
       } catch (err) {
         // One bad send must not abort the rest of the batch.
         status.notificationsFailed += 1;
@@ -214,7 +212,7 @@ export function createPoller(deps: PollerDeps) {
         );
       }
 
-      if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(sendSpacingMs);
+      if (delivery.sent < config.maxNotificationsPerCycle) await sleep(sendSpacingMs);
     }
   }
 
@@ -225,6 +223,7 @@ export function createPoller(deps: PollerDeps) {
     status.lastPollAt = Date.now();
 
     let anyOk = false;
+    const delivery = { sent: 0 };
 
     for (const target of targets) {
       const current = state.get(target.source);
@@ -246,7 +245,7 @@ export function createPoller(deps: PollerDeps) {
             `[poller] ${target.source}: ${scan.events.length} event(s) ` +
               `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
           );
-          await notify(scan.events);
+          await notify(scan.events, delivery);
         }
 
         if (scan.lastEventLedger !== null) current.lastEventLedger = scan.lastEventLedger;

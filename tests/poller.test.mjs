@@ -139,3 +139,26 @@ test("repeated send failures remain observable while the poller completes the cy
   assert.equal(result.poller.status().notificationsFailed, 2);
   assert.match(result.cursor, /"cursor": "market-cursor"/);
 });
+
+test("notification cap applies across both watched contracts", async () => {
+  const sent = [];
+  const result = await withPoller(
+    async (_server, target) => ({
+      events: [
+        event(target.source, target.source === "market" ? 31 : 41),
+        event(target.source, target.source === "market" ? 32 : 42),
+      ],
+      cursor: `${target.source}-cursor`,
+      lastEventLedger: target.source === "market" ? 32 : 42,
+      latestLedger: 42,
+      oldestLedger: 1,
+      truncated: false,
+      pages: 1,
+    }),
+    async (text) => sent.push(text),
+    { maxNotificationsPerCycle: 2 },
+  );
+
+  assert.equal(sent.length, 2);
+  assert.equal(result.poller.status().eventsSkipped, 2);
+});
