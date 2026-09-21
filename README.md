@@ -186,7 +186,7 @@ src/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and notification-format tests (including deterministic fuzz cases), or `npm run build` to produce the production output.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and deterministic test suite, or `npm run build` to produce the production output. See [docs/testing.md](docs/testing.md) for fixture boundaries and credential-free test setup.
 
 ## License
 
