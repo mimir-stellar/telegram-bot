@@ -124,6 +124,17 @@ design of `src/stellar/events.ts`:
 
 So the walk terminates on the cursor, never on the payload.
 
+To exercise this behavior without Testnet access or credentials, run the
+bounded empty-page benchmark:
+
+```bash
+npm run benchmark:empty
+```
+
+It uses an in-memory RPC fake, verifies that 1,000 empty pages are consumed
+until the configured page bound, and prints median and p95 timings. It does
+not contact Stellar or Telegram.
+
 Events are also not a source of truth for current state — a claim's stakes and
 status come from the contract's own getters. This bot is a timeline, not an
 index.

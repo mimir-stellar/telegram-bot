@@ -15,7 +15,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test tests/format.test.mjs",
-    "scan": "tsx src/stellar/events.ts"
+    "scan": "tsx src/stellar/events.ts",
+    "benchmark:empty": "tsx scripts/benchmark-empty-polling.mjs"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.2.0",
