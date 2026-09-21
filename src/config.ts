@@ -86,9 +86,7 @@ function collector() {
     contractId(name: string): string {
       const value = this.required(name);
       if (value !== "" && !CONTRACT_ID_RE.test(value)) {
-        problems.push(
-          `${name} is not a Soroban contract id (expected C… strkey, 56 chars); got "${value}"`,
-        );
+        problems.push(`${name} is not a Soroban contract id (expected C… strkey, 56 chars); got "${value}"`);
       }
       return value;
     },
@@ -126,9 +124,7 @@ function collector() {
       // Telegram chat ids are integers (channels/supergroups are negative).
       // A @channelusername also works for public channels, so both are allowed.
       if (value !== "" && !/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
-        problems.push(
-          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
-        );
+        problems.push(`${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`);
       }
       return value;
     },
@@ -165,11 +161,7 @@ export function loadConfig(): BotConfig {
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
     cursorFile: path.resolve(process.cwd(), read("CURSOR_FILE") ?? DEFAULTS.cursorFile),
-    maxNotificationsPerCycle: c.int(
-      "MAX_NOTIFICATIONS_PER_CYCLE",
-      DEFAULTS.maxNotificationsPerCycle,
-      1,
-    ),
+    maxNotificationsPerCycle: c.int("MAX_NOTIFICATIONS_PER_CYCLE", DEFAULTS.maxNotificationsPerCycle, 1),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);

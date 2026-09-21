@@ -146,10 +146,7 @@ export function createPoller(deps: PollerDeps) {
       version: 1,
       updatedAt: new Date().toISOString(),
       targets: Object.fromEntries(
-        [...state.values()].map((t) => [
-          t.source,
-          { cursor: t.cursor, lastEventLedger: t.lastEventLedger },
-        ]),
+        [...state.values()].map((t) => [t.source, { cursor: t.cursor, lastEventLedger: t.lastEventLedger }]),
       ),
     };
 
@@ -202,10 +199,7 @@ export function createPoller(deps: PollerDeps) {
       } catch (err) {
         // One bad send must not abort the rest of the batch.
         status.notificationsFailed += 1;
-        console.error(
-          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}: ` +
-            errMessage(err),
-        );
+        console.error(`[poller] send failed for ${event.payload.name} at ledger ${event.ledger}: ` + errMessage(err));
       }
 
       if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);

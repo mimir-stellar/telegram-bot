@@ -11,13 +11,7 @@
  */
 
 import { txExplorerUrl } from "../stellar/client.js";
-import {
-  formatUsdc,
-  shortAddress,
-  squadSideLabel,
-  winnerSideLabel,
-  type DecodedEvent,
-} from "../stellar/decode.js";
+import { formatUsdc, shortAddress, squadSideLabel, winnerSideLabel, type DecodedEvent } from "../stellar/decode.js";
 import type { StellarConfig } from "../config.js";
 
 /** Telegram's MarkdownV2 reserved set. All of it must be escaped, everywhere. */
@@ -61,17 +55,11 @@ function headline(event: DecodedEvent): string | null {
   switch (p.name) {
     // ── mimir-market ────────────────────────────────────────────────────────
     case "claim_created":
-      return (
-        `🆕 *New claim* \\#${p.claimId}\n` +
-        `Category: ${escapeMd(p.category)}\n` +
-        `Creator: ${who(p.creator)}`
-      );
+      return `🆕 *New claim* \\#${p.claimId}\n` + `Category: ${escapeMd(p.category)}\n` + `Creator: ${who(p.creator)}`;
 
     case "claim_challenged":
       return (
-        `⚔️ *Claim \\#${p.claimId} challenged*\n` +
-        `Stake: *${usdc(p.stake)}*\n` +
-        `Challenger: ${who(p.challenger)}`
+        `⚔️ *Claim \\#${p.claimId} challenged*\n` + `Stake: *${usdc(p.stake)}*\n` + `Challenger: ${who(p.challenger)}`
       );
 
     case "claim_resolved":

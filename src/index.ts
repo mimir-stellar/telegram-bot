@@ -47,9 +47,7 @@ async function main(): Promise<void> {
   // One read before announcing readiness: a wrong RPC URL should surface now,
   // not as a mystery in the poll log an interval later.
   const health = await server.getHealth();
-  console.log(
-    `[boot] rpc ok, status=${health.status} ledgers ${health.oldestLedger}..${health.latestLedger}`,
-  );
+  console.log(`[boot] rpc ok, status=${health.status} ledgers ${health.oldestLedger}..${health.latestLedger}`);
 
   // The bot needs the poller's status and the poller needs the bot's send path,
   // so one edge of the cycle is late-bound. This one, because it is the only

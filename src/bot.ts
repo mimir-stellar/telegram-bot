@@ -50,10 +50,7 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
   }
 
   if (status.lastError) {
-    lines.push(
-      "",
-      `Last error \\(${ago(status.lastError.at)}\\): ${escapeMd(status.lastError.message)}`,
-    );
+    lines.push("", `Last error \\(${ago(status.lastError.at)}\\): ${escapeMd(status.lastError.message)}`);
   }
   if (status.consecutiveFailures > 0) {
     lines.push(`Consecutive failed cycles: ${status.consecutiveFailures}`);

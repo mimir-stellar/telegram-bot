@@ -189,11 +189,7 @@ function topicAt(topics: unknown[], index: number, what: string): unknown {
 
 // ── Per-contract decoders ────────────────────────────────────────────────────
 
-function decodeMarket(
-  name: string,
-  topics: unknown[],
-  fields: Record<string, unknown>,
-): MarketPayload | null {
+function decodeMarket(name: string, topics: unknown[], fields: Record<string, unknown>): MarketPayload | null {
   switch (name) {
     case "claim_created":
       return {
@@ -207,10 +203,7 @@ function decodeMarket(
       return {
         name,
         claimId: num(topicAt(topics, 1, "claim_challenged.id"), "claim_challenged.id"),
-        challenger: addr(
-          topicAt(topics, 2, "claim_challenged.challenger"),
-          "claim_challenged.challenger",
-        ),
+        challenger: addr(topicAt(topics, 2, "claim_challenged.challenger"), "claim_challenged.challenger"),
         stake: big(fields.stake, "claim_challenged.stake"),
       };
 
@@ -244,10 +237,7 @@ function decodeMarket(
       return {
         name,
         claimId: num(topicAt(topics, 1, "challenger_paid.id"), "challenger_paid.id"),
-        challenger: addr(
-          topicAt(topics, 2, "challenger_paid.challenger"),
-          "challenger_paid.challenger",
-        ),
+        challenger: addr(topicAt(topics, 2, "challenger_paid.challenger"), "challenger_paid.challenger"),
         stake: big(fields.stake, "challenger_paid.stake"),
         gross: big(fields.gross, "challenger_paid.gross"),
         fee: big(fields.fee, "challenger_paid.fee"),
@@ -276,11 +266,7 @@ function decodeMarket(
   }
 }
 
-function decodeSquad(
-  name: string,
-  topics: unknown[],
-  fields: Record<string, unknown>,
-): SquadPayload | null {
+function decodeSquad(name: string, topics: unknown[], fields: Record<string, unknown>): SquadPayload | null {
   switch (name) {
     case "market_created":
       return {
@@ -390,9 +376,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     const fields = isRecord(decodedValue) ? decodedValue : {};
 
     const payload =
-      source === "market"
-        ? decodeMarket(eventName, topics, fields)
-        : decodeSquad(eventName, topics, fields);
+      source === "market" ? decodeMarket(eventName, topics, fields) : decodeSquad(eventName, topics, fields);
 
     if (payload) return { ...meta, payload };
     return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };

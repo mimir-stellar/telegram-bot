@@ -8,9 +8,7 @@ const reserved = "_*[]()~`>#+-=|{}.\\!";
 const reservedSet = new Set(Array.from(reserved));
 
 function expectedEscape(value) {
-  return Array.from(value, (char) =>
-    reservedSet.has(char) ? `\\${char}` : char,
-  ).join("");
+  return Array.from(value, (char) => (reservedSet.has(char) ? `\\${char}` : char)).join("");
 }
 
 function seededRandom(seed) {
@@ -65,8 +63,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
   };
   const message = formatEvent(config, event);
   const expectedMessage =
-    `🆕 *New claim* \\#7\nCategory: ${expectedEscape(reserved)}\n` +
-    "Creator: `GABCD`\n_ledger 42_";
+    `🆕 *New claim* \\#7\nCategory: ${expectedEscape(reserved)}\n` + "Creator: `GABCD`\n_ledger 42_";
   const sent = [];
   const fakeBot = {
     api: {

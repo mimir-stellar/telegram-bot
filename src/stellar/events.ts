@@ -112,8 +112,7 @@ export async function paginatedGetEvents(
     }
     pages += 1;
 
-    const requestedStart =
-      opts.startLedger ?? Math.max(1, health.latestLedger - (opts.lookbackLedgers ?? 0));
+    const requestedStart = opts.startLedger ?? Math.max(1, health.latestLedger - (opts.lookbackLedgers ?? 0));
 
     // The two request shapes are a discriminated union on `cursor`, so they are
     // built separately rather than spread into one object.
@@ -166,11 +165,7 @@ export async function readContractEvents(
   target: WatchTarget,
   opts: ScanOptions = {},
 ): Promise<ContractScan> {
-  const scan = await paginatedGetEvents(
-    server,
-    [{ type: "contract", contractIds: [target.contractId] }],
-    opts,
-  );
+  const scan = await paginatedGetEvents(server, [{ type: "contract", contractIds: [target.contractId] }], opts);
 
   const events = scan.events.map((event) => decodeEvent(target.source, event));
   const ledgers = events.map((e) => e.ledger).filter((l) => l > 0);
@@ -258,10 +253,7 @@ async function main(): Promise<void> {
 
     const counts = new Map<string, number>();
     for (const event of scan.events) {
-      const key =
-        event.payload.name === "unknown"
-          ? `unknown:${event.payload.eventName || "?"}`
-          : event.payload.name;
+      const key = event.payload.name === "unknown" ? `unknown:${event.payload.eventName || "?"}` : event.payload.name;
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
 
@@ -276,9 +268,7 @@ async function main(): Promise<void> {
     for (const event of scan.events.slice(-show)) {
       console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
       console.log(`  ${summarize(event)}`);
-      console.log(
-        `  ${JSON.stringify(event.payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v))}`,
-      );
+      console.log(`  ${JSON.stringify(event.payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v))}`);
     }
   }
 }
