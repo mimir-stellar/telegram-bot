@@ -184,6 +184,10 @@ src/
     format.ts              decoded event -> MarkdownV2 message
 ```
 
+## Development checks
+
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and notification-format tests (including deterministic fuzz cases), or `npm run build` to produce the production output.
+
 ## License
 
 [AGPL-3.0-or-later](./LICENSE), matching the rest of Mimir.
