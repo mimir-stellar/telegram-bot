@@ -63,6 +63,10 @@ export interface PollerDeps {
   server: rpc.Server;
   /** Sends one already-formatted MarkdownV2 message. May reject. */
   send: (text: string) => Promise<void>;
+  /** Override the event reader in tests without reaching the Stellar RPC. */
+  readEvents?: typeof readContractEvents;
+  /** Override the Telegram pacing delay in tests. */
+  sendSpacingMs?: number;
 }
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
@@ -76,6 +80,8 @@ function errMessage(err: unknown): string {
 
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
+  const readEvents = deps.readEvents ?? readContractEvents;
+  const sendSpacingMs = deps.sendSpacingMs ?? SEND_SPACING_MS;
 
   const targets: WatchTarget[] = [
     { source: "market", contractId: config.marketContractId },
@@ -208,7 +214,7 @@ export function createPoller(deps: PollerDeps) {
         );
       }
 
-      if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
+      if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(sendSpacingMs);
     }
   }
 
@@ -225,7 +231,7 @@ export function createPoller(deps: PollerDeps) {
       if (!current) continue;
 
       try {
-        const scan = await readContractEvents(server, target, {
+        const scan = await readEvents(server, target, {
           cursor: current.cursor ?? undefined,
           lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
         });
@@ -305,6 +311,9 @@ export function createPoller(deps: PollerDeps) {
     status(): PollerStatus {
       return { ...status, targets: [...state.values()].map((t) => ({ ...t })) };
     },
+
+    /** Run one polling cycle without starting the background timer. */
+    pollOnce: cycle,
   };
 }
 
