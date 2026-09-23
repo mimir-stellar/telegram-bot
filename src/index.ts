@@ -10,6 +10,7 @@ import { ConfigError, loadConfig, networkLabel } from "./config.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { createPoller } from "./poller.js";
 import { createRpcServer } from "./stellar/client.js";
+import { Logger } from "./logger.js";
 
 /**
  * Installed before anything else can throw, so a rejection during startup is
@@ -19,13 +20,13 @@ function installProcessHandlers(): void {
   // A rejected promise nobody awaited is a bug, but not a reason to stop
   // notifying. Log it and let the poll loop carry on.
   process.on("unhandledRejection", (reason) => {
-    console.error("[error] unhandled rejection:", reason);
+    Logger.error("unhandled rejection", { reason: String(reason) });
   });
 
   // An uncaught exception means state is unknown; exit so the supervisor
   // restarts us. The persisted cursor is what makes that cheap.
   process.on("uncaughtException", (err) => {
-    console.error("[fatal] uncaught exception, exiting for restart:", err);
+    Logger.fatal("uncaught exception, exiting for restart", { error: String(err) });
     process.exit(1);
   });
 }
@@ -35,21 +36,27 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
 
-  console.log(`[boot] Mimir Telegram notifier`);
-  console.log(`[boot] network      ${networkLabel(config)} (${config.rpcUrl})`);
-  console.log(`[boot] market       ${config.marketContractId}`);
-  console.log(`[boot] squad        ${config.squadContractId}`);
-  console.log(`[boot] chat         ${config.chatId}`);
-  console.log(`[boot] cursor file  ${config.cursorFile}`);
+  Logger.info("boot", {
+    service: "Mimir Telegram notifier",
+    network: networkLabel(config),
+    rpcUrl: config.rpcUrl,
+    marketContractId: config.marketContractId,
+    squadContractId: config.squadContractId,
+    chatId: config.chatId,
+    cursorFile: config.cursorFile,
+  });
 
   const server = createRpcServer(config);
 
   // One read before announcing readiness: a wrong RPC URL should surface now,
   // not as a mystery in the poll log an interval later.
   const health = await server.getHealth();
-  console.log(
-    `[boot] rpc ok, status=${health.status} ledgers ${health.oldestLedger}..${health.latestLedger}`,
-  );
+  Logger.info("boot", {
+    rpcOk: true,
+    status: health.status,
+    oldestLedger: health.oldestLedger,
+    latestLedger: health.latestLedger,
+  });
 
   // The bot needs the poller's status and the poller needs the bot's send path,
   // so one edge of the cycle is late-bound. This one, because it is the only
@@ -69,17 +76,17 @@ async function main(): Promise<void> {
   // token itself cannot authenticate, which no amount of waiting fixes.
   void bot
     .start({
-      onStart: (me) => console.log(`[boot] telegram ok, running as @${me.username}`),
+      onStart: (me) => Logger.info("boot", { telegramOk: true, username: me.username }),
     })
     .catch((err: unknown) => {
-      console.error("[fatal] telegram long-polling failed — check BOT_TOKEN:", err);
+      Logger.fatal("telegram long-polling failed — check BOT_TOKEN", { error: String(err) });
       process.exit(1);
     });
 
   await poller.start();
 
   const shutdown = (signal: string) => {
-    console.log(`[shutdown] ${signal} received, stopping`);
+    Logger.info("shutdown", { signal });
     poller.stop();
     void bot.stop().finally(() => process.exit(0));
   };
@@ -90,9 +97,9 @@ async function main(): Promise<void> {
 
 main().catch((err: unknown) => {
   if (err instanceof ConfigError) {
-    console.error(`\n${err.message}\n`);
+    Logger.error("boot", { configError: true, problems: err.problems });
     process.exit(1);
   }
-  console.error("[boot] startup failed:", err);
+  Logger.error("boot", { startupFailed: true, error: String(err) });
   process.exit(1);
 });

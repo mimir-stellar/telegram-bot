@@ -21,7 +21,7 @@ import {
 import type { StellarConfig } from "../config.js";
 
 /** Telegram's MarkdownV2 reserved set. All of it must be escaped, everywhere. */
-const MDV2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
+const MDV2_RESERVED = /[_*\[\]()~`>#+\-=|{}.!\\]/g;
 
 export function escapeMd(text: string): string {
   return text.replace(MDV2_RESERVED, (ch) => `\\${ch}`);
@@ -137,7 +137,7 @@ function headline(event: DecodedEvent): string | null {
     case "claimed":
       return (
         `💸 *Squad payout* on \\#${p.marketId}\n` +
-        `${who(p.participant)} → net *${usdc(p.net)}* \\(gross ${usdc(p.gross)}, fee ${usdc(p.fee)}\\)`
+        `${who(p.participant)} → net *${usdc(p.net)}* \\ (gross ${usdc(p.gross)}, fee ${usdc(p.fee)}\\)`
       );
 
     case "fees_claimed":
