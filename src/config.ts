@@ -30,6 +30,7 @@ export interface BotConfig extends StellarConfig {
   pollIntervalMs: number;
   startLookbackLedgers: number;
   cursorFile: string;
+  statusFile: string;
   maxNotificationsPerCycle: number;
 }
 
@@ -55,6 +56,7 @@ const DEFAULTS = {
   minPollIntervalMs: 5_000,
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
+  statusFile: "./data/status.json",
   maxNotificationsPerCycle: 20,
 } as const;
 
@@ -153,6 +155,15 @@ export function loadStellarConfig(): StellarConfig {
   return config;
 }
 
+/**
+ * Resolve just the status snapshot path. Used by `--status`, which must work
+ * without BOT_TOKEN: reading a status file is a read-only operation and should
+ * not require the credentials of the process that wrote it.
+ */
+export function resolveStatusFile(): string {
+  return path.resolve(process.cwd(), read("STATUS_FILE") ?? DEFAULTS.statusFile);
+}
+
 /** Full bot config: chain + Telegram + poller tuning. */
 export function loadConfig(): BotConfig {
   const c = collector();
@@ -165,6 +176,7 @@ export function loadConfig(): BotConfig {
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
     cursorFile: path.resolve(process.cwd(), read("CURSOR_FILE") ?? DEFAULTS.cursorFile),
+    statusFile: path.resolve(process.cwd(), read("STATUS_FILE") ?? DEFAULTS.statusFile),
     maxNotificationsPerCycle: c.int(
       "MAX_NOTIFICATIONS_PER_CYCLE",
       DEFAULTS.maxNotificationsPerCycle,
