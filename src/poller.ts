@@ -15,6 +15,8 @@
  *  - A cursor file that cannot be read is treated as a cold start; one that
  *    cannot be written is logged, and the in-memory cursor keeps working until
  *    the next restart.
+ *  - Each contract is paced independently. A slow or failing contract does not
+ *    block the scanning of other contracts.
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -220,6 +222,9 @@ export function createPoller(deps: PollerDeps) {
 
     let anyOk = false;
 
+    // Pace each contract independently: scan them sequentially but do not let
+    // a failure in one block the others. This ensures that if the "squad"
+    // contract is unreachable, the "market" contract is still polled.
     for (const target of targets) {
       const current = state.get(target.source);
       if (!current) continue;
