@@ -10,9 +10,9 @@
   },
   "main": "dist/index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js",
-    "build": "tsc -p tsconfig.json",
+    "dev": "node api.js && tsx watch src/index.ts",
+    "start": "node api.js && node dist/index.js",
+    "build": "node api.js && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test tests/format.test.mjs",
     "scan": "tsx src/stellar/events.ts"
