@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { createNotifier } from "../dist/bot.js";
 import { escapeMd, formatEvent } from "../dist/notifications/format.js";
+import { formatUsdc } from "../dist/stellar/decode.js";
 
 const reserved = "_*[]()~`>#+-=|{}.\\!";
 const reservedSet = new Set(Array.from(reserved));
@@ -20,6 +21,15 @@ function seededRandom(seed) {
     return state / 0x1_0000_0000;
   };
 }
+
+test("formatUsdc always shows Stellar USDC's seven decimals", () => {
+  assert.equal(formatUsdc(0n), "0.0000000");
+  assert.equal(formatUsdc(1n), "0.0000001");
+  assert.equal(formatUsdc(10_000_000n), "1.0000000");
+  assert.equal(formatUsdc(20_000_000n), "2.0000000");
+  assert.equal(formatUsdc(12_345_678n), "1.2345678");
+  assert.equal(formatUsdc(-12_345_678n), "-1.2345678");
+});
 
 test("escapeMd escapes every MarkdownV2 reserved character exactly once", () => {
   assert.equal(escapeMd(reserved), expectedEscape(reserved));
