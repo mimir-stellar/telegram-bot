@@ -31,6 +31,25 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /**
+   * Exit with {@link EXIT_RPC_PERSISTENT} (code 3) after this many consecutive
+   * all-target-failed cycles. 0 disables the threshold (run forever).
+   * A supervisor that restarts on exit 3 gives the process a clean slate —
+   * fresh TCP connections, reset backoff — without human intervention.
+   */
+  consecutiveFailureExitThreshold: number;
+  /**
+   * When > 0, a minimal HTTP server listens on this port. GET /healthz returns
+   * 200 while the poller has succeeded at least once in the last
+   * `pollIntervalMs * 3` window, and 503 otherwise. 0 disables the endpoint.
+   */
+  httpHealthPort: number;
+  /**
+   * Base interval for the Stellar RPC retry back-off (ms). Each consecutive
+   * all-target failure doubles the wait up to `pollIntervalMs`, then the
+   * exit threshold takes over if configured.
+   */
+  backoffBaseMs: number;
 }
 
 export class ConfigError extends Error {
@@ -56,6 +75,9 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  consecutiveFailureExitThreshold: 20,
+  httpHealthPort: 0,
+  backoffBaseMs: 5_000,
 } as const;
 
 /** Strkey for a contract: `C` + 55 base32 characters. */
@@ -170,6 +192,13 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    consecutiveFailureExitThreshold: c.int(
+      "CONSECUTIVE_FAILURE_EXIT_THRESHOLD",
+      DEFAULTS.consecutiveFailureExitThreshold,
+      0,
+    ),
+    httpHealthPort: c.int("HTTP_HEALTH_PORT", DEFAULTS.httpHealthPort, 0),
+    backoffBaseMs: c.int("BACKOFF_BASE_MS", DEFAULTS.backoffBaseMs, 100),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
