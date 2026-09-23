@@ -25,6 +25,13 @@ Built with [grammy](https://grammy.dev) and
 [`@stellar/stellar-sdk`](https://github.com/stellar/js-stellar-sdk). Reads only —
 it holds no keys and signs nothing.
 
+Every notification that carries a transaction hash also includes a
+`View on Explorer` inline button linking to that transaction on
+[stellar.expert](https://stellar.expert) (testnet or public, derived from the
+configured network passphrase). The button reuses the same URL as the
+`· tx` footer link, which stays in the message text as a fallback, and is sent
+in the same Telegram request — no second message, no extra configuration.
+
 ## What it watches
 
 | Contract | Events it notifies on |
@@ -162,7 +169,10 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 - **A failed Telegram send** drops one message; the cursor still advances. That
   is deliberate: holding the cursor back would turn a revoked token or a chat
   the bot was removed from into an infinite replay, and recovery would flood the
-  channel. Notifications are lossy on purpose — the chain is the record.
+  channel. Notifications are lossy on purpose — the chain is the record. A
+  rejected inline keyboard (or a malformed MarkdownV2 payload) fails the same
+  way: one dropped message, cursor advances, no retry loop. Events without a
+  usable transaction hash are still sent, just without the button.
 - **A corrupt cursor file** is treated as a cold start rather than a crash.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
@@ -186,7 +196,7 @@ src/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and notification-format tests (including deterministic fuzz cases), or `npm run build` to produce the production output.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build, notification-format tests (including deterministic fuzz cases) and explorer-button tests, or `npm run build` to produce the production output.
 
 ## License
 

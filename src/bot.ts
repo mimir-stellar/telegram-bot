@@ -7,7 +7,7 @@
 
 import { Bot } from "grammy";
 
-import { escapeMd } from "./notifications/format.js";
+import { escapeMd, type ExplorerKeyboard } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
 
@@ -95,12 +95,18 @@ export function createBot(deps: BotDeps): Bot {
   return bot;
 }
 
+/** Extra Telegram send options the poller may attach to a notification. */
+export interface SendExtra {
+  reply_markup?: ExplorerKeyboard | undefined;
+}
+
 /** The poller's send path: one message to the configured chat. */
 export function createNotifier(bot: Bot, config: BotConfig) {
-  return async (text: string): Promise<void> => {
+  return async (text: string, extra?: SendExtra): Promise<void> => {
     await bot.api.sendMessage(config.chatId, text, {
       parse_mode: "MarkdownV2",
       link_preview_options: { is_disabled: true },
+      ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
     });
   };
 }

@@ -22,8 +22,9 @@ import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
 
+import type { SendExtra } from "./bot.js";
 import type { BotConfig } from "./config.js";
-import { formatEvent } from "./notifications/format.js";
+import { explorerKeyboard, formatEvent } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
@@ -61,8 +62,15 @@ interface CursorFile {
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
-  /** Sends one already-formatted MarkdownV2 message. May reject. */
-  send: (text: string) => Promise<void>;
+  /**
+   * Sends one already-formatted MarkdownV2 message, with the event's explorer
+   * button when `extra.reply_markup` is set. May reject; the poller treats a
+   * rejection as one dropped message and still advances the cursor (see the
+   * failure policy at the top of this file). Retries are deliberately absent:
+   * the per-cycle cap plus send spacing is the rate-limit strategy, and a
+   * bounded drop beats an unbounded retry loop.
+   */
+  send: (text: string, extra?: SendExtra) => Promise<void>;
 }
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
@@ -180,7 +188,26 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
-      const text = formatEvent(config, event);
+      // Formatting one event must never abort the rest of the batch: remote
+      // event data is untrusted, so a malformed value is a skip, not a throw.
+      // Only safe identifiers are logged — never the raw remote payload.
+      let text: string | null;
+      let extra: SendExtra | undefined;
+      try {
+        text = formatEvent(config, event);
+        if (text !== null) {
+          const reply_markup = explorerKeyboard(config, event);
+          if (reply_markup) extra = { reply_markup };
+        }
+      } catch (err) {
+        status.eventsSkipped += 1;
+        console.error(
+          `[poller] format failed for ${event.source} event at ledger ${event.ledger}: ` +
+            errMessage(err),
+          { eventId: event.eventId, reason: "malformed_event" },
+        );
+        continue;
+      }
       if (text === null) {
         status.eventsSkipped += 1;
         continue;
@@ -196,11 +223,12 @@ export function createPoller(deps: PollerDeps) {
       }
 
       try {
-        await send(text);
+        await send(text, extra);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
-        // One bad send must not abort the rest of the batch.
+        // One bad send (Telegram down, 429, kicked from chat, rejected
+        // keyboard, bad MarkdownV2) must not abort the rest of the batch.
         status.notificationsFailed += 1;
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}: ` +

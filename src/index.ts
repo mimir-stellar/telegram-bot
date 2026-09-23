@@ -7,7 +7,7 @@
  */
 
 import { ConfigError, loadConfig, networkLabel } from "./config.js";
-import { createBot, createNotifier, registerCommands } from "./bot.js";
+import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
 import { createPoller } from "./poller.js";
 import { createRpcServer } from "./stellar/client.js";
 
@@ -54,11 +54,11 @@ async function main(): Promise<void> {
   // The bot needs the poller's status and the poller needs the bot's send path,
   // so one edge of the cycle is late-bound. This one, because it is the only
   // one that is a single function reference.
-  let notify: (text: string) => Promise<void> = async () => {
+  let notify: (text: string, extra?: SendExtra) => Promise<void> = async () => {
     throw new Error("telegram notifier not ready");
   };
 
-  const poller = createPoller({ config, server, send: (text) => notify(text) });
+  const poller = createPoller({ config, server, send: (text, extra) => notify(text, extra) });
   const bot = createBot({ config, status: () => poller.status() });
   notify = createNotifier(bot, config);
 
