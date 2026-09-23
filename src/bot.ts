@@ -6,6 +6,7 @@
  */
 
 import { Bot } from "grammy";
+import type { UserFromGetMe } from "grammy/types";
 
 import { escapeMd } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
@@ -65,11 +66,31 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  /**
+   * Pre-populated bot info. When provided (e.g. in tests) grammy skips the
+   * getMe() call so `bot.handleUpdate()` works without a real Telegram token.
+   */
+  botInfo?: UserFromGetMe;
+}
+
+/**
+ * Returns true when the chat is permitted to use restricted commands.
+ *
+ * Rules:
+ * - If `allowedChatIds` is empty the list is open (any chat may use /status).
+ * - Otherwise the incoming chat id must appear in the list. Both the numeric
+ *   id (stored as a number in grammy's ctx.chat.id) and its string form are
+ *   compared so that negative group ids such as -1001234567890 match correctly.
+ */
+function isChatAllowed(allowedChatIds: string[], chatId: number): boolean {
+  if (allowedChatIds.length === 0) return true;
+  const asString = String(chatId);
+  return allowedChatIds.some((allowed) => allowed === asString);
 }
 
 export function createBot(deps: BotDeps): Bot {
   const { config, status } = deps;
-  const bot = new Bot(config.botToken);
+  const bot = new Bot(config.botToken, deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined);
 
   bot.command("start", async (ctx) => {
     await ctx.reply(HELP, { parse_mode: "MarkdownV2" });
@@ -80,6 +101,16 @@ export function createBot(deps: BotDeps): Bot {
   });
 
   bot.command("status", async (ctx) => {
+    if (!isChatAllowed(config.allowedChatIds, ctx.chat.id)) {
+      // Silently ignore requests from unapproved chats. Responding with an
+      // error would leak the existence of the restriction; not responding at
+      // all is consistent with privacy-mode bots that simply never see most
+      // messages. Log so operators can diagnose misconfigured chat ids.
+      console.warn(
+        `[bot] /status denied for chat ${ctx.chat.id} (not in ALLOWED_CHAT_IDS)`,
+      );
+      return;
+    }
     await ctx.reply(statusMessage(config, status()), {
       parse_mode: "MarkdownV2",
       link_preview_options: { is_disabled: true },
