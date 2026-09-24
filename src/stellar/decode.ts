@@ -57,6 +57,15 @@ export interface EventMeta {
   at: number;
   /** The RPC's own event id — unique and monotonic, handy for logs. */
   eventId: string;
+  /**
+   * Optional wire version for the event payload.
+   * Accepted forms on topic[0]:
+   *   - `claim_created`            → version 1 (legacy / default)
+   *   - `v2:claim_created`         → version 2
+   *   - `claim_created.v3`         → version 3
+   * Or a numeric `version` / `payload_version` field in the value map.
+   */
+  payloadVersion: number;
 }
 
 export type MarketPayload =
@@ -128,6 +137,42 @@ export interface UnknownPayload {
 export type EventPayload = MarketPayload | SquadPayload | UnknownPayload;
 
 export type DecodedEvent = EventMeta & { payload: EventPayload };
+
+
+/**
+ * Split a versioned event name into `{ version, name }`.
+ * Unknown / missing versions default to 1 so existing contracts keep working.
+ */
+export function parseEventNameVersion(raw: string): { version: number; name: string } {
+  const trimmed = (raw || "").trim();
+  if (!trimmed) return { version: 1, name: "" };
+
+  const prefix = /^v(\d+)[:._-](.+)$/i.exec(trimmed);
+  if (prefix) {
+    return { version: Number(prefix[1]), name: prefix[2] };
+  }
+  const suffix = /^(.+)\.v(\d+)$/i.exec(trimmed);
+  if (suffix) {
+    return { version: Number(suffix[2]), name: suffix[1] };
+  }
+  return { version: 1, name: trimmed };
+}
+
+function versionFromFields(fields: Record<string, unknown>, fallback: number): number {
+  for (const key of ["version", "payload_version", "payloadVersion"]) {
+    if (!(key in fields)) continue;
+    const value = fields[key];
+    if (typeof value === "number" && Number.isInteger(value) && value >= 1) return value;
+    if (typeof value === "bigint" && value >= 1n && value <= BigInt(Number.MAX_SAFE_INTEGER)) {
+      return Number(value);
+    }
+    if (typeof value === "string" && /^\d+$/.test(value)) {
+      const n = Number(value);
+      if (n >= 1) return n;
+    }
+  }
+  return fallback;
+}
 
 // ── Scalar helpers ───────────────────────────────────────────────────────────
 
@@ -371,6 +416,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     txHash: event.txHash ?? "",
     at: Math.floor(new Date(event.ledgerClosedAt ?? 0).getTime() / 1000),
     eventId: event.id ?? "",
+    payloadVersion: 1,
   };
 
   let eventName = "";
@@ -384,18 +430,41 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     });
 
     const first = topics[0];
-    eventName = typeof first === "string" ? first : "";
+    const rawName = typeof first === "string" ? first : "";
+    const parsed = parseEventNameVersion(rawName);
+    eventName = parsed.name;
 
     const decodedValue = native(event.value);
     const fields = isRecord(decodedValue) ? decodedValue : {};
+    const payloadVersion = versionFromFields(fields, parsed.version);
+    const metaWithVersion = { ...meta, payloadVersion };
+
+    // Unsupported future versions are surfaced as unknown (fail-soft) rather
+    // than forcing a best-effort decode that could mis-read field layouts.
+    if (payloadVersion > 1 && parsed.version === payloadVersion && !(rawName.includes(":") || rawName.includes(".v"))) {
+      // version came only from fields — still attempt decode for v1-compatible shapes
+    }
+    if (payloadVersion > 2) {
+      return {
+        ...metaWithVersion,
+        payload: {
+          name: "unknown",
+          eventName: rawName || eventName,
+          reason: `unsupported payload version ${payloadVersion}`,
+        },
+      };
+    }
 
     const payload =
       source === "market"
         ? decodeMarket(eventName, topics, fields)
         : decodeSquad(eventName, topics, fields);
 
-    if (payload) return { ...meta, payload };
-    return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
+    if (payload) return { ...metaWithVersion, payload };
+    return {
+      ...metaWithVersion,
+      payload: { name: "unknown", eventName: rawName || eventName, reason: "no decoder" },
+    };
   } catch (err) {
     return {
       ...meta,

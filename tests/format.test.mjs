@@ -171,3 +171,11 @@ test("escapeMd handles a long adversarial string without dropping characters", (
   const escaped = escapeMd(input);
   assert.equal(escaped, expectedEscape(input));
 });
+
+test("parseEventNameVersion accepts legacy and versioned names", async () => {
+  const { parseEventNameVersion } = await import("../dist/stellar/decode.js");
+  assert.deepEqual(parseEventNameVersion("claim_created"), { version: 1, name: "claim_created" });
+  assert.deepEqual(parseEventNameVersion("v2:claim_created"), { version: 2, name: "claim_created" });
+  assert.deepEqual(parseEventNameVersion("claim_created.v3"), { version: 3, name: "claim_created" });
+  assert.deepEqual(parseEventNameVersion(""), { version: 1, name: "" });
+});
