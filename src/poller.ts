@@ -118,6 +118,47 @@ async function sendWithRetry(
   }
 }
 
+export function buildDigests(
+  events: DecodedEvent[],
+  config: BotConfig,
+  formatFn: (config: BotConfig, event: DecodedEvent) => string | null,
+): { text: string; count: number; skipped: number }[] {
+  const digests: { text: string; count: number; skipped: number }[] = [];
+  let currentText = "";
+  let currentCount = 0;
+  let currentSkipped = 0;
+
+  for (const event of events) {
+    if (event.payload.name === "unknown") {
+      currentSkipped += 1;
+      continue;
+    }
+
+    const text = formatFn(config, event);
+    if (text === null) {
+      currentSkipped += 1;
+      continue;
+    }
+
+    const separator = currentText ? "\n\n" : "";
+    if (currentText.length + separator.length + text.length > 4000) {
+      digests.push({ text: currentText, count: currentCount, skipped: currentSkipped });
+      currentText = text;
+      currentCount = 1;
+      currentSkipped = 0;
+    } else {
+      currentText += separator + text;
+      currentCount += 1;
+    }
+  }
+
+  if (currentText || currentSkipped > 0) {
+    digests.push({ text: currentText, count: currentCount, skipped: currentSkipped });
+  }
+
+  return digests;
+}
+
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
 
@@ -212,48 +253,35 @@ export function createPoller(deps: PollerDeps) {
   // ── One cycle ──────────────────────────────────────────────────────────────
 
   async function notify(events: DecodedEvent[]): Promise<void> {
-    let sentThisCycle = 0;
+    const digests = buildDigests(events, config, formatEvent);
+    let sentDigestsThisCycle = 0;
 
-    for (const event of events) {
-      if (event.payload.name === "unknown") {
-        status.eventsSkipped += 1;
-        console.log(
-          `[poller] skipped ${event.source} event "${event.payload.eventName}" ` +
-            `at ledger ${event.ledger}${event.payload.reason ? ` (${event.payload.reason})` : ""}`,
-        );
-        continue;
-      }
+    for (const digest of digests) {
+      status.eventsSkipped += digest.skipped;
 
-      const text = formatEvent(config, event);
-      if (text === null) {
-        status.eventsSkipped += 1;
-        continue;
-      }
+      if (!digest.text) continue;
 
-      if (sentThisCycle >= config.maxNotificationsPerCycle) {
-        status.eventsSkipped += 1;
+      if (sentDigestsThisCycle >= config.maxNotificationsPerCycle) {
+        status.eventsSkipped += digest.count;
         console.warn(
           `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
-            `dropping ${event.payload.name} at ledger ${event.ledger}`,
+            `dropping batch of ${digest.count} events`,
         );
         continue;
       }
 
       try {
-        // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text);
-        status.notificationsSent += 1;
-        sentThisCycle += 1;
+        await sendWithRetry(send, digest.text);
+        status.notificationsSent += digest.count;
+        sentDigestsThisCycle += 1;
       } catch (err) {
-        // All retries exhausted; drop the message but continue processing others.
-        status.notificationsFailed += 1;
+        status.notificationsFailed += digest.count;
         console.error(
-          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
-            errMessage(err),
+          `[poller] send failed for batch of ${digest.count} events after retries: ` + errMessage(err),
         );
       }
 
-      if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
+      if (sentDigestsThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
     }
   }
 
