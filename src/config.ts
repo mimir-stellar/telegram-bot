@@ -31,6 +31,8 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /** Milliseconds to wait between successive Telegram sends in one cycle. */
+  interSendDelayMs: number;
 }
 
 export class ConfigError extends Error {
@@ -56,6 +58,8 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  interSendDelayMs: 1_500,
+  minInterSendDelayMs: 0,
 } as const;
 
 /** Strkey for a contract: `C` + 55 base32 characters. */
@@ -169,6 +173,11 @@ export function loadConfig(): BotConfig {
       "MAX_NOTIFICATIONS_PER_CYCLE",
       DEFAULTS.maxNotificationsPerCycle,
       1,
+    ),
+    interSendDelayMs: c.int(
+      "INTER_SEND_DELAY_MS",
+      DEFAULTS.interSendDelayMs,
+      DEFAULTS.minInterSendDelayMs,
     ),
   };
 

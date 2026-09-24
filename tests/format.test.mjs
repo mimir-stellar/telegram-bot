@@ -171,3 +171,133 @@ test("escapeMd handles a long adversarial string without dropping characters", (
   const escaped = escapeMd(input);
   assert.equal(escaped, expectedEscape(input));
 });
+
+// ── clip() boundary tests ─────────────────────────────────────────────────────
+
+import { clip } from "../dist/notifications/format.js";
+
+test("clip: returns string unchanged when at exactly the max length", () => {
+  const s = "a".repeat(200);
+  assert.equal(clip(s, 200).length, 200);
+  assert.equal(clip(s, 200), s);
+});
+
+test("clip: truncates and appends ellipsis when over max", () => {
+  const s = "x".repeat(201);
+  const result = clip(s, 200);
+  // trimmed is 201, so result should be 199 chars + ellipsis = 200 logical chars
+  assert.ok(result.endsWith("…"), `Expected ellipsis at end; got: "${result.slice(-5)}"`);
+  // The result should be max length in code points
+  assert.ok([...result].length <= 200, `clip result too long: ${[...result].length}`);
+});
+
+test("clip: trims whitespace before applying the cap", () => {
+  const padded = "  hello  ";
+  assert.equal(clip(padded, 200), "hello");
+});
+
+test("clip: empty string returns empty string", () => {
+  assert.equal(clip("", 200), "");
+});
+
+test("clip: category field is bounded in claim_created notification", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const longCategory = "x".repeat(300);
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 50,
+    txHash: "",
+    at: 0,
+    eventId: "50-0",
+    payload: {
+      name: "claim_created",
+      claimId: 1,
+      creator: "GABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDE",
+      category: longCategory,
+    },
+  };
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  // The category line should not contain the full 300-char string
+  assert.ok(
+    !message.includes("x".repeat(200)),
+    "Category was not truncated in the notification output",
+  );
+});
+
+test("clip: question field is bounded in market_created notification", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const longQuestion = "Will ".repeat(100); // 500 chars
+  const event = {
+    source: "squad",
+    contractId: "squad",
+    ledger: 51,
+    txHash: "",
+    at: 0,
+    eventId: "51-0",
+    payload: {
+      name: "market_created",
+      marketId: 1,
+      captain: "GABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDE",
+      deadline: 1_800_000_000,
+      feeBps: 100,
+      question: longQuestion,
+    },
+  };
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  assert.ok(
+    !message.includes("Will ".repeat(50)),
+    "Question was not truncated in the notification output",
+  );
+});
+
+test("clip: summary field is bounded in claim_resolved notification", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const longSummary = "evidence ".repeat(100); // 900 chars
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 52,
+    txHash: "",
+    at: 0,
+    eventId: "52-0",
+    payload: {
+      name: "claim_resolved",
+      claimId: 3,
+      winnerSide: 2,
+      summary: longSummary,
+      confidence: 95,
+      evidenceHash: "abc123",
+    },
+  };
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  // The raw summary should not appear verbatim past 200 chars in the output
+  assert.ok(
+    !message.includes("evidence ".repeat(30)),
+    "Summary was not truncated in the notification output",
+  );
+});
