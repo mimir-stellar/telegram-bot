@@ -31,6 +31,12 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /**
+   * How many ledgers of slack before a persisted cursor is considered stale
+   * (i.e. below the RPC's retained floor). When exceeded the bot falls back to
+   * a cold start. Default 1000 (≈ 83 minutes on Testnet at ~5 s/ledger).
+   */
+  cursorStaleLedgerMargin: number;
 }
 
 export class ConfigError extends Error {
@@ -56,6 +62,7 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  cursorStaleLedgerMargin: 1_000,
 } as const;
 
 /** Strkey for a contract: `C` + 55 base32 characters. */
@@ -169,6 +176,11 @@ export function loadConfig(): BotConfig {
       "MAX_NOTIFICATIONS_PER_CYCLE",
       DEFAULTS.maxNotificationsPerCycle,
       1,
+    ),
+    cursorStaleLedgerMargin: c.int(
+      "CURSOR_STALE_LEDGER_MARGIN",
+      DEFAULTS.cursorStaleLedgerMargin,
+      0,
     ),
   };
 
