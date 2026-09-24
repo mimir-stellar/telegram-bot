@@ -24,6 +24,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
 import { formatEvent } from "./notifications/format.js";
+import { isEventSuppressed } from "./notifications/suppression.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
@@ -176,6 +177,15 @@ export function createPoller(deps: PollerDeps) {
         console.log(
           `[poller] skipped ${event.source} event "${event.payload.eventName}" ` +
             `at ledger ${event.ledger}${event.payload.reason ? ` (${event.payload.reason})` : ""}`,
+        );
+        continue;
+      }
+
+      if (isEventSuppressed(config.suppressedEvents, event.payload.name)) {
+        status.eventsSkipped += 1;
+        console.log(
+          `[poller] suppressed ${event.source} event "${event.payload.name}" ` +
+            `at ledger ${event.ledger} (SUPPRESSED_EVENTS)`,
         );
         continue;
       }

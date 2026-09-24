@@ -16,6 +16,8 @@ import path from "node:path";
 
 import "dotenv/config";
 
+import { parseSuppressedEvents } from "./notifications/suppression.js";
+
 export interface StellarConfig {
   marketContractId: string;
   squadContractId: string;
@@ -31,6 +33,8 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /** Notifiable event names that must not be posted (cursor still advances). */
+  suppressedEvents: ReadonlySet<string>;
 }
 
 export class ConfigError extends Error {
@@ -158,6 +162,9 @@ export function loadConfig(): BotConfig {
   const c = collector();
   const stellar = stellarFrom(c);
 
+  const suppression = parseSuppressedEvents(read("SUPPRESSED_EVENTS"));
+  for (const problem of suppression.problems) c.problems.push(problem);
+
   const config: BotConfig = {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
@@ -170,6 +177,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    suppressedEvents: suppression.suppressed,
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);

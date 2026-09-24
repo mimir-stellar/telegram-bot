@@ -167,6 +167,7 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down.
+- **Per-event suppression** via `SUPPRESSED_EVENTS` (comma-separated notifiable names) skips matching posts while still advancing the cursor. Unknown names fail startup; `/status` lists the active set.
 
 ## Layout
 
