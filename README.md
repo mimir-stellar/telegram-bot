@@ -57,9 +57,17 @@ the prompts, and copy the token it gives you (`123456789:AA…`).
 
 If your group has [privacy mode](https://core.telegram.org/bots/features#privacy-mode)
 on (the default), the bot only sees messages that are commands or replies to it —
-which is all `/status` needs.
+which covers `/status` and the operator controls below.
 
-### 3. Configure and run
+### 3. Choose an operator (optional)
+
+Set `OPERATOR_TELEGRAM_USER_ID` to the numeric **user** id returned by
+`@userinfobot` to enable `/pause` and `/resume`. The notification
+`TELEGRAM_CHAT_ID` is intentionally not accepted as authorization: in a group,
+everyone can send messages from that chat. If this variable is omitted, existing
+deployments continue unchanged and both operator commands are ignored.
+
+### 4. Configure and run
 
 ```bash
 cp .env.example .env     # then fill in BOT_TOKEN and TELEGRAM_CHAT_ID
@@ -89,6 +97,13 @@ looks healthy but notifies nobody.
 | `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
 | `/audit` | The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
+| `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
+| `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
+
+Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
+response and cannot mutate poller state. Repeated `/pause` or `/resume` commands
+are idempotent. Control state is process-local: a restart resumes polling and
+loads the existing version-1 cursor file.
 
 ## Reading events without a bot token
 
@@ -185,7 +200,9 @@ treatment as the cursor:
 ```
 
 On a cold start (no file) it begins `START_LOOKBACK_LEDGERS` behind the chain tip
-rather than replaying the whole retained window into your chat.
+rather than replaying the whole retained window into your chat. `/pause` and
+`/resume` never edit this file; they only control scheduling, so the cursor
+format remains version 1 and a restart does not preserve a pause.
 
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. On
 an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
@@ -199,17 +216,27 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 
 - **A failed RPC call** fails one contract's scan for one cycle. Its cursor is
   left untouched, so the next cycle resumes exactly where it stopped.
-- **A failed Telegram send** drops one message; the cursor still advances. That
+- **A failed Telegram send** receives at most three attempts with bounded
+  exponential backoff, then drops one message; the cursor still advances. That
   is deliberate: holding the cursor back would turn a revoked token or a chat
   the bot was removed from into an infinite replay, and recovery would flood the
-  channel. Notifications are lossy on purpose — the chain is the record.
-- **A corrupt cursor file** is treated as a cold start rather than a crash.
+  channel. Notifications are lossy on purpose — the chain is the record. Operator
+  `/resume` does not replay failed messages.
+- **A corrupt cursor file** is treated as a cold start rather than a crash. A
+  valid but RPC-rejected stale cursor is never silently rewound: the target keeps
+  that cursor, the error becomes visible in `/status`, and scheduled retries or
+  `/resume` use the same position. Recovery follows the incident runbook rather
+  than replacing an opaque cursor with a guessed ledger.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
-  down.
+  down. RPC, Telegram, and poller error text shown in `/status` or logs is
+  compact, bounded, and the configured bot token is redacted.
 - **An unreadable audit line** (or a failed append) is logged and skipped; the
   audit trail never throws into the poll loop, and a bad line never takes the
   report down. An audit file that cannot be read at all reports as empty.
+- **An operator pause** prevents new cycles but cannot cancel a bounded scan or
+  Telegram retry loop already in progress. That cycle follows the normal cursor
+  rules above; `/resume` starts the next cycle immediately.
 
 ## Health endpoint
 
@@ -218,7 +245,7 @@ checks (default `http://127.0.0.1:8787`):
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy; `503` when stopped or degraded (repeated RPC failures or a stale success window). |
+| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused`. |
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
@@ -246,7 +273,7 @@ src/
   index.ts                 entry point: config -> RPC -> bot -> poller -> health HTTP
   health.ts                local loopback GET /health for supervisors
   config.ts                env loading and validation, fails fast
-  bot.ts                   grammy setup: /start, /help, /status, /audit, /contracts
+  bot.ts                   grammy setup: /start, /help, /status, /audit, /contracts, operator pause/resume
   poller.ts                the loop: scan, notify, persist the cursor, flush audit
   audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
   audit-cli.ts             entrypoint for `npm run audit`
@@ -263,7 +290,7 @@ tests/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the notification-format, fixture, health and audit-trail suites (including deterministic fuzz cases), or `npm run build` to produce the production output. No test or check requires live Testnet access, Telegram credentials, or signing keys.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and audit-trail suites (including deterministic fuzz cases), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md).
 

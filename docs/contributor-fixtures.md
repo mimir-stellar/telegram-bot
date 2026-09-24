@@ -34,7 +34,9 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures/cursor-valid.json` | Well-formed `data/cursor.json` shape for restart docs |
 | `tests/fixtures/cursor-corrupt.txt` | Unreadable cursor sample (cold-start path) |
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
-| `tests/format.test.mjs` | Inline unit cases (MarkdownV2 escape, USDC decimals, send failures) |
+| `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
+| `tests/bot.test.mjs` | Mocked grammy operator-command routing and exact reply payloads |
+| `tests/poller.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
 
 ## Event fixture schema
 
@@ -111,6 +113,8 @@ When you add persistence tests:
 | Telegram send error | **still advances** | counted as failed | Fake `sendMessage` reject; assert no token in the Error message |
 | Corrupt cursor file | cold start | n/a | Use `cursor-corrupt.txt` contents |
 | Burst over cap | advances | extras skipped | Cap `MAX_NOTIFICATIONS_PER_CYCLE` in the fake config |
+| Unauthorized `/pause` or `/resume` | untouched | no command reply | Mock grammy with a different Telegram user id |
+| Operator pause → restart | version-1 cursor unchanged | no replay | Reload a valid cursor fixture; pause must not persist |
 
 ## Adding a new fixture case
 

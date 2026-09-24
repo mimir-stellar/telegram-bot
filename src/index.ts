@@ -11,6 +11,7 @@ import { auditEntry, createAuditLog } from "./audit.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
+import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
 
 /**
@@ -21,13 +22,13 @@ function installProcessHandlers(): void {
   // A rejected promise nobody awaited is a bug, but not a reason to stop
   // notifying. Log it and let the poll loop carry on.
   process.on("unhandledRejection", (reason) => {
-    console.error("[error] unhandled rejection:", reason);
+    console.error(`[error] unhandled rejection: ${safeErrorMessage(reason)}`);
   });
 
   // An uncaught exception means state is unknown; exit so the supervisor
   // restarts us. The persisted cursor is what makes that cheap.
   process.on("uncaughtException", (err) => {
-    console.error("[fatal] uncaught exception, exiting for restart:", err);
+    console.error(`[fatal] uncaught exception, exiting for restart: ${safeErrorMessage(err)}`);
     process.exit(1);
   });
 }
@@ -48,9 +49,11 @@ async function main(): Promise<void> {
   console.log(`[boot] network      ${networkLabel(config)} (${config.rpcUrl})`);
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
-  console.log(`[boot] chat         ${config.chatId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
   console.log(`[boot] audit file   ${config.auditFile}`);
+  console.log(
+    `[boot] operator      ${config.operatorTelegramUserId === null ? "disabled" : "configured"}`,
+  );
 
   const server = createRpcServer(config);
 
@@ -75,7 +78,13 @@ async function main(): Promise<void> {
     }),
   );
   const poller = createPoller({ config, server, send: (text) => notify(text), audit });
-  const bot = createBot({ config, status: () => poller.status(), audit });
+  const bot = createBot({
+    config,
+    status: () => poller.status(),
+    audit,
+    pause: () => poller.pause(),
+    resume: () => poller.resume(),
+  });
   notify = createNotifier(bot, config);
 
   // Local-only health HTTP for supervisors. Starts before Telegram long-poll
@@ -92,7 +101,10 @@ async function main(): Promise<void> {
       onStart: (me) => console.log(`[boot] telegram ok, running as @${me.username}`),
     })
     .catch((err: unknown) => {
-      console.error("[fatal] telegram long-polling failed — check BOT_TOKEN:", err);
+      console.error(
+        `[fatal] telegram long-polling failed — check BOT_TOKEN: ` +
+          safeErrorMessage(err, [config.botToken]),
+      );
       process.exit(1);
     });
 
@@ -107,7 +119,7 @@ async function main(): Promise<void> {
     void healthServer
       .close()
       .catch((err: unknown) => {
-        console.error(`[shutdown] health server close failed:`, err);
+        console.error(`[shutdown] health server close failed: ${safeErrorMessage(err)}`);
       })
       .finally(() => {
         void bot
@@ -129,6 +141,6 @@ main().catch((err: unknown) => {
     console.error(`\n${err.message}\n`);
     process.exit(1);
   }
-  console.error("[boot] startup failed:", err);
+  console.error(`[boot] startup failed: ${safeErrorMessage(err)}`);
   process.exit(1);
 });
