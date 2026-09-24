@@ -38,6 +38,8 @@ export interface TargetState {
 
 export interface PollerStatus {
   running: boolean;
+  /** When true, scans still run and cursors advance, but notifications are not sent. */
+  paused: boolean;
   startedAt: number;
   cycles: number;
   lastPollAt: number | null;
@@ -135,6 +137,7 @@ export function createPoller(deps: PollerDeps) {
 
   const status: PollerStatus = {
     running: false,
+    paused: false,
     startedAt: 0,
     cycles: 0,
     lastPollAt: null,
@@ -212,6 +215,26 @@ export function createPoller(deps: PollerDeps) {
   // ── One cycle ──────────────────────────────────────────────────────────────
 
   async function notify(events: DecodedEvent[]): Promise<void> {
+    if (status.paused) {
+      // Operator pause: drop notifications; cursors still advance in cycle().
+      for (const event of events) {
+        if (event.payload.name === "unknown") {
+          status.eventsSkipped += 1;
+          continue;
+        }
+        const text = formatEvent(config, event);
+        if (text === null) {
+          status.eventsSkipped += 1;
+          continue;
+        }
+        status.eventsSkipped += 1;
+        console.log(
+          `[poller] paused: suppressed ${event.payload.name} at ledger ${event.ledger}`,
+        );
+      }
+      return;
+    }
+
     let sentThisCycle = 0;
 
     for (const event of events) {
@@ -345,6 +368,26 @@ export function createPoller(deps: PollerDeps) {
       status.running = false;
       if (timer) clearTimeout(timer);
       timer = null;
+    },
+
+    pause(): void {
+      if (!status.paused) {
+        status.paused = true;
+        console.log(
+          "[poller] paused by operator (notifications suppressed; cursors still advance)",
+        );
+      }
+    },
+
+    resume(): void {
+      if (status.paused) {
+        status.paused = false;
+        console.log("[poller] resumed by operator");
+      }
+    },
+
+    isPaused(): boolean {
+      return status.paused;
     },
 
     status(): PollerStatus {
