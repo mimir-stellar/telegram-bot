@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildHealthReport, startHealthServer } from "../dist/health.js";
+import { buildHealthReport, buildMetricsReport, startHealthServer } from "../dist/health.js";
 
 function baseConfig(overrides = {}) {
   return {
@@ -176,4 +176,33 @@ test("GET /health boundary: first boot before any success stays ok", () => {
   );
   assert.equal(report.ok, true);
   assert.equal(report.status, "ok");
+});
+
+test("buildMetricsReport renders Prometheus textual format", () => {
+  const metrics = buildMetricsReport(baseConfig(), baseStatus(), 5_500);
+  assert.equal(metrics.includes('mimir_telegram_uptime_ms{network="testnet"} 4500'), true);
+  assert.equal(metrics.includes('mimir_telegram_poller_running{network="testnet"} 1'), true);
+  assert.equal(metrics.includes('mimir_telegram_poller_cycles_total{network="testnet"} 4'), true);
+  assert.equal(metrics.includes('mimir_telegram_notifications_sent_total{network="testnet"} 2'), true);
+  assert.equal(metrics.includes('mimir_telegram_latest_ledger{network="testnet"} 42'), true);
+  assert.equal(metrics.includes('mimir_telegram_target_last_event_ledger{network="testnet",source="market",contract="CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI"} 40'), true);
+});
+
+test("GET /metrics returns prometheus metrics", async () => {
+  const ephemeral = baseConfig({ healthPort: 18788 });
+  const server = startHealthServer({
+    config: ephemeral,
+    status: () => baseStatus(),
+    now: () => 5_500,
+  });
+  assert.ok(server.url);
+
+  try {
+    const res = await fetch(`${server.url}/metrics`);
+    assert.equal(res.status, 200);
+    const body = await res.text();
+    assert.equal(body.includes('mimir_telegram_uptime_ms{network="testnet"} 4500'), true);
+  } finally {
+    await server.close();
+  }
 });
