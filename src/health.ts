@@ -40,6 +40,8 @@ export interface HealthReport {
     /** Intentional operator pause; process is ready but scheduling is stopped. */
     paused: boolean;
     cycles: number;
+    /** Correlation ID for the most recently started poll cycle. */
+    lastCorrelationId: string | null;
     lastPollAt: string | null;
     lastSuccessAt: string | null;
     latestLedger: number | null;
@@ -117,6 +119,7 @@ export function buildHealthReport(
       running: poller.running,
       paused: poller.paused === true,
       cycles: poller.cycles,
+      lastCorrelationId: poller.lastCorrelationId ?? null,
       lastPollAt: iso(poller.lastPollAt),
       lastSuccessAt: iso(poller.lastSuccessAt),
       latestLedger: poller.latestLedger,

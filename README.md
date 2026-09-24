@@ -94,7 +94,8 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters, the latest poll correlation ID and the last error |
+| `/last-event` | The latest decoded event observed for each contract during this process. Undecodable or administrative events show a bounded fallback; after a restart, no event is shown until a scan observes one again. |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
@@ -195,6 +196,10 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
+- **`/last-event` is process-local**: the cursor file intentionally stores only
+  resume cursors and ledger numbers, so restarting does not claim that an old
+  event was freshly observed. The chain remains the source of truth, and an RPC
+  failure leaves the last observed event unchanged.
 
 ## Health endpoint
 
@@ -207,14 +212,20 @@ checks (default `http://127.0.0.1:8787`):
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
-cursors, and whether a target has an error. It never includes `BOT_TOKEN`,
-chat ids, private keys, or unbounded remote payloads.
+cursors, the latest poll correlation ID, and whether a target has an error. It
+never includes `BOT_TOKEN`, chat ids, private keys, or unbounded remote payloads.
 
 Configuration (see `.env.example`):
 
 - `HEALTH_HOST` — bind address (default `127.0.0.1`)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
+
+Each poll cycle gets a fresh UUID correlation ID. The ID is included in poller
+logs, `/status`, and `/health` so an RPC failure, malformed event, rate-limited
+send, or cycle error can be tied to one bounded cycle. It is not included in
+Telegram messages, persisted cursor data, or carried across a restart; the
+chain remains the source of truth.
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the health module is additive and does not change
@@ -231,7 +242,7 @@ src/
   index.ts                 entry point: config -> RPC -> bot -> poller -> health HTTP
   health.ts                local loopback GET /health for supervisors
   config.ts                env loading and validation, fails fast
-  bot.ts                   grammy setup: /start, /help, /status, /contracts, operator pause/resume
+  bot.ts                   grammy setup: /start, /help, /status, /last-event, /contracts, operator pause/resume
   poller.ts                the loop: scan, notify, persist the cursor
   stellar/
     client.ts              Soroban RPC client + explorer links (tx + contract)

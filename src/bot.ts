@@ -9,7 +9,7 @@
 
 import { Bot, type Context } from "grammy";
 
-import { escapeMd, safeErrorMessage } from "./notifications/format.js";
+import { escapeMd, formatLastEvent, safeErrorMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
@@ -20,6 +20,7 @@ const HELP_BASE = [
   "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
   "",
   "/status — what I am watching and how far I have read",
+  "/last-event — the latest event observed for each contract",
   "/contracts — the contract ids I watch and where to look them up",
   "/help — this message",
 ];
@@ -60,6 +61,7 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt)}`,
+    `Correlation ID: \`${status.lastCorrelationId ?? "none"}\``,
     `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
     "",
     "*Watching*",
@@ -85,6 +87,24 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
   }
 
   return lines.join("\n");
+}
+
+export function lastEventMessage(config: BotConfig, status: PollerStatus): string {
+  const lines = [`*Last observed events* — Stellar ${networkLabel(config)}`, ""];
+
+  for (const target of status.targets) {
+    lines.push(`*mimir\-${target.source}*`);
+    if (target.lastEvent === null) {
+      lines.push("No event has been observed since this process started\.", "");
+      continue;
+    }
+    lines.push(formatLastEvent(config, target.lastEvent), "");
+  }
+
+  if (status.targets.length === 0) {
+    lines.push("No contract scan has completed yet\.");
+  }
+  return lines.join("\n").trimEnd();
 }
 
 /**
@@ -169,6 +189,10 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
     await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
   });
 
+  bot.command("last-event", async (ctx) => {
+    await ctx.reply(lastEventMessage(config, status()), TELEGRAM_OPTIONS);
+  });
+
   // Config-only, so this never fails on account of poller or RPC state —
   // unlike /status, it has nothing to report failure on.
   bot.command("contracts", async (ctx) => {
@@ -222,6 +246,7 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "start", description: "What this bot does" },
       { command: "help", description: "Show help" },
       { command: "status", description: "Last-seen ledger and watched contracts" },
+      { command: "last-event", description: "Latest event observed per contract" },
       { command: "contracts", description: "Contract ids and explorer links" },
       { command: "pause", description: "Operator only: pause new scans" },
       { command: "resume", description: "Operator only: resume polling now" },
