@@ -129,6 +129,16 @@ export type EventPayload = MarketPayload | SquadPayload | UnknownPayload;
 
 export type DecodedEvent = EventMeta & { payload: EventPayload };
 
+/** Keep decoder diagnostics useful without copying an unbounded RPC payload. */
+const MAX_DIAGNOSTIC_LENGTH = 200;
+
+function diagnostic(value: unknown): string {
+  const compact = String(value).replace(/\s+/g, " ").trim() || "unknown error";
+  return compact.length <= MAX_DIAGNOSTIC_LENGTH
+    ? compact
+    : `${compact.slice(0, MAX_DIAGNOSTIC_LENGTH - 1)}…`;
+}
+
 // ── Scalar helpers ───────────────────────────────────────────────────────────
 
 class DecodeError extends Error {}
@@ -402,7 +412,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
       payload: {
         name: "unknown",
         eventName,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: diagnostic(err instanceof Error ? err.message : err),
       },
     };
   }

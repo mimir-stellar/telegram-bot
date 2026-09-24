@@ -74,16 +74,28 @@ export interface RawScan {
   pages: number;
 }
 
+const MAX_UINT32 = 4_294_967_295n;
+const MAX_UINT64 = 18_446_744_073_709_551_615n;
+
 /**
  * A cursor is `<TOID>-<index>`, and a TOID packs the ledger sequence into its
- * high 32 bits. Reading it lets the walk know it reached the end of the range
- * from the response it already has, instead of spending another round trip to
- * discover the cursor stopped moving.
+ * high 32 bits. This parser is only an optimization hint: the original opaque
+ * cursor is always passed to RPC unchanged, including when this returns null.
  */
 export function eventCursorLedger(cursor: string): number | null {
-  const toid = cursor.split("-")[0];
-  if (!toid || !/^\d+$/.test(toid)) return null;
-  return Number(BigInt(toid) >> 32n);
+  const match = /^(\d+)-(\d+)$/.exec(cursor);
+  if (!match) return null;
+
+  const [, toidText, indexText] = match;
+  // Bound input before BigInt so malformed remote cursors cannot cause
+  // unbounded conversion work or produce Infinity as a ledger hint.
+  if (toidText.length > 20 || indexText.length > 10) return null;
+
+  const toid = BigInt(toidText);
+  const index = BigInt(indexText);
+  if (toid > MAX_UINT64 || index > MAX_UINT32) return null;
+
+  return Number(toid >> 32n);
 }
 
 export async function paginatedGetEvents(
@@ -233,6 +245,14 @@ function summarize(event: DecodedEvent): string {
   }
 }
 
+function boundedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => {
+    if (typeof item !== "string") return typeof item === "bigint" ? item.toString() : item;
+    const compact = item.replace(/\s+/g, " ").trim();
+    return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
+  });
+}
+
 async function main(): Promise<void> {
   const config = loadStellarConfig();
   const server = createRpcServer(config);
@@ -277,7 +297,7 @@ async function main(): Promise<void> {
       console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
       console.log(`  ${summarize(event)}`);
       console.log(
-        `  ${JSON.stringify(event.payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v))}`,
+        `  ${boundedJson(event.payload)}`,
       );
     }
   }
