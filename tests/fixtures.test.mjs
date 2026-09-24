@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { createNotifier } from "../dist/bot.js";
 import { formatEvent } from "../dist/notifications/format.js";
+import { eventCursorLedger } from "../dist/stellar/events.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixturesDir = path.join(here, "fixtures");
@@ -147,6 +148,26 @@ test("valid cursor fixture parses as version-1 poller shape", async () => {
 test("corrupt cursor fixture is not JSON (cold-start path)", async () => {
   const raw = await readFile(path.join(fixturesDir, "cursor-corrupt.txt"), "utf8");
   assert.throws(() => JSON.parse(raw));
+});
+
+test("opaque cursor ledger hint accepts bounded Soroban TOIDs", () => {
+  assert.equal(eventCursorLedger("0018276211125911551-4294967295"), 4255261);
+  assert.equal(eventCursorLedger("18446744073709551615-4294967295"), 4294967295);
+});
+
+test("opaque cursor ledger hint rejects malformed and oversized tokens", () => {
+  for (const cursor of [
+    "",
+    "not-a-cursor",
+    "123",
+    "123-",
+    "123-1-extra",
+    "18446744073709551616-0",
+    "1-4294967296",
+    `${"9".repeat(100000)}-0`,
+  ]) {
+    assert.equal(eventCursorLedger(cursor), null, cursor.slice(0, 32));
+  }
 });
 
 test("long summary boundary fixture clips before sizing a chat message", async () => {

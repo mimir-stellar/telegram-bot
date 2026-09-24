@@ -194,6 +194,15 @@ rather than replaying the whole retained window into your chat. `/pause` and
 `/resume` never edit this file; they only control scheduling, so the cursor
 format remains version 1 and a restart does not preserve a pause.
 
+Cursor strings are opaque resume tokens. The scanner parses the documented
+`<TOID>-<index>` shape only as a bounded optimization for detecting that a page
+has reached the chain tip; it never reconstructs, normalizes, or replaces the
+token. Malformed or unusually large tokens therefore remain available for the
+RPC to reject as stale or invalid, while the parser returns no ledger hint and
+cannot produce an unbounded or non-finite value. A valid token rejected by RPC
+is retained in memory and status, and is retried unchanged rather than silently
+rewound.
+
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. On
 an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
 at one). On an ephemeral filesystem every restart is a cold start, and events
