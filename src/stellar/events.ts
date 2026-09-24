@@ -233,6 +233,14 @@ function summarize(event: DecodedEvent): string {
   }
 }
 
+function boundedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => {
+    if (typeof item !== "string") return typeof item === "bigint" ? item.toString() : item;
+    const compact = item.replace(/\s+/g, " ").trim();
+    return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
+  });
+}
+
 async function main(): Promise<void> {
   const config = loadStellarConfig();
   const server = createRpcServer(config);
@@ -277,7 +285,7 @@ async function main(): Promise<void> {
       console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
       console.log(`  ${summarize(event)}`);
       console.log(
-        `  ${JSON.stringify(event.payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v))}`,
+        `  ${boundedJson(event.payload)}`,
       );
     }
   }

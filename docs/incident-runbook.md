@@ -151,6 +151,12 @@ Do not manually replay large event ranges into Telegram.
 
 A malformed event must not crash the long-running process.
 
+`decodeEvent` converts malformed XDR and events introduced by a newer contract
+deployment into a bounded `unknown` record. The poller logs only the contract,
+event name, ledger, and a clipped reason, skips Telegram delivery for that
+event, and continues with the RPC cursor returned by the scan. This protects
+the long-running reader while preserving the chain as the source of truth.
+
 When investigating:
 
 1. Use `npm run scan` to inspect the affected event range.

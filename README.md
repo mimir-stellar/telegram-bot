@@ -144,6 +144,35 @@ Events are also not a source of truth for current state — a claim's stakes and
 status come from the contract's own getters. This bot is a timeline, not an
 index.
 
+## Decoder compatibility contract
+
+The decoder is deliberately forward-compatible at the event boundary:
+
+- Soroban event topics are read in declaration order, and non-topic fields are
+  read from the event value map using their deployed snake_case names.
+- A known event with a malformed topic, value, address, integer, or XDR value
+  becomes an `unknown` event. `decodeEvent` never throws into the poller, so one
+  bad event cannot stop a scan or move a cursor based on a partial payload.
+- Events that are valid on-chain but unknown to this version are retained as
+  `unknown` for bounded logs and are skipped for Telegram. They are not
+  invented, retried, or treated as current contract state.
+- Amounts remain `bigint` atomic USDC values until formatting; no floating-point
+  conversion is used. Contract strings are clipped at the notification and
+  diagnostic boundaries, and scanner output is bounded.
+
+The compatibility promise is for the deployed event wire shape and the public
+decoded payload names above, not for arbitrary XDR or future contract fields.
+Adding an optional field is safe when the existing fields retain their names
+and types. Renaming a topic or changing a field type is a decoder compatibility
+change and must be deployed together with a recorded fixture and an operational
+note. The chain remains authoritative if the bot version cannot decode an event.
+
+RPC configuration is read-only: `STELLAR_RPC_URL` must point to a Soroban RPC
+endpoint, and `STELLAR_NETWORK_PASSPHRASE` controls network labeling for
+explorer links. The client sends no signing material and creates no wallet.
+Explorer path components are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL`
+values are supported without changing cursor or decoder compatibility.
+
 ## Cursor persistence
 
 The poller writes its resume position to `data/cursor.json` (write-then-rename,
