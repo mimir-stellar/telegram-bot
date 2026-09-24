@@ -211,7 +211,24 @@ export function createBot(deps: BotDeps): Bot {
 /** The poller's send path: one message to the configured chat. */
 export function createNotifier(bot: Bot, config: BotConfig) {
   return async (text: string): Promise<void> => {
-    await bot.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+    const tasks = [];
+    tasks.push(bot.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS));
+
+    if (config.webhookUrl) {
+      tasks.push(
+        fetch(config.webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: text }),
+        }).then((res) => {
+          if (!res.ok) {
+            throw new Error(`Webhook delivered failed: ${res.status} ${res.statusText}`);
+          }
+        }),
+      );
+    }
+
+    await Promise.all(tasks);
   };
 }
 

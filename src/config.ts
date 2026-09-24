@@ -44,6 +44,10 @@ export interface BotConfig extends StellarConfig {
    * successful cycle lands within this window. `0` disables the stale check.
    */
   healthStaleMs: number;
+  /** Optional generic webhook URL to POST notifications. */
+  webhookUrl: string | null;
+  /** Optional public URL to run the bot in webhook mode instead of long-polling. */
+  telegramWebhookUrl: string | null;
 }
 
 export class ConfigError extends Error {
@@ -112,6 +116,20 @@ function collector() {
 
     url(name: string, fallback: string): string {
       const value = read(name) ?? fallback;
+      try {
+        const parsed = new URL(value);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          problems.push(`${name} must be an http(s) URL; got "${value}"`);
+        }
+      } catch {
+        problems.push(`${name} is not a valid URL; got "${value}"`);
+      }
+      return value;
+    },
+
+    optionalUrl(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
       try {
         const parsed = new URL(value);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
@@ -217,6 +235,8 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
+    webhookUrl: c.optionalUrl("WEBHOOK_URL"),
+    telegramWebhookUrl: c.optionalUrl("TELEGRAM_WEBHOOK_URL"),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);

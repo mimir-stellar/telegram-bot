@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createNotifier,
   registerCommandHandlers,
   resumeMessage,
 } from "../dist/bot.js";
@@ -30,6 +31,8 @@ function baseConfig(overrides = {}) {
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
+    webhookUrl: null,
+    telegramWebhookUrl: null,
     ...overrides,
   };
 }
@@ -177,4 +180,36 @@ test("safeErrorMessage redacts Telegram-shaped tokens and clips remote payloads"
   assert.equal(message.includes(upstreamToken), false);
   assert.equal(message.length, 240);
   assert.match(message, /^\[REDACTED] \[REDACTED] remote-payload/);
+});
+
+test("createNotifier sends to Telegram and webhook", async () => {
+  const sentToTelegram = [];
+  const bot = {
+    api: {
+      sendMessage: async (chatId, text, options) => {
+        sentToTelegram.push({ chatId, text, options });
+      },
+    },
+  };
+
+  const fetches = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    fetches.push({ url, options });
+    return { ok: true };
+  };
+
+  try {
+    const notify = createNotifier(bot, baseConfig({ webhookUrl: "https://hook.invalid" }));
+    await notify("hello");
+
+    assert.equal(sentToTelegram.length, 1);
+    assert.equal(sentToTelegram[0].text, "hello");
+
+    assert.equal(fetches.length, 1);
+    assert.equal(fetches[0].url, "https://hook.invalid");
+    assert.equal(JSON.parse(fetches[0].options.body).content, "hello");
+  } finally {
+    global.fetch = originalFetch;
+  }
 });

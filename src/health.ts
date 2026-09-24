@@ -17,6 +17,8 @@ export interface HealthDeps {
   status: () => PollerStatus;
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /** Optional handler for Telegram webhook mode. */
+  webhookHandler?: (req: http.IncomingMessage, res: http.ServerResponse) => void;
 }
 
 export interface HealthServer {
@@ -171,6 +173,11 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   const server = http.createServer((req, res) => {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
+
+    if (deps.webhookHandler && method === "POST" && url.pathname === "/telegram-webhook") {
+      deps.webhookHandler(req, res);
+      return;
+    }
 
     if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
       const report = buildHealthReport(config, status(), now());

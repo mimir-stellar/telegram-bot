@@ -6,6 +6,8 @@
  * is to still be running next week.
  */
 
+import { webhookCallback } from "grammy";
+
 import { ConfigError, loadConfig, networkLabel } from "./config.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { startHealthServer } from "./health.js";
@@ -73,24 +75,34 @@ async function main(): Promise<void> {
 
   // Local-only health HTTP for supervisors. Starts before Telegram long-poll
   // so a deploy probe can see the process even while grammy is connecting.
-  const healthServer = startHealthServer({ config, status: () => poller.status() });
+  const healthServer = startHealthServer({
+    config,
+    status: () => poller.status(),
+    webhookHandler: config.telegramWebhookUrl ? webhookCallback(bot, "http") : undefined,
+  });
 
   await registerCommands(bot);
 
-  // grammy's `start` resolves only when the bot stops, so it is not awaited.
-  // It retries transient network trouble internally; a rejection here means the
-  // token itself cannot authenticate, which no amount of waiting fixes.
-  void bot
-    .start({
-      onStart: (me) => console.log(`[boot] telegram ok, running as @${me.username}`),
-    })
-    .catch((err: unknown) => {
-      console.error(
-        `[fatal] telegram long-polling failed — check BOT_TOKEN: ` +
-          safeErrorMessage(err, [config.botToken]),
-      );
-      process.exit(1);
-    });
+  if (config.telegramWebhookUrl) {
+    const webhookUrl = new URL("/telegram-webhook", config.telegramWebhookUrl).toString();
+    await bot.api.setWebhook(webhookUrl);
+    console.log(`[boot] telegram ok, listening for webhooks at ${webhookUrl}`);
+  } else {
+    // grammy's `start` resolves only when the bot stops, so it is not awaited.
+    // It retries transient network trouble internally; a rejection here means the
+    // token itself cannot authenticate, which no amount of waiting fixes.
+    void bot
+      .start({
+        onStart: (me) => console.log(`[boot] telegram ok, long-polling as @${me.username}`),
+      })
+      .catch((err: unknown) => {
+        console.error(
+          `[fatal] telegram long-polling failed — check BOT_TOKEN: ` +
+            safeErrorMessage(err, [config.botToken]),
+        );
+        process.exit(1);
+      });
+  }
 
   await poller.start();
 
