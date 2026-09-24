@@ -42,6 +42,8 @@ export interface BotConfig extends StellarConfig {
    * successful cycle lands within this window. `0` disables the stale check.
    */
   healthStaleMs: number;
+  /** If true, print notifications to stdout and avoid writing to the cursor file. */
+  dryRun: boolean;
 }
 
 export class ConfigError extends Error {
@@ -204,6 +206,7 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
+    dryRun: read("DRY_RUN") === "true",
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
