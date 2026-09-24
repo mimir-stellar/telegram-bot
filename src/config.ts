@@ -16,6 +16,11 @@ import path from "node:path";
 
 import "dotenv/config";
 
+import {
+  parseNotificationFeatureFlags,
+  type NotificationFeatureFlags,
+} from "./notifications/featureFlags.js";
+
 export interface StellarConfig {
   marketContractId: string;
   squadContractId: string;
@@ -31,6 +36,8 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /** Coarse notification feature flags (see NOTIFY_* env vars). */
+  featureFlags: NotificationFeatureFlags;
 }
 
 export class ConfigError extends Error {
@@ -158,6 +165,13 @@ export function loadConfig(): BotConfig {
   const c = collector();
   const stellar = stellarFrom(c);
 
+  const featureFlagsParsed = parseNotificationFeatureFlags({
+    NOTIFY_ENABLED: read("NOTIFY_ENABLED"),
+    NOTIFY_MARKET: read("NOTIFY_MARKET"),
+    NOTIFY_SQUAD: read("NOTIFY_SQUAD"),
+  });
+  for (const problem of featureFlagsParsed.problems) c.problems.push(problem);
+
   const config: BotConfig = {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
@@ -170,6 +184,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    featureFlags: featureFlagsParsed.flags,
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);

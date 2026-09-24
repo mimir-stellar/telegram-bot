@@ -7,6 +7,7 @@
  */
 
 import { ConfigError, loadConfig, networkLabel } from "./config.js";
+import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { createPoller } from "./poller.js";
 import { createRpcServer } from "./stellar/client.js";
@@ -41,6 +42,7 @@ async function main(): Promise<void> {
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] chat         ${config.chatId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  console.log(`[boot] flags        ${formatFeatureFlags(config.featureFlags)}`);
 
   const server = createRpcServer(config);
 

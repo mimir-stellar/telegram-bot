@@ -8,6 +8,7 @@
 import { Bot } from "grammy";
 
 import { escapeMd } from "./notifications/format.js";
+import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
 
@@ -36,6 +37,7 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt)}`,
     `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
+    `Feature flags: ${escapeMd(formatFeatureFlags(config.featureFlags))}`,
     "",
     "*Watching*",
   ];
