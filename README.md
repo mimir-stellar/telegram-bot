@@ -92,6 +92,8 @@ empty, those commands reply "Operator only."
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
 | `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| /pause | **Operator only.** Suppress Telegram notifications. RPC scans and cursor advancement continue. In-memory only; cleared on process restart. |
+| /resume | **Operator only.** Start sending notifications again. |
 
 ## Reading events without a bot token
 
