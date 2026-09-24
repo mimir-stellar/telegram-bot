@@ -94,7 +94,7 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters, the latest poll correlation ID and the last error |
 | `/last-event` | The latest decoded event observed for each contract during this process. Undecodable or administrative events show a bounded fallback; after a restart, no event is shown until a scan observes one again. |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
@@ -212,14 +212,20 @@ checks (default `http://127.0.0.1:8787`):
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
-cursors, and whether a target has an error. It never includes `BOT_TOKEN`,
-chat ids, private keys, or unbounded remote payloads.
+cursors, the latest poll correlation ID, and whether a target has an error. It
+never includes `BOT_TOKEN`, chat ids, private keys, or unbounded remote payloads.
 
 Configuration (see `.env.example`):
 
 - `HEALTH_HOST` — bind address (default `127.0.0.1`)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
+
+Each poll cycle gets a fresh UUID correlation ID. The ID is included in poller
+logs, `/status`, and `/health` so an RPC failure, malformed event, rate-limited
+send, or cycle error can be tied to one bounded cycle. It is not included in
+Telegram messages, persisted cursor data, or carried across a restart; the
+chain remains the source of truth.
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the health module is additive and does not change

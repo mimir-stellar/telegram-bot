@@ -61,6 +61,7 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt)}`,
+    `Correlation ID: \`${status.lastCorrelationId ?? "none"}\``,
     `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
     "",
     "*Watching*",

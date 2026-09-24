@@ -18,6 +18,7 @@
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
@@ -47,6 +48,8 @@ export interface PollerStatus {
   paused: boolean;
   startedAt: number;
   cycles: number;
+  /** Correlation ID for the most recently started poll cycle. */
+  lastCorrelationId: string | null;
   lastPollAt: number | null;
   lastSuccessAt: number | null;
   latestLedger: number | null;
@@ -99,6 +102,7 @@ async function sendWithRetry(
   send: (text: string) => Promise<void>,
   text: string,
   botToken: string,
+  correlationId: string,
 ): Promise<void> {
   let attempt = 0;
   let backoff = INITIAL_BACKOFF_MS;
@@ -113,7 +117,7 @@ async function sendWithRetry(
         throw err; // Exhausted retries
       }
       console.warn(
-        `[poller] send attempt ${attempt} failed, retrying in ${backoff}ms: ` +
+        `[poller] correlation=${correlationId} send attempt ${attempt} failed, retrying in ${backoff}ms: ` +
           safeErrorMessage(err, [botToken]),
       );
       await sleep(backoff);
@@ -159,6 +163,7 @@ export function createPoller(deps: PollerDeps) {
     paused: false,
     startedAt: 0,
     cycles: 0,
+    lastCorrelationId: null,
     lastPollAt: null,
     lastSuccessAt: null,
     latestLedger: null,
@@ -211,7 +216,7 @@ export function createPoller(deps: PollerDeps) {
     }
   }
 
-  async function saveCursors(): Promise<void> {
+  async function saveCursors(correlationId: string): Promise<void> {
     const payload: CursorFile = {
       version: 1,
       updatedAt: new Date().toISOString(),
@@ -231,20 +236,22 @@ export function createPoller(deps: PollerDeps) {
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, config.cursorFile);
     } catch (err) {
-      console.error(`[poller] could not persist cursor: ${errorMessage(err)}`);
+      console.error(
+        `[poller] correlation=${correlationId} could not persist cursor: ${errorMessage(err)}`,
+      );
     }
   }
 
   // ── One cycle ──────────────────────────────────────────────────────────────
 
-  async function notify(events: DecodedEvent[]): Promise<void> {
+  async function notify(events: DecodedEvent[], correlationId: string): Promise<void> {
     let sentThisCycle = 0;
 
     for (const event of events) {
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
         console.log(
-          `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
+          `[poller] correlation=${correlationId} skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
             `at ledger ${event.ledger}` +
             (event.payload.reason
               ? ` (${boundedLabel(event.payload.reason, 160)})`
@@ -262,7 +269,7 @@ export function createPoller(deps: PollerDeps) {
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
         status.eventsSkipped += 1;
         console.warn(
-          `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
+          `[poller] correlation=${correlationId} cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
             `dropping ${event.payload.name} at ledger ${event.ledger}`,
         );
         continue;
@@ -270,14 +277,14 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text, config.botToken);
+        await sendWithRetry(send, text, config.botToken, correlationId);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
         // All retries exhausted; drop the message but continue processing others.
         status.notificationsFailed += 1;
         console.error(
-          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
+          `[poller] correlation=${correlationId} send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
             errorMessage(err),
         );
       }
@@ -290,6 +297,8 @@ export function createPoller(deps: PollerDeps) {
     if (inFlight) return;
     inFlight = true;
     status.cycles += 1;
+    const correlationId = randomUUID();
+    status.lastCorrelationId = correlationId;
     status.lastPollAt = Date.now();
 
     let anyOk = false;
@@ -311,10 +320,10 @@ export function createPoller(deps: PollerDeps) {
 
         if (scan.events.length > 0) {
           console.log(
-            `[poller] ${target.source}: ${scan.events.length} event(s) ` +
+            `[poller] correlation=${correlationId} ${target.source}: ${scan.events.length} event(s) ` +
               `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
           );
-          await notify(scan.events);
+          await notify(scan.events, correlationId);
 
           const latestEvent = scan.events.reduce<DecodedEvent | null>(
             (latest, event) => (latest === null || event.ledger >= latest.ledger ? event : latest),
@@ -330,7 +339,7 @@ export function createPoller(deps: PollerDeps) {
         const message = errorMessage(err);
         current.lastError = message;
         status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
-        console.error(`[poller] ${target.source} scan failed: ${message}`);
+        console.error(`[poller] correlation=${correlationId} ${target.source} scan failed: ${message}`);
       }
     }
 
@@ -342,7 +351,7 @@ export function createPoller(deps: PollerDeps) {
     }
 
     status.targets = [...state.values()].map((t) => ({ ...t }));
-    await saveCursors();
+    await saveCursors(correlationId);
     inFlight = false;
   }
 
@@ -363,7 +372,9 @@ export function createPoller(deps: PollerDeps) {
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
       status.lastError = { at: Date.now(), message: errorMessage(err) };
-      console.error(`[poller] cycle threw: ${errorMessage(err)}`);
+      console.error(
+        `[poller] correlation=${status.lastCorrelationId ?? "unknown"} cycle threw: ${errorMessage(err)}`,
+      );
       inFlight = false;
     }
     if (stopped || paused) return;
