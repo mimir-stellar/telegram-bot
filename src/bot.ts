@@ -1,14 +1,17 @@
 /**
  * The grammy bot: commands, and the one send path the poller uses.
  *
- * The bot half is deliberately thin. Operator controls only change when the
- * next polling cycle starts; they never edit cursors or touch chain state.
+ * The bot half is deliberately thin. It answers public status and contract
+ * commands plus operator pause/resume controls. Operator controls only change
+ * when the next polling cycle starts; they never edit cursors or touch chain
+ * state. All chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
 import { Bot, type Context } from "grammy";
 
 import { escapeMd, safeErrorMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
+import { contractExplorerUrl } from "./stellar/client.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
 
 const HELP_BASE = [
@@ -17,6 +20,7 @@ const HELP_BASE = [
   "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
   "",
   "/status — what I am watching and how far I have read",
+  "/contracts — the contract ids I watch and where to look them up",
   "/help — this message",
 ];
 
@@ -83,6 +87,37 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
   return lines.join("\n");
 }
 
+/**
+ * The `/contracts` message: which two contracts this bot watches, and where to
+ * look each one up independently — deliberately static (config only, no
+ * poller state), so it answers the same whether the poller is mid-cycle,
+ * between restarts, or wedged on a run of RPC failures. `/status` is for
+ * "is it working"; this is for "what is it even watching".
+ */
+export function contractsMessage(config: BotConfig): string {
+  const targets: Array<{ label: string; contractId: string }> = [
+    { label: "mimir\\-market", contractId: config.marketContractId },
+    { label: "mimir\\-squad", contractId: config.squadContractId },
+  ];
+
+  const lines: string[] = [
+    `*Contracts* — Mimir on Stellar ${escapeMd(networkLabel(config))}`,
+    "",
+    "Read\\-only: this bot holds no signing keys and cannot submit transactions\\.",
+  ];
+
+  for (const target of targets) {
+    lines.push(
+      "",
+      `*${target.label}*`,
+      `\`${escapeMd(target.contractId)}\``,
+      `[View on stellar\\.expert](${contractExplorerUrl(config, target.contractId)})`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
 /** Exact operator replies, exported for deterministic Telegram payload tests. */
 export function pauseMessage(result: PollerPauseResult): string {
   switch (result) {
@@ -134,6 +169,12 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
     await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
   });
 
+  // Config-only, so this never fails on account of poller or RPC state —
+  // unlike /status, it has nothing to report failure on.
+  bot.command("contracts", async (ctx) => {
+    await ctx.reply(contractsMessage(config), TELEGRAM_OPTIONS);
+  });
+
   bot.command("pause", async (ctx) => {
     if (!isOperator(ctx, config)) {
       console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
@@ -181,6 +222,7 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "start", description: "What this bot does" },
       { command: "help", description: "Show help" },
       { command: "status", description: "Last-seen ledger and watched contracts" },
+      { command: "contracts", description: "Contract ids and explorer links" },
       { command: "pause", description: "Operator only: pause new scans" },
       { command: "resume", description: "Operator only: resume polling now" },
     ]);

@@ -54,7 +54,7 @@ export function accountExplorerUrl(config: StellarConfig, address: string): stri
   return `${explorerBase(config)}/${network}/account/${id}`;
 }
 
-/** Explorer link for a Soroban contract id. */
+/** Explorer link for a Soroban contract id, used by /contracts. */
 export function contractExplorerUrl(config: StellarConfig, contractId: string): string {
   const id = contractId.trim();
   if (!id) return "";
