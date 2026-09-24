@@ -28,7 +28,31 @@ function ago(timestamp: number | null): string {
   return `${Math.round(seconds / 3600)}h ago`;
 }
 
-function statusMessage(config: BotConfig, status: PollerStatus): string {
+/**
+ * Format a ledger lag value for the status message.
+ *
+ * A lag near zero is healthy. A lag approaching the retained window (~120 960
+ * ledgers) indicates a stuck cursor; the chain may have been quiet or the RPC
+ * may have lost events.
+ */
+function lagLabel(lagLedgers: number | null): string {
+  if (lagLedgers === null || lagLedgers === 0) return "none seen yet";
+  const approxSeconds = lagLedgers * 5; // ~5s per Stellar ledger
+  if (approxSeconds < 60) return `${lagLedgers} ledgers (~${approxSeconds}s)`;
+  if (approxSeconds < 3600) return `${lagLedgers} ledgers (~${Math.round(approxSeconds / 60)}m)`;
+  return `${lagLedgers} ledgers (~${Math.round(approxSeconds / 3600)}h)`;
+}
+
+/** Compute per-target lag from the current poller status. */
+function targetLag(
+  target: PollerStatus["targets"][number],
+  latestLedger: number | null,
+): number | null {
+  if (target.lastEventLedger === null || latestLedger === null) return null;
+  return Math.max(0, latestLedger - target.lastEventLedger);
+}
+
+export function statusMessage(config: BotConfig, status: PollerStatus): string {
   const lines: string[] = [
     `*Status* — ${status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
     "",
@@ -41,12 +65,20 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
   ];
 
   for (const target of status.targets) {
+    const lag = targetLag(target, status.latestLedger);
     lines.push(
       `· mimir\\-${target.source} \`${target.contractId}\``,
-      `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
+      `  last event ledger: ${target.lastEventLedger ?? "none seen"} \\(lag: ${escapeMd(lagLabel(lag))}\\)`,
       `  cursor: \`${target.cursor ?? "none (cold start)"}\``,
     );
     if (target.lastError) lines.push(`  last error: ${escapeMd(target.lastError)}`);
+  }
+
+  if (status.consecutiveFailures > 0) {
+    lines.push(
+      "",
+      `⚠️ Consecutive failed cycles: *${status.consecutiveFailures}*`,
+    );
   }
 
   if (status.lastError) {
@@ -54,9 +86,6 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
       "",
       `Last error \\(${ago(status.lastError.at)}\\): ${escapeMd(status.lastError.message)}`,
     );
-  }
-  if (status.consecutiveFailures > 0) {
-    lines.push(`Consecutive failed cycles: ${status.consecutiveFailures}`);
   }
 
   return lines.join("\n");

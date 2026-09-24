@@ -86,7 +86,42 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract (with cursor lag), the persisted cursor, poll/send counters, consecutive failure count, and the last error |
+
+## Metrics
+
+The bot can expose a [Prometheus](https://prometheus.io)-compatible `/metrics` endpoint for scraping. It is **opt-in** — existing deployments are unaffected.
+
+```bash
+METRICS_ENABLED=true   # set in .env or environment
+METRICS_PORT=9090      # optional, default 9090
+```
+
+Once enabled, `GET http://localhost:9090/metrics` returns the standard Prometheus text format. The endpoint is read-only and carries no secrets.
+
+### Exposed metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `mimir_poll_cycles_total` | counter | Total poll cycles attempted |
+| `mimir_notifications_total{status}` | counter | Notification outcomes — `sent`, `failed`, `skipped` |
+| `mimir_rpc_calls_total{contract,status}` | counter | RPC scan outcomes — `ok` or `error`, per contract |
+| `mimir_rpc_call_duration_seconds{contract}` | histogram | Full scan duration per contract |
+| `mimir_events_decoded_total{contract,event_name}` | counter | Events observed, by contract and event name |
+| `mimir_consecutive_failures` | gauge | Current count of back-to-back failed cycles |
+| `mimir_cursor_lag_ledgers{contract}` | gauge | `latestLedger − lastEventLedger`; 0 on cold start |
+| `mimir_stale_cursor_seconds{contract}` | gauge | Approximate seconds since last event (5 s/ledger); 0 on cold start |
+| `mimir_burst_cap_hits_total` | counter | Events dropped because `MAX_NOTIFICATIONS_PER_CYCLE` was reached |
+| `mimir_last_poll_timestamp_seconds` | gauge | Unix timestamp of the last poll cycle start |
+| `mimir_last_success_timestamp_seconds` | gauge | Unix timestamp of the last cycle with ≥ 1 successful RPC scan |
+
+Standard Node.js process/GC metrics (`process_*`, `nodejs_*`) are also included.
+
+### Stale-cursor alert
+
+`mimir_cursor_lag_ledgers` growing without bound — while `mimir_rpc_calls_total{status="ok"}` is also flat — means the cursor is stuck and events are being silently missed. The retained window is ~120 960 ledgers (~1 week); events older than that are gone.
+
+`STALE_CURSOR_LEDGERS` (default 120 960) controls when the bot logs a `[poller] stale cursor warning`. Set to `0` to silence it.
 
 ## Reading events without a bot token
 
@@ -186,7 +221,7 @@ src/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and notification-format tests (including deterministic fuzz cases), or `npm run build` to produce the production output.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and all tests (notification-format tests including deterministic fuzz cases, plus metrics and safeguard tests), or `npm run build` to produce the production output.
 
 ## License
 
