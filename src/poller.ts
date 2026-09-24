@@ -23,7 +23,7 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
-import { formatEvent } from "./notifications/format.js";
+import { formatEvent, formatDigest } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
@@ -212,50 +212,49 @@ export function createPoller(deps: PollerDeps) {
   // ── One cycle ──────────────────────────────────────────────────────────────
 
   async function notify(events: DecodedEvent[]): Promise<void> {
-    let sentThisCycle = 0;
-
-    for (const event of events) {
-      if (event.payload.name === "unknown") {
-        status.eventsSkipped += 1;
-        console.log(
-          `[poller] skipped ${event.source} event "${event.payload.eventName}" ` +
-            `at ledger ${event.ledger}${event.payload.reason ? ` (${event.payload.reason})` : ""}`,
-        );
-        continue;
-      }
-
-      const text = formatEvent(config, event);
-      if (text === null) {
-        status.eventsSkipped += 1;
-        continue;
-      }
-
-      if (sentThisCycle >= config.maxNotificationsPerCycle) {
-        status.eventsSkipped += 1;
-        console.warn(
-          `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
-            `dropping ${event.payload.name} at ledger ${event.ledger}`,
-        );
-        continue;
-      }
-
-      try {
-        // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text);
-        status.notificationsSent += 1;
-        sentThisCycle += 1;
-      } catch (err) {
-        // All retries exhausted; drop the message but continue processing others.
-        status.notificationsFailed += 1;
-        console.error(
-          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
-            errMessage(err),
-        );
-      }
-
-      if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
-    }
+const knownEvents = events.filter((e) => {
+  if (e.payload.name === "unknown") {
+    status.eventsSkipped += 1;
+    return false;
   }
+  return true;
+});
+
+if (config.digestMode) {
+  const digestText = formatDigest(knownEvents);
+  if (!digestText) return;
+  try {
+    await send(digestText);
+    status.notificationsSent += 1;
+  } catch (err) {
+    status.notificationsFailed += 1;
+    console.error(`[poller] digest send failed: ${errMessage(err)}`);
+  }
+  return;
+}
+
+let sentThisCycle = 0;
+for (const event of knownEvents) {
+  const text = formatEvent(config, event);
+  if (text === null) {
+    status.eventsSkipped += 1;
+    continue;
+  }
+  if (sentThisCycle >= config.maxNotificationsPerCycle) {
+    status.eventsSkipped += 1;
+    continue;
+  }
+  try {
+    await send(text);
+    status.notificationsSent += 1;
+    sentThisCycle += 1;
+  } catch (err) {
+    status.notificationsFailed += 1;
+    console.error(`[poller] send failed: ${errMessage(err)}`);
+  }
+  if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
+}
+}
 
   async function cycle(): Promise<void> {
     if (inFlight) return;

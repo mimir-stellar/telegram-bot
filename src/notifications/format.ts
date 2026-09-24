@@ -159,3 +159,23 @@ export function formatEvent(config: StellarConfig, event: DecodedEvent): string 
   if (head === null) return null;
   return `${head}\n${footer(config, event)}`;
 }
+
+/**
+ * Formats multiple events into a single condensed digest message.
+ */
+export function formatDigest(events: DecodedEvent[]): string | null {
+  if (events.length === 0) return null;
+
+  const items: string[] = [];
+  for (const event of events) {
+    const head = headline(event);
+    if (head !== null) {
+      items.push(head);
+    }
+  }
+
+  if (items.length === 0) return null;
+
+  const header = `📜 *Mimir Digest*\n_${items.length} events in this cycle_\n\n`;
+  return header + items.join("\n\n");
+}
