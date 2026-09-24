@@ -133,6 +133,65 @@ export type DecodedEvent = EventMeta & { payload: EventPayload };
 
 class DecodeError extends Error {}
 
+/**
+ * Soft ceiling on a single event's decoded footprint.
+ *
+ * Soroban events can carry arbitrary `String` / `Bytes` values (claim summaries,
+ * evidence hashes, questions). Without a bound, a malicious or buggy contract
+ * could force the notifier to allocate and later JSON-log multi-megabyte
+ * payloads every poll cycle. The cap is measured on the XDR wire form *before*
+ * `scValToNative`, so oversized values never inflate into JS strings.
+ *
+ * 16 KiB is well above any legitimate Mimir event seen on Testnet and well
+ * below Telegram's 4096-char message limit once formatting is applied.
+ */
+export const MAX_DECODED_EVENT_XDR_BYTES = 16_384;
+
+/** Per-topic XDR budget (event name + ids/addresses are tiny). */
+export const MAX_EVENT_TOPIC_XDR_BYTES = 1_024;
+
+/** Hard ceiling on any single decoded string field after native conversion. */
+export const MAX_DECODED_STRING_CHARS = 2_048;
+
+function scValXdrBytes(value: xdr.ScVal | null | undefined): number {
+  if (!value) return 0;
+  try {
+    // Buffer length in Node; Uint8Array elsewhere.
+    const xdrBytes = value.toXDR();
+    return xdrBytes.byteLength ?? (xdrBytes as Buffer).length;
+  } catch {
+    // Unreadable XDR is treated as oversized so decode fails closed.
+    return MAX_DECODED_EVENT_XDR_BYTES + 1;
+  }
+}
+
+function assertEventXdrWithinCap(event: rpc.Api.EventResponse): void {
+  const valueBytes = scValXdrBytes(event.value);
+  if (valueBytes > MAX_DECODED_EVENT_XDR_BYTES) {
+    throw new DecodeError(
+      `event.value XDR ${valueBytes} bytes exceeds cap of ${MAX_DECODED_EVENT_XDR_BYTES}`,
+    );
+  }
+
+  const topics = event.topic ?? [];
+  let topicTotal = 0;
+  for (let i = 0; i < topics.length; i += 1) {
+    const n = scValXdrBytes(topics[i]);
+    if (n > MAX_EVENT_TOPIC_XDR_BYTES) {
+      throw new DecodeError(
+        `event.topic[${i}] XDR ${n} bytes exceeds per-topic cap of ${MAX_EVENT_TOPIC_XDR_BYTES}`,
+      );
+    }
+    topicTotal += n;
+  }
+  if (topicTotal > MAX_DECODED_EVENT_XDR_BYTES) {
+    throw new DecodeError(
+      `event.topic XDR total ${topicTotal} bytes exceeds cap of ${MAX_DECODED_EVENT_XDR_BYTES}`,
+    );
+  }
+}
+
+
 function native(value: xdr.ScVal): unknown {
   return scValToNative(value);
 }
@@ -158,11 +217,22 @@ function num(value: unknown, what: string): number {
 }
 
 function str(value: unknown, what: string): string {
-  if (typeof value === "string") return value;
-  // A contract `String` normally decodes to a JS string, but bytes-shaped
-  // payloads show up as Buffer on some SDK paths.
-  if (value instanceof Uint8Array) return Buffer.from(value).toString("utf8");
-  throw new DecodeError(`${what}: expected a string, got ${typeof value}`);
+  let s: string;
+  if (typeof value === "string") {
+    s = value;
+  } else if (value instanceof Uint8Array) {
+    // A contract `String` normally decodes to a JS string, but bytes-shaped
+    // payloads show up as Buffer on some SDK paths.
+    s = Buffer.from(value).toString("utf8");
+  } else {
+    throw new DecodeError(`${what}: expected a string, got ${typeof value}`);
+  }
+  if (s.length > MAX_DECODED_STRING_CHARS) {
+    throw new DecodeError(
+      `${what}: string length ${s.length} exceeds cap of ${MAX_DECODED_STRING_CHARS}`,
+    );
+  }
+  return s;
 }
 
 /** An `Address` decodes to its `G…`/`C…` strkey. */
@@ -375,6 +445,9 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
 
   let eventName = "";
   try {
+    // Fail closed on oversized wire payloads before native conversion allocates.
+    assertEventXdrWithinCap(event);
+
     const topics = (event.topic ?? []).map((t) => {
       try {
         return native(t);
@@ -397,12 +470,17 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     if (payload) return { ...meta, payload };
     return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
   } catch (err) {
+    const rawReason = err instanceof Error ? err.message : String(err);
+    // Reasons are logged by the poller; keep them short and never re-embed
+    // remote payload bytes that triggered the cap.
+    const reason =
+      rawReason.length > 240 ? `${rawReason.slice(0, 240)}…` : rawReason;
     return {
       ...meta,
       payload: {
         name: "unknown",
         eventName,
-        reason: err instanceof Error ? err.message : String(err),
+        reason,
       },
     };
   }
@@ -417,6 +495,17 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
  * digits makes the display unit unambiguous (`20000000n` -> `"2.0000000"`)
  * without ever converting through a floating-point number.
  */
+
+/**
+ * JSON-safe view of a payload for logs/CLI. Caps total serialized length so a
+ * capped-but-still-large unknown reason cannot blow up log lines.
+ */
+export function summarizePayloadForLog(payload: EventPayload, maxChars = 512): string {
+  const json = JSON.stringify(payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+  if (json.length <= maxChars) return json;
+  return `${json.slice(0, maxChars)}…`;
+}
+
 export function formatUsdc(units: bigint): string {
   const negative = units < 0n;
   const abs = negative ? -units : units;
