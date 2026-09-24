@@ -164,6 +164,10 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   the bot was removed from into an infinite replay, and recovery would flood the
   channel. Notifications are lossy on purpose — the chain is the record.
 - **A corrupt cursor file** is treated as a cold start rather than a crash.
+- **A stale cursor** (older than the RPC's retained window, or from a redeployed
+  contract) is just a scan that fails for one cycle; the cursor is left
+  untouched and the documented recovery is a cold start. The cursor is never
+  authoritative — the chain is.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down.
@@ -213,9 +217,51 @@ src/
     format.ts              decoded event -> MarkdownV2 message
 ```
 
+## Deploying on Railway
+
+The repo ships `railway.json` — Railway's Config-as-Code — that wires the
+deployment to the rest of this repo:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `build.buildCommand` | `npm run build` | `dist/` is gitignored; the image compiles it. |
+| `deploy.startCommand` | `npm start` | Run the built poller. |
+| `deploy.healthcheckPath` | `/health` | The same endpoint the local health module serves (`GET /health`). |
+| `deploy.requiredMountPath` | `/app/data` | Refuse to start unless a volume is attached where the cursor lives. |
+| `deploy.restartPolicyType` | `ON_FAILURE` | Restart on crash, bounded retries. |
+| `deploy.numReplicas` | `1` | One poller owns the cursor; Railway volumes cannot be used with replicas. |
+
+Volume is the one manual step — Railway never creates one from config:
+
+```bash
+railway volume add --mount-path /app/data   # or attach it from the dashboard
+```
+
+Set as Railway variables (secrets): `BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and
+`HEALTH_HOST=0.0.0.0`. Everything else keeps its repo default:
+`CURSOR_FILE=./data/cursor.json` resolves to `/app/data/cursor.json` in
+Railway's `/app` working directory, and the health endpoint binds the `PORT`
+that Railway injects (the `HEALTH_PORT` fallback, see `.env.example`). No public
+domain is needed — healthchecks run from Railway's probe host on the container
+network, which is why `HEALTH_HOST` must not stay loopback-only here.
+
+On deployed failure:
+
+- A crash restarts under `ON_FAILURE`; the volume keeps the cursor so there is
+  no notification replay. A **stale or corrupt cursor** is already handled as a
+  cold start, never a crash — see [Failure behaviour](#failure-behaviour).
+- A redeploy of a volume-backed service has a short downtime window (Railway
+  keeps only one active deployment per volume); roll back to the previous
+  revision and the cursor is still there.
+
+Config-as-Code is deprecated by Railway in favour of Infrastructure as Code
+(`.railway/railway.ts` with the Railway CLI), with a hard cutoff of 2026-12-01.
+This file captures the current, working behaviour and is the migration source of
+truth for IaC; follow Railway's migration guide when the time comes.
+
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic format and fixture suites, or `npm run build` to produce the production output.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic format, health, cursor, config, deploy and fixture suites, or `npm run build` to produce the production output.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
 
