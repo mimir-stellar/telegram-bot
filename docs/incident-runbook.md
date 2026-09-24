@@ -155,7 +155,11 @@ Do not manually replay large event ranges into Telegram.
 
 ## Malformed or unexpected events
 
-A malformed event must not crash the long-running process.
+A malformed event must not crash the long-running process. XDR conversion and
+event metadata failures are converted to a skipped `unknown` event with a
+bounded reason. The RPC response cursor is retained, so later events in the
+page and later pages remain eligible for processing; no cursor rewind or
+guessed ledger is performed.
 
 When investigating:
 

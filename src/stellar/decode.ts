@@ -30,6 +30,7 @@ export type ContractSource = "market" | "squad";
 
 /** 1 USDC in atomic units. */
 export const USDC_UNIT = 10_000_000n;
+const MAX_DECODE_REASON_LENGTH = 240;
 
 /** `WinnerSide` in `mimir-market/src/types.rs`. Unit enums decode to their u32. */
 export const WINNER_SIDE: Record<number, string> = {
@@ -132,6 +133,14 @@ export type DecodedEvent = EventMeta & { payload: EventPayload };
 // ── Scalar helpers ───────────────────────────────────────────────────────────
 
 class DecodeError extends Error {}
+
+function boundedReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const compact = message.replace(/\s+/g, " ").trim() || "unknown decode error";
+  return compact.length <= MAX_DECODE_REASON_LENGTH
+    ? compact
+    : `${compact.slice(0, MAX_DECODE_REASON_LENGTH - 1)}…`;
+}
 
 function native(value: xdr.ScVal): unknown {
   return scValToNative(value);
@@ -364,17 +373,26 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
  * reason attached. A notifier must not die on an event it was not taught.
  */
 export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse): DecodedEvent {
-  const meta: EventMeta = {
+  let meta: EventMeta = {
     source,
-    contractId: contractIdOf(event),
-    ledger: Number(event.ledger ?? 0),
-    txHash: event.txHash ?? "",
-    at: Math.floor(new Date(event.ledgerClosedAt ?? 0).getTime() / 1000),
-    eventId: event.id ?? "",
+    contractId: "",
+    ledger: 0,
+    txHash: "",
+    at: 0,
+    eventId: "",
   };
 
   let eventName = "";
   try {
+    meta = {
+      source,
+      contractId: contractIdOf(event),
+      ledger: Number(event.ledger ?? 0),
+      txHash: event.txHash ?? "",
+      at: Math.floor(new Date(event.ledgerClosedAt ?? 0).getTime() / 1000),
+      eventId: event.id ?? "",
+    };
+
     const topics = (event.topic ?? []).map((t) => {
       try {
         return native(t);
@@ -402,7 +420,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
       payload: {
         name: "unknown",
         eventName,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: boundedReason(err),
       },
     };
   }
