@@ -12,6 +12,7 @@ function baseConfig(overrides = {}) {
     networkPassphrase: "Test SDF Network ; September 2015",
     botToken: "0000000000:SECRET-TOKEN-DO-NOT-LEAK",
     chatId: "-1001234567890",
+    operatorTelegramUserId: null,
     pollIntervalMs: 30_000,
     startLookbackLedgers: 60,
     cursorFile: "./data/cursor.json",
@@ -26,6 +27,7 @@ function baseConfig(overrides = {}) {
 function baseStatus(overrides = {}) {
   return {
     running: true,
+    paused: false,
     startedAt: 1_000,
     cycles: 4,
     lastPollAt: 5_000,
@@ -64,6 +66,17 @@ test("buildHealthReport is stopped when the poller is not running", () => {
   const report = buildHealthReport(baseConfig(), baseStatus({ running: false }), 5_500);
   assert.equal(report.ok, false);
   assert.equal(report.status, "stopped");
+});
+
+test("buildHealthReport treats an operator pause as healthy", () => {
+  const report = buildHealthReport(
+    baseConfig({ healthStaleMs: 1 }),
+    baseStatus({ paused: true, lastSuccessAt: 1_000, consecutiveFailures: 10 }),
+    5_000,
+  );
+  assert.equal(report.ok, true);
+  assert.equal(report.status, "ok");
+  assert.equal(report.poller.paused, true);
 });
 
 test("buildHealthReport is degraded after repeated failures", () => {

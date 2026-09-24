@@ -29,6 +29,8 @@ export interface StellarConfig {
 export interface BotConfig extends StellarConfig {
   botToken: string;
   chatId: string;
+  /** Telegram user id allowed to run operator-only commands. Null disables them. */
+  operatorTelegramUserId: string | null;
   pollIntervalMs: number;
   startLookbackLedgers: number;
   cursorFile: string;
@@ -148,6 +150,16 @@ function collector() {
       return value;
     },
 
+    optionalUserId(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
+      if (!/^[1-9]\d*$/.test(value) || BigInt(value) > BigInt(Number.MAX_SAFE_INTEGER)) {
+        problems.push(`${name} must be a positive Telegram user id; got "${value}"`);
+        return null;
+      }
+      return value;
+    },
+
     host(name: string, fallback: string): string {
       const value = read(name) ?? fallback;
       // Keep this a host, not a URL — the health server binds a TCP listener.
@@ -192,6 +204,7 @@ export function loadConfig(): BotConfig {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
     chatId: c.chatId("TELEGRAM_CHAT_ID"),
+    operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
     cursorFile: path.resolve(process.cwd(), read("CURSOR_FILE") ?? DEFAULTS.cursorFile),
