@@ -16,6 +16,9 @@ function baseConfig(overrides = {}) {
     startLookbackLedgers: 60,
     cursorFile: "./data/cursor.json",
     maxNotificationsPerCycle: 20,
+    deadLetterFile: "./data/dead-letter.json",
+    deadLetterMax: 100,
+    deadLetterMaxAttempts: 10,
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
@@ -35,6 +38,7 @@ function baseStatus(overrides = {}) {
     notificationsSent: 2,
     notificationsFailed: 0,
     eventsSkipped: 1,
+    deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0 },
     consecutiveFailures: 0,
     lastError: null,
     targets: [

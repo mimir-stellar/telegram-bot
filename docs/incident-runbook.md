@@ -70,9 +70,9 @@ Do not manually advance the cursor to skip an RPC failure.
 3. Use `/status` to confirm the process is still running.
 4. Restart only when configuration has been corrected.
 
-Telegram delivery is intentionally lossy. A failed send does not hold the cursor back because replaying every missed notification could create an unbounded backlog or flood a recovered chat.
+A failed send does not hold the cursor back — that would turn a revoked token into an infinite replay. Instead, the formatted message is parked on the local dead-letter queue (`DEAD_LETTER_FILE`, default `data/dead-letter.json`) and replayed on later cycles once Telegram accepts sends again.
 
-The Stellar chain remains the authoritative record.
+Check `/status` for dead-letter depth / replayed / dropped counters. The queue is bounded (`DEAD_LETTER_MAX`); overflow drops the oldest entry. Entries that exhaust `DEAD_LETTER_MAX_ATTEMPTS` are dropped as well. The Stellar chain remains the authoritative record.
 
 ## Stale or corrupt cursor
 

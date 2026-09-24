@@ -7,11 +7,12 @@
  *
  *  - A failed RPC call fails ONE contract's scan for ONE cycle. Its cursor is
  *    left untouched, so the next cycle picks up exactly where it stopped.
- *  - A failed Telegram send drops ONE message. The cursor still advances.
- *    That is deliberate: holding the cursor back on a send failure means a
- *    broken bot token or a chat the bot was kicked from turns into an infinite
- *    replay of the same events forever, and recovering floods the channel.
- *    Notifications are lossy by design; the chain remains the record.
+ *  - A failed Telegram send (after bounded retries) enqueues ONE message on the
+ *    local dead-letter queue and the cursor still advances. Holding the cursor
+ *    back on a send failure would turn a broken bot token or a chat the bot
+ *    was kicked from into an infinite replay of the same events forever.
+ *    The DLQ is bounded and replayed on later cycles so transient outages can
+ *    still deliver; the chain remains the record if the queue overflows.
  *  - A cursor file that cannot be read is treated as a cold start; one that
  *    cannot be written is logged, and the in-memory cursor keeps working until
  *    the next restart.
@@ -23,6 +24,7 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
+import { createDeadLetterQueue, type DeadLetterStats } from "./deadLetter.js";
 import { formatEvent } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
@@ -50,6 +52,7 @@ export interface PollerStatus {
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
   targets: TargetState[];
+  deadLetter: DeadLetterStats;
 }
 
 interface CursorFile {
@@ -58,11 +61,23 @@ interface CursorFile {
   targets: Record<string, { cursor: string | null; lastEventLedger: number | null }>;
 }
 
+export type ReadEventsFn = typeof readContractEvents;
+
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
   /** Sends one already-formatted MarkdownV2 message. May reject. */
   send: (text: string) => Promise<void>;
+  /** Injectable for tests — defaults to the real Soroban walker. */
+  readEvents?: ReadEventsFn;
+  /** Injectable sleep for tests (skips real backoff / spacing). */
+  sleep?: (ms: number) => Promise<void>;
+  /** Injectable clock for deterministic DLQ timestamps in tests. */
+  now?: () => number;
+  /** Override inter-send spacing (default 1500ms). Tests pass 0. */
+  sendSpacingMs?: number;
+  /** Override in-cycle send retries (default 3). Tests often pass 1. */
+  maxSendRetries?: number;
 }
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
@@ -77,7 +92,10 @@ const INITIAL_BACKOFF_MS = 1_000;
 /** Maximum backoff in milliseconds for Telegram send retries. */
 const MAX_BACKOFF_MS = 10_000;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const defaultSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -94,6 +112,10 @@ function errMessage(err: unknown): string {
 async function sendWithRetry(
   send: (text: string) => Promise<void>,
   text: string,
+  opts: {
+    sleep: (ms: number) => Promise<void>;
+    maxRetries: number;
+  },
 ): Promise<void> {
   let attempt = 0;
   let backoff = INITIAL_BACKOFF_MS;
@@ -104,14 +126,14 @@ async function sendWithRetry(
       return;
     } catch (err) {
       attempt++;
-      if (attempt >= MAX_SEND_RETRIES) {
+      if (attempt >= opts.maxRetries) {
         throw err; // Exhausted retries
       }
       console.warn(
         `[poller] send attempt ${attempt} failed, retrying in ${backoff}ms: ` +
           errMessage(err),
       );
-      await sleep(backoff);
+      await opts.sleep(backoff);
       // Exponential backoff with cap
       backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
     }
@@ -120,6 +142,11 @@ async function sendWithRetry(
 
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
+  const readEvents = deps.readEvents ?? readContractEvents;
+  const sleep = deps.sleep ?? defaultSleep;
+  const now = deps.now ?? Date.now;
+  const sendSpacingMs = deps.sendSpacingMs ?? SEND_SPACING_MS;
+  const maxSendRetries = deps.maxSendRetries ?? MAX_SEND_RETRIES;
 
   const targets: WatchTarget[] = [
     { source: "market", contractId: config.marketContractId },
@@ -132,6 +159,13 @@ export function createPoller(deps: PollerDeps) {
       { source: t.source, contractId: t.contractId, cursor: null, lastEventLedger: null, lastError: null },
     ]),
   );
+
+  const deadLetter = createDeadLetterQueue({
+    filePath: config.deadLetterFile,
+    maxEntries: config.deadLetterMax,
+    maxAttempts: config.deadLetterMaxAttempts,
+    now,
+  });
 
   const status: PollerStatus = {
     running: false,
@@ -147,11 +181,16 @@ export function createPoller(deps: PollerDeps) {
     consecutiveFailures: 0,
     lastError: null,
     targets: [],
+    deadLetter: deadLetter.stats(),
   };
 
   let timer: NodeJS.Timeout | null = null;
   let stopped = false;
   let inFlight = false;
+
+  function refreshDeadLetterStatus(): void {
+    status.deadLetter = deadLetter.stats();
+  }
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
@@ -188,7 +227,7 @@ export function createPoller(deps: PollerDeps) {
   async function saveCursors(): Promise<void> {
     const payload: CursorFile = {
       version: 1,
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(now()).toISOString(),
       targets: Object.fromEntries(
         [...state.values()].map((t) => [
           t.source,
@@ -211,7 +250,7 @@ export function createPoller(deps: PollerDeps) {
 
   // ── One cycle ──────────────────────────────────────────────────────────────
 
-  async function notify(events: DecodedEvent[]): Promise<void> {
+  async function notify(events: DecodedEvent[], sendBudget: number): Promise<number> {
     let sentThisCycle = 0;
 
     for (const event of events) {
@@ -230,7 +269,7 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
-      if (sentThisCycle >= config.maxNotificationsPerCycle) {
+      if (sentThisCycle >= sendBudget) {
         status.eventsSkipped += 1;
         console.warn(
           `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
@@ -241,36 +280,71 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text);
+        await sendWithRetry(send, text, { sleep, maxRetries: maxSendRetries });
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
-        // All retries exhausted; drop the message but continue processing others.
+        // All retries exhausted; park on the DLQ and keep processing.
         status.notificationsFailed += 1;
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
             errMessage(err),
         );
+        await deadLetter.enqueue({
+          source: event.source,
+          ledger: event.ledger,
+          eventName: event.payload.name,
+          text,
+          error: err,
+        });
+        refreshDeadLetterStatus();
       }
 
-      if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
+      if (sentThisCycle < sendBudget && sendSpacingMs > 0) {
+        await sleep(sendSpacingMs);
+      }
     }
+
+    return sentThisCycle;
   }
 
   async function cycle(): Promise<void> {
     if (inFlight) return;
     inFlight = true;
     status.cycles += 1;
-    status.lastPollAt = Date.now();
+    status.lastPollAt = now();
 
     let anyOk = false;
+    let sentBudgetUsed = 0;
+
+    // Replay parked sends before new events so a recovered chat drains first.
+    try {
+      const flushBudget = Math.max(0, config.maxNotificationsPerCycle);
+      if (flushBudget > 0) {
+        const flushed = await deadLetter.flush(
+          async (text) => {
+            await sendWithRetry(send, text, { sleep, maxRetries: maxSendRetries });
+          },
+          flushBudget,
+        );
+        if (flushed.sent > 0) {
+          status.notificationsSent += flushed.sent;
+          sentBudgetUsed += flushed.sent;
+          if (sendSpacingMs > 0) await sleep(sendSpacingMs);
+        }
+        refreshDeadLetterStatus();
+      }
+    } catch (err) {
+      // flush itself swallows send errors; this is belt-and-braces.
+      console.error(`[poller] dead-letter flush threw: ${errMessage(err)}`);
+    }
 
     for (const target of targets) {
       const current = state.get(target.source);
       if (!current) continue;
 
       try {
-        const scan = await readContractEvents(server, target, {
+        const scan = await readEvents(server, target, {
           cursor: current.cursor ?? undefined,
           lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
         });
@@ -285,7 +359,24 @@ export function createPoller(deps: PollerDeps) {
             `[poller] ${target.source}: ${scan.events.length} event(s) ` +
               `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
           );
-          await notify(scan.events);
+          // Cap remaining new sends against what the DLQ already consumed.
+          const remaining = Math.max(0, config.maxNotificationsPerCycle - sentBudgetUsed);
+          if (remaining === 0) {
+            for (const event of scan.events) {
+              if (event.payload.name === "unknown" || formatEvent(config, event) === null) {
+                status.eventsSkipped += 1;
+                continue;
+              }
+              status.eventsSkipped += 1;
+            }
+            console.warn(
+              `[poller] cycle notification cap already spent on dead-letter replay; ` +
+                `skipping new events for ${target.source}`,
+            );
+          } else {
+            const sent = await notify(scan.events, remaining);
+            sentBudgetUsed += sent;
+          }
         }
 
         if (scan.lastEventLedger !== null) current.lastEventLedger = scan.lastEventLedger;
@@ -294,19 +385,20 @@ export function createPoller(deps: PollerDeps) {
       } catch (err) {
         const message = errMessage(err);
         current.lastError = message;
-        status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
+        status.lastError = { at: now(), message: `${target.source}: ${message}` };
         console.error(`[poller] ${target.source} scan failed: ${message}`);
       }
     }
 
     if (anyOk) {
-      status.lastSuccessAt = Date.now();
+      status.lastSuccessAt = now();
       status.consecutiveFailures = 0;
     } else {
       status.consecutiveFailures += 1;
     }
 
     status.targets = [...state.values()].map((t) => ({ ...t }));
+    refreshDeadLetterStatus();
     await saveCursors();
     inFlight = false;
   }
@@ -319,7 +411,7 @@ export function createPoller(deps: PollerDeps) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
-      status.lastError = { at: Date.now(), message: errMessage(err) };
+      status.lastError = { at: now(), message: errMessage(err) };
       console.error(`[poller] cycle threw: ${errMessage(err)}`);
       inFlight = false;
     }
@@ -330,14 +422,29 @@ export function createPoller(deps: PollerDeps) {
   return {
     async start(): Promise<void> {
       await loadCursors();
+      await deadLetter.load();
+      refreshDeadLetterStatus();
       status.running = true;
-      status.startedAt = Date.now();
+      status.startedAt = now();
       status.targets = [...state.values()].map((t) => ({ ...t }));
       console.log(
         `[poller] watching market=${config.marketContractId} squad=${config.squadContractId} ` +
-          `every ${config.pollIntervalMs}ms`,
+          `every ${config.pollIntervalMs}ms (dead-letter=${config.deadLetterFile}, ` +
+          `max=${config.deadLetterMax})`,
       );
       void loop();
+    },
+
+    /** Run a single cycle — used by tests; production uses start()/loop(). */
+    async pollOnce(): Promise<void> {
+      if (!status.running) {
+        await loadCursors();
+        await deadLetter.load();
+        refreshDeadLetterStatus();
+        status.running = true;
+        status.startedAt = now();
+      }
+      await cycle();
     },
 
     stop(): void {
@@ -348,7 +455,12 @@ export function createPoller(deps: PollerDeps) {
     },
 
     status(): PollerStatus {
-      return { ...status, targets: [...state.values()].map((t) => ({ ...t })) };
+      refreshDeadLetterStatus();
+      return {
+        ...status,
+        targets: [...state.values()].map((t) => ({ ...t })),
+        deadLetter: deadLetter.stats(),
+      };
     },
   };
 }

@@ -159,10 +159,14 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 
 - **A failed RPC call** fails one contract's scan for one cycle. Its cursor is
   left untouched, so the next cycle resumes exactly where it stopped.
-- **A failed Telegram send** drops one message; the cursor still advances. That
-  is deliberate: holding the cursor back would turn a revoked token or a chat
-  the bot was removed from into an infinite replay, and recovery would flood the
-  channel. Notifications are lossy on purpose — the chain is the record.
+- **A failed Telegram send** (after bounded in-cycle retries) parks one message
+  on a local dead-letter queue (`data/dead-letter.json` by default) and the
+  cursor still advances. Holding the cursor back would turn a revoked token or
+  a chat the bot was removed from into an infinite replay. Later cycles replay
+  the queue (oldest first, still under `MAX_NOTIFICATIONS_PER_CYCLE`) so a
+  transient Telegram outage can still deliver. The queue is bounded
+  (`DEAD_LETTER_MAX`); when full, the oldest entry is dropped. The chain remains
+  the record if an entry is dropped or exhausts `DEAD_LETTER_MAX_ATTEMPTS`.
 - **A corrupt cursor file** is treated as a cold start rather than a crash.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
@@ -205,6 +209,7 @@ src/
   config.ts                env loading and validation, fails fast
   bot.ts                   grammy setup: /start, /help, /status
   poller.ts                the loop: scan, notify, persist the cursor
+  deadLetter.ts            bounded local queue for failed Telegram sends
   stellar/
     client.ts              Soroban RPC client + explorer links
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
