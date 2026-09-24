@@ -26,6 +26,7 @@ import type { BotConfig } from "./config.js";
 import { formatEvent } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
+import { classifyTelegramError } from "./telegramErrors.js";
 
 export interface TargetState {
   source: ContractSource;
@@ -202,9 +203,10 @@ export function createPoller(deps: PollerDeps) {
       } catch (err) {
         // One bad send must not abort the rest of the batch.
         status.notificationsFailed += 1;
+        const classified = classifyTelegramError(err);
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}: ` +
-            errMessage(err),
+            classified.safeMessage,
         );
       }
 

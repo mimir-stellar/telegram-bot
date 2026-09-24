@@ -10,6 +10,10 @@ import { Bot } from "grammy";
 import { escapeMd } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import {
+  classifyTelegramError,
+  MAX_RATE_LIMIT_WAIT_SECONDS,
+} from "./telegramErrors.js";
 
 const HELP = [
   "*Mimir notifier*",
@@ -19,6 +23,8 @@ const HELP = [
   "/status — what I am watching and how far I have read",
   "/help — this message",
 ].join("\n");
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function ago(timestamp: number | null): string {
   if (timestamp === null) return "never";
@@ -89,19 +95,53 @@ export function createBot(deps: BotDeps): Bot {
   // grammy rethrows handler errors by default, which would take the process
   // with it. A malformed command must not be fatal.
   bot.catch((err) => {
-    console.error(`[bot] handler error on update ${err.ctx.update.update_id}:`, err.error);
+    const classified = classifyTelegramError(err.error);
+    console.error(
+      `[bot] handler error on update ${err.ctx.update.update_id}: ${classified.safeMessage}`,
+    );
   });
 
   return bot;
 }
 
-/** The poller's send path: one message to the configured chat. */
+/**
+ * The poller's send path: one message to the configured chat.
+ *
+ * On a 429 rate limit, waits up to {@link MAX_RATE_LIMIT_WAIT_SECONDS} and
+ * retries once. All other failures are logged as classified kinds and rethrown
+ * so the poller can drop that single message and keep the cursor moving.
+ */
 export function createNotifier(bot: Bot, config: BotConfig) {
   return async (text: string): Promise<void> => {
-    await bot.api.sendMessage(config.chatId, text, {
-      parse_mode: "MarkdownV2",
-      link_preview_options: { is_disabled: true },
-    });
+    const sendOnce = () =>
+      bot.api.sendMessage(config.chatId, text, {
+        parse_mode: "MarkdownV2",
+        link_preview_options: { is_disabled: true },
+      });
+
+    try {
+      await sendOnce();
+    } catch (err) {
+      const classified = classifyTelegramError(err);
+      if (classified.kind === "rate_limit") {
+        const waitSeconds = classified.retryAfterSeconds ?? 1;
+        const waitMs = Math.min(waitSeconds, MAX_RATE_LIMIT_WAIT_SECONDS) * 1000;
+        console.warn(
+          `[bot] ${classified.safeMessage}; waiting ${waitMs}ms then retrying once`,
+        );
+        await sleep(waitMs);
+        try {
+          await sendOnce();
+          return;
+        } catch (retryErr) {
+          const retryClassified = classifyTelegramError(retryErr);
+          console.error(`[bot] send retry failed: ${retryClassified.safeMessage}`);
+          throw retryErr;
+        }
+      }
+      console.error(`[bot] send failed: ${classified.safeMessage}`);
+      throw err;
+    }
   };
 }
 
@@ -115,6 +155,9 @@ export async function registerCommands(bot: Bot): Promise<void> {
     ]);
   } catch (err) {
     // Cosmetic. Never worth failing a boot over.
-    console.warn(`[bot] setMyCommands failed: ${err instanceof Error ? err.message : err}`);
+    const classified = classifyTelegramError(err);
+    console.warn(`[bot] setMyCommands failed: ${classified.safeMessage}`);
   }
 }
+
+export { classifyTelegramError } from "./telegramErrors.js";
