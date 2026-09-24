@@ -83,6 +83,95 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+
+/** Minimal RPC health surface used at boot (fakeable in tests). */
+export interface RpcHealthProbe {
+  getHealth: () => Promise<{
+    status: string;
+    latestLedger: number;
+    oldestLedger: number;
+  }>;
+}
+
+export interface StartupHealthOptions {
+  /** Wall-clock budget for retries from the first attempt. */
+  deadlineMs: number;
+  /** Delay between failed attempts (capped by remaining deadline). */
+  retryMs: number;
+  /** Optional clock for deterministic tests. */
+  now?: () => number;
+  /** Optional sleeper for deterministic tests. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Retry `getHealth()` until it succeeds or the deadline elapses.
+ *
+ * Used at process startup so a briefly unavailable RPC (deploy race, Testnet
+ * blip) does not fail the whole boot, while a permanently wrong URL still
+ * surfaces within a bounded window. Never logs tokens or full remote bodies.
+ */
+export async function waitForStartupHealth(
+  rpc: RpcHealthProbe,
+  options: StartupHealthOptions,
+): Promise<{
+  status: string;
+  latestLedger: number;
+  oldestLedger: number;
+  attempts: number;
+}> {
+  const now = options.now ?? Date.now;
+  const sleepFn = options.sleep ?? sleep;
+  const deadlineMs = Math.max(0, options.deadlineMs);
+  const retryMs = Math.max(0, options.retryMs);
+  const startedAt = now();
+  const deadlineAt = startedAt + deadlineMs;
+
+  let attempts = 0;
+  let lastError: unknown;
+
+  while (true) {
+    attempts += 1;
+    try {
+      const health = await rpc.getHealth();
+      if (attempts > 1) {
+        console.log(
+          `[poller] startup RPC health ok after ${attempts} attempt(s) ` +
+            `(${Math.max(0, now() - startedAt)}ms): status=${health.status} ` +
+            `ledgers ${health.oldestLedger}..${health.latestLedger}`,
+        );
+      }
+      return {
+        status: health.status,
+        latestLedger: health.latestLedger,
+        oldestLedger: health.oldestLedger,
+        attempts,
+      };
+    } catch (err) {
+      lastError = err;
+      const remaining = deadlineAt - now();
+      if (remaining <= 0 || retryMs <= 0) {
+        break;
+      }
+      const waitMs = Math.min(retryMs, remaining);
+      console.warn(
+        `[poller] startup RPC health attempt ${attempts} failed; ` +
+          `retrying in ${waitMs}ms (deadline ${deadlineMs}ms): ${errMessage(err)}`,
+      );
+      await sleepFn(waitMs);
+      if (now() >= deadlineAt) {
+        break;
+      }
+    }
+  }
+
+  throw new Error(
+    `RPC startup health check failed after ${attempts} attempt(s) ` +
+      `within ${deadlineMs}ms deadline: ${errMessage(lastError)}`,
+  );
+}
+
+
 /**
  * Sends a message with bounded exponential backoff.
  *
