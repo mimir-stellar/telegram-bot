@@ -6,6 +6,7 @@
  */
 
 import { Bot } from "grammy";
+import type { UserFromGetMe } from "grammy/types";
 
 import { escapeMd } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
@@ -65,11 +66,49 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  /**
+   * Pre-populated bot info. When provided (e.g. in tests) grammy skips the
+   * getMe() call so `bot.handleUpdate()` works without a real Telegram token.
+   */
+  botInfo?: UserFromGetMe;
+}
+
+/**
+ * Returns true when the chat may interact with the bot.
+ *
+ * Rules:
+ * - If `allowedChatIds` is empty the list is open (any chat may use commands).
+ * - Otherwise the incoming chat id must appear in the list. Both the numeric
+ *   id (grammy's ctx.chat.id) and its string form are compared so negative
+ *   group ids such as -1001234567890 match correctly.
+ */
+export function isChatAllowed(allowedChatIds: string[], chatId: number): boolean {
+  if (allowedChatIds.length === 0) return true;
+  const asString = String(chatId);
+  return allowedChatIds.some((allowed) => allowed === asString);
 }
 
 export function createBot(deps: BotDeps): Bot {
   const { config, status } = deps;
-  const bot = new Bot(config.botToken);
+  const bot = new Bot(
+    config.botToken,
+    deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined,
+  );
+
+  // Enforce the chat allowlist for every update that has a chat. When
+  // ALLOWED_CHAT_IDS is set, unapproved chats are silently dropped so
+  // /start, /help, /status (and any future commands) stay locked down.
+  // Empty allowlist = open (no change for existing deployments).
+  bot.use(async (ctx, next) => {
+    const chat = ctx.chat;
+    if (chat !== undefined && !isChatAllowed(config.allowedChatIds, chat.id)) {
+      console.warn(
+        `[bot] update denied for chat ${chat.id} (not in ALLOWED_CHAT_IDS)`,
+      );
+      return;
+    }
+    await next();
+  });
 
   bot.command("start", async (ctx) => {
     await ctx.reply(HELP, { parse_mode: "MarkdownV2" });
