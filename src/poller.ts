@@ -15,6 +15,8 @@
  *  - A cursor file that cannot be read is treated as a cold start; one that
  *    cannot be written is logged, and the in-memory cursor keeps working until
  *    the next restart.
+ *  - A second process that tries to start against the same lock file is refused
+ *    up front. Concurrent instances would race the cursor and double-notify.
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -23,6 +25,11 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
+import {
+  acquireInstanceLock,
+  InstanceLockError,
+  type InstanceLockHandle,
+} from "./instanceLock.js";
 import { formatEvent } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
@@ -49,6 +56,10 @@ export interface PollerStatus {
   eventsSkipped: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
+  /** Absolute path of the exclusive instance lock, or null before acquire. */
+  lockFile: string | null;
+  /** Pid recorded in the lock while this process holds it. */
+  lockPid: number | null;
   targets: TargetState[];
 }
 
@@ -102,12 +113,15 @@ export function createPoller(deps: PollerDeps) {
     eventsSkipped: 0,
     consecutiveFailures: 0,
     lastError: null,
+    lockFile: null,
+    lockPid: null,
     targets: [],
   };
 
   let timer: NodeJS.Timeout | null = null;
   let stopped = false;
   let inFlight = false;
+  let instanceLock: InstanceLockHandle | null = null;
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
@@ -284,6 +298,14 @@ export function createPoller(deps: PollerDeps) {
 
   return {
     async start(): Promise<void> {
+      // Refuse a second live process before touching the cursor or Telegram.
+      instanceLock = await acquireInstanceLock(config.lockFile);
+      status.lockFile = instanceLock.path;
+      status.lockPid = instanceLock.payload.pid;
+      console.log(
+        `[poller] instance lock acquired pid=${instanceLock.payload.pid} file=${instanceLock.path}`,
+      );
+
       await loadCursors();
       status.running = true;
       status.startedAt = Date.now();
@@ -295,11 +317,17 @@ export function createPoller(deps: PollerDeps) {
       void loop();
     },
 
-    stop(): void {
+    async stop(): Promise<void> {
       stopped = true;
       status.running = false;
       if (timer) clearTimeout(timer);
       timer = null;
+      if (instanceLock) {
+        await instanceLock.release();
+        instanceLock = null;
+        status.lockPid = null;
+        console.log(`[poller] instance lock released`);
+      }
     },
 
     status(): PollerStatus {
@@ -307,5 +335,7 @@ export function createPoller(deps: PollerDeps) {
     },
   };
 }
+
+export { InstanceLockError };
 
 export type Poller = ReturnType<typeof createPoller>;

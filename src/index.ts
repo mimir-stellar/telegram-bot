@@ -7,6 +7,7 @@
  */
 
 import { ConfigError, loadConfig, networkLabel } from "./config.js";
+import { InstanceLockError } from "./instanceLock.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { createPoller } from "./poller.js";
 import { createRpcServer } from "./stellar/client.js";
@@ -41,6 +42,7 @@ async function main(): Promise<void> {
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] chat         ${config.chatId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  console.log(`[boot] lock file    ${config.lockFile}`);
 
   const server = createRpcServer(config);
 
@@ -64,6 +66,10 @@ async function main(): Promise<void> {
 
   await registerCommands(bot);
 
+  // Lock first: refuse a second live instance before Telegram long-polling starts.
+  // That keeps a duplicate process from racing the cursor or fighting getUpdates.
+  await poller.start();
+
   // grammy's `start` resolves only when the bot stops, so it is not awaited.
   // It retries transient network trouble internally; a rejection here means the
   // token itself cannot authenticate, which no amount of waiting fixes.
@@ -73,15 +79,16 @@ async function main(): Promise<void> {
     })
     .catch((err: unknown) => {
       console.error("[fatal] telegram long-polling failed — check BOT_TOKEN:", err);
-      process.exit(1);
+      void poller.stop().finally(() => process.exit(1));
     });
-
-  await poller.start();
 
   const shutdown = (signal: string) => {
     console.log(`[shutdown] ${signal} received, stopping`);
-    poller.stop();
-    void bot.stop().finally(() => process.exit(0));
+    void (async () => {
+      await poller.stop();
+      await bot.stop();
+      process.exit(0);
+    })();
   };
 
   process.once("SIGINT", () => shutdown("SIGINT"));
@@ -89,7 +96,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  if (err instanceof ConfigError) {
+  if (err instanceof ConfigError || err instanceof InstanceLockError) {
     console.error(`\n${err.message}\n`);
     process.exit(1);
   }

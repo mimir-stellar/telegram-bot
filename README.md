@@ -153,6 +153,20 @@ at one). On an ephemeral filesystem every restart is a cold start, and events
 that happened while the bot was down are never posted. Swapping this for a real
 KV store is a deliberate future step, not something this repo does today.
 
+## Single-instance lock
+
+The poller takes an exclusive file lock (`data/poller.lock` by default, overridable
+with `INSTANCE_LOCK_FILE`) before it loads the cursor or starts Telegram long
+polling. The lock records only `pid`, `hostname`, and `acquiredAt` — never the
+bot token or any secret.
+
+- A second live process against the same lock exits immediately with a clear
+  error, so two notifiers cannot race the cursor or double-post events.
+- If the previous process died without releasing the lock, the next start
+  detects the dead pid, removes the stale file, and continues.
+- Point `INSTANCE_LOCK_FILE` at the same persistent volume as `CURSOR_FILE` so
+  the lock survives the same restarts the cursor does.
+
 ## Failure behaviour
 
 This process is meant to stay up for weeks, so a single failure never ends it:
@@ -164,6 +178,8 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   the bot was removed from into an infinite replay, and recovery would flood the
   channel. Notifications are lossy on purpose — the chain is the record.
 - **A corrupt cursor file** is treated as a cold start rather than a crash.
+- **A second concurrent instance** is refused at startup via the exclusive lock
+  above. Stale locks from crashed processes are cleared automatically.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down.
@@ -176,6 +192,7 @@ src/
   config.ts                env loading and validation, fails fast
   bot.ts                   grammy setup: /start, /help, /status
   poller.ts                the loop: scan, notify, persist the cursor
+  instanceLock.ts          exclusive process lock for the cursor owner
   stellar/
     client.ts              Soroban RPC client + explorer links
     events.ts              cursor-paginated getEvents (+ the standalone CLI)

@@ -30,6 +30,8 @@ export interface BotConfig extends StellarConfig {
   pollIntervalMs: number;
   startLookbackLedgers: number;
   cursorFile: string;
+  /** Exclusive lock so only one process owns the cursor. */
+  lockFile: string;
   maxNotificationsPerCycle: number;
 }
 
@@ -55,6 +57,7 @@ const DEFAULTS = {
   minPollIntervalMs: 5_000,
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
+  lockFile: "./data/poller.lock",
   maxNotificationsPerCycle: 20,
 } as const;
 
@@ -165,6 +168,7 @@ export function loadConfig(): BotConfig {
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
     cursorFile: path.resolve(process.cwd(), read("CURSOR_FILE") ?? DEFAULTS.cursorFile),
+    lockFile: path.resolve(process.cwd(), read("INSTANCE_LOCK_FILE") ?? DEFAULTS.lockFile),
     maxNotificationsPerCycle: c.int(
       "MAX_NOTIFICATIONS_PER_CYCLE",
       DEFAULTS.maxNotificationsPerCycle,
