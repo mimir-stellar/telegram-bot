@@ -34,7 +34,10 @@ it holds no keys and signs nothing.
 
 Admin events (`oracle_changed`, `ownership_transferred`, `fee_policy_*`,
 `fee_accrued`, `agent_attributed`) are decoded far enough to be recognised and
-then skipped — they are logged, not posted.
+then skipped — they are retained as bounded `unknown` events and logged with
+their event name, ledger, and bounded decode reason, not posted. New event names
+and malformed XDR follow the same path, so they cannot stop polling or advance a
+log with an unbounded remote payload.
 
 ## Setup
 
@@ -116,8 +119,10 @@ npm run scan -- --show 20        # print 20 decoded events per contract
 npm run scan -- --from 4226500   # explicit start ledger
 ```
 
-It prints the ledger window, an event-name histogram, and the decoded payloads.
-This is how the decoder was verified against the live deployment.
+It prints the ledger window, an event-name histogram, and bounded decoded
+payloads. Unknown or malformed events retain their ledger, transaction, event
+name, and bounded reason for audit without dumping raw remote XDR. This is how
+the decoder was verified against the live deployment.
 
 ## How the polling works
 

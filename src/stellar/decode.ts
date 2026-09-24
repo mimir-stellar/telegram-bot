@@ -133,6 +133,13 @@ export type DecodedEvent = EventMeta & { payload: EventPayload };
 
 class DecodeError extends Error {}
 
+const AUDIT_TEXT_LIMIT = 160;
+
+function auditText(value: unknown, max = AUDIT_TEXT_LIMIT): string {
+  const compact = String(value).replace(/\s+/g, " ").trim() || "unknown";
+  return compact.length <= max ? compact : `${compact.slice(0, max - 1)}…`;
+}
+
 function native(value: xdr.ScVal): unknown {
   return scValToNative(value);
 }
@@ -384,7 +391,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     });
 
     const first = topics[0];
-    eventName = typeof first === "string" ? first : "";
+    eventName = typeof first === "string" ? auditText(first) : "";
 
     const decodedValue = native(event.value);
     const fields = isRecord(decodedValue) ? decodedValue : {};
@@ -402,7 +409,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
       payload: {
         name: "unknown",
         eventName,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: auditText(err instanceof Error ? err.message : err),
       },
     };
   }

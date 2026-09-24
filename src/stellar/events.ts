@@ -207,6 +207,10 @@ function flag(name: string): string | undefined {
 function summarize(event: DecodedEvent): string {
   const p = event.payload;
   const money = (v: bigint) => `${formatUsdc(v)} USDC`;
+  const text = (value: string, max = 200): string => {
+    const compact = value.replace(/\s+/g, " ").trim();
+    return compact.length <= max ? compact : `${compact.slice(0, max - 1)}…`;
+  };
   switch (p.name) {
     case "claim_created":
       return `claim #${p.claimId} created by ${p.creator} [${p.category}]`;
@@ -219,7 +223,7 @@ function summarize(event: DecodedEvent): string {
     case "challenger_paid":
       return `claim #${p.claimId} paid ${p.challenger} net=${money(p.net)}`;
     case "market_created":
-      return `squad market #${p.marketId} by ${p.captain}: ${p.question}`;
+      return `squad market #${p.marketId} by ${p.captain}: ${text(p.question)}`;
     case "deposited":
       return `squad #${p.marketId} side=${p.side} ${p.participant} deposited ${money(p.amount)}`;
     case "resolved":
@@ -276,9 +280,11 @@ async function main(): Promise<void> {
     for (const event of scan.events.slice(-show)) {
       console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
       console.log(`  ${summarize(event)}`);
-      console.log(
-        `  ${JSON.stringify(event.payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v))}`,
-      );
+      const payload = JSON.stringify(
+        event.payload,
+        (_k, value) => (typeof value === "bigint" ? value.toString() : value),
+      ) ?? "{}";
+      console.log(`  ${payload.length <= 800 ? payload : `${payload.slice(0, 799)}…`}`);
     }
   }
 }
