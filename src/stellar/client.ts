@@ -13,11 +13,37 @@ import { rpc } from "@stellar/stellar-sdk";
 import type { StellarConfig } from "../config.js";
 import { networkLabel } from "../config.js";
 
-export function createRpcServer(config: StellarConfig): rpc.Server {
-  return new rpc.Server(config.rpcUrl, {
+export class RpcPassphraseError extends Error {
+  constructor(expected: string, actual: string) {
+    super(
+      `RPC network passphrase mismatch: expected "${expected}" but RPC reported "${actual}". ` +
+      `Check STELLAR_RPC_URL and STELLAR_NETWORK_PASSPHRASE configuration.`,
+    );
+    this.name = "RpcPassphraseError";
+  }
+}
+
+/**
+ * Create an RPC server and verify its network passphrase matches the configured value.
+ * This fail-fast check at boot prevents silent misconfigurations where the bot reads
+ * events from the wrong network.
+ *
+ * Throws RpcPassphraseError if the passphrase does not match.
+ */
+export async function createRpcServer(config: StellarConfig): Promise<rpc.Server> {
+  const server = new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
   });
+
+  // Verify the RPC's passphrase matches the configured one. This is a fail-fast
+  // check that prevents configuration errors from silently producing wrong results.
+  const network = await server.getNetwork();
+  if (network.passphrase !== config.networkPassphrase) {
+    throw new RpcPassphraseError(config.networkPassphrase, network.passphrase);
+  }
+
+  return server;
 }
 
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */

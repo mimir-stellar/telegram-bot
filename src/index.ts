@@ -10,7 +10,7 @@ import { ConfigError, loadConfig, networkLabel } from "./config.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
-import { createRpcServer } from "./stellar/client.js";
+import { RpcPassphraseError, createRpcServer } from "./stellar/client.js";
 
 /**
  * Installed before anything else can throw, so a rejection during startup is
@@ -43,7 +43,7 @@ async function main(): Promise<void> {
   console.log(`[boot] chat         ${config.chatId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
 
-  const server = createRpcServer(config);
+  const server = await createRpcServer(config);
 
   // One read before announcing readiness: a wrong RPC URL should surface now,
   // not as a mystery in the poll log an interval later.
@@ -103,6 +103,10 @@ async function main(): Promise<void> {
 main().catch((err: unknown) => {
   if (err instanceof ConfigError) {
     console.error(`\n${err.message}\n`);
+    process.exit(1);
+  }
+  if (err instanceof RpcPassphraseError) {
+    console.error(`\n[boot] configuration error: ${err.message}\n`);
     process.exit(1);
   }
   console.error("[boot] startup failed:", err);

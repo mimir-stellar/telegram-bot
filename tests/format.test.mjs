@@ -64,8 +64,9 @@ test("formatted money notifications keep explicit decimals and escape the decima
     },
   };
 
-  const message = formatEvent(config, event);
-  assert.match(message, /Stake: \*2\\\.0000000 USDC\*/);
+  const formatted = formatEvent(config, event);
+  assert.ok(formatted, "event should be formatted");
+  assert.match(formatted.text, /Stake: \*2\\\.0000000 USDC\*/);
 });
 
 test("unknown or malformed decoded events stay non-notifying", () => {
@@ -134,7 +135,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
       category: reserved,
     },
   };
-  const message = formatEvent(config, event);
+  const formatted = formatEvent(config, event);
   const expectedMessage =
     `🆕 *New claim* \\#7\nCategory: ${expectedEscape(reserved)}\n` +
     "Creator: `GABCD`\n_ledger 42_";
@@ -148,8 +149,10 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
     },
   };
 
-  assert.equal(message, expectedMessage);
-  await createNotifier(fakeBot, config)(message);
+  assert.ok(formatted, "event should be formatted");
+  assert.equal(formatted.text, expectedMessage);
+  assert.equal(formatted.previewsEnabled, false, "no tx hash so no previews");
+  await createNotifier(fakeBot, config)(formatted.text, formatted.previewsEnabled);
   assert.deepEqual(sent, [
     [
       config.chatId,
@@ -212,4 +215,116 @@ test("txExplorerUrl is centralized and network-aware", async () => {
   const custom = { ...testnet, explorerBaseUrl: "https://example.test/x/" };
   assert.equal(txExplorerUrl(custom, "zz"), "https://example.test/x/testnet/tx/zz");
   assert.equal(txExplorerUrl(testnet, "  "), "");
+});
+
+test("formatEvent enables link previews when transaction hash is present", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
+  };
+
+  // Event WITH transaction hash
+  const eventWithTx = {
+    source: "market",
+    contractId: "market",
+    ledger: 100,
+    txHash: "abc123def456",
+    at: 0,
+    eventId: "100-0",
+    payload: {
+      name: "claim_resolved",
+      claimId: 42,
+      winnerSide: 1,
+      summary: "test",
+      confidence: 90,
+      evidenceHash: "hash",
+    },
+  };
+
+  const formattedWithTx = formatEvent(config, eventWithTx);
+  assert.ok(formattedWithTx, "should format event with txHash");
+  assert.equal(formattedWithTx.previewsEnabled, true, "previews enabled when txHash present");
+  assert.match(formattedWithTx.text, /\[tx\]/);
+
+  // Event WITHOUT transaction hash
+  const eventWithoutTx = {
+    source: "market",
+    contractId: "market",
+    ledger: 101,
+    txHash: "",
+    at: 0,
+    eventId: "101-0",
+    payload: {
+      name: "claim_created",
+      claimId: 43,
+      creator: "GABCD",
+      category: "politics",
+    },
+  };
+
+  const formattedWithoutTx = formatEvent(config, eventWithoutTx);
+  assert.ok(formattedWithoutTx, "should format event without txHash");
+  assert.equal(formattedWithoutTx.previewsEnabled, false, "previews disabled when no txHash");
+  assert.equal(/\[tx\]/.test(formattedWithoutTx.text), false, "should not have [tx] link");
+});
+
+test("formatEvent disables previews for events with empty txHash", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
+  };
+
+  // Event with whitespace-only txHash
+  const eventWhitespace = {
+    source: "market",
+    contractId: "market",
+    ledger: 102,
+    txHash: "   ",
+    at: 0,
+    eventId: "102-0",
+    payload: {
+      name: "claim_cancelled",
+      claimId: 44,
+    },
+  };
+
+  const formatted = formatEvent(config, eventWhitespace);
+  assert.ok(formatted, "should format event");
+  assert.equal(formatted.previewsEnabled, false, "previews disabled for whitespace txHash");
+});
+
+test("createNotifier respects previewsEnabled flag", async () => {
+  const sent = [];
+  const fakeBot = {
+    api: {
+      sendMessage: async (...args) => {
+        sent.push(args);
+        return {};
+      },
+    },
+  };
+  const config = { chatId: "-1001234567890" };
+  const notify = createNotifier(fakeBot, config);
+
+  // Send with previews enabled
+  await notify("message with link", true);
+  assert.deepEqual(sent[sent.length - 1][2].link_preview_options.is_disabled, false);
+
+  // Send with previews disabled (default)
+  await notify("message without link");
+  assert.deepEqual(sent[sent.length - 1][2].link_preview_options.is_disabled, true);
+
+  // Send explicitly disabled
+  await notify("another message", false);
+  assert.deepEqual(sent[sent.length - 1][2].link_preview_options.is_disabled, true);
 });

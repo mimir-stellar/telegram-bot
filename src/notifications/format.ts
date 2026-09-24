@@ -8,6 +8,10 @@
  *
  * One event, one message, one line of substance. A notification is read on a
  * phone lock screen.
+ *
+ * Link previews are controlled per message: enabled for events with transaction
+ * links (which provide useful context about on-chain activity) and disabled for
+ * commands and status messages to keep the UI clean.
  */
 
 import { txExplorerUrl } from "../stellar/client.js";
@@ -153,9 +157,28 @@ function headline(event: DecodedEvent): string | null {
   }
 }
 
-/** The full message, or null when the event is not worth notifying. */
-export function formatEvent(config: StellarConfig, event: DecodedEvent): string | null {
+export interface FormattedEvent {
+  text: string;
+  /** True when link previews should be enabled for this message. */
+  previewsEnabled: boolean;
+}
+
+/**
+ * The full message with link preview metadata, or null when the event is not
+ * worth notifying.
+ *
+ * Link previews are enabled when the message contains transaction links that
+ * provide useful context about on-chain activity. This keeps explorer previews
+ * visible while preserving the UI for messages without actionable links.
+ */
+export function formatEvent(config: StellarConfig, event: DecodedEvent): FormattedEvent | null {
   const head = headline(event);
   if (head === null) return null;
-  return `${head}\n${footer(config, event)}`;
+  
+  const text = `${head}\n${footer(config, event)}`;
+  // Enable previews for events that have transaction hashes, which provide
+  // useful on-chain context. Disable for events without them.
+  const previewsEnabled = event.txHash !== null && event.txHash.trim().length > 0;
+
+  return { text, previewsEnabled };
 }
