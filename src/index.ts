@@ -6,7 +6,7 @@
  * is to still be running next week.
  */
 
-import { ConfigError, loadConfig, networkLabel } from "./config.js";
+import { ConfigError, activeProfileName, loadConfig, networkLabel } from "./config.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
@@ -36,6 +36,17 @@ async function main(): Promise<void> {
   installProcessHandlers();
 
   const config = loadConfig();
+
+  // The mock profile exists for the dry-run entry, not this one: warn loudly
+  // so a profile left set in a deployment is noticed before Telegram rejects
+  // the placeholder token.
+  const profile = activeProfileName();
+  if (profile !== null) {
+    console.warn(
+      `[boot] MIMIR_PROFILE=${profile} is set: this entry still talks to real Telegram; ` +
+        `use "npm run mock:poll" for a credential-free dry run`,
+    );
+  }
 
   console.log(`[boot] Mimir Telegram notifier`);
   console.log(`[boot] network      ${networkLabel(config)} (${config.rpcUrl})`);

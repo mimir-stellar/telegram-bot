@@ -194,9 +194,12 @@ export async function readContractEvents(
 //   npm run scan -- --pages 40    # walk further
 //   npm run scan -- --show 5      # print 5 decoded events per contract
 //   npm run scan -- --from 123456 # explicit start ledger
+//   npm run scan -- --mock        # local mock profile: no network, no credentials
 //
 // Needs no BOT_TOKEN: the public Testnet RPC is unauthenticated, so this reads
-// live chain data with nothing but the contract ids.
+// live chain data with nothing but the contract ids. `--mock` instead points
+// the same reader at a local mock Soroban RPC (`npm run mock:rpc`), selecting
+// the `MIMIR_PROFILE=mock` defaults for anything the environment leaves unset.
 
 function flag(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`);
@@ -234,6 +237,12 @@ function summarize(event: DecodedEvent): string {
 }
 
 async function main(): Promise<void> {
+  // `--mock` opts into the local mock profile before config is read. An
+  // explicit MIMIR_PROFILE in the environment still wins; blank counts as unset.
+  if (process.argv.includes("--mock") && !process.env.MIMIR_PROFILE?.trim()) {
+    process.env.MIMIR_PROFILE = "mock";
+  }
+
   const config = loadStellarConfig();
   const server = createRpcServer(config);
   const pages = Number(flag("pages") ?? EVENT_MAX_PAGES);

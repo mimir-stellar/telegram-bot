@@ -28,11 +28,39 @@ export function escapeMd(text: string): string {
 }
 
 /**
+ * Best-effort text for an unknown thrown value, without assuming it is an
+ * `Error`. The SDK throws Soroban JSON-RPC failures as plain
+ * `{ code, message }` objects (js-stellar-sdk `rpc/jsonrpc.ts`), and
+ * `String()` of those is the useless `"[object Object]"` — so object-shaped
+ * errors are read field-wise and only then fall back to a bounded dump.
+ */
+function describeError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error === null || error === undefined) return "";
+  if (typeof error === "object") {
+    const record = error as { code?: unknown; message?: unknown };
+    const code =
+      typeof record.code === "number" || typeof record.code === "string" ? record.code : null;
+    if (typeof record.message === "string" && record.message !== "") {
+      return code === null ? record.message : `${code}: ${record.message}`;
+    }
+    try {
+      const json = JSON.stringify(error);
+      if (typeof json === "string" && json !== "{}") return json;
+    } catch {
+      // Circular or exotic object; fall through to the generic label.
+    }
+    return code === null ? "error object" : `error code ${code}`;
+  }
+  return String(error);
+}
+
+/**
  * Keep operational errors actionable without copying remote payloads or the
  * bot token into logs and status messages.
  */
 export function safeErrorMessage(error: unknown, secrets: readonly string[] = []): string {
-  let message = error instanceof Error ? error.message : String(error);
+  let message = describeError(error);
   for (const secret of secrets) {
     if (secret) message = message.split(secret).join("[REDACTED]");
   }

@@ -50,6 +50,23 @@ async function waitForFailedCycle(poller) {
   throw new Error("poller failure cycle did not finish");
 }
 
+/**
+ * `stop()` lets an in-flight cycle finish, and that cycle rewrites the cursor
+ * file (write-then-rename). Deleting the directory while it lands races
+ * ENOTEMPTY, so wait for the rewrite the cycle already started.
+ */
+async function waitForCursorRewrite(cursorFile, originalUpdatedAt) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    try {
+      const current = JSON.parse(await readFile(cursorFile, "utf8")).updatedAt;
+      if (current !== originalUpdatedAt) return;
+    } catch {
+      // Mid-rename; the next attempt will see the new file.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
 test("pause/resume is bounded during an in-flight scan and restart reloads version-1 cursors", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-resume-"));
   const cursorFile = path.join(directory, "cursor.json");
@@ -113,6 +130,7 @@ test("RPC failures are bounded and redact the configured bot token in status", a
   const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-rpc-failure-"));
   const cursorFile = path.join(directory, "cursor.json");
   await writeFile(cursorFile, CURSOR_FILE, "utf8");
+  const originalUpdatedAt = JSON.parse(await readFile(cursorFile, "utf8")).updatedAt;
   const secret = "123456789:TEST-ONLY-TOKEN-NEVER-USE";
   const longPayload = "remote-payload".repeat(100);
   const poller = createPoller({
@@ -141,6 +159,7 @@ test("RPC failures are bounded and redact the configured bot token in status", a
   } finally {
     console.error = originalError;
     poller.stop();
+    await waitForCursorRewrite(cursorFile, originalUpdatedAt);
     await rm(directory, { recursive: true, force: true });
   }
 });

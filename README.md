@@ -119,6 +119,34 @@ npm run scan -- --from 4226500   # explicit start ledger
 It prints the ledger window, an event-name histogram, and the decoded payloads.
 This is how the decoder was verified against the live deployment.
 
+## Local mock profile
+
+`MIMIR_PROFILE=mock` (or the scanner's `--mock` flag) fills in any config value
+the environment leaves unset with a **local, loopback-only** Soroban mock:
+fixture contract ids, `http://127.0.0.1:8420` RPC, and an isolated cursor file
+at `data/cursor.mock.json` so a drill can never touch the real bot's position.
+Explicit environment variables always win, any other profile name fails fast at
+startup, and nothing here needs a bot token, Telegram credentials, or Testnet.
+
+```bash
+npm run mock:rpc                        # serve the fixture scenario on 127.0.0.1:8420
+npm run scan:mock                       # scanner --mock: decode the scenario, no credentials
+npm run mock:poll                       # dry run: mock RPC + real poller, sends are logged
+npm run mock:poll -- --fail-events error  # inject in-band JSON-RPC failures
+npm run mock:rpc -- --stale-cursor      # reject cursors once the poller has one
+npm run mock:poll -- --malformed        # append an undecodable event (must skip, not crash)
+npm run mock:poll -- --port 0           # ephemeral port (any entry point accepts it)
+```
+
+Failure kinds are `error`, `http-500`, `rate-limit`, and `stale-cursor`, with
+the shorthands `--fail-rpc`, `--rate-limit`, `--stale-cursor` for `getEvents`
+and `--fail-health <kind>` for `getHealth`. The mock enforces the real RPC's
+request rules — mutually exclusive `startLedger`/`cursor`, the retained floor as
+an error rather than an empty page, bounded error messages — and the dry run
+exercises the poller's cursor-safety, restart, and bounded-log guarantees end to
+end. `npm test` covers all of it (`tests/mock-*.test.mjs`); run just those with
+`npm run test:mock`.
+
 ## How the polling works
 
 Soroban's `getEvents` is **not** `eth_getLogs`, and the difference is the whole
@@ -229,21 +257,24 @@ errors are logged and ignored so they cannot stop the notifier.
 ```
 src/
   index.ts                 entry point: config -> RPC -> bot -> poller -> health HTTP
+  mock-run.ts              dry run: in-process mock RPC + real poller, log-only sends
   health.ts                local loopback GET /health for supervisors
-  config.ts                env loading and validation, fails fast
+  config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
   bot.ts                   grammy setup: /start, /help, /status, /contracts, operator pause/resume
   poller.ts                the loop: scan, notify, persist the cursor
   stellar/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
     decode.ts              typed decoding of both contracts' events
+    mock-rpc.ts            local Soroban mock: scenario, pagination, failure injection
+    mock-constants.ts      mock profile fixture ids, ports, placeholder credentials
   notifications/
     format.ts              decoded event -> MarkdownV2 message
 ```
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture and health suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile and health suites (`npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
 

@@ -203,6 +203,25 @@ Never log:
 
 When reporting an incident, include only the minimum information needed to identify the failure, such as contract, ledger, cursor state, error category, and timestamp.
 
+## Rehearsing locally (mock profile)
+
+Every failure mode in this runbook can be drilled on a laptop against the
+local mock profile — loopback only, no bot token, no Testnet, and an isolated
+`data/cursor.mock.json` that never overlaps a real bot's cursor:
+
+```bash
+npm run mock:poll -- --fail-events error   # RPC failure drill (see "RPC failures")
+npm run mock:poll -- --stale-cursor        # stale cursor drill (see "Stale or corrupt cursor")
+npm run mock:poll -- --malformed           # undecodable event drill
+npm run mock:poll                          # healthy dry run; sends are logged, not delivered
+curl -s http://127.0.0.1:8787/health | jq .status
+```
+
+Injected failures last until the process stops, so recovery is "restart without
+the flag": the cursor must resume exactly where it was, log lines stay bounded,
+and no token-shaped secret appears anywhere in the output. The same guarantees
+are asserted by `tests/mock-rpc.test.mjs` (`npm run test:mock`).
+
 ## Verification
 
 Before merging operational changes, run the repository's documented checks:

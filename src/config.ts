@@ -10,11 +10,30 @@
  *   - {@link loadStellarConfig} needs no Telegram credentials, so the chain
  *     reader (`src/stellar/events.ts`) can be run standalone against Testnet.
  *   - {@link loadConfig} is the full bot config.
+ *
+ * ── Profiles ─────────────────────────────────────────────────────────────────
+ *
+ * `MIMIR_PROFILE=mock` selects the local Soroban mock profile: it supplies
+ * defaults for values the environment does NOT set (loopback RPC, fixture
+ * contract ids, an isolated cursor file, placeholder credentials). Explicit
+ * environment variables always win, so a profile can never change an existing
+ * deployment's configuration. Any other profile name fails fast.
  */
 
 import path from "node:path";
 
 import "dotenv/config";
+
+import {
+  MOCK_BOT_TOKEN,
+  MOCK_CHAT_ID,
+  MOCK_CURSOR_FILE,
+  MOCK_MARKET_CONTRACT_ID,
+  MOCK_NETWORK_PASSPHRASE,
+  MOCK_PROFILE_NAME,
+  MOCK_RPC_DEFAULT_PORT,
+  MOCK_SQUAD_CONTRACT_ID,
+} from "./stellar/mock-constants.js";
 
 export interface StellarConfig {
   marketContractId: string;
@@ -49,11 +68,11 @@ export interface BotConfig extends StellarConfig {
 export class ConfigError extends Error {
   readonly problems: string[];
 
-  constructor(problems: string[]) {
+  constructor(problems: string[], hint?: string) {
     super(
       `Invalid configuration (${problems.length} problem${problems.length === 1 ? "" : "s"}):\n` +
         problems.map((p) => `  - ${p}`).join("\n") +
-        `\n\nCopy .env.example to .env and fill in the missing values.`,
+        `\n\n${hint ?? "Copy .env.example to .env and fill in the missing values."}`,
     );
     this.name = "ConfigError";
     this.problems = problems;
@@ -78,6 +97,42 @@ const DEFAULTS = {
 /** Strkey for a contract: `C` + 55 base32 characters. */
 const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
 
+/**
+ * Defaults each profile supplies for values the environment leaves unset.
+ * Profile values never override explicit environment variables.
+ */
+const PROFILE_DEFAULTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  [MOCK_PROFILE_NAME]: {
+    MARKET_CONTRACT_ID: MOCK_MARKET_CONTRACT_ID,
+    SQUAD_CONTRACT_ID: MOCK_SQUAD_CONTRACT_ID,
+    STELLAR_RPC_URL: `http://127.0.0.1:${MOCK_RPC_DEFAULT_PORT}`,
+    STELLAR_HORIZON_URL: `http://127.0.0.1:${MOCK_RPC_DEFAULT_PORT}/horizon`,
+    STELLAR_NETWORK_PASSPHRASE: MOCK_NETWORK_PASSPHRASE,
+    CURSOR_FILE: MOCK_CURSOR_FILE,
+    BOT_TOKEN: MOCK_BOT_TOKEN,
+    TELEGRAM_CHAT_ID: MOCK_CHAT_ID,
+  },
+};
+
+/** The profile selected by `MIMIR_PROFILE`, or null when unset. Display/boot use. */
+export function activeProfileName(): string | null {
+  return read("MIMIR_PROFILE") ?? null;
+}
+
+/** Profile defaults for the active profile. Unknown names fail fast. */
+function resolveProfileDefaults(): Record<string, string> {
+  const name = read("MIMIR_PROFILE");
+  if (name === undefined) return {};
+  const defaults = PROFILE_DEFAULTS[name];
+  if (!defaults) {
+    throw new ConfigError(
+      [`MIMIR_PROFILE must be "${MOCK_PROFILE_NAME}" when set; got "${name}"`],
+      `Unset MIMIR_PROFILE, or set MIMIR_PROFILE=${MOCK_PROFILE_NAME} for the local mock.`,
+    );
+  }
+  return { ...defaults };
+}
+
 function read(name: string): string | undefined {
   const raw = process.env[name];
   if (raw === undefined) return undefined;
@@ -85,14 +140,18 @@ function read(name: string): string | undefined {
   return trimmed === "" ? undefined : trimmed;
 }
 
-function collector() {
+function collector(profile: Record<string, string>) {
   const problems: string[] = [];
+  /** Environment first, then the active profile's defaults. */
+  const get = (name: string): string | undefined => read(name) ?? profile[name];
 
   return {
     problems,
 
+    get,
+
     required(name: string): string {
-      const value = read(name);
+      const value = get(name);
       if (value === undefined) {
         problems.push(`${name} is required but not set`);
         return "";
@@ -111,7 +170,7 @@ function collector() {
     },
 
     url(name: string, fallback: string): string {
-      const value = read(name) ?? fallback;
+      const value = get(name) ?? fallback;
       try {
         const parsed = new URL(value);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
@@ -179,7 +238,7 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     squadContractId: c.contractId("SQUAD_CONTRACT_ID"),
     rpcUrl: c.url("STELLAR_RPC_URL", DEFAULTS.rpcUrl),
     horizonUrl: c.url("STELLAR_HORIZON_URL", DEFAULTS.horizonUrl),
-    networkPassphrase: read("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
+    networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
     explorerBaseUrl: c.url(
       "STELLAR_EXPLORER_BASE_URL",
       "https://stellar.expert/explorer",
@@ -189,7 +248,7 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
 
 /** Chain-only config. No Telegram credentials required. */
 export function loadStellarConfig(): StellarConfig {
-  const c = collector();
+  const c = collector(resolveProfileDefaults());
   const config = stellarFrom(c);
   if (c.problems.length > 0) throw new ConfigError(c.problems);
   return config;
@@ -197,7 +256,7 @@ export function loadStellarConfig(): StellarConfig {
 
 /** Full bot config: chain + Telegram + poller tuning. */
 export function loadConfig(): BotConfig {
-  const c = collector();
+  const c = collector(resolveProfileDefaults());
   const stellar = stellarFrom(c);
 
   const config: BotConfig = {
@@ -207,7 +266,7 @@ export function loadConfig(): BotConfig {
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
-    cursorFile: path.resolve(process.cwd(), read("CURSOR_FILE") ?? DEFAULTS.cursorFile),
+    cursorFile: path.resolve(process.cwd(), c.get("CURSOR_FILE") ?? DEFAULTS.cursorFile),
     maxNotificationsPerCycle: c.int(
       "MAX_NOTIFICATIONS_PER_CYCLE",
       DEFAULTS.maxNotificationsPerCycle,
@@ -223,8 +282,9 @@ export function loadConfig(): BotConfig {
   return config;
 }
 
-/** `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */
+/** `mock` / `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */
 export function networkLabel(config: StellarConfig): string {
+  if (config.networkPassphrase === MOCK_NETWORK_PASSPHRASE) return "mock";
   if (config.networkPassphrase === "Test SDF Network ; September 2015") return "testnet";
   if (config.networkPassphrase === "Public Global Stellar Network ; September 2015") return "public";
   return "custom";
