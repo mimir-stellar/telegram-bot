@@ -182,11 +182,15 @@ src/
     decode.ts              typed decoding of both contracts' events
   notifications/
     format.ts              decoded event -> MarkdownV2 message
+  testing/
+    telegramFake.ts        integration fake for Telegram send failures (offline)
 ```
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and notification-format tests (including deterministic fuzz cases), or `npm run build` to produce the production output.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus notification-format and Telegram-failure fake tests (no live Testnet or bot token required), or `npm run build` to produce the production output.
+
+The Telegram failure fake (`src/testing/telegramFake.ts`) scripts 429 / 403 / 401 / network outcomes against `createNotifier` and the poller's lossy send policy so CI can cover long-running failure modes without credentials.
 
 ## License
 
