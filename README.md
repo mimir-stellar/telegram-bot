@@ -87,6 +87,7 @@ looks healthy but notifies nobody.
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
 | `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/export` | The last `LOG_BUFFER_LINES` console lines plus a state summary, for pasting into an incident report. Every line is redacted (bot token, chat id, full-precision account/contract ids) and the export is sent as plain text, so log content cannot break formatting. Disabled with `LOG_BUFFER_LINES=0`. |
 
 ## Reading events without a bot token
 
@@ -177,6 +178,7 @@ checks (default `http://127.0.0.1:8787`):
 | --- | --- |
 | `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy; `503` when stopped or degraded (repeated RPC failures or a stale success window). |
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
+| `GET /health/diag` | The same report `/export` produces in the chat, as plain text. `404` when log capture is off. For an operator with host access but no seat in the chat. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
 cursors, and whether a target has an error. It never includes `BOT_TOKEN`,
@@ -187,10 +189,13 @@ Configuration (see `.env.example`):
 - `HEALTH_HOST` — bind address (default `127.0.0.1`)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
+- `LOG_BUFFER_LINES` — recent console lines kept in memory for `/export` and `/health/diag` (default `500`; `0` disables capture and both surfaces)
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the health module is additive and does not change
-cursor format or Telegram behaviour.
+cursor format or Telegram behaviour. The log buffer is in-memory only: it is
+never written to disk, never persisted with the cursor, and disappears on
+restart, so rolling back removes nothing that outlives the process.
 
 **Failure modes:** binding fails only if the port is already taken (process
 exits via the listen error path after logging). Client disconnects and probe
@@ -202,6 +207,7 @@ errors are logged and ignored so they cannot stop the notifier.
 src/
   index.ts                 entry point: config -> RPC -> bot -> poller -> health HTTP
   health.ts                local loopback GET /health for supervisors
+  logger.ts                bounded redacted log ring + /export and /health/diag rendering
   config.ts                env loading and validation, fails fast
   bot.ts                   grammy setup: /start, /help, /status
   poller.ts                the loop: scan, notify, persist the cursor
@@ -215,7 +221,7 @@ src/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic format and fixture suites, or `npm run build` to produce the production output.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic format, health, fixture, and log-export suites, or `npm run build` to produce the production output.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
 

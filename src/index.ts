@@ -9,6 +9,7 @@
 import { ConfigError, loadConfig, networkLabel } from "./config.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { startHealthServer } from "./health.js";
+import { attachConsole, createLogCapture, secretsFor } from "./logger.js";
 import { createPoller } from "./poller.js";
 import { createRpcServer } from "./stellar/client.js";
 
@@ -36,6 +37,12 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
 
+  // Log capture installs before the first [boot] line so the export always
+  // includes startup context. Capacity 0 keeps capture off entirely.
+  const logCapture = createLogCapture(config.logBufferLines);
+  const restoreConsole = attachConsole(logCapture, secretsFor(config));
+  process.once("exit", restoreConsole);
+
   console.log(`[boot] Mimir Telegram notifier`);
   console.log(`[boot] network      ${networkLabel(config)} (${config.rpcUrl})`);
   console.log(`[boot] market       ${config.marketContractId}`);
@@ -60,14 +67,18 @@ async function main(): Promise<void> {
   };
 
   const poller = createPoller({ config, server, send: (text) => notify(text) });
-  const bot = createBot({ config, status: () => poller.status() });
+  const bot = createBot({ config, status: () => poller.status(), logs: logCapture });
   notify = createNotifier(bot, config);
 
   // Local-only health HTTP for supervisors. Starts before Telegram long-poll
   // so a deploy probe can see the process even while grammy is connecting.
-  const healthServer = startHealthServer({ config, status: () => poller.status() });
+  const healthServer = startHealthServer({
+    config,
+    status: () => poller.status(),
+    logs: logCapture,
+  });
 
-  await registerCommands(bot);
+  await registerCommands(bot, { withExport: config.logBufferLines > 0 });
 
   // grammy's `start` resolves only when the bot stops, so it is not awaited.
   // It retries transient network trouble internally; a rejection here means the
