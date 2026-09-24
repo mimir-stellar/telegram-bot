@@ -10,6 +10,12 @@ Operational guidance for recovering the Mimir Telegram notifier from missed noti
 * Cursors must only move according to the poller's existing persistence rules.
 * Logs and status output must not expose bot tokens, private keys, payment proofs, or unbounded remote payloads.
 
+Notification text from contract String fields is bounded to 200 Unicode code
+points before MarkdownV2 escaping. An oversized or malformed transaction hash
+does not receive an explorer link. The original event is still decoded and the
+cursor follows the normal poller rules; truncation affects only the Telegram
+presentation, not chain data or persisted cursor state.
+
 ## Quick health check
 
 Run:

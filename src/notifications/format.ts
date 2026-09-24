@@ -22,6 +22,8 @@ import type { StellarConfig } from "../config.js";
 
 /** Telegram's MarkdownV2 reserved set. All of it must be escaped, everywhere. */
 const MDV2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
+const MAX_EVENT_FIELD_LENGTH = 200;
+const MAX_TX_HASH_LENGTH = 128;
 
 export function escapeMd(text: string): string {
   return text.replace(MDV2_RESERVED, (ch) => `\\${ch}`);
@@ -53,15 +55,16 @@ function who(address: string): string {
   return `\`${escapeMd(shortAddress(address))}\``;
 }
 
-/** Truncate an unbounded contract String before it sizes a chat message. */
-function clip(text: string, max = 200): string {
+/** Truncate an unbounded contract String without splitting a Unicode code point. */
+function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
   const trimmed = text.trim();
-  return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max - 1)}…`;
+  const characters = Array.from(trimmed);
+  return characters.length <= max ? trimmed : `${characters.slice(0, max - 1).join("")}…`;
 }
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
-  if (!event.txHash) return `_${ledger}_`;
+  if (!event.txHash || event.txHash.length > MAX_TX_HASH_LENGTH) return `_${ledger}_`;
   return `_${ledger}_ · [tx](${txExplorerUrl(config, event.txHash)})`;
 }
 
@@ -81,7 +84,7 @@ function headline(event: DecodedEvent): string | null {
     case "claim_created":
       return (
         `🆕 *New claim* \\#${p.claimId}\n` +
-        `Category: ${escapeMd(p.category)}\n` +
+        `Category: ${escapeMd(clip(p.category))}\n` +
         `Creator: ${who(p.creator)}`
       );
 
