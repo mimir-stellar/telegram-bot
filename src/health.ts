@@ -10,11 +10,14 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { networkLabel, type BotConfig } from "./config.js";
+import { renderLogExport, type LogCapture } from "./logger.js";
 import type { PollerStatus } from "./poller.js";
 
 export interface HealthDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  /** Bounded redacted log ring; when absent or disabled, /health/diag 404s. */
+  logs?: LogCapture;
   /** Optional clock for deterministic tests. */
   now?: () => number;
 }
@@ -154,7 +157,7 @@ function sendJson(
  * useful for unit tests and one-shot CLI runs that must not bind a port.
  */
 export function startHealthServer(deps: HealthDeps): HealthServer {
-  const { config, status } = deps;
+  const { config, status, logs } = deps;
   const now = deps.now ?? Date.now;
 
   if (config.healthPort === 0) {
@@ -184,11 +187,31 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/health/diag") {
+      // Same content as the /export command, over loopback HTTP, so an
+      // operator with host access but no chat seat can pull the same report.
+      // 404 (not 403) when capture is off: nothing is being withheld, there
+      // is simply nothing to serve — and probes treat 404 as "not here".
+      if (!logs || logs.capacity() === 0) {
+        sendJson(res, 404, { ok: false, error: "log_capture_disabled" });
+        return;
+      }
+      const body = renderLogExport(config, status(), logs, now());
+      res.writeHead(200, {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "no-store",
+        "content-length": Buffer.byteLength(body),
+      });
+      res.end(`${body}\n`);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/") {
       sendJson(res, 200, {
         service: "mimir-telegram-bot",
         health: "/health",
         live: "/health/live",
+        diag: "/health/diag",
       });
       return;
     }
@@ -206,7 +229,10 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   const address = server.address() as AddressInfo | null;
   const port = address?.port ?? config.healthPort;
   const url = `http://${config.healthHost}:${port}`;
-  console.log(`[health] listening on ${url} (GET /health, GET /health/live)`);
+  console.log(
+    `[health] listening on ${url} (GET /health, GET /health/live` +
+      `${logs && logs.capacity() > 0 ? ", GET /health/diag" : ""})`,
+  );
 
   return {
     url,

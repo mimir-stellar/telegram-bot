@@ -9,6 +9,7 @@ import { Bot } from "grammy";
 
 import { escapeMd } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
+import { renderLogExport, type LogCapture } from "./logger.js";
 import type { PollerStatus } from "./poller.js";
 
 const HELP = [
@@ -17,6 +18,7 @@ const HELP = [
   "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
   "",
   "/status — what I am watching and how far I have read",
+  "/export — recent logs for an incident report (redacted, plain text)",
   "/help — this message",
 ].join("\n");
 
@@ -65,10 +67,12 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  /** Bounded redacted log ring backing /export. Absent = command disabled. */
+  logs?: LogCapture;
 }
 
 export function createBot(deps: BotDeps): Bot {
-  const { config, status } = deps;
+  const { config, status, logs } = deps;
   const bot = new Bot(config.botToken);
 
   bot.command("start", async (ctx) => {
@@ -82,6 +86,19 @@ export function createBot(deps: BotDeps): Bot {
   bot.command("status", async (ctx) => {
     await ctx.reply(statusMessage(config, status()), {
       parse_mode: "MarkdownV2",
+      link_preview_options: { is_disabled: true },
+    });
+  });
+
+  bot.command("export", async (ctx) => {
+    if (!logs || logs.capacity() === 0) {
+      await ctx.reply("Log export is disabled (LOG_BUFFER_LINES=0).");
+      return;
+    }
+    // Plain text, no parse mode: the content is redacted but untrusted, and
+    // MarkdownV2 would make any escaping slip a parsing error instead of a
+    // cosmetic wart.
+    await ctx.reply(renderLogExport(config, status(), logs), {
       link_preview_options: { is_disabled: true },
     });
   });
@@ -106,13 +123,17 @@ export function createNotifier(bot: Bot, config: BotConfig) {
 }
 
 /** Registers the command list so Telegram's UI offers autocompletion. */
-export async function registerCommands(bot: Bot): Promise<void> {
+export async function registerCommands(bot: Bot, options: { withExport?: boolean } = {}): Promise<void> {
+  const commands: Array<{ command: string; description: string }> = [
+    { command: "start", description: "What this bot does" },
+    { command: "help", description: "Show help" },
+    { command: "status", description: "Last-seen ledger and watched contracts" },
+  ];
+  if (options.withExport) {
+    commands.push({ command: "export", description: "Redacted recent logs for incident reports" });
+  }
   try {
-    await bot.api.setMyCommands([
-      { command: "start", description: "What this bot does" },
-      { command: "help", description: "Show help" },
-      { command: "status", description: "Last-seen ledger and watched contracts" },
-    ]);
+    await bot.api.setMyCommands(commands);
   } catch (err) {
     // Cosmetic. Never worth failing a boot over.
     console.warn(`[bot] setMyCommands failed: ${err instanceof Error ? err.message : err}`);
