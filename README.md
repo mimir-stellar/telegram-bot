@@ -87,6 +87,7 @@ looks healthy but notifies nobody.
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
 | `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/audit` | The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 
 ## Reading events without a bot token
 
@@ -102,6 +103,42 @@ npm run scan -- --from 4226500   # explicit start ledger
 
 It prints the ledger window, an event-name histogram, and the decoded payloads.
 This is how the decoder was verified against the live deployment.
+
+## Operator audit trail
+
+`/status` says what the poller is doing *right now*. The audit trail answers the
+question after a week of unattended running: **what actually happened** — scan
+failures and recoveries, failed Telegram sends, skipped admin events, bursts
+truncated by the per-cycle cap, cursor loads, stale cursors and cursor write
+failures.
+
+It is an append-only JSONL file (`data/audit.jsonl` by default; `AUDIT_FILE`
+changes it, leaving the value empty disables it). The poller appends after every
+cycle, so the trail survives restarts alongside the cursor. Read it two ways:
+
+```bash
+npm run audit                  # report from data/audit.jsonl
+npm run audit -- --tail 50     # render the 50 most recent lines
+npm run audit -- --json        # machine-readable stats only
+npm run audit -- --file p.jsonl
+```
+
+or send `/audit` in the chat, which merges the live in-memory window with the
+file so entries not yet flushed are still visible.
+
+Everything in the trail is safe to paste into an issue, and this is enforced
+when an entry is recorded, not by caller discipline:
+
+- Free-text details pass redaction first: bot tokens, secret/seed strkeys, URLs
+  and any unrecognized long token are replaced. Public `C…` contract ids and
+  `G…` account ids stay readable — they are chain identifiers `/status` already
+  prints.
+- Details are length-clamped (240 chars). No payloads, payment amounts as log
+  lines, or unbounded remote data are ever stored — the chain is the record.
+- The in-memory window and the report are both bounded, and the report says so
+  when older entries were not shown.
+- Reading never throws on you: an unreadable or unknown-version line is skipped
+  and counted, never fatal.
 
 ## How the polling works
 
@@ -131,7 +168,9 @@ index.
 ## Cursor persistence
 
 The poller writes its resume position to `data/cursor.json` (write-then-rename,
-so a crash mid-write cannot truncate it):
+so a crash mid-write cannot truncate it) and appends audit entries to
+`data/audit.jsonl`. Both must survive restarts, so give `data/` the same
+treatment as the cursor:
 
 ```json
 {
@@ -167,6 +206,9 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down.
+- **An unreadable audit line** (or a failed append) is logged and skipped; the
+  audit trail never throws into the poll loop, and a bad line never takes the
+  report down. An audit file that cannot be read at all reports as empty.
 
 ## Layout
 
@@ -174,19 +216,24 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 src/
   index.ts                 entry point: config -> RPC -> bot -> poller
   config.ts                env loading and validation, fails fast
-  bot.ts                   grammy setup: /start, /help, /status
-  poller.ts                the loop: scan, notify, persist the cursor
+  bot.ts                   grammy setup: /start, /help, /status, /audit
+  poller.ts                the loop: scan, notify, persist the cursor, flush audit
+  audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
+  audit-cli.ts             entrypoint for `npm run audit`
   stellar/
     client.ts              Soroban RPC client + explorer links
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
     decode.ts              typed decoding of both contracts' events
   notifications/
     format.ts              decoded event -> MarkdownV2 message
+tests/
+  format.test.mjs          notification formatting (incl. deterministic fuzz)
+  audit.test.mjs           redaction, entries, persistence, report rendering
 ```
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and notification-format tests (including deterministic fuzz cases), or `npm run build` to produce the production output.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the notification-format and audit-trail tests (including deterministic fuzz cases), or `npm run build` to produce the production output. No test or check requires live Testnet access or Telegram credentials.
 
 ## License
 

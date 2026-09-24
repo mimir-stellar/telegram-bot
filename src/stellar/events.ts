@@ -33,10 +33,12 @@
  * cycle to re-derive its position from a ledger number and re-notify.
  */
 
+import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 import type { rpc } from "@stellar/stellar-sdk";
 
+import { readAuditFile, renderAuditReport, summarizeAudit } from "../audit.js";
 import { loadStellarConfig, networkLabel } from "../config.js";
 import { createRpcServer } from "./client.js";
 import { decodeEvent, formatUsdc, type ContractSource, type DecodedEvent } from "./decode.js";
@@ -197,11 +199,48 @@ export async function readContractEvents(
 //
 // Needs no BOT_TOKEN: the public Testnet RPC is unauthenticated, so this reads
 // live chain data with nothing but the contract ids.
+//
+// The same built binary also renders the operator audit report:
+//
+//   npm run audit                 # report from data/audit.jsonl
+//   npm run audit -- --tail 50    # render 50 recent lines
+//   npm run audit -- --json       # machine-readable stats
+//   npm run audit -- --file p.jsonl
 
 function flag(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`);
   if (index === -1) return undefined;
   return process.argv[index + 1];
+}
+
+function hasFlag(name: string): boolean {
+  return process.argv.includes(`--${name}`);
+}
+
+/**
+ * Run the operator audit report CLI. Exported so `src/audit-cli.ts` can be the
+ * real entrypoint (`npm run audit`) while the chain scanner stays the default.
+ */
+export async function runAuditCli(): Promise<void> {
+  const file = flag("file") ?? "./data/audit.jsonl";
+  const tail = Math.max(0, Number(flag("tail") ?? 10));
+
+  if (!existsSync(file)) {
+    console.log(`No audit log at ${file} — nothing recorded yet (or AUDIT_FILE points elsewhere).`);
+    return;
+  }
+
+  const summary = await readAuditFile(file);
+
+  if (hasFlag("json")) {
+    console.log(JSON.stringify(summarizeAudit(summary.entries), null, 2));
+  } else {
+    console.log(renderAuditReport(summary, { tail }));
+  }
+
+  if (summary.unreadableLines > 0) {
+    console.warn(`[audit] ${summary.unreadableLines} unreadable line(s) were skipped`);
+  }
 }
 
 function summarize(event: DecodedEvent): string {
@@ -283,7 +322,8 @@ async function main(): Promise<void> {
   }
 }
 
-// Only when executed directly, not when imported by the poller.
+// Only when executed directly, not when imported by the poller. The audit
+// report has its own entrypoint (src/audit-cli.ts) that calls runAuditCli().
 const invokedPath = process.argv[1];
 if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {
   main().catch((err: unknown) => {

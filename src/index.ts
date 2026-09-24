@@ -7,6 +7,7 @@
  */
 
 import { ConfigError, loadConfig, networkLabel } from "./config.js";
+import { auditEntry, createAuditLog } from "./audit.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { createPoller } from "./poller.js";
 import { createRpcServer } from "./stellar/client.js";
@@ -30,6 +31,13 @@ function installProcessHandlers(): void {
   });
 }
 
+/** Redacted shutdown marker: what stopped the process, and nothing else. */
+function auditShutdownEntry(signal: string) {
+  return auditEntry("shutdown", {
+    detail: `stopped by ${signal === "SIGTERM" ? "SIGTERM" : "SIGINT"}`,
+  });
+}
+
 async function main(): Promise<void> {
   installProcessHandlers();
 
@@ -41,6 +49,7 @@ async function main(): Promise<void> {
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] chat         ${config.chatId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  console.log(`[boot] audit file   ${config.auditFile}`);
 
   const server = createRpcServer(config);
 
@@ -58,8 +67,14 @@ async function main(): Promise<void> {
     throw new Error("telegram notifier not ready");
   };
 
-  const poller = createPoller({ config, server, send: (text) => notify(text) });
-  const bot = createBot({ config, status: () => poller.status() });
+  const audit = createAuditLog();
+  audit.record(
+    auditEntry("boot", {
+      detail: `network=${networkLabel(config)} poll=${config.pollIntervalMs}ms`,
+    }),
+  );
+  const poller = createPoller({ config, server, send: (text) => notify(text), audit });
+  const bot = createBot({ config, status: () => poller.status(), audit });
   notify = createNotifier(bot, config);
 
   await registerCommands(bot);
@@ -81,7 +96,15 @@ async function main(): Promise<void> {
   const shutdown = (signal: string) => {
     console.log(`[shutdown] ${signal} received, stopping`);
     poller.stop();
-    void bot.stop().finally(() => process.exit(0));
+    // A clean-stop marker closes the audit window: anything after it belongs to
+    // the next run, which is how an operator tells a crash from a restart.
+    poller.audit.record(auditShutdownEntry(signal));
+    void bot
+      .stop()
+      .catch(() => undefined)
+      .finally(() => {
+        poller.flushAuditFile().catch(() => undefined).finally(() => process.exit(0));
+      });
   };
 
   process.once("SIGINT", () => shutdown("SIGINT"));

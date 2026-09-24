@@ -31,6 +31,8 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /** Append-only JSONL audit trail (see src/audit.ts). Empty disables it. */
+  auditFile: string;
 }
 
 export class ConfigError extends Error {
@@ -56,6 +58,7 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  auditFile: "./data/audit.jsonl",
 } as const;
 
 /** Strkey for a contract: `C` + 55 base32 characters. */
@@ -170,6 +173,8 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    // Resolved like the cursor file: relative paths anchor to the process cwd.
+    auditFile: path.resolve(process.cwd(), read("AUDIT_FILE") ?? DEFAULTS.auditFile),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);

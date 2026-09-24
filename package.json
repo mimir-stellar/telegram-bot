@@ -14,8 +14,10 @@
     "start": "node dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test tests/format.test.mjs",
-    "scan": "tsx src/stellar/events.ts"
+    "test": "npm run build && node --test \"tests/*.test.mjs\"",
+    "scan": "tsx src/stellar/events.ts",
+    "audit": "tsx src/audit-cli.ts",
+    "audit:report": "tsx src/audit-cli.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.2.0",
