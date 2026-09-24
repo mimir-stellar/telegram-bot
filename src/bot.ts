@@ -12,6 +12,7 @@ import { Bot, type Context } from "grammy";
 import { escapeMd, safeErrorMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
+import type { ContractSource } from "./stellar/decode.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
 
 const HELP_BASE = [
@@ -208,10 +209,15 @@ export function createBot(deps: BotDeps): Bot {
   return bot;
 }
 
-/** The poller's send path: one message to the configured chat. */
+/** The poller's send path: route each contract's messages to its named chat. */
 export function createNotifier(bot: Bot, config: BotConfig) {
-  return async (text: string): Promise<void> => {
-    await bot.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+  return async (text: string, source?: ContractSource): Promise<void> => {
+    const chatId = source === "market"
+      ? config.marketChatId ?? config.chatId
+      : source === "squad"
+        ? config.squadChatId ?? config.chatId
+        : config.chatId;
+    await bot.api.sendMessage(chatId, text, TELEGRAM_OPTIONS);
   };
 }
 

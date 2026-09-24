@@ -2,7 +2,7 @@
 
 A Telegram notifier for [Mimir](https://github.com/mimir-stellar), the AI-settled
 prediction market on Stellar. It polls Mimir's two Soroban contracts for new
-on-chain events and posts them, human-readable, into a chat or channel:
+on-chain events and posts them, human-readable, into one or more named chats or channels:
 
 ```
 🆕 New claim #7
@@ -83,7 +83,10 @@ npm start
 ```
 
 `.env.example` ships with the live Stellar Testnet contract ids, so the only two
-values you must supply are `BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Every other
+values you must supply are `BOT_TOKEN` and `TELEGRAM_CHAT_ID`. To split traffic,
+set `TELEGRAM_MARKET_CHAT_ID` and/or `TELEGRAM_SQUAD_CHAT_ID`; each overrides the
+legacy destination for that contract, while an omitted override falls back to
+`TELEGRAM_CHAT_ID`. Every other
 variable is documented inline there. A missing or malformed value aborts startup
 with all the problems listed at once — the bot never boots into a state where it
 looks healthy but notifies nobody.
@@ -181,7 +184,8 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   exponential backoff, then drops one message; the cursor still advances. That
   is deliberate: holding the cursor back would turn a revoked token or a chat
   the bot was removed from into an infinite replay, and recovery would flood the
-  channel. Notifications are lossy on purpose — the chain is the record. Operator
+  channel. The failure is isolated to that routed chat and event; other events
+  continue. Notifications are lossy on purpose — the chain is the record. Operator
   `/resume` does not replay failed messages.
 - **A corrupt cursor file** is treated as a cold start rather than a crash. A
   valid but RPC-rejected stale cursor is never silently rewound: the target keeps
