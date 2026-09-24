@@ -186,6 +186,10 @@ export function createPoller(deps: PollerDeps) {
   }
 
   async function saveCursors(): Promise<void> {
+    if (config.dryRun) {
+      return;
+    }
+
     const payload: CursorFile = {
       version: 1,
       updatedAt: new Date().toISOString(),
@@ -240,8 +244,12 @@ export function createPoller(deps: PollerDeps) {
       }
 
       try {
-        // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text);
+        if (config.dryRun) {
+          console.log(`[poller] dry-run: would send ${event.payload.name} at ledger ${event.ledger}`);
+        } else {
+          // Use bounded retry for Telegram sends to handle transient failures
+          await sendWithRetry(send, text);
+        }
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {

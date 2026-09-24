@@ -42,6 +42,9 @@ async function main(): Promise<void> {
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] chat         ${config.chatId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  if (config.dryRun) {
+    console.log(`[boot] dry run      true`);
+  }
 
   const server = createRpcServer(config);
 
