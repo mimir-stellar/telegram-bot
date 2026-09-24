@@ -31,6 +31,7 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  csvOutputFile: string;
 }
 
 export class ConfigError extends Error {
@@ -56,6 +57,7 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  csvOutputFile: "./data/scanner_output.csv",
 } as const;
 
 /** Strkey for a contract: `C` + 55 base32 characters. */
@@ -170,6 +172,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    csvOutputFile: path.resolve(process.cwd(), read("CSV_OUTPUT_FILE") ?? DEFAULTS.csvOutputFile),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
