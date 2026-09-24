@@ -1,5 +1,5 @@
 /**
- * Entry point: config -> RPC client -> bot -> poller.
+ * Entry point: config -> RPC client -> bot -> poller -> local health HTTP.
  *
  * Startup is fail-fast (a bad config exits non-zero with the reasons listed);
  * everything after startup is fail-soft, because the whole point of this process
@@ -9,6 +9,7 @@
 import { ConfigError, loadConfig, networkLabel } from "./config.js";
 import { auditEntry, createAuditLog } from "./audit.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
+import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
 import { createRpcServer } from "./stellar/client.js";
 
@@ -77,6 +78,10 @@ async function main(): Promise<void> {
   const bot = createBot({ config, status: () => poller.status(), audit });
   notify = createNotifier(bot, config);
 
+  // Local-only health HTTP for supervisors. Starts before Telegram long-poll
+  // so a deploy probe can see the process even while grammy is connecting.
+  const healthServer = startHealthServer({ config, status: () => poller.status() });
+
   await registerCommands(bot);
 
   // grammy's `start` resolves only when the bot stops, so it is not awaited.
@@ -99,11 +104,19 @@ async function main(): Promise<void> {
     // A clean-stop marker closes the audit window: anything after it belongs to
     // the next run, which is how an operator tells a crash from a restart.
     poller.audit.record(auditShutdownEntry(signal));
-    void bot
-      .stop()
-      .catch(() => undefined)
+    void healthServer
+      .close()
+      .catch((err: unknown) => {
+        console.error(`[shutdown] health server close failed:`, err);
+      })
       .finally(() => {
-        poller.flushAuditFile().catch(() => undefined).finally(() => process.exit(0));
+        void bot
+          .stop()
+          .catch(() => undefined)
+          .finally(() => {
+            // Flush last so entries recorded while stopping are persisted.
+            poller.flushAuditFile().catch(() => undefined).finally(() => process.exit(0));
+          });
       });
   };
 

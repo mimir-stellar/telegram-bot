@@ -210,11 +210,40 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   audit trail never throws into the poll loop, and a bad line never takes the
   report down. An audit file that cannot be read at all reports as empty.
 
+## Health endpoint
+
+The process exposes a **loopback HTTP** probe for supervisors and deploy
+checks (default `http://127.0.0.1:8787`):
+
+| Path | Meaning |
+| --- | --- |
+| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy; `503` when stopped or degraded (repeated RPC failures or a stale success window). |
+| `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
+
+The JSON body is operational status only: poller counters, ledgers, truncated
+cursors, and whether a target has an error. It never includes `BOT_TOKEN`,
+chat ids, private keys, or unbounded remote payloads.
+
+Configuration (see `.env.example`):
+
+- `HEALTH_HOST` — bind address (default `127.0.0.1`)
+- `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
+- `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
+
+**Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
+redeploy the previous image — the health module is additive and does not change
+cursor format or Telegram behaviour.
+
+**Failure modes:** binding fails only if the port is already taken (process
+exits via the listen error path after logging). Client disconnects and probe
+errors are logged and ignored so they cannot stop the notifier.
+
 ## Layout
 
 ```
 src/
-  index.ts                 entry point: config -> RPC -> bot -> poller
+  index.ts                 entry point: config -> RPC -> bot -> poller -> health HTTP
+  health.ts                local loopback GET /health for supervisors
   config.ts                env loading and validation, fails fast
   bot.ts                   grammy setup: /start, /help, /status, /audit
   poller.ts                the loop: scan, notify, persist the cursor, flush audit
@@ -233,7 +262,9 @@ tests/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the notification-format and audit-trail tests (including deterministic fuzz cases), or `npm run build` to produce the production output. No test or check requires live Testnet access or Telegram credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the notification-format, fixture, health and audit-trail suites (including deterministic fuzz cases), or `npm run build` to produce the production output. No test or check requires live Testnet access, Telegram credentials, or signing keys.
+
+Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md).
 
 ## License
 
