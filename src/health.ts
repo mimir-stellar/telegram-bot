@@ -45,6 +45,8 @@ export interface HealthReport {
     notificationsSent: number;
     notificationsFailed: number;
     eventsSkipped: number;
+    /** Events suppressed as already-seen across overlapping pages / resumes. */
+    eventsDeduplicated: number;
     consecutiveFailures: number;
     lastError: { at: string; message: string } | null;
     targets: Array<{
@@ -118,6 +120,7 @@ export function buildHealthReport(
       notificationsSent: poller.notificationsSent,
       notificationsFailed: poller.notificationsFailed,
       eventsSkipped: poller.eventsSkipped,
+      eventsDeduplicated: poller.eventsDeduplicated ?? 0,
       consecutiveFailures: poller.consecutiveFailures,
       lastError: poller.lastError
         ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }

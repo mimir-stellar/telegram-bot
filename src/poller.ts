@@ -23,6 +23,7 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
+import { EventDedupWindow, eventKey } from "./dedup.js";
 import { formatEvent } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
@@ -47,15 +48,28 @@ export interface PollerStatus {
   notificationsSent: number;
   notificationsFailed: number;
   eventsSkipped: number;
+  /** Events suppressed because they had already been processed (dedup). */
+  eventsDeduplicated: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
   targets: TargetState[];
 }
 
+interface CursorTarget {
+  cursor: string | null;
+  lastEventLedger: number | null;
+  /**
+   * Recently processed event ids, oldest first. Additive and bounded: older
+   * cursor files without it load as an empty window, and new files stay small
+   * because the window never grows past `EVENT_DEDUP_WINDOW`.
+   */
+  recentEventIds?: string[];
+}
+
 interface CursorFile {
   version: 1;
   updatedAt: string;
-  targets: Record<string, { cursor: string | null; lastEventLedger: number | null }>;
+  targets: Record<string, CursorTarget>;
 }
 
 export interface PollerDeps {
@@ -133,6 +147,12 @@ export function createPoller(deps: PollerDeps) {
     ]),
   );
 
+  // Per-contract redelivery guard. Kept out of `TargetState` so status output
+  // stays plain data; the window is internal bookkeeping.
+  const dedup = new Map<ContractSource, EventDedupWindow>(
+    targets.map((t) => [t.source, new EventDedupWindow(config.dedupWindow)]),
+  );
+
   const status: PollerStatus = {
     running: false,
     startedAt: 0,
@@ -144,6 +164,7 @@ export function createPoller(deps: PollerDeps) {
     notificationsSent: 0,
     notificationsFailed: 0,
     eventsSkipped: 0,
+    eventsDeduplicated: 0,
     consecutiveFailures: 0,
     lastError: null,
     targets: [],
@@ -170,10 +191,14 @@ export function createPoller(deps: PollerDeps) {
     try {
       const parsed = JSON.parse(raw) as CursorFile;
       for (const [source, saved] of Object.entries(parsed.targets ?? {})) {
-        const target = state.get(source as ContractSource);
+        const key = source as ContractSource;
+        const target = state.get(key);
         if (!target) continue;
         target.cursor = saved.cursor ?? null;
         target.lastEventLedger = saved.lastEventLedger ?? null;
+        // Restore the redelivery window too. Without this a restart would
+        // re-notify the last event the inclusive cursor hands back.
+        dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
       }
       console.log(
         `[poller] resumed from ${config.cursorFile}: ` +
@@ -192,7 +217,11 @@ export function createPoller(deps: PollerDeps) {
       targets: Object.fromEntries(
         [...state.values()].map((t) => [
           t.source,
-          { cursor: t.cursor, lastEventLedger: t.lastEventLedger },
+          {
+            cursor: t.cursor,
+            lastEventLedger: t.lastEventLedger,
+            recentEventIds: dedup.get(t.source)?.toJSON() ?? [],
+          } satisfies CursorTarget,
         ]),
       ),
     };
@@ -270,9 +299,12 @@ export function createPoller(deps: PollerDeps) {
       if (!current) continue;
 
       try {
+        const window = dedup.get(target.source) ?? new EventDedupWindow(0);
         const scan = await readContractEvents(server, target, {
           cursor: current.cursor ?? undefined,
           lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
+          seenEventIds: window.toJSON(),
+          dedupWindow: config.dedupWindow,
         });
 
         status.latestLedger = scan.latestLedger;
@@ -280,11 +312,22 @@ export function createPoller(deps: PollerDeps) {
         current.lastError = null;
         anyOk = true;
 
+        if (scan.duplicates > 0) {
+          status.eventsDeduplicated += scan.duplicates;
+          console.log(
+            `[poller] ${target.source}: suppressed ${scan.duplicates} duplicate event(s) ` +
+              `from an overlapping page or a resumed cursor`,
+          );
+        }
+
         if (scan.events.length > 0) {
           console.log(
             `[poller] ${target.source}: ${scan.events.length} event(s) ` +
               `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
           );
+          // Record before notifying: an event is "processed" once it has been
+          // read, so a crash between send and save cannot replay it.
+          for (const event of scan.events) window.add(eventKey(event));
           await notify(scan.events);
         }
 

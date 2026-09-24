@@ -37,6 +37,7 @@ import { pathToFileURL } from "node:url";
 
 import type { rpc } from "@stellar/stellar-sdk";
 
+import { DEFAULT_DEDUP_WINDOW, EventDedupWindow, eventKey } from "../dedup.js";
 import { loadStellarConfig, networkLabel } from "../config.js";
 import { createRpcServer } from "./client.js";
 import { decodeEvent, formatUsdc, type ContractSource, type DecodedEvent } from "./decode.js";
@@ -60,6 +61,18 @@ export interface ScanOptions {
   lookbackLedgers?: number | undefined;
   limit?: number | undefined;
   maxPages?: number | undefined;
+  /**
+   * Event ids already processed before this walk — the previous cycle's
+   * window, restored from the cursor file. Seeding them is what stops an
+   * inclusive cursor boundary from re-announcing an event after a resume or a
+   * restart.
+   */
+  seenEventIds?: readonly string[] | undefined;
+  /**
+   * How many recent event ids to retain while suppressing redelivery. `0`
+   * disables deduplication. Defaults to {@link DEFAULT_DEDUP_WINDOW}.
+   */
+  dedupWindow?: number | undefined;
 }
 
 export interface RawScan {
@@ -72,6 +85,8 @@ export interface RawScan {
   /** True when `maxPages` stopped the walk before the tip. */
   truncated: boolean;
   pages: number;
+  /** Events dropped because an earlier page or cycle already returned them. */
+  duplicates: number;
 }
 
 /**
@@ -97,6 +112,12 @@ export async function paginatedGetEvents(
   const health = await server.getHealth();
   const oldestLedger = health.oldestLedger;
 
+  // One window for the whole walk, pre-seeded with what earlier cycles have
+  // already announced. Pages of a cursor walk can overlap; without this the
+  // same event is both notified twice and re-counted.
+  const dedup = new EventDedupWindow(opts.dedupWindow ?? DEFAULT_DEDUP_WINDOW);
+  for (const id of opts.seenEventIds ?? []) dedup.add(id);
+
   const events: rpc.Api.EventResponse[] = [];
   let cursor: string | undefined = opts.cursor;
   let lastCursor: string | null = opts.cursor ?? null;
@@ -104,6 +125,7 @@ export async function paginatedGetEvents(
   let latestLedger = health.latestLedger;
   let truncated = false;
   let pages = 0;
+  let duplicates = 0;
 
   for (;;) {
     if (pages >= maxPages) {
@@ -125,7 +147,13 @@ export async function paginatedGetEvents(
           limit,
         });
 
-    events.push(...response.events);
+    // Drop anything an earlier page (or an earlier cycle) already produced.
+    // Order is preserved: the first occurrence wins, matching the RPC's own
+    // event ordering.
+    for (const event of response.events) {
+      if (dedup.add(eventKey(event))) events.push(event);
+      else duplicates += 1;
+    }
     latestLedger = response.latestLedger;
 
     const nextCursor = response.cursor || "";
@@ -144,7 +172,7 @@ export async function paginatedGetEvents(
     cursor = nextCursor;
   }
 
-  return { events, cursor: lastCursor, latestLedger, oldestLedger, truncated, pages };
+  return { events, cursor: lastCursor, latestLedger, oldestLedger, truncated, pages, duplicates };
 }
 
 export interface WatchTarget {
@@ -184,6 +212,7 @@ export async function readContractEvents(
     oldestLedger: scan.oldestLedger,
     truncated: scan.truncated,
     pages: scan.pages,
+    duplicates: scan.duplicates,
     lastEventLedger: ledgers.length > 0 ? Math.max(...ledgers) : null,
   };
 }
@@ -266,8 +295,8 @@ async function main(): Promise<void> {
     }
 
     console.log(
-      `pages=${scan.pages} events=${scan.events.length} truncated=${scan.truncated} ` +
-        `lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor}`,
+      `pages=${scan.pages} events=${scan.events.length} duplicates=${scan.duplicates} ` +
+        `truncated=${scan.truncated} lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor}`,
     );
     for (const [name, count] of [...counts].sort((a, b) => b[1] - a[1])) {
       console.log(`  ${count.toString().padStart(4)}  ${name}`);

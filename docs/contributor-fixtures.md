@@ -35,6 +35,8 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures/cursor-corrupt.txt` | Unreadable cursor sample (cold-start path) |
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
 | `tests/format.test.mjs` | Inline unit cases (MarkdownV2 escape, USDC decimals, send failures) |
+| `tests/dedup.test.mjs` | Inline unit cases for the bounded dedup window (`src/dedup.ts`) |
+| `tests/page-dedup.test.mjs` | Fake-RPC overlapping-page walk + fake-Telegram poller/restart cases |
 
 ## Event fixture schema
 
@@ -92,7 +94,9 @@ log and not post).
 
 - **Valid cursor** (`cursor-valid.json`): version `1`, per-target opaque
   `cursor` string + `lastEventLedger`. Matches what the poller write-then-renames
-  under `CURSOR_FILE` (default `./data/cursor.json`).
+  under `CURSOR_FILE` (default `./data/cursor.json`). New files also carry an
+  additive, bounded `recentEventIds` dedup window; a file without it is still
+  valid and loads with an empty window.
 - **Corrupt cursor** (`cursor-corrupt.txt`): not JSON. The poller must treat this
   as a **cold start**, not a crash — leave the in-memory cursor null and begin
   `START_LOOKBACK_LEDGERS` behind tip.
@@ -111,6 +115,8 @@ When you add persistence tests:
 | Telegram send error | **still advances** | counted as failed | Fake `sendMessage` reject; assert no token in the Error message |
 | Corrupt cursor file | cold start | n/a | Use `cursor-corrupt.txt` contents |
 | Burst over cap | advances | extras skipped | Cap `MAX_NOTIFICATIONS_PER_CYCLE` in the fake config |
+| Overlapping page / resumed cursor | advances | duplicate suppressed, counted | Fake RPC returns the same event id twice; assert one send |
+| Restart with a saved window | resumed | boundary event suppressed | Point two pollers at one temp `CURSOR_FILE` |
 
 ## Adding a new fixture case
 
