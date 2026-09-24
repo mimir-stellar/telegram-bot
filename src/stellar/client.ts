@@ -13,6 +13,28 @@ import { rpc } from "@stellar/stellar-sdk";
 import type { StellarConfig } from "../config.js";
 import { networkLabel } from "../config.js";
 
+/** Soroban contract strkey: `C` + 55 base32 characters. */
+const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
+
+/**
+ * Validate that a contract ID is a well-formed Soroban strkey.
+ * Returns true if valid; throws an error with a descriptive message if not.
+ * Kept as a runtime check so the poller can catch misconfigurations early
+ * before a scan attempt and log actionable diagnostics.
+ */
+export function validateContractId(contractId: string, fieldName: string = "contract ID"): boolean {
+  const trimmed = contractId.trim();
+  if (trimmed === "") {
+    throw new Error(`${fieldName} is empty`);
+  }
+  if (!CONTRACT_ID_PATTERN.test(trimmed)) {
+    throw new Error(
+      `${fieldName} is not a valid Soroban contract ID (expected C… strkey, 56 chars); got "${trimmed}"`,
+    );
+  }
+  return true;
+}
+
 export function createRpcServer(config: StellarConfig): rpc.Server {
   return new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.

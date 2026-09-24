@@ -38,7 +38,7 @@ import { pathToFileURL } from "node:url";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import { loadStellarConfig, networkLabel } from "../config.js";
-import { createRpcServer } from "./client.js";
+import { createRpcServer, validateContractId } from "./client.js";
 import { decodeEvent, formatUsdc, type ContractSource, type DecodedEvent } from "./decode.js";
 
 /** Events per request. The RPC caps this; 200 is well inside it. */
@@ -166,6 +166,10 @@ export async function readContractEvents(
   target: WatchTarget,
   opts: ScanOptions = {},
 ): Promise<ContractScan> {
+  // Validate contract ID at scan time so misconfigurations surface early
+  // with an actionable error tied to the specific target.
+  validateContractId(target.contractId, `${target.source} contract ID`);
+
   const scan = await paginatedGetEvents(
     server,
     [{ type: "contract", contractIds: [target.contractId] }],
