@@ -22,6 +22,8 @@ export interface StellarConfig {
   rpcUrl: string;
   horizonUrl: string;
   networkPassphrase: string;
+  /** Optional override for stellar.expert (or compatible) explorer origin. */
+  explorerBaseUrl: string;
 }
 
 export interface BotConfig extends StellarConfig {
@@ -142,6 +144,10 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     rpcUrl: c.url("STELLAR_RPC_URL", DEFAULTS.rpcUrl),
     horizonUrl: c.url("STELLAR_HORIZON_URL", DEFAULTS.horizonUrl),
     networkPassphrase: read("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
+    explorerBaseUrl: c.url(
+      "STELLAR_EXPLORER_BASE_URL",
+      "https://stellar.expert/explorer",
+    ),
   };
 }
 
