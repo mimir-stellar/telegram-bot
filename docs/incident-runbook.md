@@ -10,6 +10,12 @@ Operational guidance for recovering the Mimir Telegram notifier from missed noti
 * Cursors must only move according to the poller's existing persistence rules.
 * Logs and status output must not expose bot tokens, private keys, payment proofs, or unbounded remote payloads.
 
+Notification text from contract String fields is bounded to 200 Unicode code
+points before MarkdownV2 escaping. An oversized or malformed transaction hash
+does not receive an explorer link. The original event is still decoded and the
+cursor follows the normal poller rules; truncation affects only the Telegram
+presentation, not chain data or persisted cursor state.
+
 ## Quick health check
 
 Run:
@@ -149,7 +155,11 @@ Do not manually replay large event ranges into Telegram.
 
 ## Malformed or unexpected events
 
-A malformed event must not crash the long-running process.
+A malformed event must not crash the long-running process. XDR conversion and
+event metadata failures are converted to a skipped `unknown` event with a
+bounded reason. The RPC response cursor is retained, so later events in the
+page and later pages remain eligible for processing; no cursor rewind or
+guessed ledger is performed.
 
 When investigating:
 
