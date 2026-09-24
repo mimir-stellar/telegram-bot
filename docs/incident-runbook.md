@@ -36,11 +36,27 @@ npm run scan
 
 Use `--from`, `--pages`, or `--show` when a narrower or deeper scan is needed.
 
+For the bot's own recent history (what it logged, in order, including what
+happened between two `/status` reads):
+
+```text
+/export          in the chat — recent console lines + a state summary
+curl http://127.0.0.1:8787/health/diag   same report, loopback HTTP
+```
+
+Both surfaces are safe to paste into a ticket: every line is redacted on
+capture (bot token, chat id, full-precision account/contract ids are masked),
+the buffer is capped at `LOG_BUFFER_LINES` lines, and the rendered export is
+capped again at send time. Log history is in-memory only — it is never written
+to disk and does not survive a restart, so capture what you need *before*
+restarting. `LOG_BUFFER_LINES=0` disables capture and both surfaces.
+
 ## RPC failures
 
 ### Symptoms
 
 * `/status` reports a recent RPC error.
+* `/export` shows the per-target `[poller] … scan failed` lines leading up to it.
 * One contract stops advancing while the other continues.
 * Notifications from one contract are missing.
 
@@ -62,6 +78,8 @@ Do not manually advance the cursor to skip an RPC failure.
 * Event scanning continues but sends fail.
 * `/status` shows send errors or an increasing scan/send difference.
 * The bot was removed from the chat or its token was revoked.
+* `/export` shows the bounded send-retry warnings and the final
+  `send failed … after retries` line, with the token itself always masked.
 
 ### Recovery
 
@@ -157,6 +175,7 @@ Before deployment:
 * `.env` contains valid configuration without exposing secrets in source control.
 * `BOT_TOKEN` and `TELEGRAM_CHAT_ID` are supplied through the deployment secret/configuration mechanism.
 * `data/` or `CURSOR_FILE` is persistent.
+* `LOG_BUFFER_LINES` is left at its default (or raised) so post-deploy incidents are diagnosable; set it to `0` only for one-shot tooling.
 * The deployed revision passes typecheck and build checks.
 * No production credentials are committed.
 
@@ -178,7 +197,14 @@ Never log:
 * unrestricted remote API responses
 * sensitive authentication data
 
-When reporting an incident, include only the minimum information needed to identify the failure, such as contract, ledger, cursor state, error category, and timestamp.
+The `/export` command and `/health/diag` endpoint enforce the first rule
+mechanically: captured lines pass a redaction pass that masks the bot token,
+the chat id, and full-precision account/contract ids before storage, and the
+rendered export is redacted again before it is sent. If a secret ever appears
+in an export, treat it as a bug: rotate the token and file an issue with the
+redacted output.
+
+When reporting an incident, include only the minimum information needed to identify the failure, such as contract, ledger, cursor state, error category, and timestamp. `/export` output is already trimmed to that shape.
 
 ## Verification
 

@@ -42,6 +42,11 @@ export interface BotConfig extends StellarConfig {
    * successful cycle lands within this window. `0` disables the stale check.
    */
   healthStaleMs: number;
+  /**
+   * How many recent log lines the in-memory buffer keeps for `/export` and
+   * `GET /health/diag`. `0` disables capture entirely (no buffer, no hooks).
+   */
+  logBufferLines: number;
 }
 
 export class ConfigError extends Error {
@@ -71,6 +76,10 @@ const DEFAULTS = {
   healthPort: 8787,
   // 3× default poll interval — one missed cycle is fine; three is not.
   healthStaleMs: 90_000,
+  // ~5 poll cycles of the default 30s interval; every line is redacted on
+  // capture, so the buffer only ever holds console output the bot already
+  // printed.
+  logBufferLines: 500,
 } as const;
 
 /** Strkey for a contract: `C` + 55 base32 characters. */
@@ -204,6 +213,7 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
+    logBufferLines: c.int("LOG_BUFFER_LINES", DEFAULTS.logBufferLines, 0),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);

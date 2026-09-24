@@ -19,6 +19,7 @@ function baseConfig(overrides = {}) {
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
+    logBufferLines: 500,
     ...overrides,
   };
 }
@@ -163,4 +164,49 @@ test("GET /health boundary: first boot before any success stays ok", () => {
   );
   assert.equal(report.ok, true);
   assert.equal(report.status, "ok");
+});
+
+test("GET /health/diag serves redacted plain-text logs on loopback", async () => {
+  const { createLogCapture } = await import("../dist/logger.js");
+  const config = baseConfig({ healthPort: 18788 });
+  const capture = createLogCapture(10);
+  capture.add("log", `[boot] chat ${config.chatId}`);
+  capture.add("error", `[poller] token ${config.botToken} rejected`);
+
+  const server = startHealthServer({
+    config,
+    status: () => baseStatus(),
+    logs: capture,
+    now: () => 5_500,
+  });
+  try {
+    const res = await fetch(`${server.url}/health/diag`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type"), /text\/plain/);
+    const body = await res.text();
+    assert.ok(body.includes("Mimir notifier log export"));
+    assert.ok(body.includes("[poller] token"));
+    assert.equal(body.includes(config.botToken), false);
+    assert.equal(body.includes(config.chatId), false);
+    assert.equal(body.includes("SECRET-TOKEN"), false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("GET /health/diag returns 404 when log capture is disabled", async () => {
+  const config = baseConfig({ healthPort: 18789 });
+  const server = startHealthServer({
+    config,
+    status: () => baseStatus(),
+    logs: undefined,
+  });
+  try {
+    const res = await fetch(`${server.url}/health/diag`);
+    assert.equal(res.status, 404);
+    const body = await res.json();
+    assert.equal(body.error, "log_capture_disabled");
+  } finally {
+    await server.close();
+  }
 });
