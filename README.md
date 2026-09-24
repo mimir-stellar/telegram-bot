@@ -163,6 +163,10 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   is deliberate: holding the cursor back would turn a revoked token or a chat
   the bot was removed from into an infinite replay, and recovery would flood the
   channel. Notifications are lossy on purpose — the chain is the record.
+  Failures are classified (`rate_limit`, `unauthorized`, `forbidden`,
+  `network`, …) into log-safe one-liners that never include the bot token. A
+  single 429 waits up to 60s for Telegram's `retry_after` and retries once;
+  other kinds are not retried in-process.
 - **A corrupt cursor file** is treated as a cold start rather than a crash.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
@@ -175,6 +179,7 @@ src/
   index.ts                 entry point: config -> RPC -> bot -> poller
   config.ts                env loading and validation, fails fast
   bot.ts                   grammy setup: /start, /help, /status
+  telegramErrors.ts        classify/redact Telegram API failures for logs
   poller.ts                the loop: scan, notify, persist the cursor
   stellar/
     client.ts              Soroban RPC client + explorer links
@@ -186,7 +191,7 @@ src/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and notification-format tests (including deterministic fuzz cases), or `npm run build` to produce the production output.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build, notification-format, and Telegram error-classification tests (including deterministic fuzz cases), or `npm run build` to produce the production output.
 
 ## License
 
