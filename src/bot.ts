@@ -1,14 +1,16 @@
 /**
  * The grammy bot: commands, and the one send path the poller uses.
  *
- * The bot half is deliberately thin. It answers commands and exposes
- * `notify()`; all chain logic lives in `src/poller.ts` and `src/stellar/`.
+ * The bot half is deliberately thin. It answers a handful of commands and
+ * exposes `notify()`; all chain logic lives in `src/poller.ts` and
+ * `src/stellar/`.
  */
 
 import { Bot, type Context } from "grammy";
 
 import { escapeMd } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
+import { contractExplorerUrl } from "./stellar/client.js";
 import type { PollerStatus } from "./poller.js";
 
 const HELP = [
@@ -19,6 +21,7 @@ const HELP = [
   "/status — what I am watching and how far I have read",
   "/pause — operator only: suppress notifications \\(cursors still advance\\)",
   "/resume — operator only: send notifications again",
+  "/contracts — the contract ids I watch and where to look them up",
   "/help — this message",
 ].join("\n");
 
@@ -73,6 +76,35 @@ function isOperator(config: BotConfig, ctx: Context): boolean {
   const fromId = ctx.from?.id;
   if (fromId === undefined) return false;
   return config.operatorUserIds.has(String(fromId));
+/**
+ * The `/contracts` message: which two contracts this bot watches, and where to
+ * look each one up independently — deliberately static (config only, no
+ * poller state), so it answers the same whether the poller is mid-cycle,
+ * between restarts, or wedged on a run of RPC failures. `/status` is for
+ * "is it working"; this is for "what is it even watching".
+ */
+export function contractsMessage(config: BotConfig): string {
+  const targets: Array<{ label: string; contractId: string }> = [
+    { label: "mimir\\-market", contractId: config.marketContractId },
+    { label: "mimir\\-squad", contractId: config.squadContractId },
+  ];
+
+  const lines: string[] = [
+    `*Contracts* — Mimir on Stellar ${escapeMd(networkLabel(config))}`,
+    "",
+    "Read\\-only: this bot holds no signing keys and cannot submit transactions\\.",
+  ];
+
+  for (const target of targets) {
+    lines.push(
+      "",
+      `*${target.label}*`,
+      `\`${escapeMd(target.contractId)}\``,
+      `[View on stellar\\.expert](${contractExplorerUrl(config, target.contractId)})`,
+    );
+  }
+
+  return lines.join("\n");
 }
 
 export interface BotDeps {
@@ -101,38 +133,13 @@ export function createBot(deps: BotDeps): Bot {
     });
   });
 
-  bot.command("pause", async (ctx) => {
-    if (!isOperator(config, ctx)) {
-      await ctx.reply("Operator only\\.", { parse_mode: "MarkdownV2" });
-      console.warn(
-        `[bot] /pause denied for user ${ctx.from?.id ?? "unknown"} (not an operator)`,
-      );
-      return;
-    }
-    const before = status().paused;
-    pause();
-    const text = before
-      ? "Already paused\\. Notifications remain suppressed; cursors still advance\\."
-      : "Paused\\. Notifications suppressed; chain scans and cursors still advance\\. Use /resume when ready\\.";
-    await ctx.reply(text, { parse_mode: "MarkdownV2" });
-    console.log(`[bot] /pause by operator ${ctx.from?.id}`);
-  });
-
-  bot.command("resume", async (ctx) => {
-    if (!isOperator(config, ctx)) {
-      await ctx.reply("Operator only\\.", { parse_mode: "MarkdownV2" });
-      console.warn(
-        `[bot] /resume denied for user ${ctx.from?.id ?? "unknown"} (not an operator)`,
-      );
-      return;
-    }
-    const before = status().paused;
-    resume();
-    const text = before
-      ? "Resumed\\. New events will be notified again\\."
-      : "Already running\\. Notifications were not suppressed\\.";
-    await ctx.reply(text, { parse_mode: "MarkdownV2" });
-    console.log(`[bot] /resume by operator ${ctx.from?.id}`);
+  // Config-only, so this never fails on account of poller or RPC state —
+  // unlike /status, it has nothing to report failure on.
+  bot.command("contracts", async (ctx) => {
+    await ctx.reply(contractsMessage(config), {
+      parse_mode: "MarkdownV2",
+      link_preview_options: { is_disabled: true },
+    });
   });
 
   // grammy rethrows handler errors by default, which would take the process
@@ -163,6 +170,7 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "status", description: "Last-seen ledger and watched contracts" },
       { command: "pause", description: "Operator: suppress notifications" },
       { command: "resume", description: "Operator: send notifications again" },
+      { command: "contracts", description: "Contract ids and explorer links" },
     ]);
   } catch (err) {
     // Cosmetic. Never worth failing a boot over.

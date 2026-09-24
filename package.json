@@ -15,6 +15,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test tests/format.test.mjs tests/health.test.mjs tests/pause.test.mjs",
+    "test": "npm run build && node --test tests/format.test.mjs tests/health.test.mjs tests/contracts-command.test.mjs",
     "scan": "tsx src/stellar/events.ts"
   },
   "dependencies": {
