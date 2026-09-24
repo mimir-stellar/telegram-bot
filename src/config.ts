@@ -42,6 +42,11 @@ export interface BotConfig extends StellarConfig {
    * successful cycle lands within this window. `0` disables the stale check.
    */
   healthStaleMs: number;
+  /**
+   * Telegram user ids allowed to /pause and /resume.
+   * Empty = no one can pause (commands reply with a clear denial).
+   */
+  operatorUserIds: ReadonlySet<string>;
 }
 
 export class ConfigError extends Error {
@@ -157,6 +162,23 @@ function collector() {
         );
       }
       return value;
+      operatorUserIds(name: string): Set<string> {
+      const raw = read(name);
+      if (raw === undefined) return new Set();
+      const ids = new Set<string>();
+      for (const part of raw.split(",")) {
+        const id = part.trim();
+        if (id === "") continue;
+        if (!/^\d+$/.test(id)) {
+          problems.push(
+            `\( {name} entries must be numeric Telegram user ids; got " \){id}"`,
+          );
+          continue;
+        }
+        ids.add(id);
+      }
+      return ids;
+    },
     },
   };
 }
@@ -204,6 +226,7 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
+    operatorUserIds: c.operatorUserIds("OPERATOR_USER_IDS"),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
