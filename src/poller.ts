@@ -240,7 +240,7 @@ export function createPoller(deps: PollerDeps) {
    */
   async function flushAudit(): Promise<void> {
     const pending = audit.flush();
-    if (!deps.persistAudit || pending.length === 0) return;
+    if (deps.persistAudit === false || pending.length === 0) return;
     try {
       await appendAuditFile(config.auditFile, pending);
     } catch (err) {

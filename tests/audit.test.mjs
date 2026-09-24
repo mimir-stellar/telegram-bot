@@ -19,6 +19,7 @@ import {
   AUDIT_MAX_BUFFERED,
   AUDIT_MAX_DETAIL,
 } from "../dist/audit.js";
+import { createPoller } from "../dist/poller.js";
 
 // ── Redaction ────────────────────────────────────────────────────────────────
 
@@ -170,6 +171,40 @@ async function tempFile(name) {
   const file = path.join(dir, name);
   return { dir, file, cleanup: () => rm(dir, { recursive: true, force: true }) };
 }
+
+test("poller persists audit entries by default and honours explicit opt-out", async () => {
+  const { file, cleanup } = await tempFile("audit.jsonl");
+  try {
+    const audit = createAuditLog();
+    audit.record(auditEntry("boot", { at: 1, detail: "persisted by default" }));
+    const poller = createPoller({
+      config: { auditFile: file },
+      server: {},
+      send: async () => undefined,
+      audit,
+    });
+
+    await poller.flushAuditFile();
+    const summary = await readAuditFile(file);
+    assert.equal(summary.entries[0].detail, "persisted by default");
+
+    audit.record(auditEntry("shutdown", { at: 2, detail: "in-memory only" }));
+    const optedOut = createPoller({
+      config: { auditFile: file },
+      server: {},
+      send: async () => undefined,
+      audit,
+      persistAudit: false,
+    });
+    await optedOut.flushAuditFile();
+
+    const afterOptOut = await readAuditFile(file);
+    assert.equal(afterOptOut.entries.length, 1);
+    assert.ok(!afterOptOut.entries.some((entry) => entry.kind === "shutdown"));
+  } finally {
+    await cleanup();
+  }
+});
 
 test("appendAuditFile appends JSONL without clobbering prior content", async () => {
   const { file, cleanup } = await tempFile("audit.jsonl");
