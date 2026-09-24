@@ -31,6 +31,8 @@ it holds no keys and signs nothing.
 |---|---|
 | `mimir-market` | `claim_created`, `claim_challenged`, `claim_resolved`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending` |
 | `mimir-squad` | `market_created`, `deposited`, `withdrawn`, `resolved`, `claimed`, `fees_claimed` |
+| /pause | **Operator only.** Suppress Telegram notifications. RPC scans and cursor advancement continue. In-memory only; cleared on process restart. |
+| /resume | **Operator only.** Start sending notifications again. |
 
 Admin events (`oracle_changed`, `ownership_transferred`, `fee_policy_*`,
 `fee_accrued`, `agent_attributed`) are decoded far enough to be recognised and
@@ -79,6 +81,9 @@ values you must supply are `BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Every other
 variable is documented inline there. A missing or malformed value aborts startup
 with all the problems listed at once — the bot never boots into a state where it
 looks healthy but notifies nobody.
+Optional: set `OPERATOR_USER_IDS` to a comma-separated list of Telegram user ids
+(from @userinfobot). Only those users can run `/pause` and `/resume`. If unset or
+empty, those commands reply "Operator only."
 
 ## Commands
 
