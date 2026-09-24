@@ -33,6 +33,8 @@ export interface TargetState {
   cursor: string | null;
   /** Highest ledger an event was seen in, from this run or the cursor file. */
   lastEventLedger: number | null;
+  /** Latest decoded event observed in this process; not persisted in the cursor file. */
+  lastEvent: DecodedEvent | null;
   lastError: string | null;
 }
 
@@ -141,7 +143,14 @@ export function createPoller(deps: PollerDeps) {
   const state = new Map<ContractSource, TargetState>(
     targets.map((t) => [
       t.source,
-      { source: t.source, contractId: t.contractId, cursor: null, lastEventLedger: null, lastError: null },
+      {
+        source: t.source,
+        contractId: t.contractId,
+        cursor: null,
+        lastEventLedger: null,
+        lastEvent: null,
+        lastError: null,
+      },
     ]),
   );
 
@@ -306,6 +315,12 @@ export function createPoller(deps: PollerDeps) {
               `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
           );
           await notify(scan.events);
+
+          const latestEvent = scan.events.reduce<DecodedEvent | null>(
+            (latest, event) => (latest === null || event.ledger >= latest.ledger ? event : latest),
+            null,
+          );
+          if (latestEvent !== null) current.lastEvent = latestEvent;
         }
 
         if (scan.lastEventLedger !== null) current.lastEventLedger = scan.lastEventLedger;

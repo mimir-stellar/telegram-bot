@@ -178,3 +178,34 @@ test("safeErrorMessage redacts Telegram-shaped tokens and clips remote payloads"
   assert.equal(message.length, 240);
   assert.match(message, /^\[REDACTED] \[REDACTED] remote-payload/);
 });
+
+test("/last-event sends the exact MarkdownV2 payload and reports cold targets", async () => {
+  const config = baseConfig();
+  const { handlers } = mockedBot({
+    config,
+    status: () => baseStatus({
+      targets: [
+        {
+          source: "market",
+          contractId: config.marketContractId,
+          cursor: null,
+          lastEventLedger: null,
+          lastEvent: null,
+          lastError: null,
+        },
+      ],
+    }),
+    pause: () => "paused",
+    resume: () => "resumed",
+  });
+  const { ctx, replies } = commandContext(99, 75);
+
+  await handlers.get("last-event")(ctx);
+
+  assert.deepEqual(replies, [
+    [
+      "*Last observed events* — Stellar Testnet\n\n*mimir\\-market*\nNo event has been observed since this process started\\.",
+      TELEGRAM_OPTIONS,
+    ],
+  ]);
+});
