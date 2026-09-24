@@ -240,6 +240,49 @@
           "shares": "10000000"
         }
       }
+    },
+    {
+      "id": "post_restart_admin_event",
+      "kind": "restart",
+      "expect": "skip",
+      "note": "After a process restart the poller resumes from the persisted cursor. An admin event immediately following the cursor must be skipped, not posted. Verifies that cold-start cursor resume does not change the notify/skip behaviour of non-notifiable events.",
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 82,
+        "txHash": "",
+        "at": 1724000200,
+        "eventId": "82-0",
+        "payload": {
+          "name": "unknown",
+          "eventName": "fee_policy_changed",
+          "reason": "admin event — no decoder"
+        }
+      }
+    },
+    {
+      "id": "version_regression",
+      "kind": "restart",
+      "expect": "notify",
+      "note": "Regression guard: a normal notifiable event that arrives after a restart must still produce a formatted message. Ensures version metadata changes do not break the event-formatting path.",
+      "messageIncludes": [
+        "New claim",
+        "regression"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 83,
+        "txHash": "",
+        "at": 1724000201,
+        "eventId": "83-0",
+        "payload": {
+          "name": "claim_created",
+          "claimId": 99,
+          "creator": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "category": "regression"
+        }
+      }
     }
   ]
 }

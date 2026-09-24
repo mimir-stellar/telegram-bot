@@ -95,6 +95,25 @@ test("buildHealthReport never embeds bot token or chat id", () => {
   assert.equal(blob.includes("SECRET-TOKEN"), false);
 });
 
+test("buildHealthReport includes version field matching provided value", () => {
+  const report = buildHealthReport(baseConfig(), baseStatus(), 5_500, "1.2.3");
+  assert.equal(report.version, "1.2.3");
+});
+
+test("buildHealthReport defaults version to 'unknown' when omitted", () => {
+  const report = buildHealthReport(baseConfig(), baseStatus(), 5_500);
+  assert.equal(report.version, "unknown");
+});
+
+test("buildHealthReport version field is never a secret", () => {
+  const config = baseConfig();
+  const report = buildHealthReport(config, baseStatus(), 5_500, "0.1.0");
+  const blob = JSON.stringify(report);
+  assert.equal(blob.includes(config.botToken), false);
+  assert.equal(blob.includes("SECRET-TOKEN"), false);
+  assert.match(blob, /"version":"0\.1\.0"/);
+});
+
 test("startHealthServer with HEALTH_PORT=0 does not bind", async () => {
   const server = startHealthServer({
     config: baseConfig({ healthPort: 0 }),
@@ -125,6 +144,7 @@ test("GET /health returns 200 and redacted JSON for a healthy poller", async () 
     config: ephemeral,
     status: () => current,
     now: () => 5_500,
+    version: "0.1.0",
   });
   assert.ok(server.url);
 
@@ -134,6 +154,9 @@ test("GET /health returns 200 and redacted JSON for a healthy poller", async () 
     const body = await res.json();
     assert.equal(body.ok, true);
     assert.equal(body.status, "ok");
+    // Version field must be present and semver-shaped.
+    assert.equal(typeof body.version, "string");
+    assert.ok(body.version.length > 0, "version must not be empty");
     const text = JSON.stringify(body);
     assert.equal(text.includes(secret), false);
     assert.equal(text.includes(chat), false);

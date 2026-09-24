@@ -15,6 +15,8 @@ import type { PollerStatus } from "./poller.js";
 export interface HealthDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  /** Package version string, e.g. `"0.1.0"`. Included in health report JSON. */
+  version?: string;
   /** Optional clock for deterministic tests. */
   now?: () => number;
 }
@@ -32,6 +34,8 @@ export interface HealthReport {
   ok: boolean;
   status: "ok" | "degraded" | "stopped";
   service: "mimir-telegram-bot";
+  /** Package version string from package.json, e.g. `"0.1.0"`. */
+  version: string;
   network: string;
   uptimeMs: number;
   checkedAt: string;
@@ -84,6 +88,7 @@ export function buildHealthReport(
   config: BotConfig,
   poller: PollerStatus,
   nowMs: number = Date.now(),
+  version: string = "unknown",
 ): HealthReport {
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
 
@@ -105,6 +110,7 @@ export function buildHealthReport(
     ok: status === "ok",
     status,
     service: "mimir-telegram-bot",
+    version,
     network: networkLabel(config),
     uptimeMs,
     checkedAt: new Date(nowMs).toISOString(),
@@ -156,6 +162,7 @@ function sendJson(
 export function startHealthServer(deps: HealthDeps): HealthServer {
   const { config, status } = deps;
   const now = deps.now ?? Date.now;
+  const version = deps.version ?? "unknown";
 
   if (config.healthPort === 0) {
     console.log("[health] disabled (HEALTH_PORT=0)");
@@ -167,7 +174,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
     if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
-      const report = buildHealthReport(config, status(), now());
+      const report = buildHealthReport(config, status(), now(), version);
       sendJson(res, report.ok ? 200 : 503, report);
       return;
     }

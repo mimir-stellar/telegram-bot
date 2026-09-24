@@ -213,3 +213,99 @@ test("txExplorerUrl is centralized and network-aware", async () => {
   assert.equal(txExplorerUrl(custom, "zz"), "https://example.test/x/testnet/tx/zz");
   assert.equal(txExplorerUrl(testnet, "  "), "");
 });
+
+test("/status reply includes version stamp and never leaks the bot token", async () => {
+  const { createBot } = await import("../dist/bot.js");
+
+  const config = {
+    botToken: "9999999999:SECRET-TOKEN-DO-NOT-LEAK",
+    chatId: "-1001234567890",
+    marketContractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+    squadContractId: "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
+    pollIntervalMs: 30_000,
+    startLookbackLedgers: 60,
+    cursorFile: "./data/cursor.json",
+    maxNotificationsPerCycle: 20,
+    healthHost: "127.0.0.1",
+    healthPort: 0,
+    healthStaleMs: 90_000,
+  };
+
+  const fakeStatus = () => ({
+    running: true,
+    startedAt: 1_000,
+    cycles: 1,
+    lastPollAt: 2_000,
+    lastSuccessAt: 2_000,
+    latestLedger: 100,
+    oldestLedger: 1,
+    notificationsSent: 0,
+    notificationsFailed: 0,
+    eventsSkipped: 0,
+    consecutiveFailures: 0,
+    lastError: null,
+    targets: [],
+  });
+
+  const VERSION = "0.1.0";
+  const bot = createBot({ config, status: fakeStatus, version: VERSION });
+
+  // Intercept all Telegram API calls so no network is needed.
+  const apiCalls = [];
+  bot.api.config.use(async (_prev, method, payload, _signal) => {
+    apiCalls.push({ method, payload });
+    if (method === "getMe") {
+      return {
+        ok: true,
+        result: {
+          id: 1,
+          is_bot: true,
+          first_name: "Test",
+          username: "testbot",
+          can_join_groups: true,
+          can_read_all_group_messages: false,
+          supports_inline_queries: false,
+        },
+      };
+    }
+    // sendMessage, setMyCommands, etc.
+    return { ok: true, result: true };
+  });
+
+  // grammy requires bot.init() before handleUpdate.
+  await bot.init();
+
+  // Dispatch a /status command through grammy's middleware.
+  await bot.handleUpdate({
+    update_id: 1,
+    message: {
+      message_id: 1,
+      from: { id: 1, is_bot: false, first_name: "Test" },
+      chat: { id: -1001234567890, type: "supergroup", title: "Test" },
+      date: 0,
+      text: "/status",
+      entities: [{ offset: 0, length: 7, type: "bot_command" }],
+    },
+  });
+
+  // Find the sendMessage call that was the /status reply.
+  const sendCall = apiCalls.find((c) => c.method === "sendMessage");
+  assert.ok(sendCall, "expected a sendMessage call for /status reply");
+
+  const replyText = sendCall.payload.text;
+  // The reply is MarkdownV2: dots in version numbers are escaped as \. 
+  // Check that the version appears in either raw or escaped form.
+  const escapedVersion = VERSION.replace(/\./g, "\\.");
+  assert.ok(
+    replyText.includes(VERSION) || replyText.includes(escapedVersion),
+    `status reply must include version "${VERSION}" (raw or MarkdownV2-escaped); got: ${replyText}`,
+  );
+  assert.ok(
+    !replyText.includes("SECRET-TOKEN"),
+    "status reply must not include bot token",
+  );
+});

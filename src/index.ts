@@ -6,7 +6,7 @@
  * is to still be running next week.
  */
 
-import { ConfigError, loadConfig, networkLabel } from "./config.js";
+import { ConfigError, loadConfig, loadVersion, networkLabel } from "./config.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
@@ -35,8 +35,9 @@ async function main(): Promise<void> {
   installProcessHandlers();
 
   const config = loadConfig();
+  const version = loadVersion();
 
-  console.log(`[boot] Mimir Telegram notifier`);
+  console.log(`[boot] Mimir Telegram notifier v${version}`);
   console.log(`[boot] network      ${networkLabel(config)} (${config.rpcUrl})`);
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
@@ -60,12 +61,12 @@ async function main(): Promise<void> {
   };
 
   const poller = createPoller({ config, server, send: (text) => notify(text) });
-  const bot = createBot({ config, status: () => poller.status() });
+  const bot = createBot({ config, status: () => poller.status(), version });
   notify = createNotifier(bot, config);
 
   // Local-only health HTTP for supervisors. Starts before Telegram long-poll
   // so a deploy probe can see the process even while grammy is connecting.
-  const healthServer = startHealthServer({ config, status: () => poller.status() });
+  const healthServer = startHealthServer({ config, status: () => poller.status(), version });
 
   await registerCommands(bot);
 

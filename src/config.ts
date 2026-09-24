@@ -12,7 +12,9 @@
  *   - {@link loadConfig} is the full bot config.
  */
 
+import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import "dotenv/config";
 
@@ -215,4 +217,29 @@ export function networkLabel(config: StellarConfig): string {
   if (config.networkPassphrase === "Test SDF Network ; September 2015") return "testnet";
   if (config.networkPassphrase === "Public Global Stellar Network ; September 2015") return "public";
   return "custom";
+}
+
+/**
+ * Read the `version` field from `package.json` at the project root.
+ *
+ * Uses a file-relative path so it resolves correctly from both `src/` (dev)
+ * and `dist/` (production build), since the package root is always one level
+ * above either directory.
+ *
+ * Falls back to `"unknown"` rather than throwing — a missing version field
+ * must not abort a healthy running process.
+ */
+export function loadVersion(): string {
+  try {
+    // import.meta.url points at this file; package.json is two dirs up from
+    // src/config.ts (or dist/config.js).
+    const thisFile = fileURLToPath(import.meta.url);
+    const pkgPath = path.resolve(path.dirname(thisFile), "..", "package.json");
+    const raw = readFileSync(pkgPath, "utf8");
+    const pkg = JSON.parse(raw) as { version?: unknown };
+    const v = pkg.version;
+    return typeof v === "string" && v.trim() !== "" ? v.trim() : "unknown";
+  } catch {
+    return "unknown";
+  }
 }

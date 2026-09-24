@@ -48,12 +48,13 @@ async function loadCatalog() {
   return JSON.parse(raw);
 }
 
-test("fixture catalog covers positive, negative, and boundary kinds", async () => {
+test("fixture catalog covers positive, negative, boundary, and restart kinds", async () => {
   const catalog = await loadCatalog();
   const kinds = new Set(catalog.cases.map((c) => c.kind));
   assert.ok(kinds.has("positive"), "missing positive cases");
   assert.ok(kinds.has("negative"), "missing negative cases");
   assert.ok(kinds.has("boundary"), "missing boundary cases");
+  assert.ok(kinds.has("restart"), "missing restart cases");
   assert.ok(catalog.cases.length >= 8, "catalog too thin");
 });
 
@@ -147,6 +148,22 @@ test("valid cursor fixture parses as version-1 poller shape", async () => {
 test("corrupt cursor fixture is not JSON (cold-start path)", async () => {
   const raw = await readFile(path.join(fixturesDir, "cursor-corrupt.txt"), "utf8");
   assert.throws(() => JSON.parse(raw));
+});
+
+test("loadVersion returns a semver-shaped string from package.json (version regression)", async () => {
+  const { loadVersion } = await import("../dist/config.js");
+  const version = loadVersion();
+  // Must be a non-empty string — the fall-through "unknown" only fires when
+  // package.json is missing, which must never happen in this repo.
+  assert.equal(typeof version, "string");
+  assert.ok(version.length > 0, "version must not be empty");
+  assert.notEqual(version, "unknown", "package.json version must be present");
+  // Must match semver (MAJOR.MINOR.PATCH with optional pre-release / build).
+  assert.match(
+    version,
+    /^\d+\.\d+\.\d+/,
+    `version "${version}" must start with MAJOR.MINOR.PATCH`,
+  );
 });
 
 test("long summary boundary fixture clips before sizing a chat message", async () => {
