@@ -167,6 +167,11 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down.
+- **A message over Telegram's 4096-character limit** is split on newlines (or
+  hard-split when a single line is oversized) and sent as ordered chunks. The
+  poller's send path and `/status` (and other MarkdownV2 replies) share this
+  splitter so a long status or a rare oversized event never fails with
+  "message is too long".
 
 ## Health endpoint
 

@@ -27,6 +27,66 @@ export function escapeMd(text: string): string {
   return text.replace(MDV2_RESERVED, (ch) => `\\${ch}`);
 }
 
+
+/** Telegram Bot API hard limit for sendMessage / editMessageText text. */
+export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+
+/**
+ * Split a MarkdownV2 (or plain) payload so each chunk fits Telegram's size limit.
+ *
+ * Prefers breaking on newlines. Never ends a chunk on a lone trailing backslash,
+ * which would corrupt a MarkdownV2 escape sequence across chunk boundaries.
+ * Hard-splits only when a single line exceeds the limit.
+ */
+export function splitTelegramMessage(
+  text: string,
+  limit: number = TELEGRAM_MAX_MESSAGE_LENGTH,
+): string[] {
+  if (!Number.isFinite(limit) || limit < 1) {
+    throw new RangeError(`splitTelegramMessage limit must be >= 1, got ${limit}`);
+  }
+  if (text.length <= limit) return [text];
+
+  const parts: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > limit) {
+    let cut = remaining.lastIndexOf("\n", limit);
+    if (cut <= 0) cut = limit;
+
+    // If the chunk would end on an odd-length trailing backslash run, the next
+    // character belongs to that escape — pull the cut back before the run.
+    while (cut > 0) {
+      let i = cut - 1;
+      let slashes = 0;
+      while (i >= 0 && remaining[i] === "\\") {
+        slashes += 1;
+        i -= 1;
+      }
+      if (slashes % 2 === 1) {
+        cut = cut - 1;
+        continue;
+      }
+      break;
+    }
+
+    if (cut <= 0) {
+      cut = limit;
+      if (remaining[cut - 1] === "\\" && cut < remaining.length) {
+        cut = limit - 1;
+        if (cut <= 0) cut = limit;
+      }
+    }
+
+    parts.push(remaining.slice(0, cut));
+    remaining = remaining.slice(cut);
+    if (remaining.startsWith("\n")) remaining = remaining.slice(1);
+  }
+
+  if (remaining.length > 0) parts.push(remaining);
+  return parts;
+}
+
 function usdc(units: bigint): string {
   return escapeMd(`${formatUsdc(units)} USDC`);
 }

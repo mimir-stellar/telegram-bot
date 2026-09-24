@@ -5,9 +5,9 @@
  * `notify()`; all chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
-import { Bot } from "grammy";
+import { Bot, type Context } from "grammy";
 
-import { escapeMd } from "./notifications/format.js";
+import { escapeMd, splitTelegramMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
 
@@ -19,6 +19,11 @@ const HELP = [
   "/status — what I am watching and how far I have read",
   "/help — this message",
 ].join("\n");
+
+const MDV2_OPTS = {
+  parse_mode: "MarkdownV2" as const,
+  link_preview_options: { is_disabled: true },
+};
 
 function ago(timestamp: number | null): string {
   if (timestamp === null) return "never";
@@ -62,6 +67,21 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
   return lines.join("\n");
 }
 
+/** Reply with MarkdownV2, splitting when the payload exceeds Telegram's limit. */
+async function replyMarkdown(
+  ctx: Context,
+  text: string,
+  extra: { link_preview_options?: { is_disabled: boolean } } = {},
+): Promise<void> {
+  const parts = splitTelegramMessage(text);
+  for (const part of parts) {
+    await ctx.reply(part, {
+      parse_mode: "MarkdownV2",
+      ...extra,
+    });
+  }
+}
+
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
@@ -72,16 +92,15 @@ export function createBot(deps: BotDeps): Bot {
   const bot = new Bot(config.botToken);
 
   bot.command("start", async (ctx) => {
-    await ctx.reply(HELP, { parse_mode: "MarkdownV2" });
+    await replyMarkdown(ctx, HELP);
   });
 
   bot.command("help", async (ctx) => {
-    await ctx.reply(HELP, { parse_mode: "MarkdownV2" });
+    await replyMarkdown(ctx, HELP);
   });
 
   bot.command("status", async (ctx) => {
-    await ctx.reply(statusMessage(config, status()), {
-      parse_mode: "MarkdownV2",
+    await replyMarkdown(ctx, statusMessage(config, status()), {
       link_preview_options: { is_disabled: true },
     });
   });
@@ -95,13 +114,17 @@ export function createBot(deps: BotDeps): Bot {
   return bot;
 }
 
-/** The poller's send path: one message to the configured chat. */
+/**
+ * The poller's send path: one formatted MarkdownV2 payload to the configured
+ * chat. Payloads over Telegram's 4096-character limit are split into ordered
+ * chunks (newline-aware) and sent sequentially.
+ */
 export function createNotifier(bot: Bot, config: BotConfig) {
   return async (text: string): Promise<void> => {
-    await bot.api.sendMessage(config.chatId, text, {
-      parse_mode: "MarkdownV2",
-      link_preview_options: { is_disabled: true },
-    });
+    const parts = splitTelegramMessage(text);
+    for (const part of parts) {
+      await bot.api.sendMessage(config.chatId, part, MDV2_OPTS);
+    }
   };
 }
 
