@@ -37,6 +37,7 @@ export interface HealthReport {
   checkedAt: string;
   poller: {
     running: boolean;
+    paused: boolean;
     cycles: number;
     lastPollAt: string | null;
     lastSuccessAt: string | null;
@@ -110,6 +111,7 @@ export function buildHealthReport(
     checkedAt: new Date(nowMs).toISOString(),
     poller: {
       running: poller.running,
+      paused: poller.paused,
       cycles: poller.cycles,
       lastPollAt: iso(poller.lastPollAt),
       lastSuccessAt: iso(poller.lastSuccessAt),
