@@ -60,7 +60,12 @@ async function main(): Promise<void> {
   };
 
   const poller = createPoller({ config, server, send: (text) => notify(text) });
-  const bot = createBot({ config, status: () => poller.status() });
+  const bot = createBot({
+    config,
+    status: () => poller.status(),
+    pause: () => poller.pause(),
+    resume: () => poller.resume(),
+  });
   notify = createNotifier(bot, config);
 
   // Local-only health HTTP for supervisors. Starts before Telegram long-poll
