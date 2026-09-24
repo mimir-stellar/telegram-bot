@@ -147,6 +147,12 @@ so a crash mid-write cannot truncate it):
 On a cold start (no file) it begins `START_LOOKBACK_LEDGERS` behind the chain tip
 rather than replaying the whole retained window into your chat.
 
+If the file exists but is corrupt (truncated JSON, wrong `version`, or a
+non-object `targets` map), the poller renames it to
+`CURSOR_FILE.corrupt.<ISO-timestamp>` and cold-starts. That keeps the bad file
+for debugging and prevents the next `saveCursors` from silently overwriting
+evidence of the failure.
+
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. On
 an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
 at one). On an ephemeral filesystem every restart is a cold start, and events
@@ -163,7 +169,10 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   is deliberate: holding the cursor back would turn a revoked token or a chat
   the bot was removed from into an infinite replay, and recovery would flood the
   channel. Notifications are lossy on purpose — the chain is the record.
-- **A corrupt cursor file** is treated as a cold start rather than a crash.
+- **A corrupt cursor file** (invalid JSON or wrong schema) is **quarantined** to
+  `data/cursor.json.corrupt.<timestamp>` beside the live path, then treated as a
+  cold start. The next successful cycle writes a fresh `cursor.json`. Operators
+  can inspect the quarantined file; it is never deleted automatically.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down.

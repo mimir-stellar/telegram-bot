@@ -12,9 +12,10 @@
  *    broken bot token or a chat the bot was kicked from turns into an infinite
  *    replay of the same events forever, and recovering floods the channel.
  *    Notifications are lossy by design; the chain remains the record.
- *  - A cursor file that cannot be read is treated as a cold start; one that
- *    cannot be written is logged, and the in-memory cursor keeps working until
- *    the next restart.
+ *  - A cursor file that cannot be read or fails schema validation is
+ *    quarantined beside the live path (`*.corrupt.<timestamp>`) and treated as
+ *    a cold start; one that cannot be written is logged, and the in-memory
+ *    cursor keeps working until the next restart.
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -52,7 +53,7 @@ export interface PollerStatus {
   targets: TargetState[];
 }
 
-interface CursorFile {
+export interface CursorFile {
   version: 1;
   updatedAt: string;
   targets: Record<string, { cursor: string | null; lastEventLedger: number | null }>;
@@ -81,6 +82,81 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Stable quarantine path next to the live cursor file (never overwrites). */
+export function cursorQuarantinePath(cursorFile: string, at: Date = new Date()): string {
+  const stamp = at.toISOString().replace(/[:.]/g, "-");
+  return `${cursorFile}.corrupt.${stamp}`;
+}
+
+function isNullOrString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isNullOrNumber(value: unknown): value is number | null {
+  return value === null || (typeof value === "number" && Number.isFinite(value));
+}
+
+/**
+ * Strict schema check for persisted cursor state.
+ * Valid JSON with the wrong shape is treated as corrupt so we never resume
+ * from a half-understood file.
+ */
+export function isValidCursorFile(value: unknown): value is CursorFile {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  if (obj.version !== 1) return false;
+  if (typeof obj.updatedAt !== "string") return false;
+  if (obj.targets === null || typeof obj.targets !== "object" || Array.isArray(obj.targets)) {
+    return false;
+  }
+  for (const entry of Object.values(obj.targets as Record<string, unknown>)) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+    const saved = entry as Record<string, unknown>;
+    if (!isNullOrString(saved.cursor)) return false;
+    if (!isNullOrNumber(saved.lastEventLedger)) return false;
+  }
+  return true;
+}
+
+/** Parse + validate a cursor file body; throws on JSON or schema failure. */
+export function parseCursorFile(raw: string): CursorFile {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (err) {
+    throw new Error(`invalid JSON: ${errMessage(err)}`);
+  }
+  if (!isValidCursorFile(parsed)) {
+    throw new Error("failed schema validation (expected version 1 with targets map)");
+  }
+  return parsed;
+}
+
+/**
+ * Move a corrupt cursor file aside so the next save starts clean and operators
+ * can inspect the bad file. Returns the quarantine path, or null if rename failed.
+ */
+export async function quarantineCorruptCursorFile(
+  cursorFile: string,
+  reason: string,
+  at: Date = new Date(),
+): Promise<string | null> {
+  const dest = cursorQuarantinePath(cursorFile, at);
+  try {
+    await rename(cursorFile, dest);
+    console.warn(
+      `[poller] quarantined corrupt cursor file to ${dest} (${reason}); cold start`,
+    );
+    return dest;
+  } catch (err) {
+    console.warn(
+      `[poller] could not quarantine corrupt cursor at ${cursorFile}: ${errMessage(err)}; ` +
+        `cold start without removing the file (${reason})`,
+    );
+    return null;
+  }
 }
 
 /**
@@ -168,8 +244,8 @@ export function createPoller(deps: PollerDeps) {
     }
 
     try {
-      const parsed = JSON.parse(raw) as CursorFile;
-      for (const [source, saved] of Object.entries(parsed.targets ?? {})) {
+      const parsed = parseCursorFile(raw);
+      for (const [source, saved] of Object.entries(parsed.targets)) {
         const target = state.get(source as ContractSource);
         if (!target) continue;
         target.cursor = saved.cursor ?? null;
@@ -180,8 +256,10 @@ export function createPoller(deps: PollerDeps) {
           [...state.values()].map((t) => `${t.source}@${t.cursor ?? "none"}`).join(" "),
       );
     } catch (err) {
-      // A corrupt state file must not wedge the bot; a cold start is recoverable.
-      console.warn(`[poller] cursor file unreadable, starting cold: ${errMessage(err)}`);
+      // Quarantine then cold-start: never wedge on a corrupt state file, and
+      // keep the bad bytes for operators instead of overwriting them on save.
+      const reason = errMessage(err);
+      await quarantineCorruptCursorFile(config.cursorFile, reason);
     }
   }
 
