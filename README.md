@@ -131,7 +131,8 @@ index.
 ## Cursor persistence
 
 The poller writes its resume position to `data/cursor.json` (write-then-rename,
-so a crash mid-write cannot truncate it):
+so a crash mid-write cannot truncate it). The on-disk document is a **versioned
+schema** (`version: 1` today):
 
 ```json
 {
@@ -144,8 +145,20 @@ so a crash mid-write cannot truncate it):
 }
 ```
 
-On a cold start (no file) it begins `START_LOOKBACK_LEDGERS` behind the chain tip
-rather than replaying the whole retained window into your chat.
+**Compatibility / migration**
+
+- Current files (`version: 1`) load as-is.
+- Legacy unversioned envelopes (`{ "targets": … }` without `version`) and flat
+  maps (`{ "market": { "cursor": … }, "squad": … }` or string cursors) are
+  migrated in-place to schema v1 on startup, then rewritten atomically.
+- Unknown future `version` values are rejected: the bot cold-starts rather than
+  guessing, so a downgrade cannot mis-read a newer file. Upgrade the bot before
+  rolling forward again.
+- Corrupt JSON or unrecognised shapes are also a cold start (see failure
+  behaviour below). Logs never include the raw file body.
+
+On a cold start (no usable file) it begins `START_LOOKBACK_LEDGERS` behind the
+chain tip rather than replaying the whole retained window into your chat.
 
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. On
 an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
