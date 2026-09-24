@@ -155,7 +155,7 @@ When investigating:
 
 1. Use `npm run scan` to inspect the affected event range.
 2. Confirm the contract and ledger involved.
-3. Check the decoded event output without copying unrestricted remote payloads into logs or tickets.
+3. Check the bounded event name and decode reason without copying unrestricted remote payloads into logs or tickets.
 4. Preserve the existing cursor behavior.
 
 Do not modify on-chain state or attempt to repair an event by writing to the Mimir contracts.
