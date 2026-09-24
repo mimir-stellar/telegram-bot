@@ -86,7 +86,7 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters, empty-page telemetry, and the last error |
 
 ## Reading events without a bot token
 
@@ -123,6 +123,12 @@ design of `src/stellar/events.ts`:
   pages, 12 of which are empty, to reach the page holding all 11 of its events.
 
 So the walk terminates on the cursor, never on the payload.
+
+The poller exposes **empty-page telemetry** for this: cumulative and last-cycle
+counts of empty `getEvents` pages appear in `/status` and in each scan log line
+(`N page(s) (M empty)`). High empty-page ratios are expected on quiet contracts;
+a sudden drop to zero pages, or `truncated` without progress, is the signal to
+investigate RPC or `EVENT_MAX_PAGES`.
 
 Events are also not a source of truth for current state — a claim's stakes and
 status come from the contract's own getters. This bot is a timeline, not an

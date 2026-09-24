@@ -36,6 +36,10 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt)}`,
     `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
+    `RPC pages: ${status.pagesScanned} total · ${status.emptyPages} empty` +
+      (status.lastCyclePages > 0
+        ? ` · last cycle ${status.lastCycleEmptyPages}/${status.lastCyclePages} empty`
+        : ""),
     "",
     "*Watching*",
   ];

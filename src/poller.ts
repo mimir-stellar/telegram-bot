@@ -47,6 +47,14 @@ export interface PollerStatus {
   notificationsSent: number;
   notificationsFailed: number;
   eventsSkipped: number;
+  /** Cumulative empty getEvents pages across all successful target scans. */
+  emptyPages: number;
+  /** Cumulative pages walked across all successful target scans. */
+  pagesScanned: number;
+  /** Empty pages in the most recent completed cycle (all targets). */
+  lastCycleEmptyPages: number;
+  /** Pages walked in the most recent completed cycle (all targets). */
+  lastCyclePages: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
   targets: TargetState[];
@@ -100,6 +108,10 @@ export function createPoller(deps: PollerDeps) {
     notificationsSent: 0,
     notificationsFailed: 0,
     eventsSkipped: 0,
+    emptyPages: 0,
+    pagesScanned: 0,
+    lastCycleEmptyPages: 0,
+    lastCyclePages: 0,
     consecutiveFailures: 0,
     lastError: null,
     targets: [],
@@ -219,6 +231,8 @@ export function createPoller(deps: PollerDeps) {
     status.lastPollAt = Date.now();
 
     let anyOk = false;
+    let cyclePages = 0;
+    let cycleEmptyPages = 0;
 
     for (const target of targets) {
       const current = state.get(target.source);
@@ -235,11 +249,21 @@ export function createPoller(deps: PollerDeps) {
         current.lastError = null;
         anyOk = true;
 
+        cyclePages += scan.pages;
+        cycleEmptyPages += scan.emptyPages;
+        status.pagesScanned += scan.pages;
+        status.emptyPages += scan.emptyPages;
+
+        // Always surface page telemetry: empty pages are the Soroban norm, and
+        // silence on a zero-event walk hid whether the scanner kept walking.
+        console.log(
+          `[poller] ${target.source}: ${scan.events.length} event(s)` +
+            (scan.lastEventLedger !== null ? ` up to ledger ${scan.lastEventLedger}` : "") +
+            ` in ${scan.pages} page(s) (${scan.emptyPages} empty)` +
+            (scan.truncated ? " [truncated]" : ""),
+        );
+
         if (scan.events.length > 0) {
-          console.log(
-            `[poller] ${target.source}: ${scan.events.length} event(s) ` +
-              `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
-          );
           await notify(scan.events);
         }
 
@@ -253,6 +277,9 @@ export function createPoller(deps: PollerDeps) {
         console.error(`[poller] ${target.source} scan failed: ${message}`);
       }
     }
+
+    status.lastCyclePages = cyclePages;
+    status.lastCycleEmptyPages = cycleEmptyPages;
 
     if (anyOk) {
       status.lastSuccessAt = Date.now();
