@@ -97,10 +97,10 @@ export function createBot(deps: BotDeps): Bot {
 
 /** The poller's send path: one message to the configured chat. */
 export function createNotifier(bot: Bot, config: BotConfig) {
-  return async (text: string): Promise<void> => {
+  return async (text: string, previewsEnabled: boolean = false): Promise<void> => {
     await bot.api.sendMessage(config.chatId, text, {
       parse_mode: "MarkdownV2",
-      link_preview_options: { is_disabled: true },
+      link_preview_options: { is_disabled: !previewsEnabled },
     });
   };
 }

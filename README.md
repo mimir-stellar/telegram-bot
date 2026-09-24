@@ -196,6 +196,29 @@ cursor format or Telegram behaviour.
 exits via the listen error path after logging). Client disconnects and probe
 errors are logged and ignored so they cannot stop the notifier.
 
+## Configuration and reliability
+
+### Network passphrase verification
+
+On startup, the bot verifies that the configured `STELLAR_NETWORK_PASSPHRASE`
+matches the RPC's own network passphrase (from `getNetwork()`). A mismatch is a
+configuration error and the process exits fail-fast, rather than silently reading
+events from the wrong chain. The error message names both the configured and
+actual passphrases so the mismatch is immediately actionable.
+
+### Link preview control
+
+Telegram can preview URLs in messages. The bot controls link previews per
+notification:
+
+- **Enabled** for events with transaction hashes in the footer, since explorer
+  links provide useful context about on-chain activity.
+- **Disabled** for command responses (status, help) and events without
+  transaction data, to keep the UI clean and avoid loading preview metadata.
+
+This is driven by the presence of a non-empty `txHash` field on each event, not
+configuration. All persisted state and cursor format remain unchanged.
+
 ## Layout
 
 ```

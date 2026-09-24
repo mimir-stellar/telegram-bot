@@ -235,7 +235,7 @@ function summarize(event: DecodedEvent): string {
 
 async function main(): Promise<void> {
   const config = loadStellarConfig();
-  const server = createRpcServer(config);
+  const server = await createRpcServer(config);
   const pages = Number(flag("pages") ?? EVENT_MAX_PAGES);
   const show = Number(flag("show") ?? 3);
   const from = flag("from");

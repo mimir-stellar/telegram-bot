@@ -61,8 +61,8 @@ interface CursorFile {
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
-  /** Sends one already-formatted MarkdownV2 message. May reject. */
-  send: (text: string) => Promise<void>;
+  /** Sends one already-formatted MarkdownV2 message with optional link preview. */
+  send: (text: string, previewsEnabled?: boolean) => Promise<void>;
 }
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
@@ -92,15 +92,16 @@ function errMessage(err: unknown): string {
  * retries that would block the poller loop.
  */
 async function sendWithRetry(
-  send: (text: string) => Promise<void>,
+  send: (text: string, previewsEnabled?: boolean) => Promise<void>,
   text: string,
+  previewsEnabled: boolean = false,
 ): Promise<void> {
   let attempt = 0;
   let backoff = INITIAL_BACKOFF_MS;
 
   while (true) {
     try {
-      await send(text);
+      await send(text, previewsEnabled);
       return;
     } catch (err) {
       attempt++;
@@ -224,8 +225,8 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
-      const text = formatEvent(config, event);
-      if (text === null) {
+      const formatted = formatEvent(config, event);
+      if (formatted === null) {
         status.eventsSkipped += 1;
         continue;
       }
@@ -241,7 +242,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text);
+        await sendWithRetry(send, formatted.text, formatted.previewsEnabled);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
