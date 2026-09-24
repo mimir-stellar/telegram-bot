@@ -33,8 +33,8 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures/events.json` | Decoded event cases for `formatEvent` / notifier fakes |
 | `tests/fixtures/cursor-valid.json` | Well-formed `data/cursor.json` shape for restart docs |
 | `tests/fixtures/cursor-corrupt.txt` | Unreadable cursor sample (cold-start path) |
-| `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
-| `tests/format.test.mjs` | Inline unit cases (MarkdownV2 escape, USDC decimals, send failures) |
+| `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary / restart behaviour |
+| `tests/format.test.mjs` | Inline unit cases (MarkdownV2 escape, USDC decimals, send failures, version stamp) |
 
 ## Event fixture schema
 
@@ -82,11 +82,16 @@ Rules:
 | `positive` | Happy-path notification for a known market/squad event | `notify` |
 | `negative` | Malformed / unknown / admin-shaped payload → no chat message | `skip` |
 | `boundary` | Clipping, reserved MarkdownV2 chars, zero/max amounts | `notify` or `skip` |
-| `restart` | Documents cursor resume / corrupt-file cold start (see cursor fixtures) | n/a in format suite |
+| `restart` | Events arriving after a process restart / cold start from cursor resume | `notify` or `skip` |
 
 `expect: "notify"` requires a non-null MarkdownV2 string from `formatEvent`.
 `expect: "skip"` requires `null` (or an `unknown` payload that the poller would
 log and not post).
+
+`restart` cases have a `note` field explaining the post-restart scenario. They
+are not structural — `formatEvent` behaviour is identical regardless of restart
+state. The fixture documents that version metadata changes (or any other
+wiring change) must not alter the notify/skip outcome.
 
 ## Cursor fixtures and restart safety
 
@@ -120,6 +125,83 @@ When you add persistence tests:
    catalog runner needs a new expect mode.
 4. If behaviour changes ops (env vars, cursor shape), update this guide and the
    README "Development checks" link in the same PR.
+
+## Version metadata
+
+The package version (`package.json` `"version"`) is stamped at four surfaces:
+
+| Surface | Format | Source |
+| --- | --- | --- |
+| Boot log | `[boot] Mimir Telegram notifier v0.1.0` | `src/index.ts` via `loadVersion()` |
+| `/status` reply | `Status — running on Stellar testnet · v0.1.0` | `src/bot.ts` |
+| `/version` reply | `Mimir Telegram notifier v0.1.0` | `src/bot.ts` |
+| `GET /health` JSON | `{ "version": "0.1.0", … }` | `src/health.ts` / `buildHealthReport` |
+| `npm run scan` banner | `Mimir scan  v0.1.0` | `src/stellar/events.ts` |
+
+`loadVersion()` in `src/config.ts` reads `package.json` at runtime via a
+path relative to `import.meta.url`. This resolves correctly from both `src/`
+(dev with `tsx`) and `dist/` (production build). It returns `"unknown"` if the
+file is missing or unparseable — that must not happen in CI.
+
+### Tests that cover version
+
+- `tests/fixtures.test.mjs` — `loadVersion returns a semver-shaped string`
+  asserts the build resolves a `MAJOR.MINOR.PATCH` string, not `"unknown"`.
+- `tests/health.test.mjs` — three unit tests assert `buildHealthReport` emits
+  the supplied version, defaults to `"unknown"` when omitted, and never leaks
+  the bot token via the version field.
+- `tests/format.test.mjs` — `/status reply includes version stamp` dispatches a
+  fake `/status` command through `bot.handleUpdate` and checks the version
+  appears in the MarkdownV2 reply without leaking the bot token.
+
+### Version safety rules
+
+- The version comes from `package.json` only — never from env vars or user input.
+- `GET /health` includes `version` but never `botToken`, `chatId`, or any
+  credential. The health serialiser does not write those fields.
+- Bumping `package.json` `"version"` is the only step needed to update all
+  surfaces in a release.
+
+## Version metadata
+
+The package version (`package.json` `"version"`) is stamped in three places at
+runtime:
+
+| Surface | Format | Added by |
+| --- | --- | --- |
+| Boot log | `[boot] Mimir Telegram notifier v0.1.0` | `src/index.ts` via `loadVersion()` |
+| `/status` reply | `Status — running on Stellar testnet · v0.1.0` | `src/bot.ts` |
+| `/version` reply | `Mimir Telegram notifier v0.1.0` | `src/bot.ts` |
+| `GET /health` JSON | `{ "version": "0.1.0", … }` | `src/health.ts` via `buildHealthReport` |
+| `npm run scan` banner | `Mimir scan  v0.1.0` | `src/stellar/events.ts` |
+
+`loadVersion()` in `src/config.ts` reads the version once from `package.json`
+at runtime. It resolves the path relative to `import.meta.url`, so it works
+from both `src/` (dev) and `dist/` (production build). It falls back to
+`"unknown"` if the file is missing or unparseable — this must never happen in
+CI.
+
+### Tests that cover version metadata
+
+- `tests/fixtures.test.mjs` — `loadVersion returns a semver-shaped string from package.json`
+  asserts that the running build resolves a `MAJOR.MINOR.PATCH` version, not
+  the fallback `"unknown"`.
+- `tests/health.test.mjs` — three unit tests assert that `buildHealthReport`
+  includes the supplied version, defaults to `"unknown"`, and never leaks the
+  bot token through the version field.
+- `tests/format.test.mjs` — `/status reply includes version stamp` dispatches a
+  fake `/status` command through `bot.handleUpdate` and asserts the version
+  string appears in the reply without leaking the bot token.
+
+### Version safety rules
+
+- The version string comes from `package.json` only — never from environment
+  variables or user input.
+- The version field in `GET /health` must not be confused with `botToken`,
+  `chatId`, or any other credential. The health report serialiser never writes
+  those fields.
+- Changing the `package.json` `"version"` is the only required step to stamp a
+  new release across all surfaces.
 
 ## Out of scope for fixtures
 

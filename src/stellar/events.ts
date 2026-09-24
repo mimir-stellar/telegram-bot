@@ -37,7 +37,7 @@ import { pathToFileURL } from "node:url";
 
 import type { rpc } from "@stellar/stellar-sdk";
 
-import { loadStellarConfig, networkLabel } from "../config.js";
+import { loadStellarConfig, loadVersion, networkLabel } from "../config.js";
 import { createRpcServer } from "./client.js";
 import { decodeEvent, formatUsdc, type ContractSource, type DecodedEvent } from "./decode.js";
 
@@ -241,6 +241,7 @@ async function main(): Promise<void> {
   const from = flag("from");
 
   const health = await server.getHealth();
+  console.log(`Mimir scan  v${loadVersion()}`);
   console.log(`RPC        ${config.rpcUrl} (${networkLabel(config)})`);
   console.log(`ledgers    oldest=${health.oldestLedger} latest=${health.latestLedger}`);
 

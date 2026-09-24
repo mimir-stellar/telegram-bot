@@ -28,9 +28,9 @@ function ago(timestamp: number | null): string {
   return `${Math.round(seconds / 3600)}h ago`;
 }
 
-function statusMessage(config: BotConfig, status: PollerStatus): string {
+function statusMessage(config: BotConfig, status: PollerStatus, version: string): string {
   const lines: string[] = [
-    `*Status* — ${status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
+    `*Status* — ${status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)} · v${escapeMd(version)}`,
     "",
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
@@ -65,10 +65,12 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  /** Package version string, e.g. `"0.1.0"`. Shown in /status and /version. */
+  version: string;
 }
 
 export function createBot(deps: BotDeps): Bot {
-  const { config, status } = deps;
+  const { config, status, version } = deps;
   const bot = new Bot(config.botToken);
 
   bot.command("start", async (ctx) => {
@@ -80,10 +82,17 @@ export function createBot(deps: BotDeps): Bot {
   });
 
   bot.command("status", async (ctx) => {
-    await ctx.reply(statusMessage(config, status()), {
+    await ctx.reply(statusMessage(config, status(), version), {
       parse_mode: "MarkdownV2",
       link_preview_options: { is_disabled: true },
     });
+  });
+
+  bot.command("version", async (ctx) => {
+    await ctx.reply(
+      `Mimir Telegram notifier v${escapeMd(version)}`,
+      { parse_mode: "MarkdownV2" },
+    );
   });
 
   // grammy rethrows handler errors by default, which would take the process
@@ -112,6 +121,7 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "start", description: "What this bot does" },
       { command: "help", description: "Show help" },
       { command: "status", description: "Last-seen ledger and watched contracts" },
+      { command: "version", description: "Show running package version" },
     ]);
   } catch (err) {
     // Cosmetic. Never worth failing a boot over.

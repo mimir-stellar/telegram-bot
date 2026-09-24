@@ -86,7 +86,8 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters, the last error, and the running package version |
+| `/version` | The running package version (e.g. `v0.1.0`) |
 
 ## Reading events without a bot token
 
@@ -179,8 +180,8 @@ checks (default `http://127.0.0.1:8787`):
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
-cursors, and whether a target has an error. It never includes `BOT_TOKEN`,
-chat ids, private keys, or unbounded remote payloads.
+cursors, the running package version, and whether a target has an error. It
+never includes `BOT_TOKEN`, chat ids, private keys, or unbounded remote payloads.
 
 Configuration (see `.env.example`):
 
@@ -215,9 +216,11 @@ src/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic format and fixture suites, or `npm run build` to produce the production output.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic format, health, and fixture suites, or `npm run build` to produce the production output.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
+
+The package version in `package.json` is the single source of truth for version metadata. It appears in the boot log (`[boot] Mimir Telegram notifier vX.Y.Z`), the `/status` and `/version` command replies, the `GET /health` JSON response, and the `npm run scan` banner. Bumping `"version"` in `package.json` is the only step required to stamp a new release across all surfaces.
 
 ## License
 
