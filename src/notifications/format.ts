@@ -13,6 +13,7 @@
 import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
+  isUsableTxHash,
   shortAddress,
   squadSideLabel,
   winnerSideLabel,
@@ -43,8 +44,11 @@ function clip(text: string, max = 200): string {
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
-  if (!event.txHash) return `_${ledger}_`;
-  return `_${ledger}_ · [tx](${txExplorerUrl(config, event.txHash)})`;
+  // Link only well-formed 64-hex transaction hashes. An externally-derived
+  // identifier that is empty or malformed stays plain text: a broken explorer
+  // link is worse than no link, and the hash itself is never altered here.
+  if (!isUsableTxHash(event.txHash)) return `_${ledger}_`;
+  return `_${ledger}_ · [tx](${txExplorerUrl(config, event.txHash.trim())})`;
 }
 
 /**

@@ -15,6 +15,20 @@
  *  - A cursor file that cannot be read is treated as a cold start; one that
  *    cannot be written is logged, and the in-memory cursor keeps working until
  *    the next restart.
+ *  - A cursor that fell below the RPC's retained window ("stale cursor") fails
+ *    every scan with an RPC error. The cursor is deliberately left untouched —
+ *    advancing past an unreadable range would silently skip events — so an
+ *    operator must delete the cursor file to cold-start. The failure log says
+ *    so explicitly.
+ *
+ * ── Event ordering ─────────────────────────────────────────────────────────
+ *
+ * Events are notified in deterministic chain order (ledger → transaction
+ * index → operation index → RPC paging token), not in RPC array order, so a
+ * page split or a retry never reorders the channel. Within one scan,
+ * duplicate paging tokens (the RPC may repeat a page-boundary event) notify
+ * once. Restarting replays nothing already consumed: the persisted cursor is
+ * the only resume token, in the same `version: 1` format as before.
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -81,6 +95,18 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Heuristic for a cursor older than the RPC's retained event window. The RPC
+ * rejects such reads (cursor/ledger/retention errors) instead of returning an
+ * empty page. Matched only to log an actionable, bounded hint — the cursor is
+ * still left untouched so no events are silently skipped.
+ */
+function isStaleCursorError(message: string): boolean {
+  return /cursor|oldest[-_ ]?ledger|start[-_ ]?ledger|retention|not (?:found|available)|out[-_ ]?of[-_ ]?range|ledger.*(?:too old|before|below)/i.test(
+    message,
+  );
 }
 
 /**
@@ -296,6 +322,15 @@ export function createPoller(deps: PollerDeps) {
         current.lastError = message;
         status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
         console.error(`[poller] ${target.source} scan failed: ${message}`);
+        if (isStaleCursorError(message)) {
+          // Cursor semantics stay loss-free: the cursor is NOT advanced here.
+          // Only bounded metadata is logged — never the cursor file path
+          // contents, tokens, or RPC payloads.
+          console.error(
+            `[poller] ${target.source} cursor is older than the RPC retained window; ` +
+              `delete ${config.cursorFile} to cold-start (no events are skipped until then)`,
+          );
+        }
       }
     }
 
