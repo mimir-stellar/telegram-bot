@@ -213,7 +213,40 @@ npm run build
 npm test
 ```
 
-Also verify the command-level diagnostic path where applicable:
+### Incident drill simulation
+
+Exercise the automated incident drill script to verify notifier resilience across simulated RPC failures, Telegram delivery failures, stale/corrupt cursors, bursts, restarts, and malformed events without requiring live Testnet or Telegram credentials:
+
+```bash
+npm run drill
+```
+
+Or run via the scanner CLI:
+
+```bash
+npm run scan -- --drill
+```
+
+Specific failure modes can be drilled individually:
+
+```bash
+npm run drill -- --scenario rpc-failure
+npm run drill -- --scenario telegram-failure
+npm run drill -- --scenario stale-cursor
+npm run drill -- --scenario corrupt-cursor
+npm run drill -- --scenario malformed-event
+npm run drill -- --scenario rate-limit
+npm run drill -- --scenario restart
+npm run drill -- --scenario scanner-diagnostic
+```
+
+Machine-readable JSON reporting is supported:
+
+```bash
+npm run drill -- --json
+```
+
+Also verify the command-level diagnostic path against live Testnet where applicable:
 
 ```bash
 npm run scan

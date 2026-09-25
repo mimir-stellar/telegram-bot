@@ -41,6 +41,9 @@ export function safeErrorMessage(error: unknown, secrets: readonly string[] = []
   // caller does not have the configured value (for example in a unit test).
   message = message.replace(/\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]");
 
+  // Stellar secret seed strkey (S... 56 chars base32)
+  message = message.replace(/\bS[A-Z2-7]{55}\b/g, "[REDACTED]");
+
   const compact = message.replace(/\s+/g, " ").trim() || "unknown error";
   return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
 }
