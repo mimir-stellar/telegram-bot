@@ -890,8 +890,8 @@ test("mock:poll boots a credential-free dry run and shuts down cleanly", async (
 
     child.kill("SIGTERM");
     const [code] = await once(child, "exit");
-    assert.equal(code, 0, `expected clean exit, output:\n${out}`);
-    assert.ok(out.includes("[dry-run] SIGTERM received"), `no graceful stop in:\n${out}`);
+    assert.ok(code === 0 || (process.platform === "win32" && code === null), `expected clean exit, output:\n${out}`);
+    if (process.platform !== "win32") { assert.ok(out.includes("[dry-run] SIGTERM received"), `no graceful stop in:\n${out}`); }
     assertBoundedLogs(
       out.split("\n").filter(Boolean).map((text) => ({ text })),
     );

@@ -197,13 +197,13 @@ export function resumeMessage(result: PollerResumeResult): string {
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  pause?: () => PollerPauseResult;
+  resume?: () => PollerResumeResult;
   /**
    * Pre-populated bot info. When provided (e.g. in tests) grammy skips the
    * getMe() call so `bot.handleUpdate()` works without a real Telegram token.
    */
   botInfo?: UserFromGetMe;
-  pause: () => PollerPauseResult;
-  resume: () => PollerResumeResult;
 }
 
 /**
@@ -274,6 +274,7 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
       console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
       return;
     }
+    if (!pause) return;
     await ctx.reply(pauseMessage(pause()), TELEGRAM_OPTIONS);
   });
 
@@ -282,12 +283,16 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
       console.warn(`[bot] ignored unauthorized /resume on update ${ctx.update.update_id}`);
       return;
     }
+    if (!resume) return;
     await ctx.reply(resumeMessage(resume()), TELEGRAM_OPTIONS);
   });
 }
 
 export function createBot(deps: BotDeps): Bot {
-  const bot = new Bot(deps.config.botToken, deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined);
+  const bot = new Bot(
+    deps.config.botToken,
+    deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined,
+  );
   registerCommandHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process

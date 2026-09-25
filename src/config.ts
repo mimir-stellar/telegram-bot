@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Environment loading and validation.
  *
  * Fails fast and LOUDLY: a notifier that boots with a missing chat id or a
@@ -11,7 +11,7 @@
  *     reader (`src/stellar/events.ts`) can be run standalone against Testnet.
  *   - {@link loadConfig} is the full bot config.
  *
- * ── Profiles ─────────────────────────────────────────────────────────────────
+ * â”€â”€ Profiles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  *
  * `MIMIR_PROFILE=mock` selects the local Soroban mock profile: it supplies
  * defaults for values the environment does NOT set (loopback RPC, fixture
@@ -56,6 +56,7 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  notificationsFailedAlertThreshold: number;
   /** Loopback host for the local HTTP health endpoint. */
   healthHost: string;
   /** TCP port for the health endpoint. `0` disables the listener. */
@@ -92,9 +93,10 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  notificationsFailedAlertThreshold: 5,
   healthHost: "127.0.0.1",
   healthPort: 8787,
-  // 3× default poll interval — one missed cycle is fine; three is not.
+  // 3Ã— default poll interval â€” one missed cycle is fine; three is not.
   healthStaleMs: 90_000,
   channelPreviewMode: false,
 } as const;
@@ -168,7 +170,7 @@ function collector(profile: Record<string, string>) {
       const value = this.required(name);
       if (value !== "" && !CONTRACT_ID_RE.test(value)) {
         problems.push(
-          `${name} is not a Soroban contract id (expected C… strkey, 56 chars); got "${value}"`,
+          `${name} is not a Soroban contract id (expected Câ€¦ strkey, 56 chars); got "${value}"`,
         );
       }
       return value;
@@ -241,7 +243,7 @@ function collector(profile: Record<string, string>) {
       for (const entry of entries) {
         if (!/^-?\d+$/.test(entry) && !/^@[A-Za-z0-9_]{4,}$/.test(entry)) {
           problems.push(
-            `${name} contains an invalid entry "${entry}" — ` +
+            `${name} contains an invalid entry "${entry}" â€” ` +
               `each value must be a numeric chat id or a @channelusername`,
           );
         }
@@ -262,7 +264,7 @@ function collector(profile: Record<string, string>) {
 
     host(name: string, fallback: string): string {
       const value = read(name) ?? fallback;
-      // Keep this a host, not a URL — the health server binds a TCP listener.
+      // Keep this a host, not a URL â€” the health server binds a TCP listener.
       if (/[\s/]/.test(value) || value.includes("://")) {
         problems.push(
           `${name} must be a hostname or IP (e.g. 127.0.0.1); got "${value}"`,
@@ -314,6 +316,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    notificationsFailedAlertThreshold: c.int("NOTIFICATIONS_FAILED_ALERT_THRESHOLD", DEFAULTS.notificationsFailedAlertThreshold, 1),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),

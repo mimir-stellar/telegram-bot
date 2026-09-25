@@ -256,6 +256,7 @@ export function createPoller(deps: PollerDeps) {
   let paused = false;
   let inFlight = false;
   let resumePending = false;
+  let consecutiveSendFailures = 0;
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
@@ -364,6 +365,7 @@ export function createPoller(deps: PollerDeps) {
         await sendWithRetry(send, text, config.botToken, deps.sendOptions);
         status.notificationsSent += 1;
         sentThisCycle += 1;
+        consecutiveSendFailures = 0;
       } catch (err) {
         // All retries exhausted; drop the message but continue processing others.
         status.notificationsFailed += 1;
@@ -371,8 +373,19 @@ export function createPoller(deps: PollerDeps) {
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
             errorMessage(err),
-        );
+    );
+    consecutiveSendFailures += 1;
+    if (consecutiveSendFailures >= config.notificationsFailedAlertThreshold) {
+      const alertText = `⚠️ *Mimir notifier degraded*\nThe last ${consecutiveSendFailures} events failed to reach this channel due to repeated Telegram API errors\\. Some notifications were dropped\\.\nCheck the poller logs for details\\.`;
+      try {
+        await sendWithRetry(send, alertText, config.botToken);
+        console.log(`[poller] successfully delivered repeated-failures alert`);
+        consecutiveSendFailures = 0;
+      } catch (alertErr) {
+        console.error(`[poller] also failed to deliver repeated-failures alert: ` + errorMessage(alertErr));
       }
+    }
+  }
 
       if (sentThisCycle < config.maxNotificationsPerCycle && sendSpacing > 0) {
         await sleep(sendSpacing);
