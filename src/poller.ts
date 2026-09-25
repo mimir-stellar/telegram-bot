@@ -115,6 +115,14 @@ function parseCursorFile(raw: string): CursorFile {
   return { version: 1, updatedAt: String(candidate.updatedAt ?? ""), targets };
 }
 
+/** Tuning knobs for Telegram delivery; defaults suit production, tests shrink them. */
+export interface SendOptions {
+  sendSpacingMs?: number;
+  maxSendRetries?: number;
+  initialBackoffMs?: number;
+  maxBackoffMs?: number;
+}
+
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
@@ -130,19 +138,21 @@ export interface PollerDeps {
    * default; disable for in-memory-only auditing (ephemeral tooling, tests).
    */
   persistAudit?: boolean | undefined;
+  /** Telegram pacing/backoff tuning; production defaults apply when omitted. */
+  sendOptions?: SendOptions;
 }
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
-const SEND_SPACING_MS = 1_500;
+const DEFAULT_SEND_SPACING_MS = 1_500;
 
 /** Maximum number of retry attempts for a single Telegram send. */
-const MAX_SEND_RETRIES = 3;
+const DEFAULT_MAX_SEND_RETRIES = 3;
 
 /** Initial backoff in milliseconds for Telegram send retries. */
-const INITIAL_BACKOFF_MS = 1_000;
+const DEFAULT_INITIAL_BACKOFF_MS = 1_000;
 
 /** Maximum backoff in milliseconds for Telegram send retries. */
-const MAX_BACKOFF_MS = 10_000;
+const DEFAULT_MAX_BACKOFF_MS = 10_000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -159,9 +169,12 @@ async function sendWithRetry(
   send: (text: string) => Promise<void>,
   text: string,
   botToken: string,
+  opts?: SendOptions,
 ): Promise<void> {
   let attempt = 0;
-  let backoff = INITIAL_BACKOFF_MS;
+  const maxRetries = opts?.maxSendRetries ?? DEFAULT_MAX_SEND_RETRIES;
+  let backoff = opts?.initialBackoffMs ?? DEFAULT_INITIAL_BACKOFF_MS;
+  const maxBackoff = opts?.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
 
   while (true) {
     try {
@@ -169,7 +182,7 @@ async function sendWithRetry(
       return;
     } catch (err) {
       attempt++;
-      if (attempt >= MAX_SEND_RETRIES) {
+      if (attempt >= maxRetries) {
         throw err; // Exhausted retries
       }
       console.warn(
@@ -178,7 +191,7 @@ async function sendWithRetry(
       );
       await sleep(backoff);
       // Exponential backoff with cap
-      backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+      backoff = Math.min(backoff * 2, maxBackoff);
     }
   }
 }
@@ -186,6 +199,7 @@ async function sendWithRetry(
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
   const audit: AuditLog = deps.audit ?? createAuditLog();
+  const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
   const boundedLabel = (value: unknown, max = 120): string => {
     const compact = String(value).replace(/\s+/g, " ").trim() || "unknown";
@@ -304,6 +318,9 @@ export function createPoller(deps: PollerDeps) {
   async function flushAudit(): Promise<void> {
     const pending = audit.flush();
     if (deps.persistAudit === false || pending.length === 0) return;
+    // Some callers (tests, tooling) build a partial config with no auditFile.
+    // In-memory auditing still works; there is simply nowhere to persist to.
+    if (typeof config.auditFile !== "string" || config.auditFile === "") return;
     try {
       await appendAuditFile(config.auditFile, pending);
     } catch (err) {
@@ -379,7 +396,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text, config.botToken);
+        await sendWithRetry(send, text, config.botToken, deps.sendOptions);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
@@ -396,7 +413,9 @@ export function createPoller(deps: PollerDeps) {
         );
       }
 
-      if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
+      if (sentThisCycle < config.maxNotificationsPerCycle && sendSpacing > 0) {
+        await sleep(sendSpacing);
+      }
     }
 
     return { sent: sentThisCycle, failed, skipped };

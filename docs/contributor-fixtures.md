@@ -37,7 +37,11 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
 | `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
 | `tests/bot.test.mjs` | Mocked grammy operator-command routing and exact reply payloads |
-| `tests/poller.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
+| `tests/poller.test.mjs` | Cursor load/advance, RPC and Telegram failure, send cap, stop semantics |
+| `tests/poller-controls.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
+| `tests/cursor-restart.test.mjs` | Stale cursors, unwritable data dir, restart round-trip |
+| `tests/helpers/temp-data.mjs` | Ephemeral data directory helper shared by persistence tests |
+| `tests/soak.test.mjs` | Long-run memory/timer/log boundedness under scripted RPC and Telegram failures (mock timers, forced GC, leak control) |
 | `tests/mock-rpc.test.mjs` | Live mock RPC: scanner walks, poller failure drills, cursor safety, log bounds |
 | `tests/mock-profile.test.mjs` | `MIMIR_PROFILE=mock` defaults, explicit-env precedence, unknown-profile failure |
 
@@ -102,10 +106,25 @@ log and not post).
   as a **cold start**, not a crash — leave the in-memory cursor null and begin
   `START_LOOKBACK_LEDGERS` behind tip.
 
-When you add persistence tests:
+When you add persistence tests, use the **ephemeral data directory** helper in
+`tests/helpers/temp-data.mjs` instead of hand-rolled `/tmp` paths:
 
-- Point `CURSOR_FILE` at a path under `os.tmpdir()`.
-- Always unlink the temp file in `finally`, including after failed assertions.
+```js
+import { createTempDataDir, withTempDataDir } from "./helpers/temp-data.mjs";
+
+test("resumes", () =>
+  withTempDataDir(async (dir) => {
+    const cursorFile = dir.file("cursor.json"); // fresh dir under os.tmpdir()
+    // ...write fixtures, start a poller with { cursorFile }, assert...
+  })); // directory is removed even if an assertion throws
+```
+
+- `createTempDataDir(prefix)` returns `{ root, file(name), cleanup() }`; for a
+  whole file, create one at module level and call `test.after(() => dir.cleanup())`.
+- Never point tests at the repo `data/` directory or at fixed `/tmp/...` names:
+  they collide across runs and leak state into later ones.
+- Let a poller finish its cycle (wait for its cursor save) before cleanup, or a
+  late write can recreate the directory.
 - Never commit a real runtime `data/cursor.json` from a live bot.
 
 ## Failure-mode expectations (keep fixtures aligned)

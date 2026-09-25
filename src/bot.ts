@@ -8,6 +8,7 @@
  */
 
 import { Bot, type Context } from "grammy";
+import type { UserFromGetMe } from "grammy/types";
 
 import { escapeMd, previewMessage, safeErrorMessage } from "./notifications/format.js";
 export { previewMessage } from "./notifications/format.js";
@@ -222,8 +223,28 @@ export interface BotDeps {
   audit?: AuditLog | undefined;
   /** Where the audit JSONL file lives, for the file-backed report. */
   auditFile?: string | undefined;
+  /**
+   * Pre-populated bot info. When provided (e.g. in tests) grammy skips the
+   * getMe() call so `bot.handleUpdate()` works without a real Telegram token.
+   */
+  botInfo?: UserFromGetMe;
   pause: () => PollerPauseResult;
   resume: () => PollerResumeResult;
+}
+
+/**
+ * Returns true when the chat is permitted to use restricted commands.
+ *
+ * Rules:
+ * - If `allowedChatIds` is empty the list is open (any chat may use /status).
+ * - Otherwise the incoming chat id must appear in the list. Both the numeric
+ *   id (stored as a number in grammy's ctx.chat.id) and its string form are
+ *   compared so that negative group ids such as -1001234567890 match correctly.
+ */
+function isChatAllowed(allowedChatIds: string[], chatId: number): boolean {
+  if (allowedChatIds.length === 0) return true;
+  const asString = String(chatId);
+  return allowedChatIds.some((allowed) => allowed === asString);
 }
 
 function isOperator(ctx: Context, config: BotConfig): boolean {
@@ -247,6 +268,16 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
   });
 
   bot.command("status", async (ctx) => {
+    if (!isChatAllowed(config.allowedChatIds, ctx.chat.id)) {
+      // Silently ignore requests from unapproved chats. Responding with an
+      // error would leak the existence of the restriction; not responding at
+      // all is consistent with privacy-mode bots that simply never see most
+      // messages. Log so operators can diagnose misconfigured chat ids.
+      console.warn(
+        `[bot] /status denied for chat ${ctx.chat.id} (not in ALLOWED_CHAT_IDS)`,
+      );
+      return;
+    }
     await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
   });
 
@@ -310,7 +341,7 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
 }
 
 export function createBot(deps: BotDeps): Bot {
-  const bot = new Bot(deps.config.botToken);
+  const bot = new Bot(deps.config.botToken, deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined);
   registerCommandHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process

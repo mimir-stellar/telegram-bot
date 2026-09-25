@@ -75,11 +75,22 @@ npm install
 npm run dev              # tsx, restarts on change
 ```
 
-For production:
+For production (Node):
 
 ```bash
 npm run build
 npm start
+```
+
+For production (Docker):
+
+```bash
+docker build -t mimir-telegram-bot .
+docker run -d \
+  --name mimir-bot \
+  --env-file .env \
+  -v $(pwd)/data:/app/data \
+  mimir-telegram-bot
 ```
 
 `.env.example` ships with the live Stellar Testnet contract ids, so the only two
@@ -116,10 +127,15 @@ npm run scan                     # both contracts, from the RPC's retained floor
 npm run scan -- --pages 40       # walk further
 npm run scan -- --show 20        # print 20 decoded events per contract
 npm run scan -- --from 4226500   # explicit start ledger
+npm run scan -- --json           # one mimir-scan-v1 JSON document on stdout
+npm run scan -- --json --show 20 # JSON including 20 decoded events per contract
 ```
 
-It prints the ledger window, an event-name histogram, and the decoded payloads.
-This is how the decoder was verified against the live deployment.
+Human mode prints the ledger window, an event-name histogram, and the decoded
+payloads. With `--json`, stdout is a single `mimir-scan-v1` document (bigints as
+decimal strings) and progress goes to stderr, so `npm run scan -- --json | jq`
+stays valid. Neither mode prints bot tokens or signing keys — the scanner never
+holds them. This is how the decoder was verified against the live deployment.
 
 ## Operator audit trail
 
@@ -262,6 +278,10 @@ rather than replaying the whole retained window into your chat. `/pause` and
 `/resume` never edit this file; they only control scheduling, so the cursor
 format remains version 1 and a restart does not preserve a pause.
 
+Tests never use this directory: they run against an ephemeral data directory
+created under the OS temp dir and removed afterwards (see
+[docs/contributor-fixtures.md](docs/contributor-fixtures.md)).
+
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. On
 an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
 at one). On an ephemeral filesystem every restart is a cold start, and events
@@ -297,6 +317,36 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
 
+## Long-running operation
+
+The notifier is meant to run for weeks through Stellar RPC and Telegram outages.
+Everything it keeps in memory is fixed-size or capped:
+
+- Per-target state is two small records (cursor, last event ledger, last error).
+- A scan walks at most 20 event pages, and each cycle sends at most
+  `MAX_NOTIFICATIONS_PER_CYCLE` messages; the rest are counted as skipped.
+- Error text is redacted (bot token) and clipped before it reaches `/status`,
+  `/health`, or logs; unknown or malformed events are logged as one bounded line.
+- At most one poll timer is pending, and `stop()` leaves none behind.
+
+`tests/soak.test.mjs` enforces this offline: it drives about 1,700 poll cycles
+through a scripted fake RPC (outages, stale-cursor rejections, malformed and
+unknown events) with every Telegram send failing, under mocked timers. It asserts
+that heap growth after a forced GC stays under 4 MB, that status and every log
+line stay bounded and token-free, and that timers do not accumulate. A control
+test deliberately leaks per send and must trip the same threshold, so the check
+cannot silently stop working. It needs no Testnet, Telegram credentials, or keys.
+
+**Deployment assumptions:** one process per chat and cursor file (two writers
+would race on `CURSOR_FILE`), the cursor path on persistent storage, and a
+supervisor that restarts the process and probes `GET /health`. If you suspect a
+leak in production, watch the process RSS over days; a restart is always safe.
+
+**Rollback:** deploy the previous build and start it against the same
+`CURSOR_FILE`. The cursor format is unchanged (version 1) and the chain is the
+source of truth, so nothing is replayed beyond the last saved cursor and nothing
+needs migrating. Keep a copy of the cursor file if you want an exact resume point.
+
 ## Health endpoint
 
 The process exposes a **loopback HTTP** probe for supervisors and deploy
@@ -313,7 +363,7 @@ chat ids, private keys, or unbounded remote payloads.
 
 Configuration (see `.env.example`):
 
-- `HEALTH_HOST` — bind address (default `127.0.0.1`)
+- `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
 

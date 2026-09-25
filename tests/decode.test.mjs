@@ -318,6 +318,100 @@ test("decodeEvent: squad deposited decodes side and amount", () => {
   assert.equal(result.payload.side, 1);
 });
 
+test("decodeEvent: squad withdrawn decodes correctly", () => {
+  const amount = 20_000_000n;
+  const raw = {
+    id: "22-0",
+    contractId: "C2",
+    ledger: 22,
+    txHash: "jkl",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("withdrawn"), scU64(5), scU32(2), scAddress(ADDR)],
+    value: nativeToScVal({ amount: scI128(amount) }),
+  };
+  const result = decodeEvent("squad", raw);
+  assert.equal(result.payload.name, "withdrawn");
+  assert.equal(result.payload.marketId, 5);
+  assert.equal(result.payload.side, 2);
+  assert.equal(result.payload.participant, ADDR);
+  assert.equal(result.payload.amount, amount);
+});
+
+test("decodeEvent: squad resolved decodes pools and result", () => {
+  const poolA = 100_000_000n;
+  const poolB = 200_000_000n;
+  const raw = {
+    id: "23-0",
+    contractId: "C2",
+    ledger: 23,
+    txHash: "mno",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("resolved"), scU64(5)],
+    value: nativeToScVal({ result: scU32(1), pool_a: scI128(poolA), pool_b: scI128(poolB) }),
+  };
+  const result = decodeEvent("squad", raw);
+  assert.equal(result.payload.name, "resolved");
+  assert.equal(result.payload.marketId, 5);
+  assert.equal(result.payload.result, 1);
+  assert.equal(result.payload.poolA, poolA);
+  assert.equal(result.payload.poolB, poolB);
+});
+
+test("decodeEvent: squad claimed decodes gross, fee, and net", () => {
+  const gross = 100_000_000n;
+  const fee = 5_000_000n;
+  const net = 95_000_000n;
+  const raw = {
+    id: "24-0",
+    contractId: "C2",
+    ledger: 24,
+    txHash: "pqr",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claimed"), scU64(5), scAddress(ADDR)],
+    value: nativeToScVal({ gross: scI128(gross), fee: scI128(fee), net: scI128(net) }),
+  };
+  const result = decodeEvent("squad", raw);
+  assert.equal(result.payload.name, "claimed");
+  assert.equal(result.payload.marketId, 5);
+  assert.equal(result.payload.participant, ADDR);
+  assert.equal(result.payload.gross, gross);
+  assert.equal(result.payload.fee, fee);
+  assert.equal(result.payload.net, net);
+});
+
+test("decodeEvent: squad fees_claimed decodes recipient and amount", () => {
+  const amount = 10_000_000n;
+  const raw = {
+    id: "25-0",
+    contractId: "C2",
+    ledger: 25,
+    txHash: "stu",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("fees_claimed"), scAddress(ADDR)],
+    value: nativeToScVal({ amount: scI128(amount) }),
+  };
+  const result = decodeEvent("squad", raw);
+  assert.equal(result.payload.name, "fees_claimed");
+  assert.equal(result.payload.recipient, ADDR);
+  assert.equal(result.payload.amount, amount);
+});
+
+test("decodeEvent: squad event with negative amount yields unknown without throwing", () => {
+  const raw = {
+    id: "26-0",
+    contractId: "C2",
+    ledger: 26,
+    txHash: "vwx",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("deposited"), scU64(5), scU32(1), scAddress(ADDR)],
+    value: nativeToScVal({ amount: scI128(-50n), shares: scI128(50n) }),
+  };
+  let result;
+  assert.doesNotThrow(() => { result = decodeEvent("squad", raw); });
+  assert.equal(result.payload.name, "unknown");
+  assert.match(result.payload.reason, /expected non-negative amount/);
+});
+
 test("decodeEvent: admin market event (oracle_changed) yields unknown/no decoder", () => {
   const raw = {
     id: "30-0",

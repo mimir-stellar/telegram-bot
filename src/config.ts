@@ -48,6 +48,8 @@ export interface StellarConfig {
 export interface BotConfig extends StellarConfig {
   botToken: string;
   chatId: string;
+  /** Chats allowed to use /status. Empty array means no restriction. */
+  allowedChatIds: string[];
   /** Telegram user id allowed to run operator-only commands. Null disables them. */
   operatorTelegramUserId: string | null;
   pollIntervalMs: number;
@@ -225,6 +227,32 @@ function collector(profile: Record<string, string>) {
       return value;
     },
 
+    /**
+     * Parses an optional comma-separated list of chat ids / @usernames.
+     * Returns an empty array when the variable is absent or empty (= no
+     * restriction). Each entry is validated with the same rules as chatId.
+     */
+    allowedChatIds(name: string): string[] {
+      const raw = read(name);
+      if (raw === undefined) return [];
+
+      const entries = raw
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+
+      for (const entry of entries) {
+        if (!/^-?\d+$/.test(entry) && !/^@[A-Za-z0-9_]{4,}$/.test(entry)) {
+          problems.push(
+            `${name} contains an invalid entry "${entry}" — ` +
+              `each value must be a numeric chat id or a @channelusername`,
+          );
+        }
+      }
+
+      return entries;
+    },
+
     optionalUserId(name: string): string | null {
       const value = read(name);
       if (value === undefined) return null;
@@ -279,6 +307,7 @@ export function loadConfig(): BotConfig {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
     chatId: c.chatId("TELEGRAM_CHAT_ID"),
+    allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
