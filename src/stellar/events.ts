@@ -97,9 +97,17 @@ export async function paginatedGetEvents(
   const health = await server.getHealth();
   const oldestLedger = health.oldestLedger;
 
-  const events: rpc.Api.EventResponse[] = [];
   let cursor: string | undefined = opts.cursor;
-  let lastCursor: string | null = opts.cursor ?? null;
+  if (cursor) {
+    const cLedger = eventCursorLedger(cursor);
+    if (cLedger !== null && cLedger < oldestLedger) {
+      console.error(`[scanner] cursor ledger ${cLedger} is older than retained window ${oldestLedger}, discarding`);
+      cursor = undefined;
+    }
+  }
+
+  const events: rpc.Api.EventResponse[] = [];
+  let lastCursor: string | null = cursor ?? null;
   let previousCursor = "";
   let latestLedger = health.latestLedger;
   let truncated = false;
@@ -241,8 +249,8 @@ async function main(): Promise<void> {
   const from = flag("from");
 
   const health = await server.getHealth();
-  console.log(`RPC        ${config.rpcUrl} (${networkLabel(config)})`);
-  console.log(`ledgers    oldest=${health.oldestLedger} latest=${health.latestLedger}`);
+  console.error(`RPC        ${config.rpcUrl} (${networkLabel(config)})`);
+  console.error(`ledgers    oldest=${health.oldestLedger} latest=${health.latestLedger}`);
 
   const targets: WatchTarget[] = [
     { source: "market", contractId: config.marketContractId },
@@ -250,7 +258,7 @@ async function main(): Promise<void> {
   ];
 
   for (const target of targets) {
-    console.log(`\n=== ${target.source}  ${target.contractId} ===`);
+    console.error(`\n=== ${target.source}  ${target.contractId} ===`);
     const scan = await readContractEvents(server, target, {
       maxPages: pages,
       startLedger: from ? Number(from) : health.oldestLedger,
@@ -265,19 +273,19 @@ async function main(): Promise<void> {
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
 
-    console.log(
+    console.error(
       `pages=${scan.pages} events=${scan.events.length} truncated=${scan.truncated} ` +
         `lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor}`,
     );
     for (const [name, count] of [...counts].sort((a, b) => b[1] - a[1])) {
-      console.log(`  ${count.toString().padStart(4)}  ${name}`);
+      console.error(`  ${count.toString().padStart(4)}  ${name}`);
     }
 
     for (const event of scan.events.slice(-show)) {
-      console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
-      console.log(`  ${summarize(event)}`);
+      console.error(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
+      console.error(`  ${summarize(event)}`);
       console.log(
-        `  ${JSON.stringify(event.payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v))}`,
+        JSON.stringify(event.payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
       );
     }
   }

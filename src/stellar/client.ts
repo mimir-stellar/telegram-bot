@@ -17,6 +17,10 @@ export function createRpcServer(config: StellarConfig): rpc.Server {
   return new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
+    timeout: 15_000,
+    headers: {
+      "User-Agent": "mimir-telegram-bot/1.0",
+    },
   });
 }
 
@@ -41,7 +45,7 @@ function explorerBase(config: StellarConfig): string {
 /** Explorer link for a transaction hash, used in notification footers. */
 export function txExplorerUrl(config: StellarConfig, txHash: string): string {
   const hash = txHash.trim();
-  if (!hash) return "";
+  if (!hash || !/^[a-fA-F0-9]{64}$/.test(hash)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/tx/${hash}`;
 }
@@ -49,7 +53,7 @@ export function txExplorerUrl(config: StellarConfig, txHash: string): string {
 /** Explorer link for a classic / contract account. */
 export function accountExplorerUrl(config: StellarConfig, address: string): string {
   const id = address.trim();
-  if (!id) return "";
+  if (!id || !/^[GC][A-Z2-7]{55}$/.test(id)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/account/${id}`;
 }
@@ -57,7 +61,7 @@ export function accountExplorerUrl(config: StellarConfig, address: string): stri
 /** Explorer link for a Soroban contract id, used by /contracts. */
 export function contractExplorerUrl(config: StellarConfig, contractId: string): string {
   const id = contractId.trim();
-  if (!id) return "";
+  if (!id || !/^C[A-Z2-7]{55}$/.test(id)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/contract/${id}`;
 }
