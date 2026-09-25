@@ -23,7 +23,7 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
-import { formatEvent } from "./notifications/format.js";
+import { formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
@@ -36,8 +36,13 @@ export interface TargetState {
   lastError: string | null;
 }
 
+export type PollerPauseResult = "paused" | "already-paused" | "stopped";
+export type PollerResumeResult = "resumed" | "already-running" | "stopped";
+
 export interface PollerStatus {
   running: boolean;
+  /** Operator pause only prevents new cycles; an in-flight cycle may finish. */
+  paused: boolean;
   startedAt: number;
   cycles: number;
   lastPollAt: number | null;
@@ -68,14 +73,65 @@ export interface PollerDeps {
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
 const SEND_SPACING_MS = 1_500;
 
+/** Maximum number of retry attempts for a single Telegram send. */
+const MAX_SEND_RETRIES = 3;
+
+/** Initial backoff in milliseconds for Telegram send retries. */
+const INITIAL_BACKOFF_MS = 1_000;
+
+/** Maximum backoff in milliseconds for Telegram send retries. */
+const MAX_BACKOFF_MS = 10_000;
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function errMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+
+/**
+ * Sends a message with bounded exponential backoff.
+ *
+ * If the Telegram API is temporarily unavailable (rate limit, network error,
+ * or bad token), we retry a few times with increasing delays. This prevents
+ * transient failures from dropping notifications while avoiding infinite
+ * retries that would block the poller loop.
+ */
+async function sendWithRetry(
+  send: (text: string) => Promise<void>,
+  text: string,
+  botToken: string,
+): Promise<void> {
+  let attempt = 0;
+  let backoff = INITIAL_BACKOFF_MS;
+
+  while (true) {
+    try {
+      await send(text);
+      return;
+    } catch (err) {
+      attempt++;
+      if (attempt >= MAX_SEND_RETRIES) {
+        throw err; // Exhausted retries
+      }
+      console.warn(
+        `[poller] send attempt ${attempt} failed, retrying in ${backoff}ms: ` +
+          safeErrorMessage(err, [botToken]),
+      );
+      await sleep(backoff);
+      // Exponential backoff with cap
+      backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+    }
+  }
 }
 
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
+  const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
+  const boundedLabel = (value: unknown, max = 120): string => {
+    const compact = String(value).replace(/\s+/g, " ").trim() || "unknown";
+    return compact.length <= max ? compact : `${compact.slice(0, max - 1)}…`;
+  };
+  const cursorPreview = (cursor: string | null): string => {
+    if (cursor === null) return "none";
+    return boundedLabel(cursor, 24);
+  };
 
   const targets: WatchTarget[] = [
     { source: "market", contractId: config.marketContractId },
@@ -91,6 +147,7 @@ export function createPoller(deps: PollerDeps) {
 
   const status: PollerStatus = {
     running: false,
+    paused: false,
     startedAt: 0,
     cycles: 0,
     lastPollAt: null,
@@ -107,7 +164,9 @@ export function createPoller(deps: PollerDeps) {
 
   let timer: NodeJS.Timeout | null = null;
   let stopped = false;
+  let paused = false;
   let inFlight = false;
+  let resumePending = false;
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
@@ -133,11 +192,13 @@ export function createPoller(deps: PollerDeps) {
       }
       console.log(
         `[poller] resumed from ${config.cursorFile}: ` +
-          [...state.values()].map((t) => `${t.source}@${t.cursor ?? "none"}`).join(" "),
+          [...state.values()]
+            .map((t) => `${t.source}@${cursorPreview(t.cursor)}`)
+            .join(" "),
       );
     } catch (err) {
       // A corrupt state file must not wedge the bot; a cold start is recoverable.
-      console.warn(`[poller] cursor file unreadable, starting cold: ${errMessage(err)}`);
+      console.warn(`[poller] cursor file unreadable, starting cold: ${errorMessage(err)}`);
     }
   }
 
@@ -161,7 +222,7 @@ export function createPoller(deps: PollerDeps) {
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, config.cursorFile);
     } catch (err) {
-      console.error(`[poller] could not persist cursor: ${errMessage(err)}`);
+      console.error(`[poller] could not persist cursor: ${errorMessage(err)}`);
     }
   }
 
@@ -174,8 +235,11 @@ export function createPoller(deps: PollerDeps) {
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
         console.log(
-          `[poller] skipped ${event.source} event "${event.payload.eventName}" ` +
-            `at ledger ${event.ledger}${event.payload.reason ? ` (${event.payload.reason})` : ""}`,
+          `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
+            `at ledger ${event.ledger}` +
+            (event.payload.reason
+              ? ` (${boundedLabel(event.payload.reason, 160)})`
+              : ""),
         );
         continue;
       }
@@ -196,15 +260,16 @@ export function createPoller(deps: PollerDeps) {
       }
 
       try {
-        await send(text);
+        // Use bounded retry for Telegram sends to handle transient failures
+        await sendWithRetry(send, text, config.botToken);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
-        // One bad send must not abort the rest of the batch.
+        // All retries exhausted; drop the message but continue processing others.
         status.notificationsFailed += 1;
         console.error(
-          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}: ` +
-            errMessage(err),
+          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
+            errorMessage(err),
         );
       }
 
@@ -247,7 +312,7 @@ export function createPoller(deps: PollerDeps) {
         // Advance last — see the failure policy at the top of this file.
         if (scan.cursor) current.cursor = scan.cursor;
       } catch (err) {
-        const message = errMessage(err);
+        const message = errorMessage(err);
         current.lastError = message;
         status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
         console.error(`[poller] ${target.source} scan failed: ${message}`);
@@ -266,25 +331,41 @@ export function createPoller(deps: PollerDeps) {
     inFlight = false;
   }
 
+  function schedule(delayMs: number): void {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      void loop();
+    }, delayMs);
+  }
+
   async function loop(): Promise<void> {
-    if (stopped) return;
+    if (stopped || paused || inFlight) return;
     try {
       await cycle();
     } catch (err) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
-      status.lastError = { at: Date.now(), message: errMessage(err) };
-      console.error(`[poller] cycle threw: ${errMessage(err)}`);
+      status.lastError = { at: Date.now(), message: errorMessage(err) };
+      console.error(`[poller] cycle threw: ${errorMessage(err)}`);
       inFlight = false;
     }
-    if (stopped) return;
-    timer = setTimeout(() => void loop(), config.pollIntervalMs);
+    if (stopped || paused) return;
+    if (resumePending) {
+      resumePending = false;
+      schedule(0);
+    } else {
+      schedule(config.pollIntervalMs);
+    }
   }
 
   return {
     async start(): Promise<void> {
       await loadCursors();
+      stopped = false;
+      paused = false;
+      status.paused = false;
       status.running = true;
       status.startedAt = Date.now();
       status.targets = [...state.values()].map((t) => ({ ...t }));
@@ -295,9 +376,38 @@ export function createPoller(deps: PollerDeps) {
       void loop();
     },
 
+    pause(): PollerPauseResult {
+      if (stopped) return "stopped";
+      if (paused) return "already-paused";
+      paused = true;
+      status.paused = true;
+      resumePending = false;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      console.log("[poller] paused by operator; an in-flight cycle may finish");
+      return "paused";
+    },
+
+    resume(): PollerResumeResult {
+      if (stopped) return "stopped";
+      if (!paused) return "already-running";
+      paused = false;
+      status.paused = false;
+      console.log("[poller] resumed by operator; next cycle starts now");
+      if (inFlight) {
+        resumePending = true;
+      } else {
+        schedule(0);
+      }
+      return "resumed";
+    },
+
     stop(): void {
       stopped = true;
+      paused = false;
+      status.paused = false;
       status.running = false;
+      resumePending = false;
       if (timer) clearTimeout(timer);
       timer = null;
     },
