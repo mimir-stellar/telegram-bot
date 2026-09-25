@@ -464,7 +464,6 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
  * reason attached. A notifier must not die on an event it was not taught.
  */
 export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse): DecodedEvent {
-  const closedAtMs = event?.ledgerClosedAt ? new Date(event.ledgerClosedAt).getTime() : 0;
   const meta: EventMeta = {
     source,
     contractId: contractIdOf(event),

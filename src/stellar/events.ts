@@ -286,7 +286,8 @@ export function buildScanJsonTarget(scan: ContractScan, show: number): ScanJsonT
     lastEventLedger: scan.lastEventLedger,
     cursor: scan.cursor,
     histogram: eventHistogram(scan.events),
-    events: scan.events.slice(-limit).map((event) => ({
+    // slice(-0) would return everything, so show=0 must be special-cased
+    events: (limit > 0 ? scan.events.slice(-limit) : []).map((event) => ({
       ledger: event.ledger,
       txHash: event.txHash,
       eventId: event.eventId,
@@ -419,7 +420,7 @@ async function main(): Promise<void> {
       console.log(`  ${count.toString().padStart(4)}  ${name}`);
     }
 
-    for (const event of scan.events.slice(-show)) {
+    for (const event of show > 0 ? scan.events.slice(-show) : []) {
       console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
       console.log(`  ${summarize(event)}`);
       console.log(

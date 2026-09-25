@@ -109,6 +109,14 @@ function parseCursorFile(raw: string): CursorFile {
   return { version: 1, updatedAt: String(candidate.updatedAt ?? ""), targets };
 }
 
+/** Tuning knobs for Telegram delivery; defaults suit production, tests shrink them. */
+export interface SendOptions {
+  sendSpacingMs?: number;
+  maxSendRetries?: number;
+  initialBackoffMs?: number;
+  maxBackoffMs?: number;
+}
+
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
@@ -144,6 +152,7 @@ async function sendWithRetry(
   send: (text: string) => Promise<void>,
   text: string,
   botToken: string,
+  opts?: SendOptions,
 ): Promise<void> {
   let attempt = 0;
   const maxRetries = opts?.maxSendRetries ?? DEFAULT_MAX_SEND_RETRIES;
@@ -172,6 +181,7 @@ async function sendWithRetry(
 
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
+  const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
   const boundedLabel = (value: unknown, max = 120): string => {
     const compact = String(value).replace(/\s+/g, " ").trim() || "unknown";
@@ -321,7 +331,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text, config.botToken);
+        await sendWithRetry(send, text, config.botToken, deps.sendOptions);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {

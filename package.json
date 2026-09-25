@@ -14,7 +14,6 @@
     "start": "node dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test tests/format.test.mjs tests/allowlist.test.mjs",
     "test": "npm run build && node --test tests/*.test.mjs",
     "test:mock": "npm run build && node --test tests/mock-*.test.mjs",
     "scan": "tsx src/stellar/events.ts",
