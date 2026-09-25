@@ -27,6 +27,24 @@ export function escapeMd(text: string): string {
   return text.replace(MDV2_RESERVED, (ch) => `\\${ch}`);
 }
 
+/**
+ * Keep operational errors actionable without copying remote payloads or the
+ * bot token into logs and status messages.
+ */
+export function safeErrorMessage(error: unknown, secrets: readonly string[] = []): string {
+  let message = error instanceof Error ? error.message : String(error);
+  for (const secret of secrets) {
+    if (secret) message = message.split(secret).join("[REDACTED]");
+  }
+
+  // Also cover a Telegram token embedded in an upstream error when the
+  // caller does not have the configured value (for example in a unit test).
+  message = message.replace(/\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]");
+
+  const compact = message.replace(/\s+/g, " ").trim() || "unknown error";
+  return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
+}
+
 function usdc(units: bigint): string {
   return escapeMd(`${formatUsdc(units)} USDC`);
 }
