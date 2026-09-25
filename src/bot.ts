@@ -9,7 +9,8 @@
 
 import { Bot, type Context } from "grammy";
 
-import { escapeMd, safeErrorMessage } from "./notifications/format.js";
+import { escapeMd, previewMessage, safeErrorMessage } from "./notifications/format.js";
+export { previewMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
@@ -21,6 +22,7 @@ const HELP_BASE = [
   "",
   "/status — what I am watching and how far I have read",
   "/contracts — the contract ids I watch and where to look them up",
+  "/preview — preview channel notification formatting",
   "/help — this message",
 ];
 
@@ -53,9 +55,10 @@ function cursorPreview(cursor: string | null): string {
   return compact.length <= 24 ? compact : `${compact.slice(0, 23)}…`;
 }
 
-function statusMessage(config: BotConfig, status: PollerStatus): string {
+export function statusMessage(config: BotConfig, status: PollerStatus): string {
   const lines: string[] = [
     `*Status* — ${status.paused ? "paused" : status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
+    `Channel preview: ${config.channelPreviewMode ? "enabled" : "disabled"}`,
     "",
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
@@ -67,7 +70,7 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
 
   for (const target of status.targets) {
     lines.push(
-      `· mimir\\-${target.source} \`${target.contractId}\``,
+      `· mimir\\-${target.source} \\(${escapeMd(target.version ?? "v1")}\\) \`${target.contractId}\``,
       `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
       `  cursor: \`${cursorPreview(target.cursor)}\``,
     );
@@ -95,9 +98,17 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
  * "is it working"; this is for "what is it even watching".
  */
 export function contractsMessage(config: BotConfig): string {
-  const targets: Array<{ label: string; contractId: string }> = [
-    { label: "mimir\\-market", contractId: config.marketContractId },
-    { label: "mimir\\-squad", contractId: config.squadContractId },
+  const targets: Array<{ label: string; version: string; contractId: string }> = [
+    {
+      label: "mimir\\-market",
+      version: config.marketContractVersion ?? "v1",
+      contractId: config.marketContractId,
+    },
+    {
+      label: "mimir\\-squad",
+      version: config.squadContractVersion ?? "v1",
+      contractId: config.squadContractId,
+    },
   ];
 
   const lines: string[] = [
@@ -109,7 +120,7 @@ export function contractsMessage(config: BotConfig): string {
   for (const target of targets) {
     lines.push(
       "",
-      `*${target.label}*`,
+      `*${target.label}* \\(${escapeMd(target.version ?? "v1")}\\)`,
       `\`${escapeMd(target.contractId)}\``,
       `[View on stellar\\.expert](${contractExplorerUrl(config, target.contractId)})`,
     );
@@ -175,6 +186,13 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
     await ctx.reply(contractsMessage(config), TELEGRAM_OPTIONS);
   });
 
+  bot.command("preview", async (ctx) => {
+    const text = ctx.message?.text ?? "";
+    const spaceIndex = text.indexOf(" ");
+    const arg = spaceIndex !== -1 ? text.slice(spaceIndex + 1).trim() : "";
+    await ctx.reply(previewMessage(config, arg || "market"), TELEGRAM_OPTIONS);
+  });
+
   bot.command("pause", async (ctx) => {
     if (!isOperator(ctx, config)) {
       console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
@@ -223,6 +241,7 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "help", description: "Show help" },
       { command: "status", description: "Last-seen ledger and watched contracts" },
       { command: "contracts", description: "Contract ids and explorer links" },
+      { command: "preview", description: "Preview channel notification formatting" },
       { command: "pause", description: "Operator only: pause new scans" },
       { command: "resume", description: "Operator only: resume polling now" },
     ]);
@@ -231,3 +250,4 @@ export async function registerCommands(bot: Bot): Promise<void> {
     console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);
   }
 }
+

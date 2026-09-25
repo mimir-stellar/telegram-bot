@@ -1,5 +1,5 @@
 /**
- * Decode Mimir contract events into typed objects.
+ * Decode Mimir contract events into typed objects, split by contract version.
  *
  * ── Wire shape ───────────────────────────────────────────────────────────────
  *
@@ -12,9 +12,11 @@
  * So `ClaimChallenged { #[topic] id, #[topic] challenger, stake }` arrives as
  *   topics: "claim_challenged" | <u64 id> | <G… challenger>   value: { stake }
  *
- * Every field name below is taken from the deployed contracts' event
- * definitions (`contracts-soroban/mimir-market/src/events.rs` and
- * `contracts-soroban/mimir-squad/src/events.rs`), not inferred.
+ * ── Versioned Decoders ───────────────────────────────────────────────────────
+ *
+ * Decoders are split by contract version (`v1`, `v2`, etc.). Version dispatch
+ * looks up the appropriate decoder function while safely falling back to v1 or
+ * unknown payloads if an unrecognised version or event shape is encountered.
  *
  * ── Amounts ──────────────────────────────────────────────────────────────────
  *
@@ -27,6 +29,18 @@ import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
 
 /** Which of the two Mimir contracts an event came from. */
 export type ContractSource = "market" | "squad";
+
+/** Supported contract versions for decoder selection. */
+export type ContractVersion = "v1" | "v2" | string;
+
+export const DEFAULT_CONTRACT_VERSION: ContractVersion = "v1";
+export const SUPPORTED_CONTRACT_VERSIONS: ContractVersion[] = ["v1", "v2"];
+
+export function normalizeContractVersion(raw?: string): string {
+  if (!raw) return DEFAULT_CONTRACT_VERSION;
+  const v = raw.trim().toLowerCase();
+  return v || DEFAULT_CONTRACT_VERSION;
+}
 
 /** 1 USDC in atomic units. */
 export const USDC_UNIT = 10_000_000n;
@@ -51,6 +65,7 @@ export const SQUAD_SIDE: Record<number, string> = {
 export interface EventMeta {
   source: ContractSource;
   contractId: string;
+  version: string;
   ledger: number;
   txHash: string;
   /** Ledger close time, unix seconds. */
@@ -60,7 +75,7 @@ export interface EventMeta {
 }
 
 export type MarketPayload =
-  | { name: "claim_created"; claimId: number; creator: string; category: string }
+  | { name: "claim_created"; claimId: number; creator: string; category: string; title?: string }
   | { name: "claim_challenged"; claimId: number; challenger: string; stake: bigint }
   | {
       name: "claim_resolved";
@@ -69,6 +84,7 @@ export type MarketPayload =
       summary: string;
       confidence: number;
       evidenceHash: string;
+      resolver?: string;
     }
   | { name: "claim_cancelled"; claimId: number }
   | {
@@ -100,6 +116,7 @@ export type SquadPayload =
       deadline: number;
       feeBps: number;
       question: string;
+      category?: string;
     }
   | {
       name: "deposited";
@@ -159,10 +176,13 @@ function num(value: unknown, what: string): number {
 
 function str(value: unknown, what: string): string {
   if (typeof value === "string") return value;
-  // A contract `String` normally decodes to a JS string, but bytes-shaped
-  // payloads show up as Buffer on some SDK paths.
   if (value instanceof Uint8Array) return Buffer.from(value).toString("utf8");
   throw new DecodeError(`${what}: expected a string, got ${typeof value}`);
+}
+
+function optStr(value: unknown, what: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return str(value, what);
 }
 
 /** An `Address` decodes to its `G…`/`C…` strkey. */
@@ -172,6 +192,11 @@ function addr(value: unknown, what: string): string {
     throw new DecodeError(`${what}: expected a Stellar address strkey, got "${s}"`);
   }
   return s;
+}
+
+function optAddr(value: unknown, what: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return addr(value, what);
 }
 
 function hex(value: unknown, what: string): string {
@@ -187,9 +212,21 @@ function topicAt(topics: unknown[], index: number, what: string): unknown {
   return topics[index];
 }
 
-// ── Per-contract decoders ────────────────────────────────────────────────────
+// ── Per-contract version decoders ────────────────────────────────────────────
 
-function decodeMarket(
+export type MarketDecoderFn = (
+  name: string,
+  topics: unknown[],
+  fields: Record<string, unknown>,
+) => MarketPayload | null;
+
+export type SquadDecoderFn = (
+  name: string,
+  topics: unknown[],
+  fields: Record<string, unknown>,
+) => SquadPayload | null;
+
+export function decodeMarketV1(
   name: string,
   topics: unknown[],
   fields: Record<string, unknown>,
@@ -270,13 +307,42 @@ function decodeMarket(
       };
 
     default:
-      // `oracle_changed`, `ownership_transferred`, `agent_attributed`,
-      // `fee_accrued`, `fee_policy_*` — real events with no notification.
       return null;
   }
 }
 
-function decodeSquad(
+export function decodeMarketV2(
+  name: string,
+  topics: unknown[],
+  fields: Record<string, unknown>,
+): MarketPayload | null {
+  // v2 Market extension support: decode v2 fields if present, else fallback to v1.
+  if (name === "claim_created" && fields.title !== undefined) {
+    return {
+      name,
+      claimId: num(topicAt(topics, 1, "claim_created.id"), "claim_created.id"),
+      creator: addr(topicAt(topics, 2, "claim_created.creator"), "claim_created.creator"),
+      category: str(fields.category, "claim_created.category"),
+      title: str(fields.title, "claim_created.title"),
+    };
+  }
+
+  if (name === "claim_resolved" && fields.resolver !== undefined) {
+    return {
+      name,
+      claimId: num(topicAt(topics, 1, "claim_resolved.id"), "claim_resolved.id"),
+      winnerSide: num(fields.winner_side, "claim_resolved.winner_side"),
+      summary: str(fields.summary, "claim_resolved.summary"),
+      confidence: num(fields.confidence, "claim_resolved.confidence"),
+      evidenceHash: hex(fields.evidence_hash, "claim_resolved.evidence_hash"),
+      resolver: optAddr(fields.resolver, "claim_resolved.resolver"),
+    };
+  }
+
+  return decodeMarketV1(name, topics, fields);
+}
+
+export function decodeSquadV1(
   name: string,
   topics: unknown[],
   fields: Record<string, unknown>,
@@ -342,6 +408,38 @@ function decodeSquad(
   }
 }
 
+export function decodeSquadV2(
+  name: string,
+  topics: unknown[],
+  fields: Record<string, unknown>,
+): SquadPayload | null {
+  if (name === "market_created" && fields.category !== undefined) {
+    return {
+      name,
+      marketId: num(topicAt(topics, 1, "market_created.market_id"), "market_created.market_id"),
+      captain: addr(topicAt(topics, 2, "market_created.captain"), "market_created.captain"),
+      deadline: num(fields.deadline, "market_created.deadline"),
+      feeBps: num(fields.fee_bps, "market_created.fee_bps"),
+      question: str(fields.question, "market_created.question"),
+      category: optStr(fields.category, "market_created.category"),
+    };
+  }
+
+  return decodeSquadV1(name, topics, fields);
+}
+
+/** Registry of decoders for market contracts by version. */
+export const MARKET_DECODERS: Record<string, MarketDecoderFn> = {
+  v1: decodeMarketV1,
+  v2: decodeMarketV2,
+};
+
+/** Registry of decoders for squad contracts by version. */
+export const SQUAD_DECODERS: Record<string, SquadDecoderFn> = {
+  v1: decodeSquadV1,
+  v2: decodeSquadV2,
+};
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /** `event.contractId` is a `Contract` on some SDK paths and a string on others. */
@@ -357,16 +455,23 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
 }
 
 /**
- * Decode one RPC event.
+ * Decode one RPC event for a specific contract version.
  *
  * Never throws: an event this bot does not understand — a new contract event, a
- * shape change, a field it cannot read — becomes an `unknown` payload with the
- * reason attached. A notifier must not die on an event it was not taught.
+ * shape change, a field it cannot read, or malformed XDR — becomes an `unknown`
+ * payload with the reason attached. A notifier must not die on an event it was
+ * not taught.
  */
-export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse): DecodedEvent {
+export function decodeEvent(
+  source: ContractSource,
+  event: rpc.Api.EventResponse,
+  version: string = DEFAULT_CONTRACT_VERSION,
+): DecodedEvent {
+  const normVersion = normalizeContractVersion(version);
   const meta: EventMeta = {
     source,
     contractId: contractIdOf(event),
+    version: normVersion,
     ledger: Number(event.ledger ?? 0),
     txHash: event.txHash ?? "",
     at: Math.floor(new Date(event.ledgerClosedAt ?? 0).getTime() / 1000),
@@ -375,7 +480,8 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
 
   let eventName = "";
   try {
-    const topics = (event.topic ?? []).map((t) => {
+    const rawTopics = event.topic ?? [];
+    const topics = rawTopics.map((t) => {
       try {
         return native(t);
       } catch {
@@ -384,18 +490,45 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     });
 
     const first = topics[0];
-    eventName = typeof first === "string" ? first : "";
+    if (typeof first === "string") {
+      eventName = first;
+    } else if (first instanceof Uint8Array) {
+      eventName = Buffer.from(first).toString("utf8");
+    } else {
+      eventName = "";
+    }
 
-    const decodedValue = native(event.value);
+    let decodedValue: unknown = null;
+    if (event.value) {
+      try {
+        decodedValue = native(event.value);
+      } catch (err) {
+        return {
+          ...meta,
+          payload: {
+            name: "unknown",
+            eventName,
+            reason: `malformed XDR value: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        };
+      }
+    }
+
     const fields = isRecord(decodedValue) ? decodedValue : {};
 
-    const payload =
-      source === "market"
-        ? decodeMarket(eventName, topics, fields)
-        : decodeSquad(eventName, topics, fields);
+    const decoderMap = source === "market" ? MARKET_DECODERS : SQUAD_DECODERS;
+    const decoder =
+      decoderMap[normVersion] ??
+      decoderMap[DEFAULT_CONTRACT_VERSION] ??
+      (source === "market" ? decodeMarketV1 : decodeSquadV1);
+
+    const payload = decoder(eventName, topics, fields);
 
     if (payload) return { ...meta, payload };
-    return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
+    return {
+      ...meta,
+      payload: { name: "unknown", eventName, reason: `no decoder for ${source} (${normVersion})` },
+    };
   } catch (err) {
     return {
       ...meta,
@@ -437,3 +570,4 @@ export function winnerSideLabel(side: number): string {
 export function squadSideLabel(side: number): string {
   return SQUAD_SIDE[side] ?? `side ${side}`;
 }
+

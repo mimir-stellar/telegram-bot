@@ -39,6 +39,7 @@ export interface HealthReport {
     running: boolean;
     /** Intentional operator pause; process is ready but scheduling is stopped. */
     paused: boolean;
+    channelPreviewMode: boolean;
     cycles: number;
     lastPollAt: string | null;
     lastSuccessAt: string | null;
@@ -51,6 +52,7 @@ export interface HealthReport {
     lastError: { at: string; message: string } | null;
     targets: Array<{
       source: string;
+      version: string;
       /** Public contract id (on-chain). */
       contractId: string;
       lastEventLedger: number | null;
@@ -116,6 +118,7 @@ export function buildHealthReport(
     poller: {
       running: poller.running,
       paused: poller.paused === true,
+      channelPreviewMode: config.channelPreviewMode === true,
       cycles: poller.cycles,
       lastPollAt: iso(poller.lastPollAt),
       lastSuccessAt: iso(poller.lastSuccessAt),
@@ -130,6 +133,7 @@ export function buildHealthReport(
         : null,
       targets: poller.targets.map((t) => ({
         source: t.source,
+        version: t.version ?? "v1",
         contractId: t.contractId,
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),

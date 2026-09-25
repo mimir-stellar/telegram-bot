@@ -30,6 +30,7 @@ import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 export interface TargetState {
   source: ContractSource;
   contractId: string;
+  version: string;
   cursor: string | null;
   /** Highest ledger an event was seen in, from this run or the cursor file. */
   lastEventLedger: number | null;
@@ -60,7 +61,10 @@ export interface PollerStatus {
 interface CursorFile {
   version: 1;
   updatedAt: string;
-  targets: Record<string, { cursor: string | null; lastEventLedger: number | null }>;
+  targets: Record<
+    string,
+    { cursor: string | null; lastEventLedger: number | null; version?: string }
+  >;
 }
 
 export interface PollerDeps {
@@ -134,14 +138,29 @@ export function createPoller(deps: PollerDeps) {
   };
 
   const targets: WatchTarget[] = [
-    { source: "market", contractId: config.marketContractId },
-    { source: "squad", contractId: config.squadContractId },
+    {
+      source: "market",
+      contractId: config.marketContractId,
+      version: config.marketContractVersion,
+    },
+    {
+      source: "squad",
+      contractId: config.squadContractId,
+      version: config.squadContractVersion,
+    },
   ];
 
   const state = new Map<ContractSource, TargetState>(
     targets.map((t) => [
       t.source,
-      { source: t.source, contractId: t.contractId, cursor: null, lastEventLedger: null, lastError: null },
+      {
+        source: t.source,
+        contractId: t.contractId,
+        version: t.version ?? "v1",
+        cursor: null,
+        lastEventLedger: null,
+        lastError: null,
+      },
     ]),
   );
 
@@ -209,7 +228,7 @@ export function createPoller(deps: PollerDeps) {
       targets: Object.fromEntries(
         [...state.values()].map((t) => [
           t.source,
-          { cursor: t.cursor, lastEventLedger: t.lastEventLedger },
+          { cursor: t.cursor, lastEventLedger: t.lastEventLedger, version: t.version },
         ]),
       ),
     };
@@ -370,7 +389,8 @@ export function createPoller(deps: PollerDeps) {
       status.startedAt = Date.now();
       status.targets = [...state.values()].map((t) => ({ ...t }));
       console.log(
-        `[poller] watching market=${config.marketContractId} squad=${config.squadContractId} ` +
+        `[poller] watching market=${config.marketContractId} (${config.marketContractVersion}) ` +
+          `squad=${config.squadContractId} (${config.squadContractVersion}) ` +
           `every ${config.pollIntervalMs}ms`,
       );
       void loop();

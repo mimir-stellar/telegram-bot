@@ -213,3 +213,59 @@ test("txExplorerUrl is centralized and network-aware", async () => {
   assert.equal(txExplorerUrl(custom, "zz"), "https://example.test/x/testnet/tx/zz");
   assert.equal(txExplorerUrl(testnet, "  "), "");
 });
+
+test("formatEvent prefixes message with [PREVIEW MODE] when channelPreviewMode is enabled", async () => {
+  const { formatEvent } = await import("../dist/notifications/format.js");
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
+    channelPreviewMode: true,
+  };
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 100,
+    txHash: "hash123",
+    at: 0,
+    eventId: "100-0",
+    payload: {
+      name: "claim_created",
+      claimId: 5,
+      creator: "GABCD",
+      category: "sports",
+    },
+  };
+  const message = formatEvent(config, event);
+  assert.match(message, /^🧪 \*\[PREVIEW MODE\]\*\n🆕 \*New claim\*/);
+});
+
+test("formatFallbackEvent formats actionable degraded event notification with redacted reason", async () => {
+  const { formatFallbackEvent } = await import("../dist/notifications/format.js");
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
+  };
+  const event = {
+    source: "market",
+    contractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+    ledger: 200,
+    txHash: "hash456",
+    at: 0,
+    eventId: "200-0",
+    payload: { name: "unknown" },
+  };
+  const fallback = formatFallbackEvent(config, event, "corrupt payload 123456789:SECRET-TOKEN-ABCD");
+  assert.match(fallback, /⚠️ \*Event Notification Fallback\*/);
+  assert.equal(fallback.includes("SECRET-TOKEN"), false);
+});
+

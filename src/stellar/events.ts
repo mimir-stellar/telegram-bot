@@ -150,17 +150,19 @@ export async function paginatedGetEvents(
 export interface WatchTarget {
   source: ContractSource;
   contractId: string;
+  version?: string;
 }
 
 export interface ContractScan extends Omit<RawScan, "events"> {
   source: ContractSource;
   contractId: string;
+  version: string;
   events: DecodedEvent[];
   /** Highest ledger among the returned events, or null when there were none. */
   lastEventLedger: number | null;
 }
 
-/** Scan one contract and decode everything it returned. */
+/** Scan one contract and decode everything it returned for the configured version. */
 export async function readContractEvents(
   server: rpc.Server,
   target: WatchTarget,
@@ -172,12 +174,14 @@ export async function readContractEvents(
     opts,
   );
 
-  const events = scan.events.map((event) => decodeEvent(target.source, event));
+  const version = target.version ?? "v1";
+  const events = scan.events.map((event) => decodeEvent(target.source, event, version));
   const ledgers = events.map((e) => e.ledger).filter((l) => l > 0);
 
   return {
     source: target.source,
     contractId: target.contractId,
+    version,
     events,
     cursor: scan.cursor,
     latestLedger: scan.latestLedger,
@@ -209,7 +213,7 @@ function summarize(event: DecodedEvent): string {
   const money = (v: bigint) => `${formatUsdc(v)} USDC`;
   switch (p.name) {
     case "claim_created":
-      return `claim #${p.claimId} created by ${p.creator} [${p.category}]`;
+      return `claim #${p.claimId} created by ${p.creator} [${p.category}]${p.title ? ` "${p.title}"` : ""}`;
     case "claim_challenged":
       return `claim #${p.claimId} challenged by ${p.challenger} for ${money(p.stake)}`;
     case "claim_resolved":
@@ -245,12 +249,20 @@ async function main(): Promise<void> {
   console.log(`ledgers    oldest=${health.oldestLedger} latest=${health.latestLedger}`);
 
   const targets: WatchTarget[] = [
-    { source: "market", contractId: config.marketContractId },
-    { source: "squad", contractId: config.squadContractId },
+    {
+      source: "market",
+      contractId: config.marketContractId,
+      version: config.marketContractVersion,
+    },
+    {
+      source: "squad",
+      contractId: config.squadContractId,
+      version: config.squadContractVersion,
+    },
   ];
 
   for (const target of targets) {
-    console.log(`\n=== ${target.source}  ${target.contractId} ===`);
+    console.log(`\n=== ${target.source} (${target.version ?? "v1"})  ${target.contractId} ===`);
     const scan = await readContractEvents(server, target, {
       maxPages: pages,
       startLedger: from ? Number(from) : health.oldestLedger,

@@ -19,6 +19,8 @@ import "dotenv/config";
 export interface StellarConfig {
   marketContractId: string;
   squadContractId: string;
+  marketContractVersion: string;
+  squadContractVersion: string;
   rpcUrl: string;
   horizonUrl: string;
   networkPassphrase: string;
@@ -44,6 +46,8 @@ export interface BotConfig extends StellarConfig {
    * successful cycle lands within this window. `0` disables the stale check.
    */
   healthStaleMs: number;
+  /** When true, notifications sent to Telegram are formatted in preview mode. */
+  channelPreviewMode: boolean;
 }
 
 export class ConfigError extends Error {
@@ -61,6 +65,8 @@ export class ConfigError extends Error {
 }
 
 const DEFAULTS = {
+  marketContractVersion: "v1",
+  squadContractVersion: "v1",
   rpcUrl: "https://soroban-testnet.stellar.org",
   horizonUrl: "https://horizon-testnet.stellar.org",
   networkPassphrase: "Test SDF Network ; September 2015",
@@ -73,6 +79,7 @@ const DEFAULTS = {
   healthPort: 8787,
   // 3× default poll interval — one missed cycle is fine; three is not.
   healthStaleMs: 90_000,
+  channelPreviewMode: false,
 } as const;
 
 /** Strkey for a contract: `C` + 55 base32 characters. */
@@ -110,6 +117,17 @@ function collector() {
       return value;
     },
 
+    contractVersion(name: string, fallback: string): string {
+      const raw = read(name);
+      if (raw === undefined) return fallback;
+      const trimmed = raw.toLowerCase().trim();
+      if (!/^[a-z0-9_.-]+$/.test(trimmed)) {
+        problems.push(`${name} must be a valid version string (e.g. v1, v2); got "${raw}"`);
+        return fallback;
+      }
+      return trimmed;
+    },
+
     url(name: string, fallback: string): string {
       const value = read(name) ?? fallback;
       try {
@@ -136,6 +154,16 @@ function collector() {
         return fallback;
       }
       return parsed;
+    },
+
+    bool(name: string, fallback: boolean): boolean {
+      const raw = read(name);
+      if (raw === undefined) return fallback;
+      const lower = raw.toLowerCase();
+      if (lower === "true" || lower === "1" || lower === "yes") return true;
+      if (lower === "false" || lower === "0" || lower === "no") return false;
+      problems.push(`${name} must be a boolean (true/false); got "${raw}"`);
+      return fallback;
     },
 
     chatId(name: string): string {
@@ -177,6 +205,14 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
   return {
     marketContractId: c.contractId("MARKET_CONTRACT_ID"),
     squadContractId: c.contractId("SQUAD_CONTRACT_ID"),
+    marketContractVersion: c.contractVersion(
+      "MARKET_CONTRACT_VERSION",
+      DEFAULTS.marketContractVersion,
+    ),
+    squadContractVersion: c.contractVersion(
+      "SQUAD_CONTRACT_VERSION",
+      DEFAULTS.squadContractVersion,
+    ),
     rpcUrl: c.url("STELLAR_RPC_URL", DEFAULTS.rpcUrl),
     horizonUrl: c.url("STELLAR_HORIZON_URL", DEFAULTS.horizonUrl),
     networkPassphrase: read("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
@@ -217,6 +253,7 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
+    channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);

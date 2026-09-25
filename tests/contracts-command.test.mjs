@@ -82,11 +82,11 @@ test("contractsMessage renders both contract ids, testnet explorer links, and th
       "\n" +
       "Read\\-only: this bot holds no signing keys and cannot submit transactions\\.\n" +
       "\n" +
-      "*mimir\\-market*\n" +
+      "*mimir\\-market* \\(v1\\)\n" +
       `\`${MARKET_ID}\`\n` +
       `[View on stellar\\.expert](https://stellar.expert/explorer/testnet/contract/${MARKET_ID})\n` +
       "\n" +
-      "*mimir\\-squad*\n" +
+      "*mimir\\-squad* \\(v1\\)\n" +
       `\`${SQUAD_ID}\`\n` +
       `[View on stellar\\.expert](https://stellar.expert/explorer/testnet/contract/${SQUAD_ID})`,
   );
@@ -226,5 +226,5 @@ test("registerCommands includes /contracts alongside the existing commands", asy
 
   assert.equal(calls.length, 1);
   const commands = calls[0].commands.map((c) => c.command);
-  assert.deepEqual(commands, ["start", "help", "status", "contracts", "pause", "resume"]);
+  assert.deepEqual(commands, ["start", "help", "status", "contracts", "preview", "pause", "resume"]);
 });
