@@ -61,6 +61,10 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt)}`,
     `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
+    `RPC failures: ${status.rpcFailures}` +
+      (status.consecutiveSendFailures > 0
+        ? ` · consecutive send failures: ${status.consecutiveSendFailures}`
+        : ""),
     "",
     "*Watching*",
   ];

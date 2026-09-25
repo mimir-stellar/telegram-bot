@@ -35,6 +35,12 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /**
+   * How many ledgers of slack before a persisted cursor is considered stale
+   * (i.e. below the RPC's retained floor). When exceeded the bot falls back to
+   * a cold start. Default 1000 (≈ 83 minutes on Testnet at ~5 s/ledger).
+   */
+  cursorStaleLedgerMargin: number;
   /** Loopback host for the local HTTP health endpoint. */
   healthHost: string;
   /** TCP port for the health endpoint. `0` disables the listener. */
@@ -69,6 +75,7 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  cursorStaleLedgerMargin: 1_000,
   healthHost: "127.0.0.1",
   healthPort: 8787,
   // 3× default poll interval — one missed cycle is fine; three is not.
@@ -212,6 +219,11 @@ export function loadConfig(): BotConfig {
       "MAX_NOTIFICATIONS_PER_CYCLE",
       DEFAULTS.maxNotificationsPerCycle,
       1,
+    ),
+    cursorStaleLedgerMargin: c.int(
+      "CURSOR_STALE_LEDGER_MARGIN",
+      DEFAULTS.cursorStaleLedgerMargin,
+      0,
     ),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
     // Port 0 is the explicit disable switch (min 0).

@@ -146,8 +146,21 @@ index.
 
 ## Cursor persistence
 
-The poller writes its resume position to `data/cursor.json` (write-then-rename,
-so a crash mid-write cannot truncate it):
+The poller writes its resume position to `data/cursor.json` using an atomic
+write-then-rename sequence:
+
+```
+cursor.json.tmp  →  rename  →  cursor.json   (primary, atomic)
+cursor.json      →  copy   →  cursor.json.bak (backup, written after primary)
+```
+
+A crash mid-write cannot corrupt the primary: the rename only completes when the
+file is fully written. The backup is written immediately after each successful
+primary save, so it always reflects the last committed state.
+
+On startup, the primary is tried first. If it is missing or corrupt, the backup
+is tried with a warning in the log. If both fail, the bot starts cold. The
+primary is re-created on the next successful save.
 
 ```json
 {
@@ -160,6 +173,16 @@ so a crash mid-write cannot truncate it):
 }
 ```
 
+On a cold start (no file, or stale cursor — see below) it begins
+`START_LOOKBACK_LEDGERS` behind the chain tip rather than replaying the whole
+retained window into your chat.
+
+**Stale cursor detection:** a persisted cursor whose embedded ledger is more than
+`CURSOR_STALE_LEDGER_MARGIN` ledgers below the RPC's oldest retained ledger is
+discarded and that target falls back to a cold start. This prevents the bot from
+issuing a `startLedger` request below the retention floor — which is an RPC
+error, not an empty result. The default margin of 1 000 ledgers (~83 min on
+Testnet at ~5 s/ledger) gives a comfortable buffer for short outages.
 On a cold start (no file) it begins `START_LOOKBACK_LEDGERS` behind the chain tip
 rather than replaying the whole retained window into your chat. `/pause` and
 `/resume` never edit this file; they only control scheduling, so the cursor
@@ -176,6 +199,20 @@ KV store is a deliberate future step, not something this repo does today.
 This process is meant to stay up for weeks, so a single failure never ends it:
 
 - **A failed RPC call** fails one contract's scan for one cycle. Its cursor is
+  left untouched, so the next cycle resumes exactly where it stopped. The
+  `/status` command shows a per-target `rpcFailures` counter and the last error
+  message.
+- **A failed Telegram send** drops one message; the cursor still advances. That
+  is deliberate: holding the cursor back would turn a revoked token or a chat
+  the bot was removed from into an infinite replay, and recovery would flood the
+  channel. Notifications are lossy on purpose — the chain is the record.
+  `consecutiveSendFailures` in `/status` helps distinguish a one-off blip from a
+  sustained outage.
+- **A corrupt cursor file** is treated as a cold start rather than a crash. If
+  only the primary is corrupt, the backup is used with a warning. If both are
+  corrupt, the bot starts cold.
+- **A stale cursor** (whose embedded ledger is below the RPC's retention floor)
+  is discarded on startup to avoid an RPC error on the first scan.
   left untouched, so the next cycle resumes exactly where it stopped.
 - **A failed Telegram send** receives at most three attempts with bounded
   exponential backoff, then drops one message; the cursor still advances. That
@@ -243,6 +280,7 @@ src/
 
 ## Development checks
 
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and all tests (notification-format tests and poller behaviour tests, including deterministic fuzz cases), or `npm run build` to produce the production output.
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture and health suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
