@@ -356,13 +356,6 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
   return "";
 }
 
-/**
- * Decode one RPC event.
- *
- * Never throws: an event this bot does not understand — a new contract event, a
- * shape change, a field it cannot read — becomes an `unknown` payload with the
- * reason attached. A notifier must not die on an event it was not taught.
- */
 export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse): DecodedEvent {
   const meta: EventMeta = {
     source,
@@ -384,7 +377,8 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     });
 
     const first = topics[0];
-    eventName = typeof first === "string" ? first : "";
+    const rawEventName = typeof first === "string" ? first : "";
+    eventName = rawEventName.length > 100 ? `${rawEventName.slice(0, 100)}…` : rawEventName;
 
     const decodedValue = native(event.value);
     const fields = isRecord(decodedValue) ? decodedValue : {};
@@ -397,12 +391,14 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     if (payload) return { ...meta, payload };
     return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const reason = msg.length > 256 ? `${msg.slice(0, 256)}…` : msg;
     return {
       ...meta,
       payload: {
         name: "unknown",
         eventName,
-        reason: err instanceof Error ? err.message : String(err),
+        reason,
       },
     };
   }
