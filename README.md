@@ -75,11 +75,22 @@ npm install
 npm run dev              # tsx, restarts on change
 ```
 
-For production:
+For production (Node):
 
 ```bash
 npm run build
 npm start
+```
+
+For production (Docker):
+
+```bash
+docker build -t mimir-telegram-bot .
+docker run -d \
+  --name mimir-bot \
+  --env-file .env \
+  -v $(pwd)/data:/app/data \
+  mimir-telegram-bot
 ```
 
 `.env.example` ships with the live Stellar Testnet contract ids, so the only two
@@ -301,7 +312,7 @@ chat ids, private keys, or unbounded remote payloads.
 
 Configuration (see `.env.example`):
 
-- `HEALTH_HOST` — bind address (default `127.0.0.1`)
+- `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
 
