@@ -35,6 +35,8 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /** Milliseconds to wait between successive Telegram sends in one cycle. */
+  interSendDelayMs: number;
   /** Loopback host for the local HTTP health endpoint. */
   healthHost: string;
   /** TCP port for the health endpoint. `0` disables the listener. */
@@ -69,6 +71,8 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  interSendDelayMs: 1_500,
+  minInterSendDelayMs: 0,
   healthHost: "127.0.0.1",
   healthPort: 8787,
   // 3× default poll interval — one missed cycle is fine; three is not.
@@ -212,6 +216,11 @@ export function loadConfig(): BotConfig {
       "MAX_NOTIFICATIONS_PER_CYCLE",
       DEFAULTS.maxNotificationsPerCycle,
       1,
+    ),
+    interSendDelayMs: c.int(
+      "INTER_SEND_DELAY_MS",
+      DEFAULTS.interSendDelayMs,
+      DEFAULTS.minInterSendDelayMs,
     ),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
     // Port 0 is the explicit disable switch (min 0).

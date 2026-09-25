@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Tests run entirely in-process (Node's built-in test runner). No live network
+# calls, no Testnet RPC, no Telegram credentials. The scan CLI and the poller
+# loop both require external services — those are verified manually with
+# `npm run scan` against Testnet.
 permissions:
   contents: read
 
@@ -12,7 +16,7 @@ permissions:
 # CI is deterministic: no live RPC or Telegram calls. The poller's chain
 # correctness against live data is verified separately with `npm run scan`.
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +31,7 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Build and test
       - name: Build
         run: npm run build
 

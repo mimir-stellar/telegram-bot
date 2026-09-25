@@ -15,6 +15,12 @@
  *  - A cursor file that cannot be read is treated as a cold start; one that
  *    cannot be written is logged, and the in-memory cursor keeps working until
  *    the next restart.
+ *  - A cursor file with an unrecognised or missing version is treated as a cold
+ *    start rather than silently misread.
+ *  - A cursor whose ledger is far behind the RPC's retained floor triggers a
+ *    warning, because events in the gap will never be posted.
+ *  - Consecutive full-cycle failures are counted; a structured warning is
+ *    emitted at thresholds so an operator can act before the bot falls silent.
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -23,6 +29,8 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
+import { clip, formatEvent } from "./notifications/format.js";
+import { eventCursorLedger, readContractEvents, type WatchTarget } from "./stellar/events.js";
 import { formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
@@ -70,8 +78,22 @@ export interface PollerDeps {
   send: (text: string) => Promise<void>;
 }
 
-/** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
-const SEND_SPACING_MS = 1_500;
+/**
+ * How many ledgers a cursor can lag behind the retained floor before the poller
+ * warns. Events in the gap are already gone — this threshold makes the operator
+ * aware before the lag grows indefinitely.
+ *
+ * 10 % of the approximate Testnet window (~120 960 ledgers ≈ a week).
+ */
+const STALE_CURSOR_LEDGER_LAG = 12_096;
+
+/**
+ * Consecutive-failure thresholds at which a structured warning is emitted.
+ * The thresholds are deliberately non-linear so that short transient glitches
+ * (1–4 cycles) are silent, a medium outage (5+) is visible, and a long outage
+ * (10+) is highlighted loudly.
+ */
+const CONSECUTIVE_FAILURE_THRESHOLDS = [5, 10, 25, 50, 100];
 
 /** Maximum number of retry attempts for a single Telegram send. */
 const MAX_SEND_RETRIES = 3;
@@ -141,7 +163,13 @@ export function createPoller(deps: PollerDeps) {
   const state = new Map<ContractSource, TargetState>(
     targets.map((t) => [
       t.source,
-      { source: t.source, contractId: t.contractId, cursor: null, lastEventLedger: null, lastError: null },
+      {
+        source: t.source,
+        contractId: t.contractId,
+        cursor: null,
+        lastEventLedger: null,
+        lastError: null,
+      },
     ]),
   );
 
@@ -183,7 +211,26 @@ export function createPoller(deps: PollerDeps) {
     }
 
     try {
-      const parsed = JSON.parse(raw) as CursorFile;
+      const parsed = JSON.parse(raw) as Partial<CursorFile>;
+
+      // Version guard: if the field is absent or not 1, the file was written
+      // by a different version of this code. Cold-starting is safer than
+      // silently misreading an unknown layout.
+      if (parsed.version === undefined) {
+        console.warn(
+          `[poller] cursor file at ${config.cursorFile} has no version field; ` +
+            `cold-starting rather than risking a misread. Delete the file to suppress this.`,
+        );
+        return;
+      }
+      if (parsed.version !== 1) {
+        console.warn(
+          `[poller] cursor file version ${String(parsed.version)} is not supported ` +
+            `(expected 1); cold-starting. Delete the file or downgrade to the matching release.`,
+        );
+        return;
+      }
+
       for (const [source, saved] of Object.entries(parsed.targets ?? {})) {
         const target = state.get(source as ContractSource);
         if (!target) continue;
@@ -226,6 +273,32 @@ export function createPoller(deps: PollerDeps) {
     }
   }
 
+  // ── Stale cursor detection ─────────────────────────────────────────────────
+
+  /**
+   * Warn when a persisted cursor points to a ledger that has already fallen
+   * behind the retained floor. Events in that gap will never be delivered.
+   * This can happen after a long outage or an accidental ephemeral filesystem.
+   */
+  function checkStaleCursors(oldestLedger: number): void {
+    for (const target of state.values()) {
+      if (!target.cursor) continue;
+      const cursorLedger = eventCursorLedger(target.cursor);
+      if (cursorLedger === null) continue;
+
+      const lag = oldestLedger - cursorLedger;
+      if (lag > STALE_CURSOR_LEDGER_LAG) {
+        console.warn(
+          `[poller] STALE CURSOR — ${target.source} cursor is at ledger ${cursorLedger}, ` +
+            `but the RPC only retains from ledger ${oldestLedger} ` +
+            `(${lag} ledgers behind, ~${Math.round((lag * 5) / 60)} minutes of events lost). ` +
+            `Events in the gap will not be posted. ` +
+            `Delete ${config.cursorFile} to cold-start and resume from the current tip.`,
+        );
+      }
+    }
+  }
+
   // ── One cycle ──────────────────────────────────────────────────────────────
 
   async function notify(events: DecodedEvent[]): Promise<void> {
@@ -234,7 +307,13 @@ export function createPoller(deps: PollerDeps) {
     for (const event of events) {
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
+        // Clip the event name and reason: these come from remote contract data
+        // and must not produce unbounded log output.
+        const safeName = clip(event.payload.eventName ?? "", 80);
+        const safeReason = event.payload.reason ? ` (${clip(event.payload.reason, 120)})` : "";
         console.log(
+          `[poller] skipped ${event.source} event "${safeName}" ` +
+            `at ledger ${event.ledger}${safeReason}`,
           `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
             `at ledger ${event.ledger}` +
             (event.payload.reason
@@ -252,10 +331,15 @@ export function createPoller(deps: PollerDeps) {
 
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
         status.eventsSkipped += 1;
-        console.warn(
-          `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
-            `dropping ${event.payload.name} at ledger ${event.ledger}`,
-        );
+        // Log clearly that the cap was reached, not just that an event was dropped.
+        if (sentThisCycle === config.maxNotificationsPerCycle) {
+          console.warn(
+            `[poller] MAX_NOTIFICATIONS_PER_CYCLE cap (${config.maxNotificationsPerCycle}) reached ` +
+              `this cycle — remaining events skipped. ` +
+              `Raise MAX_NOTIFICATIONS_PER_CYCLE or wait for the next cycle. ` +
+              `Cursor still advances; the chain is the record.`,
+          );
+        }
         continue;
       }
 
@@ -273,7 +357,11 @@ export function createPoller(deps: PollerDeps) {
         );
       }
 
-      if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
+      // Pace sends to stay under Telegram's ~20 messages/minute limit.
+      // interSendDelayMs is configurable via INTER_SEND_DELAY_MS.
+      if (sentThisCycle < config.maxNotificationsPerCycle && config.interSendDelayMs > 0) {
+        await sleep(config.interSendDelayMs);
+      }
     }
   }
 
@@ -300,6 +388,9 @@ export function createPoller(deps: PollerDeps) {
         current.lastError = null;
         anyOk = true;
 
+        // Warn if this cursor is already behind the RPC's retention window.
+        checkStaleCursors(scan.oldestLedger);
+
         if (scan.events.length > 0) {
           console.log(
             `[poller] ${target.source}: ${scan.events.length} event(s) ` +
@@ -324,6 +415,7 @@ export function createPoller(deps: PollerDeps) {
       status.consecutiveFailures = 0;
     } else {
       status.consecutiveFailures += 1;
+      emitCircuitBreakerWarning();
     }
 
     status.targets = [...state.values()].map((t) => ({ ...t }));
@@ -331,6 +423,24 @@ export function createPoller(deps: PollerDeps) {
     inFlight = false;
   }
 
+  /**
+   * Emit a structured warning at each consecutive-failure threshold.
+   * The warning is emitted exactly once per threshold crossing (not every cycle),
+   * which makes it grep-able and avoids log spam during a long outage.
+   */
+  function emitCircuitBreakerWarning(): void {
+    const n = status.consecutiveFailures;
+    if (!CONSECUTIVE_FAILURE_THRESHOLDS.includes(n)) return;
+
+    const lastMsg = status.lastError?.message ?? "unknown";
+    // Clip the error message: it could contain unbounded RPC response text.
+    const safeMsg = clip(lastMsg, 200);
+    console.warn(
+      `[poller] CONSECUTIVE FAILURES: ${n} full cycles failed in a row. ` +
+        `Last error: ${safeMsg}. ` +
+        `Check RPC connectivity (${config.rpcUrl}) and Telegram bot status. ` +
+        `The cursor is safe; the bot will resume automatically when the error clears.`,
+    );
   function schedule(delayMs: number): void {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
@@ -347,6 +457,9 @@ export function createPoller(deps: PollerDeps) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
+      emitCircuitBreakerWarning();
+      status.lastError = { at: Date.now(), message: errMessage(err) };
+      console.error(`[poller] cycle threw: ${errMessage(err)}`);
       status.lastError = { at: Date.now(), message: errorMessage(err) };
       console.error(`[poller] cycle threw: ${errorMessage(err)}`);
       inFlight = false;

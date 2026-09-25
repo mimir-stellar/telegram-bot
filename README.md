@@ -110,10 +110,13 @@ The chain reader runs standalone. Testnet's Soroban RPC is public and
 unauthenticated, so this needs nothing but the contract ids:
 
 ```bash
-npm run scan                     # both contracts, from the RPC's retained floor
-npm run scan -- --pages 40       # walk further
-npm run scan -- --show 20        # print 20 decoded events per contract
-npm run scan -- --from 4226500   # explicit start ledger
+npm run scan                         # both contracts, from the RPC's retained floor
+npm run scan -- --pages 40           # walk further
+npm run scan -- --show 20            # print 20 decoded events per contract
+npm run scan -- --from 4226500       # explicit start ledger
+npm run scan -- --contract market    # scan only the market contract
+npm run scan -- --contract squad     # scan only the squad contract
+npm run scan -- --help               # show usage
 ```
 
 It prints the ledger window, an event-name histogram, and the decoded payloads.
@@ -165,6 +168,11 @@ rather than replaying the whole retained window into your chat. `/pause` and
 `/resume` never edit this file; they only control scheduling, so the cursor
 format remains version 1 and a restart does not preserve a pause.
 
+The `version` field is checked on load. A file with a missing or unrecognised
+version is treated as a cold start (warning logged) rather than silently
+misread. This protects against reading a file written by a future release after
+a downgrade.
+
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. On
 an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
 at one). On an ephemeral filesystem every restart is a cold start, and events
@@ -181,6 +189,21 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   exponential backoff, then drops one message; the cursor still advances. That
   is deliberate: holding the cursor back would turn a revoked token or a chat
   the bot was removed from into an infinite replay, and recovery would flood the
+  channel. Notifications are lossy on purpose — the chain is the record.
+- **A corrupt cursor file** is treated as a cold start rather than a crash.
+- **A cursor file with a missing or unrecognised `version` field** is treated as
+  a cold start; a warning is logged with instructions to delete the file.
+- **A stale cursor** — one pointing to a ledger more than ~10 % of the
+  retention window behind `oldestLedger` — causes a warning that names the
+  cursor file, the gap size, and how to recover. Events in the gap are already
+  gone from the RPC and will not be posted.
+- **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle. A
+  single warning is logged when the cap is hit, and the cursor still advances.
+  Telegram's rate limiter is never the thing that takes the bot down.
+- **Consecutive full-cycle failures** are counted. A structured warning is
+  emitted the first time the count crosses 5, 10, 25, 50, or 100 consecutive
+  failed cycles, naming the RPC URL, the last error, and confirming the cursor
+  is intact.
   channel. Notifications are lossy on purpose — the chain is the record. Operator
   `/resume` does not replay failed messages.
 - **A corrupt cursor file** is treated as a cold start rather than a crash. A
@@ -243,6 +266,9 @@ src/
 
 ## Development checks
 
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and all
+tests (format, config validation, and poller behaviour — no live Testnet or Telegram
+credentials required), or `npm run build` to produce the production output.
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture and health suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
