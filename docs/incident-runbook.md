@@ -1,0 +1,264 @@
+# Incident Runbook
+
+Operational guidance for recovering the Mimir Telegram notifier from missed notifications, without treating Telegram as the source of truth.
+
+## Operating principles
+
+* Stellar chain state is the source of truth.
+* The notifier is read-only and never holds signing keys or private keys.
+* A notification failure must not alter on-chain state.
+* Cursors must only move according to the poller's existing persistence rules.
+* Logs and status output must not expose bot tokens, private keys, payment proofs, or unbounded remote payloads.
+
+Notification text from contract String fields is bounded to 200 Unicode code
+points before MarkdownV2 escaping. An oversized or malformed transaction hash
+does not receive an explorer link. The original event is still decoded and the
+cursor follows the normal poller rules; truncation affects only the Telegram
+presentation, not chain data or persisted cursor state.
+
+## Quick health check
+
+Run:
+
+```bash
+/health
+```
+
+Or for full poller state details:
+
+```bash
+/status
+```
+
+Check:
+
+* overall readiness and status (`ok`, `degraded`, `stopped`)
+* current chain tip
+* RPC retained-history floor
+* watched contract IDs
+* last event ledger per contract
+* persisted cursor
+* poll/send counters
+* last error and consecutive failure count
+
+For a read-only chain diagnostic without a Telegram token:
+
+```bash
+npm run scan
+```
+
+Use `--from`, `--pages`, or `--show` when a narrower or deeper scan is needed.
+
+## Operator pause and resume
+
+`/pause` and `/resume` require the numeric user id configured in
+`OPERATOR_TELEGRAM_USER_ID`. A notification chat id is not authorization because
+all members of a group can send commands there. Unauthorized attempts receive no
+reply and do not change polling.
+
+`/pause` cancels the next scheduled cycle. A cycle already reading events or
+retrying Telegram may finish under its existing bounded limits and normal cursor
+rules. `/resume` is idempotent and schedules the next cycle immediately; it does
+not rewind, reset, or replay cursors and cannot recover messages already dropped
+after Telegram failures.
+
+Pause state is process-local. A restart always begins polling while loading the
+existing version-1 cursor file, preventing a stale pause from surviving a deploy.
+An operator pause is reported as healthy by `/health` with `poller.paused=true`.
+
+## RPC failures
+
+### Symptoms
+
+* `/status` reports a recent RPC error.
+* One contract stops advancing while the other continues.
+* Notifications from one contract are missing.
+
+### Recovery
+
+1. Confirm the RPC endpoint is reachable.
+2. Run `npm run scan` to verify that the chain reader can access retained events.
+3. Check the retained-history floor reported by the RPC.
+4. Restart the process only if the underlying RPC problem has been resolved.
+
+The affected contract's cursor is left unchanged after a failed scan, so the next polling cycle can retry from the same position. If the operator intentionally used `/pause`, use `/resume` only after the RPC is healthy; otherwise normal polling already retries on schedule.
+
+Do not manually advance the cursor to skip an RPC failure.
+
+## Telegram failures
+
+### Symptoms
+
+* Event scanning continues but sends fail.
+* `/status` shows send errors or an increasing scan/send difference.
+* The bot was removed from the chat or its token was revoked.
+
+### Recovery
+
+1. Confirm the bot token and chat configuration are valid.
+2. Confirm the bot is still present in the target chat and has permission to post.
+3. Use `/status` to confirm the process is still running and not intentionally paused.
+4. Restart only when configuration has been corrected. If polling was deliberately paused, use `/resume` after the token/chat is healthy.
+
+Telegram delivery is intentionally lossy. The poller commits the opaque cursor
+after processing the returned page, even when sends are partial. A failed send
+does not hold the cursor back because replaying every missed notification could
+create an unbounded backlog or flood a recovered chat. The log reports the
+sent/failed/skipped counts for that commit.
+
+The Stellar chain remains the authoritative record.
+
+## Stale or corrupt cursor
+
+### Symptoms
+
+* The cursor cannot be parsed.
+* The stored cursor is incompatible with the current cursor format.
+* The process reports a cursor-loading problem.
+
+### Recovery
+
+A corrupt cursor is treated as a cold start. A syntactically valid cursor that
+Soroban rejects as stale is different: the poller keeps it unchanged, exposes
+the bounded RPC error in `/status`, and retries the same position. `/resume`
+also leaves it unchanged. This avoids duplicate notifications or skipped chain
+history from a guessed reset.
+
+Before changing `CURSOR_FILE` or deleting persisted state, preserve the existing file for investigation if possible.
+
+If the stored cursor is confirmed incompatible or permanently outside RPC retention, stop the notifier, preserve the cursor file for investigation, and deliberately perform a cold start with the configured `START_LOOKBACK_LEDGERS` after checking the retained-history floor. This may produce duplicate notifications, but it does not skip or replay all retained history.
+
+On a cold start, the poller begins from its configured lookback rather than replaying the entire retained RPC history.
+
+Never replace a cursor with an arbitrary ledger or cursor value unless the repository's cursor format and retained-history requirements have been verified. `/pause` and `/resume` are safe alternatives because they leave the version-1 cursor file untouched.
+
+## Process restart
+
+### Persistent deployment
+
+Ensure `data/` or the path configured by `CURSOR_FILE` is on persistent storage.
+
+After a restart:
+
+1. Check `/status`.
+2. Confirm the persisted cursor is present.
+3. Confirm polling resumes normally.
+4. Check that counters and last-event ledgers begin advancing again.
+
+### Ephemeral deployment
+
+If the filesystem is ephemeral, every restart behaves like a cold start. Events that occurred while the process was down may not be posted.
+
+Use persistent storage for long-running deployments.
+
+## Rate limiting
+
+Notification bursts are bounded by `MAX_NOTIFICATIONS_PER_CYCLE` and spaced out.
+
+If Telegram rate limits are observed:
+
+1. Confirm the process remains alive.
+2. Check `/status` for send errors.
+3. Do not disable the notification cap to compensate.
+4. Allow subsequent polling cycles to continue normally.
+
+Do not manually replay large event ranges into Telegram.
+
+## Malformed or unexpected events
+
+A malformed event must not crash the long-running process.
+
+`decodeEvent` converts malformed XDR and events introduced by a newer contract
+deployment into a bounded `unknown` record. The poller logs only the contract,
+event name, ledger, and a clipped reason, skips Telegram delivery for that
+event, and continues with the RPC cursor returned by the scan. This protects
+the long-running reader while preserving the chain as the source of truth.
+
+When investigating:
+
+1. Use `npm run scan` to inspect the affected event range.
+2. Confirm the contract and ledger involved.
+3. Check the decoded event output without copying unrestricted remote payloads into logs or tickets.
+4. Preserve the existing cursor behavior.
+
+Do not modify on-chain state or attempt to repair an event by writing to the Mimir contracts.
+
+## Safe rollback
+
+For a deployment containing only documentation or operational changes:
+
+1. Stop the affected deployment according to its hosting platform's procedure; use `/pause` only to stop scheduling while leaving the process available.
+2. Revert to the previously known-good application revision.
+3. Preserve the persistent `data/` volume.
+4. Restart the known-good revision.
+5. Check `/status`.
+6. Verify that the persisted cursor is still present and polling resumes.
+
+Do not delete cursor state as part of a normal rollback.
+
+## Deployment checklist
+
+Before deployment:
+
+* `.env` contains valid configuration without exposing secrets in source control.
+* `BOT_TOKEN` and `TELEGRAM_CHAT_ID` are supplied through the deployment secret/configuration mechanism.
+* `data/` or `CURSOR_FILE` is persistent.
+* The deployed revision passes typecheck and build checks.
+* No production credentials are committed.
+
+After deployment:
+
+* Confirm the process starts successfully.
+* Run `/status`.
+* Confirm the expected contract IDs and cursor are shown.
+* Confirm the last event ledger advances after new events.
+* Monitor RPC and Telegram errors.
+
+## Security and logging
+
+Never log:
+
+* Telegram bot tokens
+* private keys or signing material
+* payment proofs
+* unrestricted remote API responses
+* sensitive authentication data
+
+When reporting an incident, include only the minimum information needed to identify the failure, such as contract, ledger, cursor state, error category, and timestamp.
+
+## Rehearsing locally (mock profile)
+
+Every failure mode in this runbook can be drilled on a laptop against the
+local mock profile — loopback only, no bot token, no Testnet, and an isolated
+`data/cursor.mock.json` that never overlaps a real bot's cursor:
+
+```bash
+npm run mock:poll -- --fail-events error   # RPC failure drill (see "RPC failures")
+npm run mock:poll -- --stale-cursor        # stale cursor drill (see "Stale or corrupt cursor")
+npm run mock:poll -- --malformed           # undecodable event drill
+npm run mock:poll                          # healthy dry run; sends are logged, not delivered
+curl -s http://127.0.0.1:8787/health | jq .status
+```
+
+Injected failures last until the process stops, so recovery is "restart without
+the flag": the cursor must resume exactly where it was, log lines stay bounded,
+and no token-shaped secret appears anywhere in the output. The same guarantees
+are asserted by `tests/mock-rpc.test.mjs` (`npm run test:mock`).
+
+## Verification
+
+Before merging operational changes, run the repository's documented checks:
+
+```bash
+npm run typecheck
+npm run build
+npm test
+```
+
+Also verify the command-level diagnostic path where applicable:
+
+```bash
+npm run scan
+```
+
+The notifier should remain read-only throughout incident recovery. The chain remains the source of truth even when Telegram delivery is unavailable.
