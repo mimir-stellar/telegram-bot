@@ -332,7 +332,6 @@ cursor format or Telegram behaviour.
 **Failure modes:** binding fails only if the port is already taken (process
 exits via the listen error path after logging). Client disconnects and probe
 errors are logged and ignored so they cannot stop the notifier.
-- **Per-event suppression** via `SUPPRESSED_EVENTS` (comma-separated notifiable names) skips matching posts while still advancing the cursor. Unknown names fail startup; `/status` lists the active set.
 
 ## Layout
 
