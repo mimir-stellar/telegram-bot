@@ -109,6 +109,60 @@ test("stopped poller rejects both operator controls", () => {
   assert.equal(poller.status().paused, false);
 });
 
+test("unsupported cursor versions fall back to a cold start", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-cursor-format-"));
+  const cursorFile = path.join(directory, "cursor.json");
+  await writeFile(
+    cursorFile,
+    JSON.stringify({ version: 2, targets: { market: { cursor: "123-0", lastEventLedger: 40 } } }),
+    "utf8",
+  );
+
+  const poller = createPoller({
+    config: baseConfig(cursorFile),
+    server: stuckServer(),
+    send: async () => undefined,
+  });
+
+  try {
+    await poller.start();
+    assert.equal(poller.status().targets[0].cursor, null);
+    assert.equal(poller.status().targets[1].cursor, null);
+  } finally {
+    poller.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("each poll cycle requests one notification-sized RPC page", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-page-checkpoint-"));
+  const cursorFile = path.join(directory, "cursor.json");
+  const requests = [];
+  const poller = createPoller({
+    config: baseConfig(cursorFile),
+    server: {
+      getHealth: async () => ({ oldestLedger: 1, latestLedger: 100 }),
+      getEvents: async (options) => {
+        requests.push(options);
+        return { events: [], cursor: "123-0", latestLedger: 100 };
+      },
+    },
+    send: async () => undefined,
+  });
+
+  try {
+    await poller.start();
+    for (let attempt = 0; attempt < 100 && requests.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(requests.length, 2);
+    assert.ok(requests.every((request) => request.limit === 20));
+  } finally {
+    poller.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("RPC failures are bounded and redact the configured bot token in status", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-rpc-failure-"));
   const cursorFile = path.join(directory, "cursor.json");
