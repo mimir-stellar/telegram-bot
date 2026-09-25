@@ -43,7 +43,7 @@ export function txExplorerUrl(config: StellarConfig, txHash: string): string {
   const hash = txHash.trim();
   if (!hash) return "";
   const network = explorerNetworkSegment(config);
-  return `${explorerBase(config)}/${network}/tx/${hash}`;
+  return `${explorerBase(config)}/${network}/tx/${encodeURIComponent(hash)}`;
 }
 
 /** Explorer link for a classic / contract account. */
@@ -51,7 +51,7 @@ export function accountExplorerUrl(config: StellarConfig, address: string): stri
   const id = address.trim();
   if (!id) return "";
   const network = explorerNetworkSegment(config);
-  return `${explorerBase(config)}/${network}/account/${id}`;
+  return `${explorerBase(config)}/${network}/account/${encodeURIComponent(id)}`;
 }
 
 /** Explorer link for a Soroban contract id, used by /contracts. */
@@ -59,5 +59,5 @@ export function contractExplorerUrl(config: StellarConfig, contractId: string): 
   const id = contractId.trim();
   if (!id) return "";
   const network = explorerNetworkSegment(config);
-  return `${explorerBase(config)}/${network}/contract/${id}`;
+  return `${explorerBase(config)}/${network}/contract/${encodeURIComponent(id)}`;
 }

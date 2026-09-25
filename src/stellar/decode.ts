@@ -23,7 +23,7 @@
  * decoding and are only converted for display, at the formatting edge.
  */
 
-import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
+import { scValToNative, xdr, type rpc } from "@stellar/stellar-sdk";
 
 /** Which of the two Mimir contracts an event came from. */
 export type ContractSource = "market" | "squad";
@@ -129,12 +129,78 @@ export type EventPayload = MarketPayload | SquadPayload | UnknownPayload;
 
 export type DecodedEvent = EventMeta & { payload: EventPayload };
 
+// ── Topic Schemas ────────────────────────────────────────────────────────────
+
+export interface TopicSchemaSpec {
+  expectedCount: number;
+  types: Array<"int" | "address" | "string">;
+}
+
+export const MARKET_TOPIC_SCHEMAS: Record<string, TopicSchemaSpec> = {
+  claim_created: { expectedCount: 3, types: ["int", "address"] },
+  claim_challenged: { expectedCount: 3, types: ["int", "address"] },
+  claim_resolved: { expectedCount: 2, types: ["int"] },
+  claim_cancelled: { expectedCount: 2, types: ["int"] },
+  market_settled: { expectedCount: 2, types: ["int"] },
+  challenger_paid: { expectedCount: 3, types: ["int", "address"] },
+  fee_claimed: { expectedCount: 2, types: ["address"] },
+  withdrawal: { expectedCount: 2, types: ["address"] },
+  withdrawal_pending: { expectedCount: 2, types: ["address"] },
+};
+
+export const SQUAD_TOPIC_SCHEMAS: Record<string, TopicSchemaSpec> = {
+  market_created: { expectedCount: 3, types: ["int", "address"] },
+  deposited: { expectedCount: 4, types: ["int", "int", "address"] },
+  withdrawn: { expectedCount: 4, types: ["int", "int", "address"] },
+  resolved: { expectedCount: 2, types: ["int"] },
+  claimed: { expectedCount: 3, types: ["int", "address"] },
+  fees_claimed: { expectedCount: 2, types: ["address"] },
+};
+
 // ── Scalar helpers ───────────────────────────────────────────────────────────
 
 class DecodeError extends Error {}
 
+export function sanitizeReason(reason: string, maxLength = 200): string {
+  if (!reason) return "";
+  let cleaned = String(reason)
+    .replace(/\b\d{8,10}:[A-Za-z0-9_-]{32,}\b/g, "[REDACTED]")
+    .replace(/\bS[A-Z2-7]{55}\b/g, "[REDACTED]")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (cleaned.length > maxLength) {
+    cleaned = `${cleaned.slice(0, maxLength - 1)}…`;
+  }
+  return cleaned;
+}
+
 function native(value: xdr.ScVal): unknown {
   return scValToNative(value);
+}
+
+function decodeScVal(val: unknown): unknown {
+  if (val === null || val === undefined) return null;
+  if (typeof val === "string") {
+    try {
+      const scVal = xdr.ScVal.fromXDR(val, "base64");
+      return scValToNative(scVal);
+    } catch {
+      return val;
+    }
+  }
+  if (val instanceof Uint8Array || Buffer.isBuffer(val)) {
+    try {
+      const scVal = xdr.ScVal.fromXDR(Buffer.from(val));
+      return scValToNative(scVal);
+    } catch {
+      return val;
+    }
+  }
+  try {
+    return native(val as xdr.ScVal);
+  } catch {
+    return val;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -159,8 +225,6 @@ function num(value: unknown, what: string): number {
 
 function str(value: unknown, what: string): string {
   if (typeof value === "string") return value;
-  // A contract `String` normally decodes to a JS string, but bytes-shaped
-  // payloads show up as Buffer on some SDK paths.
   if (value instanceof Uint8Array) return Buffer.from(value).toString("utf8");
   throw new DecodeError(`${what}: expected a string, got ${typeof value}`);
 }
@@ -185,6 +249,49 @@ function topicAt(topics: unknown[], index: number, what: string): unknown {
     throw new DecodeError(`${what}: missing topic[${index}] (event has ${topics.length} topics)`);
   }
   return topics[index];
+}
+
+export function validateTopicSchema(
+  source: ContractSource,
+  eventName: string,
+  topics: unknown[],
+): { valid: boolean; reason?: string } {
+  const schemas = source === "market" ? MARKET_TOPIC_SCHEMAS : SQUAD_TOPIC_SCHEMAS;
+  const schema = schemas[eventName];
+  if (!schema) {
+    return { valid: true };
+  }
+
+  if (topics.length !== schema.expectedCount) {
+    return {
+      valid: false,
+      reason: `topic schema mismatch for ${eventName}: expected ${schema.expectedCount} topics, got ${topics.length}`,
+    };
+  }
+
+  for (let i = 0; i < schema.types.length; i++) {
+    const expectedType = schema.types[i];
+    const pos = i + 1;
+    const topicVal = topics[pos];
+
+    try {
+      if (expectedType === "int") {
+        num(topicVal, `${eventName}.topic[${pos}]`);
+      } else if (expectedType === "address") {
+        addr(topicVal, `${eventName}.topic[${pos}]`);
+      } else if (expectedType === "string") {
+        str(topicVal, `${eventName}.topic[${pos}]`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        valid: false,
+        reason: `topic schema mismatch for ${eventName}.topic[${pos}]: ${msg}`,
+      };
+    }
+  }
+
+  return { valid: true };
 }
 
 // ── Per-contract decoders ────────────────────────────────────────────────────
@@ -270,8 +377,6 @@ function decodeMarket(
       };
 
     default:
-      // `oracle_changed`, `ownership_transferred`, `agent_attributed`,
-      // `fee_accrued`, `fee_policy_*` — real events with no notification.
       return null;
   }
 }
@@ -344,7 +449,6 @@ function decodeSquad(
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
-/** `event.contractId` is a `Contract` on some SDK paths and a string on others. */
 function contractIdOf(event: rpc.Api.EventResponse): string {
   const raw: unknown = (event as { contractId?: unknown }).contractId;
   if (typeof raw === "string") return raw;
@@ -367,26 +471,76 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
   const meta: EventMeta = {
     source,
     contractId: contractIdOf(event),
-    ledger: Number(event.ledger ?? 0),
-    txHash: event.txHash ?? "",
-    at: Math.floor(new Date(event.ledgerClosedAt ?? 0).getTime() / 1000),
-    eventId: event.id ?? "",
+    ledger: Number(event?.ledger ?? 0),
+    txHash: event?.txHash ?? "",
+    at: Math.floor(new Date(event?.ledgerClosedAt ?? 0).getTime() / 1000),
+    eventId: event?.id ?? "",
   };
+
+  if (!event || !Array.isArray(event.topic)) {
+    return {
+      ...meta,
+      payload: { name: "unknown", eventName: "", reason: "missing or invalid topic array" },
+    };
+  }
+
+  if (event.topic.length === 0) {
+    return {
+      ...meta,
+      payload: { name: "unknown", eventName: "", reason: "empty topic array" },
+    };
+  }
 
   let eventName = "";
   try {
-    const topics = (event.topic ?? []).map((t) => {
+    const topics = event.topic.map((t, idx) => {
       try {
-        return native(t);
-      } catch {
-        return null;
+        return decodeScVal(t);
+      } catch (err) {
+        throw new DecodeError(
+          `malformed XDR at topic[${idx}]: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     });
 
     const first = topics[0];
-    eventName = typeof first === "string" ? first : "";
+    if (typeof first !== "string" || !first) {
+      return {
+        ...meta,
+        payload: { name: "unknown", eventName: "", reason: "topic[0] is not an event name string" },
+      };
+    }
+    eventName = first;
 
-    const decodedValue = native(event.value);
+    const schemaValidation = validateTopicSchema(source, eventName, topics);
+    if (!schemaValidation.valid) {
+      return {
+        ...meta,
+        payload: {
+          name: "unknown",
+          eventName,
+          reason: sanitizeReason(schemaValidation.reason ?? "topic schema mismatch"),
+        },
+      };
+    }
+
+    let decodedValue: unknown = {};
+    if (event.value !== undefined && event.value !== null) {
+      try {
+        decodedValue = decodeScVal(event.value);
+      } catch (err) {
+        return {
+          ...meta,
+          payload: {
+            name: "unknown",
+            eventName,
+            reason: sanitizeReason(
+              `malformed value XDR: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          },
+        };
+      }
+    }
     const fields = isRecord(decodedValue) ? decodedValue : {};
 
     const payload =
@@ -402,7 +556,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
       payload: {
         name: "unknown",
         eventName,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: sanitizeReason(err instanceof Error ? err.message : String(err)),
       },
     };
   }
@@ -437,3 +591,4 @@ export function winnerSideLabel(side: number): string {
 export function squadSideLabel(side: number): string {
   return SQUAD_SIDE[side] ?? `side ${side}`;
 }
+

@@ -192,6 +192,7 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
   compact, bounded, and the configured bot token is redacted.
+- **Malformed events and topic schema mismatches** are validated before decoding. If an event has missing topics, an unexpected topic count or argument type, or corrupted XDR, it is decoded to an `unknown` payload with a sanitized, bounded reason and skipped rather than crashing the scanner or sending invalid notifications.
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
