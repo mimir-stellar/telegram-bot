@@ -105,7 +105,7 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters, chain-tip cache hits/misses and the last error |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
@@ -184,6 +184,12 @@ design of `src/stellar/events.ts`:
   pages, 12 of which are empty, to reach the page holding all 11 of its events.
 
 So the walk terminates on the cursor, never on the payload.
+
+`getHealth()` is read **once per cycle** and reused by every watched contract
+(`src/stellar/ledger-cache.ts`): a cycle watching two contracts performs one
+tip read, not one per contract, and both targets see the same tip. A failed
+tip read is not cached, so the next target retries and each target still fails
+independently.
 
 Events are also not a source of truth for current state — a claim's stakes and
 status come from the contract's own getters. This bot is a timeline, not an

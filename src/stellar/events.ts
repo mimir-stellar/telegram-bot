@@ -39,6 +39,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 
 import { loadStellarConfig, networkLabel } from "../config.js";
 import { createRpcServer } from "./client.js";
+import type { LedgerTip } from "./ledger-cache.js";
 import { decodeEvent, formatUsdc, type ContractSource, type DecodedEvent } from "./decode.js";
 
 /** Events per request. The RPC caps this; 200 is well inside it. */
@@ -60,6 +61,12 @@ export interface ScanOptions {
   lookbackLedgers?: number | undefined;
   limit?: number | undefined;
   maxPages?: number | undefined;
+  /**
+   * Chain tip cached by the caller for this poll cycle. When set, the scan does
+   * NOT call `getHealth()`; the caller owns refreshing it per cycle (see
+   * `LedgerCache`). Omitted means a one-shot scan fetches its own tip.
+   */
+  ledgerTip?: LedgerTip | undefined;
 }
 
 export interface RawScan {
@@ -99,7 +106,9 @@ export async function paginatedGetEvents(
   const limit = Math.max(1, opts.limit ?? EVENT_PAGE_LIMIT);
   const maxPages = Math.max(1, opts.maxPages ?? EVENT_MAX_PAGES);
 
-  const health = await server.getHealth();
+  // Reuse the caller's per-cycle tip when provided; a one-shot scan still
+  // fetches its own. `ledgerTip` carries the same oldest/latest fields.
+  const health = opts.ledgerTip ?? (await server.getHealth());
   const oldestLedger = health.oldestLedger;
 
   const events: rpc.Api.EventResponse[] = [];

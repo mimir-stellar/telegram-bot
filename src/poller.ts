@@ -26,6 +26,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 import type { BotConfig } from "./config.js";
 import { formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
+import { LedgerCache } from "./stellar/ledger-cache.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
 export interface TargetState {
@@ -55,6 +56,8 @@ export interface PollerStatus {
   eventsSkipped: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
+  /** Chain-tip cache counters for the current process (reset never zeroes them). */
+  ledgerCache: { hits: number; misses: number };
   targets: TargetState[];
 }
 
@@ -218,8 +221,14 @@ export function createPoller(deps: PollerDeps) {
     eventsSkipped: 0,
     consecutiveFailures: 0,
     lastError: null,
+    ledgerCache: { hits: 0, misses: 0 },
     targets: [],
   };
+
+  // One chain tip per poll cycle. `Infinity` ttl + a reset at the top of each
+  // cycle means the tip is fetched exactly once per cycle, no matter how many
+  // targets are watched, without a wall-clock expiry mid-cycle.
+  const ledgerCache = new LedgerCache({ ttlMs: Number.POSITIVE_INFINITY });
 
   let timer: NodeJS.Timeout | null = null;
   let stopped = false;
@@ -358,6 +367,10 @@ export function createPoller(deps: PollerDeps) {
     status.cycles += 1;
     status.lastPollAt = Date.now();
 
+    // A cycle gets a fresh view of the chain tip; every target in this cycle
+    // reuses it instead of each calling getHealth().
+    ledgerCache.reset();
+
     let anyOk = false;
 
     for (const target of targets) {
@@ -365,13 +378,18 @@ export function createPoller(deps: PollerDeps) {
       if (!current) continue;
 
       try {
+        // Shared per-cycle tip: the first target fetches it, the rest reuse it.
+        // A failed fetch is not cached, so a later target retries and this
+        // target fails independently, exactly as before.
+        const tip = await ledgerCache.get(server);
         const scan = await readContractEvents(server, target, {
           cursor: current.cursor ?? undefined,
           lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
+          ledgerTip: tip,
         });
 
-        status.latestLedger = scan.latestLedger;
-        status.oldestLedger = scan.oldestLedger;
+        status.latestLedger = tip.latestLedger;
+        status.oldestLedger = tip.oldestLedger;
         current.lastError = null;
         anyOk = true;
 
@@ -499,7 +517,11 @@ export function createPoller(deps: PollerDeps) {
     },
 
     status(): PollerStatus {
-      return { ...status, targets: [...state.values()].map((t) => ({ ...t })) };
+      return {
+        ...status,
+        ledgerCache: ledgerCache.stats(),
+        targets: [...state.values()].map((t) => ({ ...t })),
+      };
     },
   };
 }
