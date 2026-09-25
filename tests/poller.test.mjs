@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -207,5 +207,44 @@ test("persistent volume warning is logged and status updated when cursor directo
     console.warn = originalWarn;
     poller.stop();
     await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("persistent volume warning is logged and status updated when cursor file permissions check fails", async () => {
+  const secret = "123456789:TEST-ONLY-TOKEN-NEVER-USE";
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-cursor-perm-"));
+  const cursorFile = path.join(directory, "cursor.json");
+  await writeFile(cursorFile, CURSOR_FILE, "utf8");
+  await chmod(cursorFile, 0o444);
+
+  const poller = createPoller({
+    config: baseConfig(cursorFile),
+    server: stuckServer(),
+    send: async () => undefined,
+  });
+
+  const originalWarn = console.warn;
+  const warnLogs = [];
+  console.warn = (...args) => warnLogs.push(args.join(" "));
+
+  try {
+    await poller.start();
+    const st = poller.status();
+    assert.equal(st.persistentVolumeAvailable, false);
+    assert.ok(st.persistentVolumeError);
+    assert.equal(st.persistentVolumeError.includes(secret), false);
+
+    const health = buildHealthReport(baseConfig(cursorFile), st);
+    assert.equal(health.poller.persistentVolumeAvailable, false);
+    assert.ok(health.poller.persistentVolumeError);
+
+    const warnings = warnLogs.join("\n");
+    assert.ok(warnings.includes("persistent volume warning"));
+    assert.equal(warnings.includes(secret), false);
+  } finally {
+    console.warn = originalWarn;
+    poller.stop();
+    await chmod(cursorFile, 0o666);
+    await rm(directory, { recursive: true, force: true });
   }
 });

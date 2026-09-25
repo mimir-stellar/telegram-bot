@@ -97,11 +97,11 @@ The Stellar chain remains the authoritative record.
 
 * The cursor cannot be parsed.
 * The stored cursor is incompatible with the current cursor format.
-* The process reports a cursor-loading problem.
+* The process reports a cursor-loading problem or cursor-file permissions warning.
 
 ### Recovery
 
-A corrupt cursor is treated as a cold start. A syntactically valid cursor that
+A corrupt cursor is treated as a cold start. An unwritable or unreadable cursor file logs an actionable warning and falls back to in-memory cursors (`persistentVolumeAvailable: false`). A syntactically valid cursor that
 Soroban rejects as stale is different: the poller keeps it unchanged, exposes
 the bounded RPC error in `/status`, and retries the same position. `/resume`
 also leaves it unchanged. This avoids duplicate notifications or skipped chain

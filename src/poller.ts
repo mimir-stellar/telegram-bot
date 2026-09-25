@@ -17,7 +17,8 @@
  *    the next restart.
  */
 
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
@@ -184,9 +185,6 @@ export function createPoller(deps: PollerDeps) {
       await mkdir(dir, { recursive: true });
       await writeFile(probeFile, "probe", "utf8");
       await unlink(probeFile);
-      status.persistentVolumeAvailable = true;
-      status.persistentVolumeError = null;
-      return true;
     } catch (err) {
       const msg = errorMessage(err);
       status.persistentVolumeAvailable = false;
@@ -201,6 +199,25 @@ export function createPoller(deps: PollerDeps) {
       }
       return false;
     }
+
+    try {
+      await access(config.cursorFile, constants.R_OK | constants.W_OK);
+    } catch (err: unknown) {
+      const error = err as { code?: string };
+      if (error && error.code !== "ENOENT") {
+        const msg = errorMessage(err);
+        status.persistentVolumeAvailable = false;
+        status.persistentVolumeError = msg;
+        console.warn(
+          `[poller] persistent volume warning: cursor file ${config.cursorFile} permissions check failed (${msg}); falling back to in-memory cursors`,
+        );
+        return false;
+      }
+    }
+
+    status.persistentVolumeAvailable = true;
+    status.persistentVolumeError = null;
+    return true;
   }
 
   async function loadCursors(): Promise<void> {
@@ -209,11 +226,18 @@ export function createPoller(deps: PollerDeps) {
     let raw: string;
     try {
       raw = await readFile(config.cursorFile, "utf8");
-    } catch {
-      console.log(
-        `[poller] no cursor file at ${config.cursorFile}; cold start ` +
-          `${config.startLookbackLedgers} ledgers behind the tip`,
-      );
+    } catch (err: unknown) {
+      const error = err as { code?: string };
+      if (error && error.code !== "ENOENT") {
+        console.warn(
+          `[poller] cursor file unreadable due to permissions: ${errorMessage(err)}`,
+        );
+      } else {
+        console.log(
+          `[poller] no cursor file at ${config.cursorFile}; cold start ` +
+            `${config.startLookbackLedgers} ledgers behind the tip`,
+        );
+      }
       return;
     }
 
