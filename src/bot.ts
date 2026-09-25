@@ -61,9 +61,13 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt)}`,
     `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
-    "",
-    "*Watching*",
   ];
+
+  if (status.persistentVolumeAvailable === false) {
+    lines.push(`Volume warning: persistent storage unavailable \\(${escapeMd(status.persistentVolumeError ?? "unwritable")}\\)`);
+  }
+
+  lines.push("", "*Watching*");
 
   for (const target of status.targets) {
     lines.push(

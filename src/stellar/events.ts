@@ -39,7 +39,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 
 import { loadStellarConfig, networkLabel } from "../config.js";
 import { createRpcServer } from "./client.js";
-import { decodeEvent, formatUsdc, type ContractSource, type DecodedEvent } from "./decode.js";
+import { decodeEvent, formatUsdc, sanitizeReason, type ContractSource, type DecodedEvent } from "./decode.js";
 
 /** Events per request. The RPC caps this; 200 is well inside it. */
 export const EVENT_PAGE_LIMIT = 200;
@@ -99,6 +99,17 @@ export async function paginatedGetEvents(
 
   const events: rpc.Api.EventResponse[] = [];
   let cursor: string | undefined = opts.cursor;
+
+  if (cursor) {
+    const cursorLedger = eventCursorLedger(cursor);
+    if (cursorLedger !== null && cursorLedger < oldestLedger) {
+      console.warn(
+        `[events] cursor ${cursor} (ledger ${cursorLedger}) is behind retained floor ${oldestLedger}; falling back to startLedger`,
+      );
+      cursor = undefined;
+    }
+  }
+
   let lastCursor: string | null = opts.cursor ?? null;
   let previousCursor = "";
   let latestLedger = health.latestLedger;
@@ -115,15 +126,33 @@ export async function paginatedGetEvents(
     const requestedStart =
       opts.startLedger ?? Math.max(1, health.latestLedger - (opts.lookbackLedgers ?? 0));
 
-    // The two request shapes are a discriminated union on `cursor`, so they are
-    // built separately rather than spread into one object.
-    const response: rpc.Api.GetEventsResponse = cursor
-      ? await server.getEvents({ filters, cursor, limit })
-      : await server.getEvents({
-          filters,
-          startLedger: Math.max(requestedStart, oldestLedger),
-          limit,
-        });
+    let response: rpc.Api.GetEventsResponse;
+    if (cursor) {
+      try {
+        response = await server.getEvents({ filters, cursor, limit });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/cursor|startledger|oldestledger|out of range|invalid/i.test(msg)) {
+          console.warn(
+            `[events] cursor request failed (${sanitizeReason(msg)}), falling back to startLedger`,
+          );
+          cursor = undefined;
+          response = await server.getEvents({
+            filters,
+            startLedger: Math.max(requestedStart, oldestLedger),
+            limit,
+          });
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      response = await server.getEvents({
+        filters,
+        startLedger: Math.max(requestedStart, oldestLedger),
+        limit,
+      });
+    }
 
     events.push(...response.events);
     latestLedger = response.latestLedger;

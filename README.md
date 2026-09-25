@@ -165,11 +165,7 @@ rather than replaying the whole retained window into your chat. `/pause` and
 `/resume` never edit this file; they only control scheduling, so the cursor
 format remains version 1 and a restart does not preserve a pause.
 
-**Deployment note:** a flat file is fine for v0 but it must survive restarts. On
-an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
-at one). On an ephemeral filesystem every restart is a cold start, and events
-that happened while the bot was down are never posted. Swapping this for a real
-KV store is a deliberate future step, not something this repo does today.
+**Deployment note:** a flat file is fine for v0 but it must survive restarts. At startup, the poller verifies persistent-volume availability and cursor-file permissions by testing write access to the configured `CURSOR_FILE` directory and read/write access to any existing cursor file. If persistent-volume or file-permission verification fails, the poller logs an actionable warning and falls back to in-memory cursor management without crashing, ensuring operational continuity while surfacing volume warnings via `/status` and `/health`. On an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE` at one). On an ephemeral filesystem every restart is a cold start, and events that happened while the bot was down are never posted. Swapping this for a real KV store is a deliberate future step, not something this repo does today.
 
 ## Failure behaviour
 
@@ -192,6 +188,7 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
   compact, bounded, and the configured bot token is redacted.
+- **Malformed events and topic schema mismatches** are validated before decoding. If an event has missing topics, an unexpected topic count or argument type, or corrupted XDR, it is decoded to an `unknown` payload with a sanitized, bounded reason and skipped rather than crashing the scanner or sending invalid notifications.
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.

@@ -17,7 +17,8 @@
  *    the next restart.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
@@ -55,6 +56,8 @@ export interface PollerStatus {
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
   targets: TargetState[];
+  persistentVolumeAvailable: boolean;
+  persistentVolumeError: string | null;
 }
 
 interface CursorFile {
@@ -160,6 +163,8 @@ export function createPoller(deps: PollerDeps) {
     consecutiveFailures: 0,
     lastError: null,
     targets: [],
+    persistentVolumeAvailable: true,
+    persistentVolumeError: null,
   };
 
   let timer: NodeJS.Timeout | null = null;
@@ -170,15 +175,69 @@ export function createPoller(deps: PollerDeps) {
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
+  async function verifyPersistentVolume(): Promise<boolean> {
+    const dir = path.dirname(config.cursorFile);
+    const probeFile = path.join(
+      dir,
+      `.volume-probe-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,
+    );
+    try {
+      await mkdir(dir, { recursive: true });
+      await writeFile(probeFile, "probe", "utf8");
+      await unlink(probeFile);
+    } catch (err) {
+      const msg = errorMessage(err);
+      status.persistentVolumeAvailable = false;
+      status.persistentVolumeError = msg;
+      console.warn(
+        `[poller] persistent volume warning: cursor directory ${dir} is not writable (${msg}); falling back to in-memory cursors`,
+      );
+      try {
+        await unlink(probeFile);
+      } catch {
+        // ignore probe file cleanup failure
+      }
+      return false;
+    }
+
+    try {
+      await access(config.cursorFile, constants.R_OK | constants.W_OK);
+    } catch (err: unknown) {
+      const error = err as { code?: string };
+      if (error && error.code !== "ENOENT") {
+        const msg = errorMessage(err);
+        status.persistentVolumeAvailable = false;
+        status.persistentVolumeError = msg;
+        console.warn(
+          `[poller] persistent volume warning: cursor file ${config.cursorFile} permissions check failed (${msg}); falling back to in-memory cursors`,
+        );
+        return false;
+      }
+    }
+
+    status.persistentVolumeAvailable = true;
+    status.persistentVolumeError = null;
+    return true;
+  }
+
   async function loadCursors(): Promise<void> {
+    await verifyPersistentVolume();
+
     let raw: string;
     try {
       raw = await readFile(config.cursorFile, "utf8");
-    } catch {
-      console.log(
-        `[poller] no cursor file at ${config.cursorFile}; cold start ` +
-          `${config.startLookbackLedgers} ledgers behind the tip`,
-      );
+    } catch (err: unknown) {
+      const error = err as { code?: string };
+      if (error && error.code !== "ENOENT") {
+        console.warn(
+          `[poller] cursor file unreadable due to permissions: ${errorMessage(err)}`,
+        );
+      } else {
+        console.log(
+          `[poller] no cursor file at ${config.cursorFile}; cold start ` +
+            `${config.startLookbackLedgers} ledgers behind the tip`,
+        );
+      }
       return;
     }
 
@@ -221,8 +280,13 @@ export function createPoller(deps: PollerDeps) {
       const tmp = `${config.cursorFile}.tmp`;
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, config.cursorFile);
+      status.persistentVolumeAvailable = true;
+      status.persistentVolumeError = null;
     } catch (err) {
-      console.error(`[poller] could not persist cursor: ${errorMessage(err)}`);
+      const msg = errorMessage(err);
+      status.persistentVolumeAvailable = false;
+      status.persistentVolumeError = msg;
+      console.error(`[poller] could not persist cursor: ${msg}`);
     }
   }
 
