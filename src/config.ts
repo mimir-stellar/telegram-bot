@@ -22,11 +22,15 @@ export interface StellarConfig {
   rpcUrl: string;
   horizonUrl: string;
   networkPassphrase: string;
+  /** Optional override for stellar.expert (or compatible) explorer origin. */
+  explorerBaseUrl: string;
 }
 
 export interface BotConfig extends StellarConfig {
   botToken: string;
   chatId: string;
+  /** Telegram user id allowed to run operator-only commands. Null disables them. */
+  operatorTelegramUserId: string | null;
   pollIntervalMs: number;
   startLookbackLedgers: number;
   cursorFile: string;
@@ -37,6 +41,15 @@ export interface BotConfig extends StellarConfig {
    * a cold start. Default 1000 (≈ 83 minutes on Testnet at ~5 s/ledger).
    */
   cursorStaleLedgerMargin: number;
+  /** Loopback host for the local HTTP health endpoint. */
+  healthHost: string;
+  /** TCP port for the health endpoint. `0` disables the listener. */
+  healthPort: number;
+  /**
+   * After the first successful poll, treat the process as degraded if no
+   * successful cycle lands within this window. `0` disables the stale check.
+   */
+  healthStaleMs: number;
 }
 
 export class ConfigError extends Error {
@@ -63,6 +76,10 @@ const DEFAULTS = {
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
   cursorStaleLedgerMargin: 1_000,
+  healthHost: "127.0.0.1",
+  healthPort: 8787,
+  // 3× default poll interval — one missed cycle is fine; three is not.
+  healthStaleMs: 90_000,
 } as const;
 
 /** Strkey for a contract: `C` + 55 base32 characters. */
@@ -139,6 +156,27 @@ function collector() {
       }
       return value;
     },
+
+    optionalUserId(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
+      if (!/^[1-9]\d*$/.test(value) || BigInt(value) > BigInt(Number.MAX_SAFE_INTEGER)) {
+        problems.push(`${name} must be a positive Telegram user id; got "${value}"`);
+        return null;
+      }
+      return value;
+    },
+
+    host(name: string, fallback: string): string {
+      const value = read(name) ?? fallback;
+      // Keep this a host, not a URL — the health server binds a TCP listener.
+      if (/[\s/]/.test(value) || value.includes("://")) {
+        problems.push(
+          `${name} must be a hostname or IP (e.g. 127.0.0.1); got "${value}"`,
+        );
+      }
+      return value;
+    },
   };
 }
 
@@ -149,6 +187,10 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     rpcUrl: c.url("STELLAR_RPC_URL", DEFAULTS.rpcUrl),
     horizonUrl: c.url("STELLAR_HORIZON_URL", DEFAULTS.horizonUrl),
     networkPassphrase: read("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
+    explorerBaseUrl: c.url(
+      "STELLAR_EXPLORER_BASE_URL",
+      "https://stellar.expert/explorer",
+    ),
   };
 }
 
@@ -169,6 +211,7 @@ export function loadConfig(): BotConfig {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
     chatId: c.chatId("TELEGRAM_CHAT_ID"),
+    operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
     cursorFile: path.resolve(process.cwd(), read("CURSOR_FILE") ?? DEFAULTS.cursorFile),
@@ -182,6 +225,10 @@ export function loadConfig(): BotConfig {
       DEFAULTS.cursorStaleLedgerMargin,
       0,
     ),
+    healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
+    // Port 0 is the explicit disable switch (min 0).
+    healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),
+    healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
