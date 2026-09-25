@@ -96,6 +96,7 @@ looks healthy but notifies nobody.
 | `/help` | Same, plus the command list |
 | `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
+| `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
 

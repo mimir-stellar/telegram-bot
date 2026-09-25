@@ -59,8 +59,15 @@ test("buildHealthReport is ok for a fresh running poller", () => {
   assert.equal(report.service, "mimir-telegram-bot");
   assert.equal(report.network, "testnet");
   assert.equal(report.uptimeMs, 4_500);
+  assert.equal(report.poller.channelPreviewMode, false);
   assert.equal(report.poller.targets[0].cursorPreview.endsWith("…"), true);
 });
+
+test("buildHealthReport reflects enabled channelPreviewMode", () => {
+  const report = buildHealthReport(baseConfig({ channelPreviewMode: true }), baseStatus(), 5_500);
+  assert.equal(report.poller.channelPreviewMode, true);
+});
+
 
 test("buildHealthReport is stopped when the poller is not running", () => {
   const report = buildHealthReport(baseConfig(), baseStatus({ running: false }), 5_500);

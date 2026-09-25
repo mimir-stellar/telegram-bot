@@ -172,8 +172,85 @@ function headline(event: DecodedEvent): string | null {
 }
 
 /** The full message, or null when the event is not worth notifying. */
-export function formatEvent(config: StellarConfig, event: DecodedEvent): string | null {
-  const head = headline(event);
-  if (head === null) return null;
-  return `${head}\n${footer(config, event)}`;
+export function formatEvent(
+  config: StellarConfig & { channelPreviewMode?: boolean },
+  event: DecodedEvent,
+): string | null {
+  try {
+    const head = headline(event);
+    if (head === null) return null;
+    const body = `${head}\n${footer(config, event)}`;
+    if (config.channelPreviewMode) {
+      return `🧪 *[PREVIEW MODE]*\n${body}`;
+    }
+    return body;
+  } catch (err) {
+    return formatFallbackEvent(config, event, safeErrorMessage(err));
+  }
 }
+
+/**
+ * Fallback message when an event payload is malformed or an error occurs during formatting.
+ */
+export function formatFallbackEvent(
+  config: StellarConfig,
+  event: DecodedEvent,
+  reason = "malformed payload",
+): string {
+  const source = escapeMd(event.source ?? "unknown");
+  const contract = escapeMd(shortAddress(event.contractId ?? "unknown"));
+  const ledger = escapeMd(String(event.ledger ?? "unknown"));
+  const safeReason = escapeMd(safeErrorMessage(reason));
+  const txPart = event.txHash ? ` · [tx](${txExplorerUrl(config, event.txHash)})` : "";
+  return (
+    `⚠️ *Event Notification Fallback* \\(${source}\\)\n` +
+    `Contract: \`${contract}\` · Ledger: ${ledger}${txPart}\n` +
+    `Reason: _${safeReason}_`
+  );
+}
+
+/**
+ * Generate a channel preview message for on-demand preview commands.
+ */
+export function previewMessage(config: StellarConfig, target = "market"): string {
+  const isSquad = target.trim().toLowerCase() === "squad";
+
+  if (isSquad) {
+    const sampleEvent: DecodedEvent = {
+      source: "squad",
+      contractId: config.squadContractId,
+      ledger: 1000000,
+      txHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      at: Math.floor(Date.now() / 1000),
+      eventId: "1000000-1",
+      payload: {
+        name: "market_created",
+        marketId: 1,
+        question: "Will Stellar process 1M Soroban operations in 24 hours?",
+        captain: "GDZCB3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+        feeBps: 100,
+        deadline: 1770000000,
+      },
+    };
+    const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
+    return `🧪 *Channel Preview — mimir\\-squad*\n\n${formatted}`;
+  }
+
+  const sampleEvent: DecodedEvent = {
+    source: "market",
+    contractId: config.marketContractId,
+    ledger: 1000000,
+    txHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    at: Math.floor(Date.now() / 1000),
+    eventId: "1000000-0",
+    payload: {
+      name: "claim_created",
+      claimId: 1,
+      category: "crypto",
+      creator: "GBMGZ3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+    },
+  };
+  const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
+  return `🧪 *Channel Preview — mimir\\-market*\n\n${formatted}`;
+}
+

@@ -9,7 +9,8 @@
 
 import { Bot, type Context } from "grammy";
 
-import { escapeMd, safeErrorMessage } from "./notifications/format.js";
+import { escapeMd, previewMessage, safeErrorMessage } from "./notifications/format.js";
+export { previewMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
@@ -21,6 +22,7 @@ const HELP_BASE = [
   "",
   "/status — what I am watching and how far I have read",
   "/contracts — the contract ids I watch and where to look them up",
+  "/preview — preview channel notification formatting",
   "/help — this message",
 ];
 
@@ -56,6 +58,7 @@ function cursorPreview(cursor: string | null): string {
 function statusMessage(config: BotConfig, status: PollerStatus): string {
   const lines: string[] = [
     `*Status* — ${status.paused ? "paused" : status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
+    `Channel preview: ${config.channelPreviewMode ? "enabled" : "disabled"}`,
     "",
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
@@ -175,6 +178,13 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
     await ctx.reply(contractsMessage(config), TELEGRAM_OPTIONS);
   });
 
+  bot.command("preview", async (ctx) => {
+    const text = ctx.message?.text ?? "";
+    const spaceIndex = text.indexOf(" ");
+    const arg = spaceIndex !== -1 ? text.slice(spaceIndex + 1).trim() : "";
+    await ctx.reply(previewMessage(config, arg || "market"), TELEGRAM_OPTIONS);
+  });
+
   bot.command("pause", async (ctx) => {
     if (!isOperator(ctx, config)) {
       console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
@@ -223,6 +233,7 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "help", description: "Show help" },
       { command: "status", description: "Last-seen ledger and watched contracts" },
       { command: "contracts", description: "Contract ids and explorer links" },
+      { command: "preview", description: "Preview channel notification formatting" },
       { command: "pause", description: "Operator only: pause new scans" },
       { command: "resume", description: "Operator only: resume polling now" },
     ]);
@@ -231,3 +242,4 @@ export async function registerCommands(bot: Bot): Promise<void> {
     console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);
   }
 }
+

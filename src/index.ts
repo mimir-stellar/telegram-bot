@@ -45,6 +45,9 @@ async function main(): Promise<void> {
   console.log(
     `[boot] operator      ${config.operatorTelegramUserId === null ? "disabled" : "configured"}`,
   );
+  console.log(
+    `[boot] preview mode  ${config.channelPreviewMode ? "enabled" : "disabled"}`,
+  );
 
   const server = createRpcServer(config);
 
