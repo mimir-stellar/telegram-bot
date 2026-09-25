@@ -366,7 +366,7 @@ test("decodeEvent: squad unknown event yields unknown/no decoder", () => {
 
 // ── Oversized strings / clip() in formatEvent ────────────────────────────────
 
-test("formatEvent: long category in claim_created is rendered without truncation", () => {
+test("formatEvent: long category in claim_created is clipped to the field limit", () => {
   // claim_created renders the category directly; there is no clip() call there,
   // but it should still not throw or produce bad markdown.
   const config = {
@@ -390,8 +390,9 @@ test("formatEvent: long category in claim_created is rendered without truncation
   let msg;
   assert.doesNotThrow(() => { msg = formatEvent(config, event); });
   assert.ok(msg !== null, "should produce a message");
-  // The full category is in the message (no truncation at this field)
-  assert.ok(msg.includes(escapeMd(longCategory)));
+  // #250 clips oversized fields at 200 chars; the full 500-char category must not appear
+  assert.equal(msg.includes(escapeMd(longCategory)), false);
+  assert.ok(msg.includes(escapeMd("a".repeat(150))));
 });
 
 test("formatEvent: claim_resolved summary is clipped at 200 characters", () => {
