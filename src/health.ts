@@ -58,6 +58,8 @@ export interface HealthReport {
       cursorPreview: string | null;
       hasError: boolean;
     }>;
+    persistentVolumeAvailable: boolean;
+    persistentVolumeError: string | null;
   };
 }
 
@@ -135,6 +137,8 @@ export function buildHealthReport(
         cursorPreview: previewCursor(t.cursor),
         hasError: t.lastError !== null,
       })),
+      persistentVolumeAvailable: poller.persistentVolumeAvailable ?? true,
+      persistentVolumeError: poller.persistentVolumeError ?? null,
     },
   };
 }

@@ -165,11 +165,7 @@ rather than replaying the whole retained window into your chat. `/pause` and
 `/resume` never edit this file; they only control scheduling, so the cursor
 format remains version 1 and a restart does not preserve a pause.
 
-**Deployment note:** a flat file is fine for v0 but it must survive restarts. On
-an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
-at one). On an ephemeral filesystem every restart is a cold start, and events
-that happened while the bot was down are never posted. Swapping this for a real
-KV store is a deliberate future step, not something this repo does today.
+**Deployment note:** a flat file is fine for v0 but it must survive restarts. At startup, the poller verifies persistent-volume availability by testing write access to the configured `CURSOR_FILE` directory. If persistent-volume verification fails, the poller logs an actionable warning and falls back to in-memory cursor management without crashing, ensuring operational continuity while surfacing volume warnings via `/status` and `/health`. On an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE` at one). On an ephemeral filesystem every restart is a cold start, and events that happened while the bot was down are never posted. Swapping this for a real KV store is a deliberate future step, not something this repo does today.
 
 ## Failure behaviour
 

@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createPoller } from "../dist/poller.js";
+import { buildHealthReport } from "../dist/health.js";
 
 const CURSOR_FILE = JSON.stringify({
   version: 1,
@@ -142,5 +143,69 @@ test("RPC failures are bounded and redact the configured bot token in status", a
     console.error = originalError;
     poller.stop();
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("persistent volume availability is verified at startup when directory is writable", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-pv-writable-"));
+  const cursorFile = path.join(directory, "cursor.json");
+
+  const poller = createPoller({
+    config: baseConfig(cursorFile),
+    server: stuckServer(),
+    send: async () => undefined,
+  });
+
+  try {
+    await poller.start();
+    const st = poller.status();
+    assert.equal(st.persistentVolumeAvailable, true);
+    assert.equal(st.persistentVolumeError, null);
+
+    const health = buildHealthReport(baseConfig(cursorFile), st);
+    assert.equal(health.poller.persistentVolumeAvailable, true);
+    assert.equal(health.poller.persistentVolumeError, null);
+  } finally {
+    poller.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("persistent volume warning is logged and status updated when cursor directory is unwritable", async () => {
+  const secret = "123456789:TEST-ONLY-TOKEN-NEVER-USE";
+  // On both Windows and Linux, placing a file where a directory is expected causes mkdir to fail with ENOTDIR or EEXIST
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mimir-pv-unwritable-"));
+  const blockingFilePath = path.join(tmpDir, "blocking-file");
+  await writeFile(blockingFilePath, "not a directory", "utf8");
+  const invalidCursorPath = path.join(blockingFilePath, "sub-dir", "cursor.json");
+
+  const poller = createPoller({
+    config: baseConfig(invalidCursorPath),
+    server: stuckServer(),
+    send: async () => undefined,
+  });
+
+  const originalWarn = console.warn;
+  const warnLogs = [];
+  console.warn = (...args) => warnLogs.push(args.join(" "));
+
+  try {
+    await poller.start();
+    const st = poller.status();
+    assert.equal(st.persistentVolumeAvailable, false);
+    assert.ok(st.persistentVolumeError);
+    assert.equal(st.persistentVolumeError.includes(secret), false);
+
+    const health = buildHealthReport(baseConfig(invalidCursorPath), st);
+    assert.equal(health.poller.persistentVolumeAvailable, false);
+    assert.ok(health.poller.persistentVolumeError);
+
+    const warnings = warnLogs.join("\n");
+    assert.ok(warnings.includes("persistent volume warning"));
+    assert.equal(warnings.includes(secret), false);
+  } finally {
+    console.warn = originalWarn;
+    poller.stop();
+    await rm(tmpDir, { recursive: true, force: true });
   }
 });
