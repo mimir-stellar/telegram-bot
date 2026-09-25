@@ -30,7 +30,7 @@ const HELP_BASE = [
   "/help — this message",
 ];
 
-function helpMessage(config: BotConfig): string {
+export function helpMessage(config: BotConfig): string {
   if (config.operatorTelegramUserId === null) return HELP_BASE.join("\n");
   return [
     ...HELP_BASE.slice(0, -1),
@@ -40,7 +40,7 @@ function helpMessage(config: BotConfig): string {
   ].join("\n");
 }
 
-const TELEGRAM_OPTIONS = {
+export const TELEGRAM_OPTIONS = {
   parse_mode: "MarkdownV2" as const,
   link_preview_options: { is_disabled: true },
 };
@@ -227,14 +227,200 @@ export function createBot(deps: BotDeps): Bot {
   resume: () => PollerResumeResult;
 }
 
-function isOperator(ctx: Context, config: BotConfig): boolean {
+export function isOperator(ctx: Context, config: BotConfig): boolean {
   const operatorId = config.operatorTelegramUserId;
   return operatorId !== null && ctx.from?.id.toString() === operatorId;
 }
 
+function isMessageNotModified(err: unknown): boolean {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /message is not modified/i.test(msg);
+}
+
+export async function safeAnswerCallback(
+  ctx: Context,
+  config: BotConfig,
+  params: { text?: string; show_alert?: boolean } = {},
+): Promise<void> {
+  if (ctx.callbackQuery?.id) {
+    try {
+      await ctx.answerCallbackQuery(params);
+    } catch (err) {
+      console.warn(
+        `[bot] answerCallbackQuery failed: ${safeErrorMessage(err, [config.botToken])}`,
+      );
+    }
+  }
+}
+
+export async function updateOrReplyMessage(
+  ctx: Context,
+  text: string,
+  replyMarkup?: InlineKeyboard,
+): Promise<void> {
+  const options = {
+    ...TELEGRAM_OPTIONS,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+  };
+
+  if (ctx.callbackQuery?.message) {
+    try {
+      await ctx.editMessageText(text, options);
+      return;
+    } catch (err) {
+      if (isMessageNotModified(err)) {
+        return;
+      }
+      // If edit failed (e.g. message too old or deleted), fall through to reply
+    }
+  }
+
+  if (ctx.chat) {
+    await ctx.reply(text, options);
+    return;
+  }
+
+  // no-op: callers that need to target the configured chat should call
+  // `ctx.api.sendMessage(config.chatId, ...)` directly when `ctx.chat` is
+  // unavailable. handleCallbackQuery does this.
+}
+
+export async function handleCallbackQuery(
+  ctx: Context,
+  deps: BotDeps,
+): Promise<void> {
+  const { config, status } = deps;
+  const pause = deps.pause ?? (() => "stopped");
+  const resume = deps.resume ?? (() => "stopped");
+  const rawData = ctx.callbackQuery?.data;
+
+  // Validate callback query data before acting
+  const validation = validateCallbackData(rawData);
+
+  if (!validation.ok) {
+    console.warn(
+      `[bot] rejected invalid callback query (${validation.reason}) on update ${ctx.update.update_id}`,
+    );
+    await safeAnswerCallback(ctx, config, {
+      text: validation.fallbackText,
+      show_alert: false,
+    });
+    return;
+  }
+
+  const { action } = validation;
+
+  // Enforce operator role authorization
+  if (action.type === "pause" || action.type === "resume") {
+    if (!isOperator(ctx, config)) {
+      console.warn(
+        `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
+      );
+      await safeAnswerCallback(ctx, config, {
+        text: CALLBACK_UNAUTHORIZED_FEEDBACK,
+        show_alert: true,
+      });
+      return;
+    }
+  }
+
+  // Execute validated action
+  try {
+    switch (action.type) {
+      case "status": {
+        const text = statusMessage(config, status());
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text, statusKeyboard(config));
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, {
+            ...TELEGRAM_OPTIONS,
+            reply_markup: statusKeyboard(config),
+          });
+        }
+        await safeAnswerCallback(ctx, config, { text: "Status refreshed" });
+        break;
+      }
+
+      case "contracts": {
+        const text = contractsMessage(config);
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text, contractsKeyboard());
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+        }
+        await safeAnswerCallback(ctx, config, { text: "Contracts" });
+        break;
+      }
+
+      case "help": {
+        const text = helpMessage(config);
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text);
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+        }
+        await safeAnswerCallback(ctx, config, { text: "Help" });
+        break;
+      }
+
+      case "pause": {
+        const result = pause();
+        const text = pauseMessage(result);
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text, operatorKeyboard());
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+        }
+        await safeAnswerCallback(ctx, config, {
+          text: result === "paused" ? "Polling paused" : result === "already-paused" ? "Already paused" : "Cannot pause",
+        });
+        break;
+      }
+
+      case "resume": {
+        const result = resume();
+        const text = resumeMessage(result);
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text, operatorKeyboard());
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+        }
+        await safeAnswerCallback(ctx, config, {
+          text: result === "resumed" ? "Polling resumed" : result === "already-running" ? "Already running" : "Cannot resume",
+        });
+        break;
+      }
+    }
+  } catch (err) {
+    console.error(
+      `[bot] callback error on action ${action.type}: ${safeErrorMessage(err, [config.botToken])}`,
+    );
+    await safeAnswerCallback(ctx, config, { text: "Action failed" });
+  }
+}
+
+/** Register callback handlers on a grammy-compatible bot or mock. */
+export function registerCallbackHandlers(
+  bot: Bot | { on: (event: string, handler: (ctx: Context) => Promise<void>) => void },
+  deps: BotDeps,
+): void {
+  (bot as { on: (event: string, handler: (ctx: Context) => Promise<void>) => void }).on(
+    "callback_query",
+    async (ctx: Context) => {
+      await handleCallbackQuery(ctx, deps);
+    },
+  );
+}
+
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
-export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
-  const { config, status, pause, resume } = deps;
+export function registerCommandHandlers(
+  bot: Bot | { command: (name: string, handler: (ctx: Context) => Promise<void>) => void },
+  deps: BotDeps,
+): void {
+  const { config, status } = deps;
+  const pause = deps.pause ?? (() => "stopped");
+  const resume = deps.resume ?? (() => "stopped");
 
   bot.command("start", async (ctx) => {
     await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
@@ -297,8 +483,14 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
 }
 
 export function createBot(deps: BotDeps): Bot {
-  const bot = new Bot(deps.config.botToken);
+  // Allow tests and partial harness overrides to omit a real token by using a
+  // harmless placeholder. In production `config.botToken` should always be
+  // provided; this only prevents grammy from throwing during certain unit
+  // tests where the test harness accidentally passes a partial config.
+  const token = deps.config?.botToken ?? process.env.BOT_TOKEN ?? "TEST-BOT-TOKEN";
+  const bot = new Bot(token);
   registerCommandHandlers(bot, deps);
+  registerCallbackHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.
