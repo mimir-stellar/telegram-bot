@@ -97,6 +97,7 @@ looks healthy but notifies nobody.
 | `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
 | `/audit` | The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
+| `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
 
@@ -156,6 +157,34 @@ when an entry is recorded, not by caller discipline:
 - Reading never throws on you: an unreadable or unknown-version line is skipped
   and counted, never fatal.
 
+## Local mock profile
+
+`MIMIR_PROFILE=mock` (or the scanner's `--mock` flag) fills in any config value
+the environment leaves unset with a **local, loopback-only** Soroban mock:
+fixture contract ids, `http://127.0.0.1:8420` RPC, and an isolated cursor file
+at `data/cursor.mock.json` so a drill can never touch the real bot's position.
+Explicit environment variables always win, any other profile name fails fast at
+startup, and nothing here needs a bot token, Telegram credentials, or Testnet.
+
+```bash
+npm run mock:rpc                        # serve the fixture scenario on 127.0.0.1:8420
+npm run scan:mock                       # scanner --mock: decode the scenario, no credentials
+npm run mock:poll                       # dry run: mock RPC + real poller, sends are logged
+npm run mock:poll -- --fail-events error  # inject in-band JSON-RPC failures
+npm run mock:rpc -- --stale-cursor      # reject cursors once the poller has one
+npm run mock:poll -- --malformed        # append an undecodable event (must skip, not crash)
+npm run mock:poll -- --port 0           # ephemeral port (any entry point accepts it)
+```
+
+Failure kinds are `error`, `http-500`, `rate-limit`, and `stale-cursor`, with
+the shorthands `--fail-rpc`, `--rate-limit`, `--stale-cursor` for `getEvents`
+and `--fail-health <kind>` for `getHealth`. The mock enforces the real RPC's
+request rules — mutually exclusive `startLedger`/`cursor`, the retained floor as
+an error rather than an empty page, bounded error messages — and the dry run
+exercises the poller's cursor-safety, restart, and bounded-log guarantees end to
+end. `npm test` covers all of it (`tests/mock-*.test.mjs`); run just those with
+`npm run test:mock`.
+
 ## How the polling works
 
 Soroban's `getEvents` is **not** `eth_getLogs`, and the difference is the whole
@@ -180,6 +209,35 @@ So the walk terminates on the cursor, never on the payload.
 Events are also not a source of truth for current state — a claim's stakes and
 status come from the contract's own getters. This bot is a timeline, not an
 index.
+
+## Decoder compatibility contract
+
+The decoder is deliberately forward-compatible at the event boundary:
+
+- Soroban event topics are read in declaration order, and non-topic fields are
+  read from the event value map using their deployed snake_case names.
+- A known event with a malformed topic, value, address, integer, or XDR value
+  becomes an `unknown` event. `decodeEvent` never throws into the poller, so one
+  bad event cannot stop a scan or move a cursor based on a partial payload.
+- Events that are valid on-chain but unknown to this version are retained as
+  `unknown` for bounded logs and are skipped for Telegram. They are not
+  invented, retried, or treated as current contract state.
+- Amounts remain `bigint` atomic USDC values until formatting; no floating-point
+  conversion is used. Contract strings are clipped at the notification and
+  diagnostic boundaries, and scanner output is bounded.
+
+The compatibility promise is for the deployed event wire shape and the public
+decoded payload names above, not for arbitrary XDR or future contract fields.
+Adding an optional field is safe when the existing fields retain their names
+and types. Renaming a topic or changing a field type is a decoder compatibility
+change and must be deployed together with a recorded fixture and an operational
+note. The chain remains authoritative if the bot version cannot decode an event.
+
+RPC configuration is read-only: `STELLAR_RPC_URL` must point to a Soroban RPC
+endpoint, and `STELLAR_NETWORK_PASSPHRASE` controls network labeling for
+explorer links. The client sends no signing material and creates no wallet.
+Explorer path components are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL`
+values are supported without changing cursor or decoder compatibility.
 
 ## Cursor persistence
 
@@ -216,12 +274,13 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 
 - **A failed RPC call** fails one contract's scan for one cycle. Its cursor is
   left untouched, so the next cycle resumes exactly where it stopped.
-- **A failed Telegram send** receives at most three attempts with bounded
-  exponential backoff, then drops one message; the cursor still advances. That
-  is deliberate: holding the cursor back would turn a revoked token or a chat
-  the bot was removed from into an infinite replay, and recovery would flood the
-  channel. Notifications are lossy on purpose — the chain is the record. Operator
-  `/resume` does not replay failed messages.
+- **A partial notification batch** commits the opaque RPC cursor after the
+  returned page has been processed. Unknown events, events beyond
+  `MAX_NOTIFICATIONS_PER_CYCLE`, and sends that exhaust three bounded retries
+  are counted as skipped or failed and are not replayed. Holding the cursor
+  back would turn a revoked token or removed chat into an infinite replay, and
+  recovery would flood the channel. Notifications are lossy on purpose — the
+  chain is the record; the poller logs the sent/failed/skipped commit decision.
 - **A corrupt cursor file** is treated as a cold start rather than a crash. A
   valid but RPC-rejected stale cursor is never silently rewound: the target keeps
   that cursor, the error becomes visible in `/status`, and scheduled retries or
@@ -271,9 +330,10 @@ errors are logged and ignored so they cannot stop the notifier.
 ```
 src/
   index.ts                 entry point: config -> RPC -> bot -> poller -> health HTTP
+  mock-run.ts              dry run: in-process mock RPC + real poller, log-only sends
   health.ts                local loopback GET /health for supervisors
-  config.ts                env loading and validation, fails fast
-  bot.ts                   grammy setup: /start, /help, /status, /audit, /contracts, operator pause/resume
+  config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
+  bot.ts                   grammy setup: /start, /help, /status, /audit, /contracts, /health, /preview, operator pause/resume
   poller.ts                the loop: scan, notify, persist the cursor, flush audit
   audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
   audit-cli.ts             entrypoint for `npm run audit`
@@ -281,6 +341,8 @@ src/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
     decode.ts              typed decoding of both contracts' events
+    mock-rpc.ts            local Soroban mock: scenario, pagination, failure injection
+    mock-constants.ts      mock profile fixture ids, ports, placeholder credentials
   notifications/
     format.ts              decoded event -> MarkdownV2 message
 tests/
@@ -290,7 +352,7 @@ tests/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and audit-trail suites (including deterministic fuzz cases), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile, health and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md).
 
