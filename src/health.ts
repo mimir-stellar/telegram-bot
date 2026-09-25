@@ -52,6 +52,7 @@ export interface HealthReport {
     lastError: { at: string; message: string } | null;
     targets: Array<{
       source: string;
+      version: string;
       /** Public contract id (on-chain). */
       contractId: string;
       lastEventLedger: number | null;
@@ -132,6 +133,7 @@ export function buildHealthReport(
         : null,
       targets: poller.targets.map((t) => ({
         source: t.source,
+        version: t.version ?? "v1",
         contractId: t.contractId,
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),

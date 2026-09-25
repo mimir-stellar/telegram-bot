@@ -219,6 +219,7 @@ export function previewMessage(config: StellarConfig, target = "market"): string
     const sampleEvent: DecodedEvent = {
       source: "squad",
       contractId: config.squadContractId,
+      version: config.squadContractVersion,
       ledger: 1000000,
       txHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
       at: Math.floor(Date.now() / 1000),
@@ -239,6 +240,7 @@ export function previewMessage(config: StellarConfig, target = "market"): string
   const sampleEvent: DecodedEvent = {
     source: "market",
     contractId: config.marketContractId,
+    version: config.marketContractVersion,
     ledger: 1000000,
     txHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
     at: Math.floor(Date.now() / 1000),

@@ -55,7 +55,7 @@ function cursorPreview(cursor: string | null): string {
   return compact.length <= 24 ? compact : `${compact.slice(0, 23)}…`;
 }
 
-function statusMessage(config: BotConfig, status: PollerStatus): string {
+export function statusMessage(config: BotConfig, status: PollerStatus): string {
   const lines: string[] = [
     `*Status* — ${status.paused ? "paused" : status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
     `Channel preview: ${config.channelPreviewMode ? "enabled" : "disabled"}`,
@@ -70,7 +70,7 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
 
   for (const target of status.targets) {
     lines.push(
-      `· mimir\\-${target.source} \`${target.contractId}\``,
+      `· mimir\\-${target.source} \\(${escapeMd(target.version ?? "v1")}\\) \`${target.contractId}\``,
       `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
       `  cursor: \`${cursorPreview(target.cursor)}\``,
     );
@@ -98,9 +98,17 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
  * "is it working"; this is for "what is it even watching".
  */
 export function contractsMessage(config: BotConfig): string {
-  const targets: Array<{ label: string; contractId: string }> = [
-    { label: "mimir\\-market", contractId: config.marketContractId },
-    { label: "mimir\\-squad", contractId: config.squadContractId },
+  const targets: Array<{ label: string; version: string; contractId: string }> = [
+    {
+      label: "mimir\\-market",
+      version: config.marketContractVersion ?? "v1",
+      contractId: config.marketContractId,
+    },
+    {
+      label: "mimir\\-squad",
+      version: config.squadContractVersion ?? "v1",
+      contractId: config.squadContractId,
+    },
   ];
 
   const lines: string[] = [
@@ -112,7 +120,7 @@ export function contractsMessage(config: BotConfig): string {
   for (const target of targets) {
     lines.push(
       "",
-      `*${target.label}*`,
+      `*${target.label}* \\(${escapeMd(target.version ?? "v1")}\\)`,
       `\`${escapeMd(target.contractId)}\``,
       `[View on stellar\\.expert](${contractExplorerUrl(config, target.contractId)})`,
     );

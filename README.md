@@ -36,6 +36,8 @@ Admin events (`oracle_changed`, `ownership_transferred`, `fee_policy_*`,
 `fee_accrued`, `agent_attributed`) are decoded far enough to be recognised and
 then skipped — they are logged, not posted.
 
+Contract events are decoded using version-specific decoders (`v1`, `v2`, configurable via `MARKET_CONTRACT_VERSION` and `SQUAD_CONTRACT_VERSION`). Malformed XDR payloads are safely converted into actionable `unknown` events without halting the scanner or poller loop.
+
 ## Setup
 
 ### 1. Get a bot token

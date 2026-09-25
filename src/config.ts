@@ -19,6 +19,8 @@ import "dotenv/config";
 export interface StellarConfig {
   marketContractId: string;
   squadContractId: string;
+  marketContractVersion: string;
+  squadContractVersion: string;
   rpcUrl: string;
   horizonUrl: string;
   networkPassphrase: string;
@@ -63,6 +65,8 @@ export class ConfigError extends Error {
 }
 
 const DEFAULTS = {
+  marketContractVersion: "v1",
+  squadContractVersion: "v1",
   rpcUrl: "https://soroban-testnet.stellar.org",
   horizonUrl: "https://horizon-testnet.stellar.org",
   networkPassphrase: "Test SDF Network ; September 2015",
@@ -111,6 +115,17 @@ function collector() {
         );
       }
       return value;
+    },
+
+    contractVersion(name: string, fallback: string): string {
+      const raw = read(name);
+      if (raw === undefined) return fallback;
+      const trimmed = raw.toLowerCase().trim();
+      if (!/^[a-z0-9_.-]+$/.test(trimmed)) {
+        problems.push(`${name} must be a valid version string (e.g. v1, v2); got "${raw}"`);
+        return fallback;
+      }
+      return trimmed;
     },
 
     url(name: string, fallback: string): string {
@@ -190,6 +205,14 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
   return {
     marketContractId: c.contractId("MARKET_CONTRACT_ID"),
     squadContractId: c.contractId("SQUAD_CONTRACT_ID"),
+    marketContractVersion: c.contractVersion(
+      "MARKET_CONTRACT_VERSION",
+      DEFAULTS.marketContractVersion,
+    ),
+    squadContractVersion: c.contractVersion(
+      "SQUAD_CONTRACT_VERSION",
+      DEFAULTS.squadContractVersion,
+    ),
     rpcUrl: c.url("STELLAR_RPC_URL", DEFAULTS.rpcUrl),
     horizonUrl: c.url("STELLAR_HORIZON_URL", DEFAULTS.horizonUrl),
     networkPassphrase: read("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,

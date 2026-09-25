@@ -82,11 +82,11 @@ test("contractsMessage renders both contract ids, testnet explorer links, and th
       "\n" +
       "Read\\-only: this bot holds no signing keys and cannot submit transactions\\.\n" +
       "\n" +
-      "*mimir\\-market*\n" +
+      "*mimir\\-market* \\(v1\\)\n" +
       `\`${MARKET_ID}\`\n` +
       `[View on stellar\\.expert](https://stellar.expert/explorer/testnet/contract/${MARKET_ID})\n` +
       "\n" +
-      "*mimir\\-squad*\n" +
+      "*mimir\\-squad* \\(v1\\)\n" +
       `\`${SQUAD_ID}\`\n` +
       `[View on stellar\\.expert](https://stellar.expert/explorer/testnet/contract/${SQUAD_ID})`,
   );
