@@ -190,9 +190,12 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   `/resume` use the same position. Recovery follows the incident runbook rather
   than replacing an opaque cursor with a guessed ledger.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
-  spaced out, so Telegram's rate limiter is never the thing that takes the bot
-  down. RPC, Telegram, and poller error text shown in `/status` or logs is
-  compact, bounded, and the configured bot token is redacted.
+  and the RPC reader fetches one page of that size per cycle. The page cursor
+  is persisted before the next burst, so a restart replays at most one bounded
+  page rather than an entire multi-page scan. Messages are spaced out so
+  Telegram's rate limiter is never the thing that takes the bot down. RPC,
+  Telegram, and poller error text shown in `/status` or logs is compact,
+  bounded, and the configured bot token is redacted.
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.

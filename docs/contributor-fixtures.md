@@ -112,7 +112,7 @@ When you add persistence tests:
 | RPC error for one contract | **unchanged** for that target | none that cycle | Fake rejected `readContractEvents`; assert cursor string identical |
 | Telegram send error | **commits after partial delivery** | counted as failed | Fake `sendMessage` reject; assert cursor advances and no token appears in the Error message |
 | Corrupt cursor file | cold start | n/a | Use `cursor-corrupt.txt` contents |
-| Burst over cap | advances | extras skipped | Cap `MAX_NOTIFICATIONS_PER_CYCLE` in the fake config |
+| Page-sized burst | advances after one page | at most the configured page size | Assert fake RPC receives `limit=MAX_NOTIFICATIONS_PER_CYCLE` and `maxPages=1` |
 | Unauthorized `/pause` or `/resume` | untouched | no command reply | Mock grammy with a different Telegram user id |
 | Operator pause → restart | version-1 cursor unchanged | no replay | Reload a valid cursor fixture; pause must not persist |
 

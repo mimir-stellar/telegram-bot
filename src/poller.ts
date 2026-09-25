@@ -353,6 +353,11 @@ export function createPoller(deps: PollerDeps) {
         const scan = await readContractEvents(server, target, {
           cursor: current.cursor ?? undefined,
           lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
+          // Keep one RPC page per cycle. The page cursor is the only safe
+          // checkpoint for an opaque Soroban event stream, and bounding the
+          // page to the delivery cap keeps a burst recoverable after restart.
+          limit: config.maxNotificationsPerCycle,
+          maxPages: 1,
         });
 
         status.latestLedger = scan.latestLedger;
@@ -382,6 +387,8 @@ export function createPoller(deps: PollerDeps) {
             );
           }
         }
+        // Persist each target checkpoint before scanning the next contract.
+        await saveCursors();
       } catch (err) {
         const message = errorMessage(err);
         current.lastError = message;
@@ -398,7 +405,6 @@ export function createPoller(deps: PollerDeps) {
     }
 
     status.targets = [...state.values()].map((t) => ({ ...t }));
-    await saveCursors();
     inFlight = false;
   }
 
