@@ -17,7 +17,7 @@
  *    the next restart.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
@@ -68,6 +68,17 @@ export interface PollerDeps {
   server: rpc.Server;
   /** Sends one already-formatted MarkdownV2 message. May reject. */
   send: (text: string) => Promise<void>;
+  /**
+   * Monotonic clock used for all timestamps in {@link PollerStatus}.
+   * Defaults to `Date.now`. Inject a fake in tests to make time deterministic.
+   */
+  now?: () => number;
+  /**
+   * Async delay used for send-spacing and retry back-off.
+   * Defaults to a real `setTimeout`-based sleep. Inject a no-op in tests to
+   * avoid waiting for real wall-clock time.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
@@ -82,7 +93,7 @@ const INITIAL_BACKOFF_MS = 1_000;
 /** Maximum backoff in milliseconds for Telegram send retries. */
 const MAX_BACKOFF_MS = 10_000;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 
 /**
@@ -97,6 +108,7 @@ async function sendWithRetry(
   send: (text: string) => Promise<void>,
   text: string,
   botToken: string,
+  sleep: (ms: number) => Promise<void>,
 ): Promise<void> {
   let attempt = 0;
   let backoff = INITIAL_BACKOFF_MS;
@@ -123,6 +135,8 @@ async function sendWithRetry(
 
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? defaultSleep;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
   const boundedLabel = (value: unknown, max = 120): string => {
     const compact = String(value).replace(/\s+/g, " ").trim() || "unknown";
@@ -205,7 +219,7 @@ export function createPoller(deps: PollerDeps) {
   async function saveCursors(): Promise<void> {
     const payload: CursorFile = {
       version: 1,
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(now()).toISOString(),
       targets: Object.fromEntries(
         [...state.values()].map((t) => [
           t.source,
@@ -220,7 +234,21 @@ export function createPoller(deps: PollerDeps) {
       // that sends the next start back to the beginning of the retained window.
       const tmp = `${config.cursorFile}.tmp`;
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-      await rename(tmp, config.cursorFile);
+      // On Windows, rename over an existing file throws EPERM. Remove the
+      // destination first so the swap is safe on all platforms. This is a
+      // best-effort remove: if it fails (e.g. the file does not exist yet),
+      // we continue and let rename handle it.
+      try { await unlink(config.cursorFile); } catch { /* does not exist — fine */ }
+      try {
+        await rename(tmp, config.cursorFile);
+      } catch (renameErr) {
+        // Windows sometimes rejects rename even to a fresh path (e.g. antivirus
+        // scan holding the file). Fall back to a direct overwrite, which is
+        // not atomic but still correct for this single-writer process.
+        console.warn(`[poller] rename failed, falling back to direct write: ${errorMessage(renameErr)}`);
+        await writeFile(config.cursorFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+        try { await unlink(tmp); } catch { /* ignore */ }
+      }
     } catch (err) {
       console.error(`[poller] could not persist cursor: ${errorMessage(err)}`);
     }
@@ -261,7 +289,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text, config.botToken);
+        await sendWithRetry(send, text, config.botToken, sleep);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
@@ -281,7 +309,7 @@ export function createPoller(deps: PollerDeps) {
     if (inFlight) return;
     inFlight = true;
     status.cycles += 1;
-    status.lastPollAt = Date.now();
+    status.lastPollAt = now();
 
     let anyOk = false;
 
@@ -314,13 +342,13 @@ export function createPoller(deps: PollerDeps) {
       } catch (err) {
         const message = errorMessage(err);
         current.lastError = message;
-        status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
+        status.lastError = { at: now(), message: `${target.source}: ${message}` };
         console.error(`[poller] ${target.source} scan failed: ${message}`);
       }
     }
 
     if (anyOk) {
-      status.lastSuccessAt = Date.now();
+      status.lastSuccessAt = now();
       status.consecutiveFailures = 0;
     } else {
       status.consecutiveFailures += 1;
@@ -347,7 +375,7 @@ export function createPoller(deps: PollerDeps) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
-      status.lastError = { at: Date.now(), message: errorMessage(err) };
+      status.lastError = { at: now(), message: errorMessage(err) };
       console.error(`[poller] cycle threw: ${errorMessage(err)}`);
       inFlight = false;
     }
@@ -367,7 +395,7 @@ export function createPoller(deps: PollerDeps) {
       paused = false;
       status.paused = false;
       status.running = true;
-      status.startedAt = Date.now();
+      status.startedAt = now();
       status.targets = [...state.values()].map((t) => ({ ...t }));
       console.log(
         `[poller] watching market=${config.marketContractId} squad=${config.squadContractId} ` +
