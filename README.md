@@ -177,12 +177,13 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 
 - **A failed RPC call** fails one contract's scan for one cycle. Its cursor is
   left untouched, so the next cycle resumes exactly where it stopped.
-- **A failed Telegram send** receives at most three attempts with bounded
-  exponential backoff, then drops one message; the cursor still advances. That
-  is deliberate: holding the cursor back would turn a revoked token or a chat
-  the bot was removed from into an infinite replay, and recovery would flood the
-  channel. Notifications are lossy on purpose — the chain is the record. Operator
-  `/resume` does not replay failed messages.
+- **A partial notification batch** commits the opaque RPC cursor after the
+  returned page has been processed. Unknown events, events beyond
+  `MAX_NOTIFICATIONS_PER_CYCLE`, and sends that exhaust three bounded retries
+  are counted as skipped or failed and are not replayed. Holding the cursor
+  back would turn a revoked token or removed chat into an infinite replay, and
+  recovery would flood the channel. Notifications are lossy on purpose — the
+  chain is the record; the poller logs the sent/failed/skipped commit decision.
 - **A corrupt cursor file** is treated as a cold start rather than a crash. A
   valid but RPC-rejected stale cursor is never silently rewound: the target keeps
   that cursor, the error becomes visible in `/status`, and scheduled retries or

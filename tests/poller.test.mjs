@@ -109,6 +109,31 @@ test("stopped poller rejects both operator controls", () => {
   assert.equal(poller.status().paused, false);
 });
 
+test("unsupported cursor versions fall back to a cold start", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-cursor-format-"));
+  const cursorFile = path.join(directory, "cursor.json");
+  await writeFile(
+    cursorFile,
+    JSON.stringify({ version: 2, targets: { market: { cursor: "123-0", lastEventLedger: 40 } } }),
+    "utf8",
+  );
+
+  const poller = createPoller({
+    config: baseConfig(cursorFile),
+    server: stuckServer(),
+    send: async () => undefined,
+  });
+
+  try {
+    await poller.start();
+    assert.equal(poller.status().targets[0].cursor, null);
+    assert.equal(poller.status().targets[1].cursor, null);
+  } finally {
+    poller.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("RPC failures are bounded and redact the configured bot token in status", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-rpc-failure-"));
   const cursorFile = path.join(directory, "cursor.json");

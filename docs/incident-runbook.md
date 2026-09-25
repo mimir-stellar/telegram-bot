@@ -87,7 +87,11 @@ Do not manually advance the cursor to skip an RPC failure.
 3. Use `/status` to confirm the process is still running and not intentionally paused.
 4. Restart only when configuration has been corrected. If polling was deliberately paused, use `/resume` after the token/chat is healthy.
 
-Telegram delivery is intentionally lossy. A failed send does not hold the cursor back because replaying every missed notification could create an unbounded backlog or flood a recovered chat.
+Telegram delivery is intentionally lossy. The poller commits the opaque cursor
+after processing the returned page, even when sends are partial. A failed send
+does not hold the cursor back because replaying every missed notification could
+create an unbounded backlog or flood a recovered chat. The log reports the
+sent/failed/skipped counts for that commit.
 
 The Stellar chain remains the authoritative record.
 
