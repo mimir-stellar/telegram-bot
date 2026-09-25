@@ -9,6 +9,12 @@ on:
 # calls, no Testnet RPC, no Telegram credentials. The scan CLI and the poller
 # loop both require external services — those are verified manually with
 # `npm run scan` against Testnet.
+permissions:
+  contents: read
+
+
+# CI is deterministic: no live RPC or Telegram calls. The poller's chain
+# correctness against live data is verified separately with `npm run scan`.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -26,4 +32,8 @@ jobs:
         run: npm run typecheck
 
       - name: Build and test
+      - name: Build
+        run: npm run build
+
+      - name: Test
         run: npm test

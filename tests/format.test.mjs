@@ -47,6 +47,7 @@ test("formatted money notifications keep explicit decimals and escape the decima
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
   };
   const event = {
     source: "market",
@@ -75,6 +76,7 @@ test("unknown or malformed decoded events stay non-notifying", () => {
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
   };
   const event = {
     source: "market",
@@ -116,6 +118,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
   };
   const event = {
     source: "market",
@@ -300,4 +303,41 @@ test("clip: summary field is bounded in claim_resolved notification", () => {
     !message.includes("evidence ".repeat(30)),
     "Summary was not truncated in the notification output",
   );
+test("txExplorerUrl is centralized and network-aware", async () => {
+  const { txExplorerUrl, accountExplorerUrl, contractExplorerUrl, DEFAULT_EXPLORER_BASE_URL } =
+    await import("../dist/stellar/client.js");
+
+  const testnet = {
+    marketContractId: "C" + "A".repeat(55),
+    squadContractId: "C" + "B".repeat(55),
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: DEFAULT_EXPLORER_BASE_URL,
+  };
+  assert.equal(
+    txExplorerUrl(testnet, "abcd"),
+    "https://stellar.expert/explorer/testnet/tx/abcd",
+  );
+  assert.equal(
+    accountExplorerUrl(testnet, "G" + "A".repeat(55)),
+    "https://stellar.expert/explorer/testnet/account/G" + "A".repeat(55),
+  );
+  assert.equal(
+    contractExplorerUrl(testnet, testnet.marketContractId),
+    `https://stellar.expert/explorer/testnet/contract/${testnet.marketContractId}`,
+  );
+
+  const pub = {
+    ...testnet,
+    networkPassphrase: "Public Global Stellar Network ; September 2015",
+  };
+  assert.equal(
+    txExplorerUrl(pub, "ffff"),
+    "https://stellar.expert/explorer/public/tx/ffff",
+  );
+
+  const custom = { ...testnet, explorerBaseUrl: "https://example.test/x/" };
+  assert.equal(txExplorerUrl(custom, "zz"), "https://example.test/x/testnet/tx/zz");
+  assert.equal(txExplorerUrl(testnet, "  "), "");
 });
