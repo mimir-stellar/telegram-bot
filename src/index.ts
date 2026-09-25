@@ -6,12 +6,15 @@
  * is to still be running next week.
  */
 
+import http from "node:http";
+
 import { ConfigError, loadConfig, networkLabel } from "./config.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
+import { registry } from "./metrics.js";
 
 /**
  * Installed before anything else can throw, so a rejection during startup is
@@ -32,6 +35,46 @@ function installProcessHandlers(): void {
   });
 }
 
+/**
+ * Start a minimal HTTP server that serves Prometheus metrics at GET /metrics.
+ * All other paths return 404. Errors on individual requests are logged but do
+ * not affect the bot's poll loop.
+ */
+function startMetricsServer(port: number): http.Server {
+  const server = http.createServer((req, res) => {
+    if (req.method !== "GET" || req.url !== "/metrics") {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Not found\n");
+      return;
+    }
+
+    registry.metrics().then(
+      (output) => {
+        res.writeHead(200, {
+          "Content-Type": registry.contentType,
+          "Cache-Control": "no-cache",
+        });
+        res.end(output);
+      },
+      (err: unknown) => {
+        console.error("[metrics] registry.metrics() failed:", err);
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("Internal error\n");
+      },
+    );
+  });
+
+  server.on("error", (err) => {
+    console.error(`[metrics] HTTP server error:`, err);
+  });
+
+  server.listen(port, () => {
+    console.log(`[boot] metrics     http://localhost:${port}/metrics`);
+  });
+
+  return server;
+}
+
 async function main(): Promise<void> {
   installProcessHandlers();
 
@@ -42,6 +85,7 @@ async function main(): Promise<void> {
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  console.log(`[boot] metrics      ${config.metricsEnabled ? `enabled (port ${config.metricsPort})` : "disabled"}`);
   console.log(
     `[boot] operator      ${config.operatorTelegramUserId === null ? "disabled" : "configured"}`,
   );
@@ -92,11 +136,24 @@ async function main(): Promise<void> {
       process.exit(1);
     });
 
+  // Start the metrics HTTP server before the poll loop so scrapers can see the
+  // process as live as soon as the bot announces itself.
+  let metricsServer: http.Server | null = null;
+  if (config.metricsEnabled) {
+    metricsServer = startMetricsServer(config.metricsPort);
+  }
+
   await poller.start();
 
   const shutdown = (signal: string) => {
     console.log(`[shutdown] ${signal} received, stopping`);
     poller.stop();
+    if (metricsServer) {
+      metricsServer.close(() => {
+        console.log("[shutdown] metrics server closed");
+      });
+    }
+    void bot.stop().finally(() => process.exit(0));
     void healthServer
       .close()
       .catch((err: unknown) => {

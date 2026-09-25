@@ -35,6 +35,17 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /** When true, a Prometheus /metrics endpoint is served on `metricsPort`. */
+  metricsEnabled: boolean;
+  /** TCP port for the /metrics HTTP server. Only used when `metricsEnabled`. */
+  metricsPort: number;
+  /**
+   * Ledger count threshold for stale-cursor warnings.
+   * When the gap between the chain tip and the last observed event ledger for a
+   * contract exceeds this value, a warning is logged every poll cycle.
+   * 0 disables the check.
+   */
+  staleCursorLedgers: number;
   /** Loopback host for the local HTTP health endpoint. */
   healthHost: string;
   /** TCP port for the health endpoint. `0` disables the listener. */
@@ -69,6 +80,10 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  metricsEnabled: false,
+  metricsPort: 9090,
+  /** Log a stale-cursor warning when lag exceeds this many ledgers. ~1 week. */
+  staleCursorLedgers: 120_960,
   healthHost: "127.0.0.1",
   healthPort: 8787,
   // 3× default poll interval — one missed cycle is fine; three is not.
@@ -150,6 +165,14 @@ function collector() {
       return value;
     },
 
+    bool(name: string, fallback: boolean): boolean {
+      const raw = read(name);
+      if (raw === undefined) return fallback;
+      const lower = raw.toLowerCase();
+      if (lower === "true" || lower === "1" || lower === "yes") return true;
+      if (lower === "false" || lower === "0" || lower === "no") return false;
+      problems.push(`${name} must be a boolean (true/false/1/0/yes/no); got "${raw}"`);
+      return fallback;
     optionalUserId(name: string): string | null {
       const value = read(name);
       if (value === undefined) return null;
@@ -213,6 +236,9 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    metricsEnabled: c.bool("METRICS_ENABLED", DEFAULTS.metricsEnabled),
+    metricsPort: c.int("METRICS_PORT", DEFAULTS.metricsPort, 1),
+    staleCursorLedgers: c.int("STALE_CURSOR_LEDGERS", DEFAULTS.staleCursorLedgers, 0),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),

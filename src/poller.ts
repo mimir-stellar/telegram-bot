@@ -23,6 +23,20 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
+import {
+  burstCapHitsTotal,
+  consecutiveFailures as consecutiveFailuresGauge,
+  cursorLagLedgers,
+  eventsDecodedTotal,
+  lastPollTimestampSeconds,
+  lastSuccessTimestampSeconds,
+  notificationsTotal,
+  pollCyclesTotal,
+  rpcCallDurationSeconds,
+  rpcCallsTotal,
+  staleCursorSeconds,
+} from "./metrics.js";
+import { formatEvent } from "./notifications/format.js";
 import { formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
@@ -234,6 +248,7 @@ export function createPoller(deps: PollerDeps) {
     for (const event of events) {
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
+        notificationsTotal.inc({ status: "skipped" });
         console.log(
           `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
             `at ledger ${event.ledger}` +
@@ -247,11 +262,14 @@ export function createPoller(deps: PollerDeps) {
       const text = formatEvent(config, event);
       if (text === null) {
         status.eventsSkipped += 1;
+        notificationsTotal.inc({ status: "skipped" });
         continue;
       }
 
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
         status.eventsSkipped += 1;
+        notificationsTotal.inc({ status: "skipped" });
+        burstCapHitsTotal.inc();
         console.warn(
           `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
             `dropping ${event.payload.name} at ledger ${event.ledger}`,
@@ -263,10 +281,12 @@ export function createPoller(deps: PollerDeps) {
         // Use bounded retry for Telegram sends to handle transient failures
         await sendWithRetry(send, text, config.botToken);
         status.notificationsSent += 1;
+        notificationsTotal.inc({ status: "sent" });
         sentThisCycle += 1;
       } catch (err) {
         // All retries exhausted; drop the message but continue processing others.
         status.notificationsFailed += 1;
+        notificationsTotal.inc({ status: "failed" });
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
             errorMessage(err),
@@ -283,11 +303,16 @@ export function createPoller(deps: PollerDeps) {
     status.cycles += 1;
     status.lastPollAt = Date.now();
 
+    pollCyclesTotal.inc();
+    lastPollTimestampSeconds.set(Math.floor(Date.now() / 1000));
+
     let anyOk = false;
 
     for (const target of targets) {
       const current = state.get(target.source);
       if (!current) continue;
+
+      const t0 = performance.now();
 
       try {
         const scan = await readContractEvents(server, target, {
@@ -295,10 +320,21 @@ export function createPoller(deps: PollerDeps) {
           lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
         });
 
+        const durationSeconds = (performance.now() - t0) / 1000;
+        rpcCallDurationSeconds.observe({ contract: target.source }, durationSeconds);
+        rpcCallsTotal.inc({ contract: target.source, status: "ok" });
+
         status.latestLedger = scan.latestLedger;
         status.oldestLedger = scan.oldestLedger;
         current.lastError = null;
         anyOk = true;
+
+        // Record per-event metrics.
+        for (const event of scan.events) {
+          const eventName =
+            event.payload.name === "unknown" ? event.payload.eventName || "unknown" : event.payload.name;
+          eventsDecodedTotal.inc({ contract: target.source, event_name: eventName });
+        }
 
         if (scan.events.length > 0) {
           console.log(
@@ -311,7 +347,38 @@ export function createPoller(deps: PollerDeps) {
         if (scan.lastEventLedger !== null) current.lastEventLedger = scan.lastEventLedger;
         // Advance last — see the failure policy at the top of this file.
         if (scan.cursor) current.cursor = scan.cursor;
+
+        // ── Operational safeguards ─────────────────────────────────────────
+
+        // Stale-cursor gauge: seconds since last event (0 on cold start).
+        if (current.lastEventLedger !== null) {
+          // We don't have ledger-close times here, so we approximate with
+          // the age of the lastEventLedger expressed in ledgers * 5s/ledger.
+          // For a precise wall-clock measure the poller would need to carry
+          // lastEventAt; this gauge is "cursor lag in ledgers" expressed as
+          // approximate seconds and is accurate enough for alerting.
+          const lagLedgers = Math.max(0, scan.latestLedger - current.lastEventLedger);
+          cursorLagLedgers.set({ contract: target.source }, lagLedgers);
+          // Approximate: Stellar closes a ledger ~every 5 seconds.
+          staleCursorSeconds.set({ contract: target.source }, lagLedgers * 5);
+
+          // Warn loudly if the lag exceeds the configured threshold.
+          if (config.staleCursorLedgers > 0 && lagLedgers > config.staleCursorLedgers) {
+            console.warn(
+              `[poller] stale cursor warning: ${target.source} last event was ` +
+                `${lagLedgers} ledgers ago (threshold ${config.staleCursorLedgers}); ` +
+                `the RPC retained window is ~120960 ledgers`,
+            );
+          }
+        } else {
+          // Cold start: no event seen yet.
+          staleCursorSeconds.set({ contract: target.source }, 0);
+          cursorLagLedgers.set({ contract: target.source }, 0);
+        }
       } catch (err) {
+        rpcCallsTotal.inc({ contract: target.source, status: "error" });
+
+        const message = errMessage(err);
         const message = errorMessage(err);
         current.lastError = message;
         status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
@@ -322,8 +389,11 @@ export function createPoller(deps: PollerDeps) {
     if (anyOk) {
       status.lastSuccessAt = Date.now();
       status.consecutiveFailures = 0;
+      consecutiveFailuresGauge.set(0);
+      lastSuccessTimestampSeconds.set(Math.floor(Date.now() / 1000));
     } else {
       status.consecutiveFailures += 1;
+      consecutiveFailuresGauge.set(status.consecutiveFailures);
     }
 
     status.targets = [...state.values()].map((t) => ({ ...t }));
@@ -347,6 +417,9 @@ export function createPoller(deps: PollerDeps) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
+      consecutiveFailuresGauge.set(status.consecutiveFailures);
+      status.lastError = { at: Date.now(), message: errMessage(err) };
+      console.error(`[poller] cycle threw: ${errMessage(err)}`);
       status.lastError = { at: Date.now(), message: errorMessage(err) };
       console.error(`[poller] cycle threw: ${errorMessage(err)}`);
       inFlight = false;
