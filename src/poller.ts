@@ -68,6 +68,8 @@ export interface PollerDeps {
   server: rpc.Server;
   /** Sends one already-formatted MarkdownV2 message. May reject. */
   send: (text: string) => Promise<void>;
+  /** Optional sleep implementation for deterministic tests and drills. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
@@ -82,7 +84,10 @@ const INITIAL_BACKOFF_MS = 1_000;
 /** Maximum backoff in milliseconds for Telegram send retries. */
 const MAX_BACKOFF_MS = 10_000;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const defaultSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 
 
 /**
@@ -97,6 +102,7 @@ async function sendWithRetry(
   send: (text: string) => Promise<void>,
   text: string,
   botToken: string,
+  sleepFn: (ms: number) => Promise<void> = defaultSleep,
 ): Promise<void> {
   let attempt = 0;
   let backoff = INITIAL_BACKOFF_MS;
@@ -114,7 +120,7 @@ async function sendWithRetry(
         `[poller] send attempt ${attempt} failed, retrying in ${backoff}ms: ` +
           safeErrorMessage(err, [botToken]),
       );
-      await sleep(backoff);
+      await sleepFn(backoff);
       // Exponential backoff with cap
       backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
     }
@@ -123,6 +129,7 @@ async function sendWithRetry(
 
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
+  const pollerSleep = deps.sleep ?? defaultSleep;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
   const boundedLabel = (value: unknown, max = 120): string => {
     const compact = String(value).replace(/\s+/g, " ").trim() || "unknown";
@@ -261,7 +268,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text, config.botToken);
+        await sendWithRetry(send, text, config.botToken, pollerSleep);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
@@ -273,7 +280,7 @@ export function createPoller(deps: PollerDeps) {
         );
       }
 
-      if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
+      if (sentThisCycle < config.maxNotificationsPerCycle) await pollerSleep(SEND_SPACING_MS);
     }
   }
 
@@ -414,6 +421,21 @@ export function createPoller(deps: PollerDeps) {
 
     status(): PollerStatus {
       return { ...status, targets: [...state.values()].map((t) => ({ ...t })) };
+    },
+
+    /** Run one polling cycle directly and await its completion. */
+    async cycle(): Promise<void> {
+      await cycle();
+    },
+
+    /** Ensure cursors are loaded and run one polling cycle directly. */
+    async pollOnce(): Promise<void> {
+      if (status.startedAt === 0) {
+        await loadCursors();
+        status.running = true;
+        status.startedAt = Date.now();
+      }
+      await cycle();
     },
   };
 }

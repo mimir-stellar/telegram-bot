@@ -37,6 +37,8 @@ Do not wire `npm run scan` into automated tests.
 | `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
 | `tests/bot.test.mjs` | Mocked grammy operator-command routing and exact reply payloads |
 | `tests/poller.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
+| `tests/drill.test.mjs` | Comprehensive unit and integration coverage for all 8 incident drill failure scenarios |
+| `src/drill.ts` | Standalone incident drill script and credential-free integration fakes (`npm run drill`) |
 
 ## Event fixture schema
 

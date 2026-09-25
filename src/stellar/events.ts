@@ -204,6 +204,10 @@ function flag(name: string): string | undefined {
   return process.argv[index + 1];
 }
 
+function hasFlag(name: string): boolean {
+  return process.argv.includes(`--${name}`);
+}
+
 function summarize(event: DecodedEvent): string {
   const p = event.payload;
   const money = (v: bigint) => `${formatUsdc(v)} USDC`;
@@ -234,6 +238,12 @@ function summarize(event: DecodedEvent): string {
 }
 
 async function main(): Promise<void> {
+  if (hasFlag("drill")) {
+    const { runIncidentDrillCli } = await import("../drill.js");
+    await runIncidentDrillCli();
+    return;
+  }
+
   const config = loadStellarConfig();
   const server = createRpcServer(config);
   const pages = Number(flag("pages") ?? EVENT_MAX_PAGES);

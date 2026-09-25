@@ -237,13 +237,16 @@ src/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
     decode.ts              typed decoding of both contracts' events
+  drill.ts                 credential-free incident drill script and failure simulation
   notifications/
     format.ts              decoded event -> MarkdownV2 message
 ```
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture and health suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health, and drill suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+
+Run `npm run drill` to simulate incident scenarios (RPC failures, Telegram rate limits and outages, stale/corrupt cursors, bursts, restarts, and malformed events) against in-memory integration fakes.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
 
