@@ -13,6 +13,7 @@
 import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
+  isUsableTxHash,
   shortAddress,
   squadSideLabel,
   winnerSideLabel,
@@ -106,8 +107,11 @@ const TX_HASH_RE = /^[0-9a-fA-F]{64}$/;
 
 /** Explorer URL for an event's transaction, or null when it has none usable. */
 export function eventExplorerUrl(config: StellarConfig, event: DecodedEvent): string | null {
+  // Link only well-formed 64-hex transaction hashes. An externally-derived
+  // identifier that is empty, oversized or malformed gets no link: a broken
+  // explorer link is worse than no link, and the hash itself is never altered here.
   const raw = event.txHash ?? "";
-  if (raw.length > MAX_TX_HASH_LENGTH) return null;
+  if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
   const txHash = raw.trim();
   if (!TX_HASH_RE.test(txHash)) return null;
   try {
@@ -305,6 +309,10 @@ export function previewMessage(config: StellarConfig, target = "market"): string
       txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
       at: Math.floor(Date.now() / 1000),
       eventId: "1000000-1",
+      eventType: "contract",
+      transactionIndex: 0,
+      operationIndex: 0,
+      inSuccessfulContractCall: true,
       payload: {
         name: "market_created",
         marketId: 1,
@@ -325,6 +333,10 @@ export function previewMessage(config: StellarConfig, target = "market"): string
     txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
     at: Math.floor(Date.now() / 1000),
     eventId: "1000000-0",
+    eventType: "contract",
+    transactionIndex: 0,
+    operationIndex: 0,
+    inSuccessfulContractCall: true,
     payload: {
       name: "claim_created",
       claimId: 1,

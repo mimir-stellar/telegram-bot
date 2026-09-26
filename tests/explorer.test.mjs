@@ -91,7 +91,7 @@ test("notifier sends the exact Telegram payload: MarkdownV2 text + inline keyboa
     },
   };
 
-  await createNotifier(fakeBot, config)(text, { reply_markup: keyboard });
+  await createNotifier(fakeBot, config)(text, undefined, { reply_markup: keyboard });
 
   assert.deepEqual(sent, [
     [
@@ -197,7 +197,7 @@ test("Telegram API failure propagates (bounded: the poller drops one message, no
     },
   };
   const notify = createNotifier(fakeBot, testnetConfig());
-  await assert.rejects(notify("text", { reply_markup: explorerKeyboard(testnetConfig(), claimChallengedEvent()) }), err429);
+  await assert.rejects(notify("text", undefined, { reply_markup: explorerKeyboard(testnetConfig(), claimChallengedEvent()) }), err429);
   assert.equal(calls, 1, "notifier must not retry internally");
 });
 
@@ -326,7 +326,7 @@ test("payloads and errors expose no tokens, keys, or unbounded remote objects", 
   const sent = [];
   const fakeBot = { api: { sendMessage: async (...a) => { sent.push(a); return {}; } } };
   const text = formatEvent(config, claimChallengedEvent());
-  await createNotifier(fakeBot, config)(text, { reply_markup: explorerKeyboard(config, claimChallengedEvent()) });
+  await createNotifier(fakeBot, config)(text, undefined, { reply_markup: explorerKeyboard(config, claimChallengedEvent()) });
   const wire = JSON.stringify(sent);
   assert.ok(!wire.includes("SECRET-TOKEN"));
   assert.ok(wire.length < 10_000, "bounded payload");
