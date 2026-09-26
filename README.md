@@ -304,6 +304,11 @@ leak in production, watch the process RSS over days; a restart is always safe.
 `CURSOR_FILE`. The cursor format is unchanged (version 1) and the chain is the
 source of truth, so nothing is replayed beyond the last saved cursor and nothing
 needs migrating. Keep a copy of the cursor file if you want an exact resume point.
+- **A message over Telegram's 4096-character limit** is split on newlines (or
+  hard-split when a single line is oversized) and sent as ordered chunks. The
+  poller's send path and `/status` (and other MarkdownV2 replies) share this
+  splitter so a long status or a rare oversized event never fails with
+  "message is too long".
 
 ## Health endpoint
 
