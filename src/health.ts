@@ -62,6 +62,8 @@ export interface HealthReport {
     /** Events suppressed as already-seen across overlapping pages / resumes. */
     eventsDeduplicated: number;
     notificationsDropped: number;
+    /** Cursors automatically rewound to the RPC's retained floor this run. */
+    cursorRewinds: number;
     consecutiveFailures: number;
     lastError: { at: string; message: string } | null;
     /**
@@ -77,6 +79,8 @@ export interface HealthReport {
       lastEventLedger: number | null;
       /** Opaque resume cursor; not a secret. Truncated for readability. */
       cursorPreview: string | null;
+      /** Ledger a target is resuming from after a floor rewind, or null. */
+      rewindFromLedger: number | null;
       hasError: boolean;
     }>;
   };
@@ -194,6 +198,7 @@ export function buildHealthReport(
       eventsSkipped: poller.eventsSkipped,
       eventsDeduplicated: poller.eventsDeduplicated ?? 0,
       notificationsDropped: poller.notificationsDropped ?? 0,
+      cursorRewinds: poller.cursorRewinds ?? 0,
       consecutiveFailures: poller.consecutiveFailures,
       lastError: poller.lastError
         ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }
@@ -205,6 +210,7 @@ export function buildHealthReport(
         contractId: t.contractId,
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),
+        rewindFromLedger: typeof t.rewindFromLedger === "number" ? t.rewindFromLedger : null,
         hasError: t.lastError !== null,
       })),
     },
