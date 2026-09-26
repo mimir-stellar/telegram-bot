@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createBot, healthMessage, registerCommands } from "../dist/bot.js";
+import { createBot, registerCommands } from "../dist/bot.js";
 import { buildHealthReport, startHealthServer } from "../dist/health.js";
 
 function baseConfig(overrides = {}) {
@@ -21,6 +21,7 @@ function baseConfig(overrides = {}) {
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
+    routes: [{ chatId: "-1001234567890", channelPreviewMode: false }],
     ...overrides,
   };
 }

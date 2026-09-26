@@ -73,6 +73,7 @@ function baseConfig(overrides = {}) {
     startLookbackLedgers: 60,
     cursorFile: dataDir.file("unused-cursor.json"),
     maxNotificationsPerCycle: 5,
+    routes: [{ chatId: "-1001234567890", channelPreviewMode: false }],
     ...overrides,
   };
 }
@@ -329,7 +330,7 @@ test("poller: RPC failure for one target does not prevent the other from scannin
 
   const config = baseConfig({ cursorFile: dataDir.file("rpc-fail.json"), pollIntervalMs: 9_999_999 });
   const sent = [];
-  const poller = createPoller({ config, server, send: async (msg) => { sent.push(msg); } });
+  const poller = createPoller({ config, server, send: async (chatId, msg) => { sent.push(msg); } });
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 50));
@@ -589,7 +590,7 @@ test("poller: maxNotificationsPerCycle cap — events beyond cap are skipped", a
   const poller = createPoller({
     config,
     server,
-    send: async (msg) => { sent.push(msg); },
+    send: async (chatId, msg) => { sent.push(msg); },
   });
 
   await poller.start();

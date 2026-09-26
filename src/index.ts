@@ -124,7 +124,7 @@ async function main(): Promise<void> {
     pause: () => poller.pause(),
     resume: () => poller.resume(),
   });
-  notify = createNotifier(bot, config);
+  notify = createNotifier(bot);
 
   // Local-only health HTTP for supervisors. Starts before Telegram long-poll
   // so a deploy probe can see the process even while grammy is connecting.

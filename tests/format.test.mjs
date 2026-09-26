@@ -149,7 +149,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
   };
 
   assert.equal(message, expectedMessage);
-  await createNotifier(fakeBot, config)(message);
+  await createNotifier(fakeBot)(config.chatId, message);
   assert.deepEqual(sent, [
     [
       config.chatId,
@@ -227,8 +227,8 @@ test("oversized squad questions are clipped without splitting emoji", () => {
 test("createNotifier preserves Telegram send failures for the poller", async () => {
   const error = new Error("Telegram API unavailable");
   const fakeBot = { api: { sendMessage: async () => Promise.reject(error) } };
-  const notify = createNotifier(fakeBot, { chatId: "-1001234567890" });
-  await assert.rejects(notify("message"), error);
+  const notify = createNotifier(fakeBot);
+  await assert.rejects(notify("-1001234567890", "message"), error);
 });
 
 test("createNotifier routes named contract sources and preserves the legacy fallback", async () => {
