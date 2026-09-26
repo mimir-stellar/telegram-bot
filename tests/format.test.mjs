@@ -65,7 +65,7 @@ test("formatted money notifications keep explicit decimals and escape the decima
   };
 
   const message = formatEvent(config, event);
-  assert.match(message, /Stake: \*2\\\.0000000 USDC\*/);
+  assert.match(message, /Stake: \*2\\.0000000 USDC\*/);
 });
 
 test("unknown or malformed decoded events stay non-notifying", () => {
@@ -235,6 +235,78 @@ test("escapeMd handles a long adversarial string without dropping characters", (
   const input = reserved.repeat(10_000);
   const escaped = escapeMd(input);
   assert.equal(escaped, expectedEscape(input));
+});
+
+test("createNotifier links to threaded replies when replyToMessageId is provided", async () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const sent = [];
+  const fakeBot = {
+    api: {
+      sendMessage: async (...args) => {
+        sent.push(args);
+        return {};
+      },
+    },
+  };
+
+  const notify = createNotifier(fakeBot, config);
+  await notify("threaded message", 12345);
+
+  assert.deepEqual(sent, [
+    [
+      config.chatId,
+      "threaded message",
+      {
+        parse_mode: "MarkdownV2",
+        link_preview_options: { is_disabled: true },
+        reply_parameters: {
+          chat_id: config.chatId,
+          message_id: 12345,
+        },
+      },
+    ],
+  ]);
+});
+
+test("createNotifier sends without reply_parameters when replyToMessageId is undefined", async () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const sent = [];
+  const fakeBot = {
+    api: {
+      sendMessage: async (...args) => {
+        sent.push(args);
+        return {};
+      },
+    },
+  };
+
+  const notify = createNotifier(fakeBot, config);
+  await notify("standalone message");
+
+  assert.deepEqual(sent, [
+    [
+      config.chatId,
+      "standalone message",
+      {
+        parse_mode: "MarkdownV2",
+        link_preview_options: { is_disabled: true },
+      },
+    ],
+  ]);
 });
 
 test("txExplorerUrl is centralized and network-aware", async () => {
