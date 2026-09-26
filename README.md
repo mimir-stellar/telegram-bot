@@ -2,7 +2,7 @@
 
 A Telegram notifier for [Mimir](https://github.com/mimir-stellar), the AI-settled
 prediction market on Stellar. It polls Mimir's two Soroban contracts for new
-on-chain events and posts them, human-readable, into a chat or channel:
+on-chain events and posts them, human-readable, into one or more named chats or channels:
 
 ```
 🆕 New claim #7
@@ -94,7 +94,10 @@ docker run -d \
 ```
 
 `.env.example` ships with the live Stellar Testnet contract ids, so the only two
-values you must supply are `BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Every other
+values you must supply are `BOT_TOKEN` and `TELEGRAM_CHAT_ID`. To split traffic,
+set `TELEGRAM_MARKET_CHAT_ID` and/or `TELEGRAM_SQUAD_CHAT_ID`; each overrides the
+legacy destination for that contract, while an omitted override falls back to
+`TELEGRAM_CHAT_ID`. Every other
 variable is documented inline there. A missing or malformed value aborts startup
 with all the problems listed at once — the bot never boots into a state where it
 looks healthy but notifies nobody.
@@ -105,7 +108,7 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip counters (plus messages dropped by a shutdown drain) and the last error |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
@@ -243,7 +246,9 @@ so a crash mid-write cannot truncate it):
 On a cold start (no file) it begins `START_LOOKBACK_LEDGERS` behind the chain tip
 rather than replaying the whole retained window into your chat. `/pause` and
 `/resume` never edit this file; they only control scheduling, so the cursor
-format remains version 1 and a restart does not preserve a pause.
+format remains version 1 and a restart does not preserve a pause. A graceful
+shutdown flushes any cursor state that is still only in memory before the
+process exits — see [Graceful shutdown](#graceful-shutdown).
 
 Tests never use this directory: they run against an ephemeral data directory
 created under the OS temp dir and removed afterwards (see
@@ -266,8 +271,9 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   `MAX_NOTIFICATIONS_PER_CYCLE`, and sends that exhaust three bounded retries
   are counted as skipped or failed and are not replayed. Holding the cursor
   back would turn a revoked token or removed chat into an infinite replay, and
-  recovery would flood the channel. Notifications are lossy on purpose — the
-  chain is the record; the poller logs the sent/failed/skipped commit decision.
+  recovery would flood the channel. A failed send is isolated to that routed
+  chat and event; other events continue. Notifications are lossy on purpose —
+  the chain is the record; the poller logs the sent/failed/skipped commit decision.
 - **A corrupt cursor file** is treated as a cold start rather than a crash. A
   valid but RPC-rejected stale cursor is never silently rewound: the target keeps
   that cursor, the error becomes visible in `/status`, and scheduled retries or
@@ -295,6 +301,56 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
+- **A shutdown** stops scheduling, drops what has not been sent yet, waits at
+  most `SHUTDOWN_TIMEOUT_MS` for the cycle in progress, and flushes any cursor
+  state that is still only in memory — see
+  [Graceful shutdown](#graceful-shutdown).
+
+## Graceful shutdown
+
+`SIGINT`/`SIGTERM` starts a bounded drain rather than a hard stop:
+
+1. The poller stops scheduling cycles and reports itself as `stopping`.
+2. Notifications that have not been sent yet are **dropped**: counted in
+   `/status`, logged once with a bounded line, and left to the chain. A send
+   already in flight is allowed to finish, but it does not start another
+   retry/backoff step.
+3. The cycle in progress gets `SHUTDOWN_TIMEOUT_MS` (default `10000`, `0`
+   skips the wait) to finish and write its cursors.
+4. Any cursor state still only in memory is flushed to `CURSOR_FILE`, then the
+   health endpoint and the Telegram long-poll are closed and the process exits
+   `0`.
+
+Cursors only ever advance after their events have been handed to Telegram, so
+flushing at any point is safe: the file a restart resumes from never skips an
+event the chain still has to show. What the drain gives up is *delivery* of the
+messages it had not started — notifications are lossy by design and the chain
+is the record, exactly as for a failed Telegram send.
+
+Why drop rather than finish the burst? Finishing means up to
+`MAX_NOTIFICATIONS_PER_CYCLE` messages × 1.5s spacing plus retry backoff —
+minutes that would hold a deploy open. Worse, hitting the deadline halfway
+would leave the cursor behind messages that were already sent, replaying them
+on restart. Dropping keeps the drain bounded *and* the resume exact.
+
+**A second `SIGINT`/`SIGTERM` exits immediately** (`130`/`143`) if a drain ever
+gets stuck. That skips the flush but never corrupts the file: the cursor is
+written to a temporary file and renamed, so the worst case is resuming from the
+last completed cycle. The teardown after the flush is capped too —
+`SHUTDOWN_TIMEOUT_MS + 10000` ms, then the process exits `1` with the cursor
+file already written.
+
+Where the drain is visible:
+
+| Where | Field |
+| --- | --- |
+| `GET /health` | `poller.stopping`, `poller.pendingFlush`, `poller.lastFlushAt`, `poller.notificationsDropped`. A deliberate drain reports `ok`, not `degraded` |
+| `/status` | `stopping` in the headline, `dropped during shutdown N` in the counters, and a drain line while it lasts |
+
+Configuration is additive: `SHUTDOWN_TIMEOUT_MS` is optional (see
+`.env.example`), no existing variable is renamed, and the version-1 cursor
+format is unchanged — a deployment that omits the new key gets the `10000` ms
+default.
 
 ## Long-running operation
 

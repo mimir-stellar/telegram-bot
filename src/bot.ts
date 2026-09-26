@@ -14,6 +14,7 @@ import { escapeMd, previewMessage, safeErrorMessage } from "./notifications/form
 export { previewMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
+import type { ContractSource } from "./stellar/decode.js";
 import { buildHealthReport, chainClockLabel } from "./health.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
 
@@ -59,15 +60,26 @@ function cursorPreview(cursor: string | null): string {
 }
 
 function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = Date.now()): string {
+  const lifecycle = status.stopping
+    ? "stopping"
+    : status.paused
+      ? "paused"
+      : status.running
+        ? "running"
+        : "stopped";
+
   const lines: string[] = [
-    `*Status* — ${status.paused ? "paused" : status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
+    `*Status* — ${lifecycle} on Stellar ${networkLabel(config)}`,
     `Channel preview: ${config.channelPreviewMode ? "enabled" : "disabled"}`,
     "",
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Chain clock skew: ${escapeMd(chainClockLabel(status.chainClockAt, nowMs))}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
-    `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
+    `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}` +
+      (status.notificationsDropped
+        ? ` · dropped during shutdown ${status.notificationsDropped}`
+        : ""),
     "",
     "*Watching*",
   ];
@@ -89,6 +101,15 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
   }
   if (status.consecutiveFailures > 0) {
     lines.push(`Consecutive failed cycles: ${status.consecutiveFailures}`);
+  }
+
+  if (status.stopping) {
+    lines.push(
+      "",
+      "Graceful shutdown in progress: no new cycles, unsent notifications dropped" +
+        (status.pendingFlush ? ", cursor flush still pending" : ", cursor flushed") +
+        "\\.",
+    );
   }
 
   return lines.join("\n");
@@ -304,19 +325,15 @@ export function createBot(deps: BotDeps): Bot {
   return bot;
 }
 
-/** The poller's send path: one message to the configured chat. */
+/** The poller's send path: route each contract's messages to its named chat. */
 export function createNotifier(bot: Bot, config: BotConfig) {
-  return async (text: string): Promise<void> => {
-    try {
-      await bot.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
-    } catch (err) {
-      if (!isMarkdownParseError(err)) throw err;
-      console.warn(
-        `[bot] MarkdownV2 parse failed for notification; retrying as plain text: ` +
-          safeErrorMessage(err, [config.botToken]),
-      );
-      await bot.api.sendMessage(config.chatId, markdownFallbackText(text));
-    }
+  return async (text: string, source?: ContractSource): Promise<void> => {
+    const chatId = source === "market"
+      ? config.marketChatId ?? config.chatId
+      : source === "squad"
+        ? config.squadChatId ?? config.chatId
+        : config.chatId;
+    await bot.api.sendMessage(chatId, text, TELEGRAM_OPTIONS);
   };
 }
 
