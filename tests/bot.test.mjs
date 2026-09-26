@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createNotifier,
   registerCommandHandlers,
   resumeMessage,
 } from "../dist/bot.js";
@@ -30,6 +31,8 @@ function baseConfig(overrides = {}) {
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
+    webhookUrl: null,
+    telegramWebhookUrl: null,
     ...overrides,
   };
 }

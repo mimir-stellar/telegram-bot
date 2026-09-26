@@ -224,6 +224,20 @@ function collector(profile: Record<string, string>) {
       return value;
     },
 
+    optionalUrl(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
+      try {
+        const parsed = new URL(value);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          problems.push(`${name} must be an http(s) URL; got "${value}"`);
+        }
+      } catch {
+        problems.push(`${name} is not a valid URL; got "${value}"`);
+      }
+      return value;
+    },
+
     int(name: string, fallback: number, min: number): number {
       const raw = read(name);
       if (raw === undefined) return fallback;

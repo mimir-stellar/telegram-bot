@@ -130,7 +130,11 @@ async function main(): Promise<void> {
 
   // Local-only health HTTP for supervisors. Starts before Telegram long-poll
   // so a deploy probe can see the process even while grammy is connecting.
-  const healthServer = startHealthServer({ config, status: () => poller.status() });
+  const healthServer = startHealthServer({
+    config,
+    status: () => poller.status(),
+    webhookHandler: config.telegramWebhookUrl ? webhookCallback(bot, "http") : undefined,
+  });
 
   await registerCommands(bot);
 
