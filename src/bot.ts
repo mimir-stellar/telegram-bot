@@ -39,6 +39,28 @@ const TELEGRAM_OPTIONS = {
   link_preview_options: { is_disabled: true },
 };
 
+function markdownFallbackText(text: string): string {
+  return text.replace(/\\([_\*\[\]()~`>#+\-=|{}.!\\])/g, "$1");
+}
+
+function isMarkdownParseError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:can\'t parse entities|can\"t parse entities|can\s+parse entities|can't parse entities|parse entities)/i.test(message);
+}
+
+async function replyWithMarkdownFallback(ctx: Context, config: BotConfig, text: string): Promise<void> {
+  try {
+    await ctx.reply(text, TELEGRAM_OPTIONS);
+  } catch (err) {
+    if (!isMarkdownParseError(err)) throw err;
+    console.warn(
+      `[bot] MarkdownV2 parse failed for reply; retrying as plain text: ` +
+        safeErrorMessage(err, [config.botToken]),
+    );
+    await ctx.reply(markdownFallbackText(text));
+  }
+}
+
 function ago(timestamp: number | null): string {
   if (timestamp === null) return "never";
   const seconds = Math.round((Date.now() - timestamp) / 1000);
@@ -158,21 +180,21 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
   const { config, status, pause, resume } = deps;
 
   bot.command("start", async (ctx) => {
-    await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, helpMessage(config));
   });
 
   bot.command("help", async (ctx) => {
-    await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, helpMessage(config));
   });
 
   bot.command("status", async (ctx) => {
-    await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, statusMessage(config, status()));
   });
 
   // Config-only, so this never fails on account of poller or RPC state —
   // unlike /status, it has nothing to report failure on.
   bot.command("contracts", async (ctx) => {
-    await ctx.reply(contractsMessage(config), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, contractsMessage(config));
   });
 
   bot.command("pause", async (ctx) => {
@@ -180,7 +202,7 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
       console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
       return;
     }
-    await ctx.reply(pauseMessage(pause()), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, pauseMessage(pause()));
   });
 
   bot.command("resume", async (ctx) => {
@@ -188,7 +210,7 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
       console.warn(`[bot] ignored unauthorized /resume on update ${ctx.update.update_id}`);
       return;
     }
-    await ctx.reply(resumeMessage(resume()), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, resumeMessage(resume()));
   });
 }
 
@@ -211,7 +233,16 @@ export function createBot(deps: BotDeps): Bot {
 /** The poller's send path: one message to the configured chat. */
 export function createNotifier(bot: Bot, config: BotConfig) {
   return async (text: string): Promise<void> => {
-    await bot.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+    try {
+      await bot.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+    } catch (err) {
+      if (!isMarkdownParseError(err)) throw err;
+      console.warn(
+        `[bot] MarkdownV2 parse failed for notification; retrying as plain text: ` +
+          safeErrorMessage(err, [config.botToken]),
+      );
+      await bot.api.sendMessage(config.chatId, markdownFallbackText(text));
+    }
   };
 }
 
