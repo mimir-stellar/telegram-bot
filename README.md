@@ -105,7 +105,7 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, any restart gap (ledgers lost + when the cursor was reset), poll/send counters and the last error |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
@@ -243,6 +243,30 @@ Tests never use this directory: they run against an ephemeral data directory
 created under the OS temp dir and removed afterwards (see
 [docs/contributor-fixtures.md](docs/contributor-fixtures.md)).
 
+### Restart gaps
+
+The RPC keeps a **rolling window** of events and drops everything older, so a
+long enough downtime leaves the persisted cursor *behind the retained floor*.
+The events between the cursor and the floor can never be read again — there is
+nothing to recover them from — so the poller:
+
+1. compares each resumed cursor with the retained floor reported by
+   `getHealth()` (at boot, and again whenever a scan fails and the window may
+   have moved);
+2. logs one warning naming the target, the cursor's ledger, the floor, and how
+   many ledgers were skipped;
+3. **resets that target to a cold start**, because retrying a cursor below the
+   floor fails the same way every cycle and would wedge the target until someone
+   edited the file by hand. Resetting to the configured lookback — not to the
+   floor — avoids replaying up to a week of events into the chat.
+
+The gap is visible afterwards in `/status` (per target) and in `/health`
+(`restartGaps`, `lastRestartGap`, and per-target `gapLedgers`). A cursor is never
+reset while it is inside the window: an RPC failure alone leaves it exactly
+where it was. A cursor whose ledger cannot be parsed is reported as
+`cursorUnreadable` and left untouched, because the RPC cursor is opaque by
+design — parse failure here is not evidence that the RPC will reject it.
+
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. On
 an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
 at one). On an ephemeral filesystem every restart is a cold start, and events
@@ -267,6 +291,11 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   that cursor, the error becomes visible in `/status`, and scheduled retries or
   `/resume` use the same position. Recovery follows the incident runbook rather
   than replacing an opaque cursor with a guessed ledger.
+- **A cursor that has fallen below the RPC's retained window** (a restart longer
+  than the window) is detected against the floor, reported once, and reset to a
+  cold start — see [Restart gaps](#restart-gaps). The events in that gap are
+  already unrecoverable, so the one thing the poller must not do is retry that
+  cursor forever.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
@@ -316,8 +345,8 @@ checks (default `http://127.0.0.1:8787`):
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
-cursors, and whether a target has an error. It never includes `BOT_TOKEN`,
-chat ids, private keys, or unbounded remote payloads.
+cursors, restart-gap ledger counts, and whether a target has an error. It never
+includes `BOT_TOKEN`, chat ids, private keys, or unbounded remote payloads.
 
 Configuration (see `.env.example`):
 
@@ -355,7 +384,7 @@ src/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, restart-gap, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 ### Lockfile reproducibility
 

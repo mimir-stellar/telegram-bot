@@ -16,6 +16,12 @@
  *  - A cursor file that cannot be read is treated as a cold start; one that
  *    cannot be written is logged, and the in-memory cursor keeps working until
  *    the next restart.
+ *  - A persisted cursor that has fallen BELOW the RPC's retained window — a
+ *    restart (or a run of RPC failures) longer than the window — is detected
+ *    against the retained floor, reported once, and reset to a cold start.
+ *    The events in that gap are already unrecoverable: the RPC does not retain
+ *    them. Retrying the stale cursor forever is the one answer that is never
+ *    right, because it wedges the target until someone edits the file by hand.
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -25,7 +31,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
 import { formatEvent, safeErrorMessage } from "./notifications/format.js";
-import { readContractEvents, type WatchTarget } from "./stellar/events.js";
+import { eventCursorLedger, readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
 export interface TargetState {
@@ -34,12 +40,42 @@ export interface TargetState {
   cursor: string | null;
   /** Highest ledger an event was seen in, from this run or the cursor file. */
   lastEventLedger: number | null;
+  /**
+   * Ledgers whose events were lost because the persisted cursor sat below the
+   * RPC's retained floor. `0` until a restart gap is detected for this target.
+   */
+  gapLedgers: number;
+  /**
+   * When a stale cursor was reset to a cold start, or `null` if that has never
+   * happened for this target.
+   */
+  cursorResetAt: number | null;
+  /**
+   * A cursor is persisted but its ledger cannot be parsed. It is left untouched
+   * (the RPC still gets to accept or reject it) and surfaced for operators.
+   */
+  cursorUnreadable: boolean;
   lastError: string | null;
 }
 
 export type PollerPauseResult = "paused" | "already-paused" | "stopped";
 export type PollerResumeResult = "resumed" | "already-running" | "stopped";
 
+/**
+ * A resume position that fell out of the RPC's retained window: the events
+ * between the cursor and the retained floor are gone for good.
+ */
+export interface RestartGap {
+  /** When the gap was detected. */
+  at: number;
+  source: ContractSource;
+  /** Ledger the persisted cursor pointed at. */
+  cursorLedger: number;
+  /** The RPC's retained floor at detection time. */
+  oldestLedger: number;
+  /** Ledgers whose events are unrecoverable (`oldestLedger - cursorLedger`). */
+  missedLedgers: number;
+}
 export interface PollerStatus {
   running: boolean;
   /** Operator pause only prevents new cycles; an in-flight cycle may finish. */
@@ -55,6 +91,10 @@ export interface PollerStatus {
   eventsSkipped: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
+  /** How many times a stale cursor has been reset since this process started. */
+  restartGaps: number;
+  /** Details of the most recent restart gap, or `null` when none was seen. */
+  lastRestartGap: RestartGap | null;
   targets: TargetState[];
   /** RPC circuit breaker state */
   circuitBreaker: {
@@ -132,6 +172,48 @@ export interface PollerDeps {
   sendOptions?: SendOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
+  /** Optional clock for deterministic tests. */
+  now?: () => number;
+}
+
+/**
+ * Where a persisted cursor sits relative to the RPC's retained window.
+ *
+ * The RPC only keeps a rolling window of events, so a resume position can be
+ * *older* than the oldest ledger it still serves. That is not an error in the
+ * cursor — the cursor is exactly where it said it was — but the events between
+ * it and the floor can never be read again, and the next scan must not pretend
+ * otherwise.
+ */
+export type CursorWindowVerdict =
+  | { status: "no-cursor" }
+  | { status: "unknown-floor" }
+  | { status: "unreadable"; cursor: string }
+  | { status: "inside"; cursorLedger: number; behind: number }
+  | { status: "stale"; cursorLedger: number; missedLedgers: number };
+
+/**
+ * Classify a cursor against the retained floor. Pure so the boundary cases
+ * (cursor exactly at the floor, an unparseable cursor, an unknown floor) are
+ * testable without an RPC.
+ */
+export function classifyCursorWindow(
+  cursor: string | null,
+  oldestLedger: number | null,
+): CursorWindowVerdict {
+  if (cursor === null || cursor === "") return { status: "no-cursor" };
+  if (oldestLedger === null || !Number.isFinite(oldestLedger) || oldestLedger <= 0) {
+    return { status: "unknown-floor" };
+  }
+
+  const cursorLedger = eventCursorLedger(cursor);
+  if (cursorLedger === null) return { status: "unreadable", cursor };
+
+  // Exactly at the floor is still inside the window: that ledger is retained.
+  if (cursorLedger < oldestLedger) {
+    return { status: "stale", cursorLedger, missedLedgers: oldestLedger - cursorLedger };
+  }
+  return { status: "inside", cursorLedger, behind: cursorLedger - oldestLedger };
 }
 
 export interface CircuitBreakerOptions {
@@ -206,6 +288,8 @@ export function createPoller(deps: PollerDeps) {
   const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
   const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
   const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
+  /** Injectable for deterministic tests; the process clock otherwise. */
+  const now = deps.now ?? Date.now;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
   const boundedLabel = (value: unknown, max = 120): string => {
     const compact = String(value).replace(/\s+/g, " ").trim() || "unknown";
@@ -224,7 +308,16 @@ export function createPoller(deps: PollerDeps) {
   const state = new Map<ContractSource, TargetState>(
     targets.map((t) => [
       t.source,
-      { source: t.source, contractId: t.contractId, cursor: null, lastEventLedger: null, lastError: null },
+      {
+        source: t.source,
+        contractId: t.contractId,
+        cursor: null,
+        lastEventLedger: null,
+        gapLedgers: 0,
+        cursorResetAt: null,
+        cursorUnreadable: false,
+        lastError: null,
+      },
     ]),
   );
 
@@ -242,6 +335,8 @@ export function createPoller(deps: PollerDeps) {
     eventsSkipped: 0,
     consecutiveFailures: 0,
     lastError: null,
+    restartGaps: 0,
+    lastRestartGap: null,
     targets: [],
     circuitBreaker: {
       open: false,
@@ -294,7 +389,7 @@ export function createPoller(deps: PollerDeps) {
   async function saveCursors(): Promise<void> {
     const payload: CursorFile = {
       version: 1,
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(now()).toISOString(),
       targets: Object.fromEntries(
         [...state.values()].map((t) => [
           t.source,
@@ -313,6 +408,76 @@ export function createPoller(deps: PollerDeps) {
     } catch (err) {
       console.error(`[poller] could not persist cursor: ${errorMessage(err)}`);
     }
+  }
+
+  // ── Restart-gap detection ──────────────────────────────────────────────────
+
+  /**
+   * Refresh the RPC's ledger window, best-effort. Returns the retained floor,
+   * or `null` when the RPC cannot be reached — probing must never end the
+   * process, because the poller exists to survive exactly this.
+   */
+  async function probeFloor(): Promise<number | null> {
+    try {
+      const health = await server.getHealth();
+      status.latestLedger = health.latestLedger;
+      status.oldestLedger = health.oldestLedger;
+      return health.oldestLedger;
+    } catch (err) {
+      console.warn(`[poller] could not read the RPC ledger window: ${errorMessage(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Compare one target's resume position with the retained floor and, when the
+   * cursor has fallen out of the window, reset it to a cold start.
+   *
+   * Reset — rather than "start from the floor" — is deliberate: the retained
+   * window is up to a week of events and replaying it into the chat is the
+   * flood this bot's cold-start lookback exists to avoid. `MAX_NOTIFICATIONS_
+   * PER_CYCLE` still bounds what a cold start can post.
+   *
+   * Detection is reported once per gap, not once per cycle: the cursor is reset
+   * on the first detection, so a target can only be stale again after another
+   * restart (or another RPC outage) leaves it behind a floor that has moved on.
+   */
+  function enforceCursorWindow(current: TargetState, oldestLedger: number | null): void {
+    if (oldestLedger === null) return;
+
+    const verdict = classifyCursorWindow(current.cursor, oldestLedger);
+
+    if (verdict.status === "unreadable") {
+      if (!current.cursorUnreadable) {
+        current.cursorUnreadable = true;
+        console.warn(
+          `[poller] ${current.source}: persisted cursor has no readable ledger position; ` +
+            `leaving it untouched and letting the RPC accept or reject it`,
+        );
+      }
+      return;
+    }
+    current.cursorUnreadable = false;
+    if (verdict.status !== "stale") return;
+
+    const at = now();
+    current.cursor = null;
+    current.gapLedgers = verdict.missedLedgers;
+    current.cursorResetAt = at;
+    status.restartGaps += 1;
+    status.lastRestartGap = {
+      at,
+      source: current.source,
+      cursorLedger: verdict.cursorLedger,
+      oldestLedger,
+      missedLedgers: verdict.missedLedgers,
+    };
+    console.warn(
+      `[poller] ${current.source}: restart gap — cursor at ledger ${verdict.cursorLedger} ` +
+        `is ${verdict.missedLedgers} ledger(s) below the RPC retained floor ${oldestLedger}; ` +
+        `those events are unrecoverable, so the cursor is reset to a cold start ` +
+        `(up to ${config.startLookbackLedgers} ledgers behind the tip)`,
+    );
   }
 
   // ── One cycle ──────────────────────────────────────────────────────────────
@@ -386,7 +551,7 @@ export function createPoller(deps: PollerDeps) {
     if (inFlight) return;
     inFlight = true;
     status.cycles += 1;
-    status.lastPollAt = Date.now();
+    status.lastPollAt = now();
 
     // ── Circuit breaker check ─────────────────────────────────────────────────────
     if (status.circuitBreaker.open) {
@@ -418,6 +583,12 @@ export function createPoller(deps: PollerDeps) {
     for (const target of targets) {
       const current = state.get(target.source);
       if (!current) continue;
+
+      // A cursor left below the retained floor makes every scan fail the same
+      // way, so check it against the last known floor before asking. The floor
+      // is refreshed on the failure path below, which is what catches a window
+      // that rolled past us while the scans were failing.
+      enforceCursorWindow(current, status.oldestLedger);
 
       try {
         const scan = await readContractEvents(server, target, {
@@ -454,6 +625,9 @@ export function createPoller(deps: PollerDeps) {
         // deliberate drops, to avoid replaying a permanent Telegram failure.
         if (scan.cursor) {
           current.cursor = scan.cursor;
+          // The RPC accepted the resume position and moved it, so whatever we
+          // could not read locally is no longer the position we hold.
+          current.cursorUnreadable = false;
           if (delivery.failed > 0 || delivery.skipped > 0) {
             console.warn(
               `[poller] ${target.source}: committed cursor after partial delivery ` +
@@ -465,8 +639,13 @@ export function createPoller(deps: PollerDeps) {
         cycleFailures++;
         const message = errorMessage(err);
         current.lastError = message;
-        status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
+        status.lastError = { at: now(), message: `${target.source}: ${message}` };
         console.error(`[poller] ${target.source} scan failed: ${message}`);
+
+        // A scan failing is exactly when the floor is unknown or has moved —
+        // read it, then give a now-stale cursor its one bounded recovery
+        // instead of retrying the same ledger every cycle forever.
+        enforceCursorWindow(current, await probeFloor());
       }
     }
 
@@ -485,7 +664,7 @@ export function createPoller(deps: PollerDeps) {
     }
 
     if (anyOk) {
-      status.lastSuccessAt = Date.now();
+      status.lastSuccessAt = now();
       status.consecutiveFailures = 0;
     } else {
       status.consecutiveFailures += 1;
@@ -512,7 +691,7 @@ export function createPoller(deps: PollerDeps) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
-      status.lastError = { at: Date.now(), message: errorMessage(err) };
+      status.lastError = { at: now(), message: errorMessage(err) };
       console.error(`[poller] cycle threw: ${errorMessage(err)}`);
       inFlight = false;
     }
@@ -532,7 +711,15 @@ export function createPoller(deps: PollerDeps) {
       paused = false;
       status.paused = false;
       status.running = true;
-      status.startedAt = Date.now();
+      status.startedAt = now();
+
+      // One bounded probe at boot so a cursor that fell out of the retained
+      // window is reported (with the ledgers it lost) instead of showing up as
+      // a scan that fails every cycle. An unreachable RPC is not fatal here:
+      // the loop below retries, and `cycle` re-probes on failure.
+      const floor = await probeFloor();
+      for (const current of state.values()) enforceCursorWindow(current, floor);
+
       status.targets = [...state.values()].map((t) => ({ ...t }));
       console.log(
         `[poller] watching market=${config.marketContractId} squad=${config.squadContractId} ` +
