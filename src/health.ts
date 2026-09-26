@@ -58,6 +58,9 @@ export interface HealthReport {
       /** Opaque resume cursor; not a secret. Truncated for readability. */
       cursorPreview: string | null;
       hasError: boolean;
+      /** Cursor unchanged across successful cycles while behind tip. */
+      cursorStalled: boolean;
+      cyclesWithoutAdvance: number;
     }>;
   };
 }
@@ -80,7 +83,8 @@ function previewCursor(cursor: string | null): string | null {
  * - `ok` / HTTP 200 when the poller is running and has not exceeded the
  *   consecutive-failure budget (and, once it has succeeded at least once,
  *   a successful poll happened within `healthStaleMs`).
- * - `degraded` / HTTP 503 when running but stale or failing repeatedly.
+ * - `degraded` / HTTP 503 when running but stale, failing repeatedly, or a
+ *   watched cursor is stalled (unchanged while behind tip).
  * - `stopped` / HTTP 503 when the poller is not running.
  */
 export function buildHealthReport(
@@ -104,7 +108,8 @@ export function buildHealthReport(
       hasEverSucceeded &&
       config.healthStaleMs > 0 &&
       nowMs - (poller.lastSuccessAt as number) > config.healthStaleMs;
-    status = tooManyFailures || stale ? "degraded" : "ok";
+    const cursorStalled = poller.targets.some((t) => t.cursorStalled);
+    status = tooManyFailures || stale || cursorStalled ? "degraded" : "ok";
   }
 
   return {
@@ -136,6 +141,8 @@ export function buildHealthReport(
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),
         hasError: t.lastError !== null,
+        cursorStalled: t.cursorStalled,
+        cyclesWithoutAdvance: t.cyclesWithoutAdvance,
       })),
     },
   };

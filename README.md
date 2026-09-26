@@ -267,6 +267,10 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   that cursor, the error becomes visible in `/status`, and scheduled retries or
   `/resume` use the same position. Recovery follows the incident runbook rather
   than replacing an opaque cursor with a guessed ledger.
+- **A cursor that never advances** while the chain tip keeps moving is detected
+  after several successful cycles: a `CURSOR STALLED` warning is logged, `/status`
+  and `/health` surface the stall, and health goes degraded. Sitting idle at the
+  tip is not a stall. The cursor file is left intact; the bot keeps retrying.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down. RPC, Telegram, and poller error text shown in `/status` or logs is

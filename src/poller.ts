@@ -16,6 +16,9 @@
  *  - A cursor file that cannot be read is treated as a cold start; one that
  *    cannot be written is logged, and the in-memory cursor keeps working until
  *    the next restart.
+ *  - A cursor that stays identical across successful cycles while the chain tip
+ *    keeps moving is treated as stalled: a warning is logged and status/health
+ *    surface the condition. Idle at the tip is not a stall.
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -24,6 +27,8 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
+import { formatEvent } from "./notifications/format.js";
+import { eventCursorLedger, readContractEvents, type WatchTarget } from "./stellar/events.js";
 import { formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
@@ -35,6 +40,13 @@ export interface TargetState {
   /** Highest ledger an event was seen in, from this run or the cursor file. */
   lastEventLedger: number | null;
   lastError: string | null;
+  /**
+   * Successful cycles where this target's cursor did not advance while still
+   * behind the chain tip. Reset when the cursor moves or catches the tip.
+   */
+  cyclesWithoutAdvance: number;
+  /** True once {@link CURSOR_STALL_CYCLES} consecutive non-advancing cycles fire. */
+  cursorStalled: boolean;
 }
 
 export type PollerPauseResult = "paused" | "already-paused" | "stopped";
@@ -150,6 +162,18 @@ const DEFAULT_CIRCUIT_COOLDOWN_MS = 60_000;
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
 const DEFAULT_SEND_SPACING_MS = 1_500;
 
+/**
+ * Successful poll cycles with an unchanged cursor while behind tip before we
+ * warn. At the default 30s interval this is ~2.5 minutes of no progress.
+ */
+export const CURSOR_STALL_CYCLES = 5;
+
+/**
+ * Minimum tip−cursor ledger gap before an unchanged cursor counts as stalled.
+ * A gap of 0–1 is normal while sitting on the tip between ledgers.
+ */
+export const CURSOR_STALL_MIN_LAG_LEDGERS = 2;
+
 /** Maximum number of retry attempts for a single Telegram send. */
 const DEFAULT_MAX_SEND_RETRIES = 3;
 
@@ -224,7 +248,15 @@ export function createPoller(deps: PollerDeps) {
   const state = new Map<ContractSource, TargetState>(
     targets.map((t) => [
       t.source,
-      { source: t.source, contractId: t.contractId, cursor: null, lastEventLedger: null, lastError: null },
+      {
+        source: t.source,
+        contractId: t.contractId,
+        cursor: null,
+        lastEventLedger: null,
+        lastError: null,
+        cyclesWithoutAdvance: 0,
+        cursorStalled: false,
+      },
     ]),
   );
 
@@ -313,6 +345,56 @@ export function createPoller(deps: PollerDeps) {
     } catch (err) {
       console.error(`[poller] could not persist cursor: ${errorMessage(err)}`);
     }
+  }
+
+
+  /**
+   * Detect a cursor that never advances while the chain tip moves on.
+   *
+   * Sitting idle at the tip (cursor ledger within {@link CURSOR_STALL_MIN_LAG_LEDGERS}
+   * of `latestLedger`) is normal and must not warn. A stuck RPC that keeps
+   * echoing the same mid-window cursor while the tip advances is the failure
+   * mode this catches.
+   */
+  function trackCursorAdvance(
+    target: TargetState,
+    previousCursor: string | null,
+    latestLedger: number,
+  ): void {
+    const cursor = target.cursor;
+    if (!cursor) {
+      target.cyclesWithoutAdvance = 0;
+      target.cursorStalled = false;
+      return;
+    }
+
+    const cursorLedger = eventCursorLedger(cursor);
+    const lag = cursorLedger === null ? 0 : latestLedger - cursorLedger;
+    const behindTip = lag >= CURSOR_STALL_MIN_LAG_LEDGERS;
+    const advanced = previousCursor !== cursor;
+    // First successful assignment after a cold start is progress, not a stall.
+    const firstAssignment = previousCursor === null;
+
+    if (firstAssignment || advanced || !behindTip) {
+      target.cyclesWithoutAdvance = 0;
+      target.cursorStalled = false;
+      return;
+    }
+
+    target.cyclesWithoutAdvance += 1;
+    if (target.cyclesWithoutAdvance < CURSOR_STALL_CYCLES) return;
+
+    if (!target.cursorStalled) {
+      console.warn(
+        `[poller] CURSOR STALLED — ${target.source} cursor has not advanced for ` +
+          `${target.cyclesWithoutAdvance} successful cycles while ${lag} ledgers behind ` +
+          `tip ${latestLedger}` +
+          (cursorLedger !== null ? ` (cursor ledger ${cursorLedger})` : "") +
+          `. Check RPC getEvents pagination; cursor file ${config.cursorFile} is intact. ` +
+          `The bot will keep retrying; the chain remains the record.`,
+      );
+    }
+    target.cursorStalled = true;
   }
 
   // ── One cycle ──────────────────────────────────────────────────────────────
@@ -420,6 +502,7 @@ export function createPoller(deps: PollerDeps) {
       if (!current) continue;
 
       try {
+        const previousCursor = current.cursor;
         const scan = await readContractEvents(server, target, {
           cursor: current.cursor ?? undefined,
           lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
@@ -461,6 +544,7 @@ export function createPoller(deps: PollerDeps) {
             );
           }
         }
+        trackCursorAdvance(current, previousCursor, scan.latestLedger);
       } catch (err) {
         cycleFailures++;
         const message = errorMessage(err);
