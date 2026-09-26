@@ -42,7 +42,10 @@ export interface DedupableEvent {
  * event as unique. `null` means "cannot identify" — callers pass those through
  * un-deduplicated instead of guessing.
  */
-export function eventKey(event: DedupableEvent): string | null {
+export function eventKey(event: DedupableEvent | null | undefined): string | null {
+  // A malformed RPC entry (null, a primitive) has no identity; pass it through
+  // so the decoder can skip it instead of crashing the page walk.
+  if (!event || typeof event !== "object") return null;
   if (typeof event.id === "string" && event.id !== "") return event.id;
   if (typeof event.eventId === "string" && event.eventId !== "") return event.eventId;
 

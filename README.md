@@ -2,7 +2,7 @@
 
 A Telegram notifier for [Mimir](https://github.com/mimir-stellar), the AI-settled
 prediction market on Stellar. It polls Mimir's two Soroban contracts for new
-on-chain events and posts them, human-readable, into a chat or channel:
+on-chain events and posts them, human-readable, into one or more named chats or channels:
 
 ```
 🆕 New claim #7
@@ -94,7 +94,10 @@ docker run -d \
 ```
 
 `.env.example` ships with the live Stellar Testnet contract ids, so the only two
-values you must supply are `BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Every other
+values you must supply are `BOT_TOKEN` and `TELEGRAM_CHAT_ID`. To split traffic,
+set `TELEGRAM_MARKET_CHAT_ID` and/or `TELEGRAM_SQUAD_CHAT_ID`; each overrides the
+legacy destination for that contract, while an omitted override falls back to
+`TELEGRAM_CHAT_ID`. Every other
 variable is documented inline there. A missing or malformed value aborts startup
 with all the problems listed at once — the bot never boots into a state where it
 looks healthy but notifies nobody.
@@ -105,7 +108,7 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip counters (plus messages dropped by a shutdown drain) and the last error |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
@@ -115,6 +118,69 @@ Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
 response and cannot mutate poller state. Repeated `/pause` or `/resume` commands
 are idempotent. Control state is process-local: a restart resumes polling and
 loads the existing version-1 cursor file.
+
+## Machine-readable status snapshot
+
+`/status` is for a human in the chat. For a supervisor, a dashboard, or a shell
+on the box, the poller also writes the same facts as JSON to `STATUS_FILE`
+(default `data/status.json`) after every cycle, and on start and stop:
+
+```bash
+npm start -- --status          # or: node dist/index.js --status
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-21T10:00:00.000Z",
+  "uptimeMs": 3600000,
+  "running": true,
+  "network": "testnet",
+  "rpcUrl": "https://soroban-testnet.stellar.org",
+  "chatId": "-…7890",
+  "pollIntervalMs": 30000,
+  "maxNotificationsPerCycle": 20,
+  "cycles": 120,
+  "lastPollAt": 1755770400000,
+  "lastSuccessAt": 1755770400000,
+  "latestLedger": 4226733,
+  "oldestLedger": 4105773,
+  "notificationsSent": 11,
+  "notificationsFailed": 0,
+  "eventsSkipped": 3,
+  "consecutiveFailures": 0,
+  "lastError": null,
+  "targets": [
+    {
+      "source": "market",
+      "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+      "cursor": "0018276211125911551-4294967295",
+      "lastEventLedger": 4226729,
+      "lastError": null
+    }
+  ]
+}
+```
+
+`--status` reads the file only — it never contacts Telegram or the RPC — so it is
+safe to run from a health check or a cron job while the bot is running. It exits
+`0` when a snapshot was read and `1` when there is none or it is not valid JSON.
+
+**What is deliberately not in it.** The snapshot is built from an allowlist of
+fields, so nothing can leak by accident. It never contains the bot token, a
+private key, or a payment proof. The chat id is redacted to its sign and last
+four digits (`-…7890`), and every string that comes from outside the process —
+RPC errors, Telegram errors, cursors — is whitespace-collapsed and truncated
+(`MAX_ERROR_CHARS`, 300) so a hostile or chatty endpoint cannot write an
+unbounded blob into the file or into a log line. The write is atomic
+(write-then-rename), so a reader never sees a half-written document.
+
+**Reading it in a health check.** `running: false` means the process stopped
+deliberately (SIGINT/SIGTERM) or has not started; `consecutiveFailures > 0` with
+a fresh `lastPollAt` means the RPC is failing but the loop is alive; a
+`generatedAt` that stops advancing means the process is wedged or gone. The
+chain remains the source of truth — this file reports on the reader, it is not a
+substitute for reading the chain.
 
 ## Reading events without a bot token
 
@@ -278,7 +344,9 @@ backward-compatible in both directions.
 On a cold start (no file) it begins `START_LOOKBACK_LEDGERS` behind the chain tip
 rather than replaying the whole retained window into your chat. `/pause` and
 `/resume` never edit this file; they only control scheduling, so the cursor
-format remains version 1 and a restart does not preserve a pause.
+format remains version 1 and a restart does not preserve a pause. A graceful
+shutdown flushes any cursor state that is still only in memory before the
+process exits — see [Graceful shutdown](#graceful-shutdown).
 
 Tests never use this directory: they run against an ephemeral data directory
 created under the OS temp dir and removed afterwards (see
@@ -301,8 +369,12 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   `MAX_NOTIFICATIONS_PER_CYCLE`, and sends that exhaust three bounded retries
   are counted as skipped or failed and are not replayed. Holding the cursor
   back would turn a revoked token or removed chat into an infinite replay, and
-  recovery would flood the channel. Notifications are lossy on purpose — the
-  chain is the record; the poller logs the sent/failed/skipped commit decision.
+  recovery would flood the channel. A failed send is isolated to that routed
+  chat and event; other events continue. Notifications are lossy on purpose —
+  the chain is the record; the poller logs the sent/failed/skipped commit decision.
+  A rejected inline keyboard (or a malformed MarkdownV2 payload) fails the same
+  way as any other send. Events without a usable transaction hash are still
+  sent, just without the explorer button.
 - **A corrupt cursor file** is treated as a cold start rather than a crash. A
   valid but RPC-rejected stale cursor is never silently rewound: the target keeps
   that cursor, the error becomes visible in `/status`, and scheduled retries or
@@ -319,6 +391,7 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   wedge it.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
+
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
   compact, bounded, and the configured bot token is redacted.
 - **A duplicate event** — the same id from an overlapping page, a resumed
@@ -334,6 +407,59 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
+- **A status file that cannot be written** is logged and ignored; it is an
+  observability signal, never a reason to stop notifying. A corrupt snapshot
+  makes `--status` exit `1` rather than print garbage.
+- **A shutdown** stops scheduling, drops what has not been sent yet, waits at
+  most `SHUTDOWN_TIMEOUT_MS` for the cycle in progress, and flushes any cursor
+  state that is still only in memory — see
+  [Graceful shutdown](#graceful-shutdown).
+
+## Graceful shutdown
+
+`SIGINT`/`SIGTERM` starts a bounded drain rather than a hard stop:
+
+1. The poller stops scheduling cycles and reports itself as `stopping`.
+2. Notifications that have not been sent yet are **dropped**: counted in
+   `/status`, logged once with a bounded line, and left to the chain. A send
+   already in flight is allowed to finish, but it does not start another
+   retry/backoff step.
+3. The cycle in progress gets `SHUTDOWN_TIMEOUT_MS` (default `10000`, `0`
+   skips the wait) to finish and write its cursors.
+4. Any cursor state still only in memory is flushed to `CURSOR_FILE`, then the
+   health endpoint and the Telegram long-poll are closed and the process exits
+   `0`.
+
+Cursors only ever advance after their events have been handed to Telegram, so
+flushing at any point is safe: the file a restart resumes from never skips an
+event the chain still has to show. What the drain gives up is *delivery* of the
+messages it had not started — notifications are lossy by design and the chain
+is the record, exactly as for a failed Telegram send.
+
+Why drop rather than finish the burst? Finishing means up to
+`MAX_NOTIFICATIONS_PER_CYCLE` messages × 1.5s spacing plus retry backoff —
+minutes that would hold a deploy open. Worse, hitting the deadline halfway
+would leave the cursor behind messages that were already sent, replaying them
+on restart. Dropping keeps the drain bounded *and* the resume exact.
+
+**A second `SIGINT`/`SIGTERM` exits immediately** (`130`/`143`) if a drain ever
+gets stuck. That skips the flush but never corrupts the file: the cursor is
+written to a temporary file and renamed, so the worst case is resuming from the
+last completed cycle. The teardown after the flush is capped too —
+`SHUTDOWN_TIMEOUT_MS + 10000` ms, then the process exits `1` with the cursor
+file already written.
+
+Where the drain is visible:
+
+| Where | Field |
+| --- | --- |
+| `GET /health` | `poller.stopping`, `poller.pendingFlush`, `poller.lastFlushAt`, `poller.notificationsDropped`. A deliberate drain reports `ok`, not `degraded` |
+| `/status` | `stopping` in the headline, `dropped during shutdown N` in the counters, and a drain line while it lasts |
+
+Configuration is additive: `SHUTDOWN_TIMEOUT_MS` is optional (see
+`.env.example`), no existing variable is renamed, and the version-1 cursor
+format is unchanged — a deployment that omits the new key gets the `10000` ms
+default.
 
 ## Long-running operation
 
@@ -411,6 +537,7 @@ src/
   bot.ts                   grammy setup: /start, /help, /status, /contracts, operator pause/resume
   dedup.ts                 bounded event-id window (reader + poller dedup)
   poller.ts                the loop: scan, notify, persist the cursor
+  status.ts                machine-readable status snapshot (allowlisted, bounded)
   stellar/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
@@ -420,6 +547,48 @@ src/
   notifications/
     format.ts              decoded event -> MarkdownV2 message
 ```
+
+## Deploying on Railway
+
+The repo ships `railway.json` — Railway's Config-as-Code — that wires the
+deployment to the rest of this repo:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `build.buildCommand` | `npm run build` | `dist/` is gitignored; the image compiles it. |
+| `deploy.startCommand` | `npm start` | Run the built poller. |
+| `deploy.healthcheckPath` | `/health` | The same endpoint the local health module serves (`GET /health`). |
+| `deploy.requiredMountPath` | `/app/data` | Refuse to start unless a volume is attached where the cursor lives. |
+| `deploy.restartPolicyType` | `ON_FAILURE` | Restart on crash, bounded retries. |
+| `deploy.numReplicas` | `1` | One poller owns the cursor; Railway volumes cannot be used with replicas. |
+
+Volume is the one manual step — Railway never creates one from config:
+
+```bash
+railway volume add --mount-path /app/data   # or attach it from the dashboard
+```
+
+Set as Railway variables (secrets): `BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and
+`HEALTH_HOST=0.0.0.0`. Everything else keeps its repo default:
+`CURSOR_FILE=./data/cursor.json` resolves to `/app/data/cursor.json` in
+Railway's `/app` working directory, and the health endpoint binds the `PORT`
+that Railway injects (the `HEALTH_PORT` fallback, see `.env.example`). No public
+domain is needed — healthchecks run from Railway's probe host on the container
+network, which is why `HEALTH_HOST` must not stay loopback-only here.
+
+On deployed failure:
+
+- A crash restarts under `ON_FAILURE`; the volume keeps the cursor so there is
+  no notification replay. A **stale or corrupt cursor** is already handled as a
+  cold start, never a crash — see [Failure behaviour](#failure-behaviour).
+- A redeploy of a volume-backed service has a short downtime window (Railway
+  keeps only one active deployment per volume); roll back to the previous
+  revision and the cursor is still there.
+
+Config-as-Code is deprecated by Railway in favour of Infrastructure as Code
+(`.railway/railway.ts` with the Railway CLI), with a hard cutoff of 2026-12-01.
+This file captures the current, working behaviour and is the migration source of
+truth for IaC; follow Railway's migration guide when the time comes.
 
 ## Development checks
 

@@ -16,6 +16,24 @@
  *  - A cursor file that cannot be read is treated as a cold start; one that
  *    cannot be written is logged, and the in-memory cursor keeps working until
  *    the next restart.
+ *  - A graceful shutdown (`poller.shutdown()`) stops scheduling, drops the
+ *    notifications that have not been sent yet, waits a bounded time for the
+ *    in-flight cycle, and flushes cursors that are still only in memory. The
+ *    process then exits with the file matching what a restart resumes from.
+ *  - A cursor that fell below the RPC's retained window ("stale cursor") fails
+ *    every scan with an RPC error. The cursor is deliberately left untouched —
+ *    advancing past an unreadable range would silently skip events — so an
+ *    operator must delete the cursor file to cold-start. The failure log says
+ *    so explicitly.
+ *
+ * ── Event ordering ─────────────────────────────────────────────────────────
+ *
+ * Events are notified in deterministic chain order (ledger → transaction
+ * index → operation index → RPC paging token), not in RPC array order, so a
+ * page split or a retry never reorders the channel. Within one scan,
+ * duplicate paging tokens (the RPC may repeat a page-boundary event) notify
+ * once. Restarting replays nothing already consumed: the persisted cursor is
+ * the only resume token, in the same `version: 1` format as before.
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -23,9 +41,11 @@ import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
 
-import type { BotConfig } from "./config.js";
+import type { SendExtra } from "./bot.js";
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
 import { EventDedupWindow, eventKey } from "./dedup.js";
-import { formatEvent, safeErrorMessage } from "./notifications/format.js";
+import { explorerKeyboard, formatEvent, safeErrorMessage } from "./notifications/format.js";
+import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
@@ -45,6 +65,11 @@ export interface PollerStatus {
   running: boolean;
   /** Operator pause only prevents new cycles; an in-flight cycle may finish. */
   paused: boolean;
+  /**
+   * A graceful shutdown is in progress: no new cycle starts and notifications
+   * that have not been sent yet are dropped rather than retried.
+   */
+  stopping: boolean;
   /**
    * Chain clock: unix ms close time of the newest chain event this poller has
    * observed. `null` before the first scan returns one.
@@ -66,11 +91,17 @@ export interface PollerStatus {
   oldestLedger: number | null;
   notificationsSent: number;
   notificationsFailed: number;
+  /** Never attempted (unknown, malformed or over the per-cycle cap). */
   eventsSkipped: number;
+  /** Not attempted because a graceful shutdown started first. */
+  notificationsDropped: number;
   /** Events suppressed because they had already been processed (dedup). */
   eventsDeduplicated: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
+  /** In-memory cursor state is newer than the persisted file. */
+  pendingFlush: boolean;
+  lastFlushAt: number | null;
   targets: TargetState[];
   /** RPC circuit breaker state */
   circuitBreaker: {
@@ -79,18 +110,6 @@ export interface PollerStatus {
     failureCount: number;
     lastFailureAt: number | null;
   };
-}
-
-
-interface CursorTarget {
-  cursor: string | null;
-  lastEventLedger: number | null;
-  /**
-   * Recently processed event ids, oldest first. Additive and bounded: older
-   * cursor files without it load as an empty window, and new files stay small
-   * because the window never grows past `EVENT_DEDUP_WINDOW`.
-   */
-  recentEventIds?: string[];
 }
 
 interface CursorFile {
@@ -103,6 +122,17 @@ interface CursorFile {
    */
   chainClockAt?: number | null;
   targets: Record<string, CursorTarget>;
+}
+
+interface CursorTarget {
+  cursor: string | null;
+  lastEventLedger: number | null;
+  /**
+   * Recently processed event ids, oldest first. Additive and bounded: older
+   * cursor files without it load as an empty window, and new files stay small
+   * because the window never grows past `EVENT_DEDUP_WINDOW`.
+   */
+  recentEventIds?: string[];
 }
 
 /**
@@ -196,11 +226,37 @@ export interface SendOptions {
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
-  /** Sends one already-formatted MarkdownV2 message. May reject. */
-  send: (text: string) => Promise<void>;
+  /**
+   * Sends one already-formatted MarkdownV2 message to the chat routed for
+   * `source`, with the event's explorer button when `extra.reply_markup` is
+   * set. May reject.
+   */
+  send: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>;
   sendOptions?: SendOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
+  /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
+  now?: () => number;
+}
+
+export interface ShutdownOptions {
+  /**
+   * Milliseconds to wait for an in-flight cycle before flushing anyway.
+   * Defaults to `config.shutdownTimeoutMs`; `0` does not wait at all.
+   */
+  timeoutMs?: number;
+}
+
+export interface ShutdownResult {
+  /** False when a cycle was still running when the wait budget expired. */
+  drained: boolean;
+  /**
+   * False only when state was pending and the write failed. True also when
+   * there was nothing to flush — the file then already matches memory.
+   */
+  flushed: boolean;
+  /** Milliseconds spent draining and flushing, on this poller's clock. */
+  waitedMs: number;
 }
 
 export interface CircuitBreakerOptions {
@@ -230,6 +286,24 @@ const DEFAULT_MAX_BACKOFF_MS = 10_000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Wait for `promise`, resolving `false` if `timeoutMs` elapses first.
+ *
+ * Used by shutdown so a wedged read or a Telegram retry loop can never hold the
+ * process open past the operator's budget. The timer is always cleared, so an
+ * early settle never keeps the event loop alive.
+ */
+function withinDeadline(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const deadline = setTimeout(() => resolve(false), timeoutMs);
+    const settled = () => {
+      clearTimeout(deadline);
+      resolve(true);
+    };
+    void promise.then(settled, settled);
+  });
+}
+
 
 /** Timeout for each RPC scan request */
 const SCAN_TIMEOUT_MS = 15_000;
@@ -256,18 +330,35 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 
 /**
+ * Heuristic for a cursor older than the RPC's retained event window. The RPC
+ * rejects such reads (cursor/ledger/retention errors) instead of returning an
+ * empty page. Matched only to log an actionable, bounded hint — the cursor is
+ * still left untouched so no events are silently skipped.
+ */
+function isStaleCursorError(message: string): boolean {
+  return /cursor|oldest[-_ ]?ledger|start[-_ ]?ledger|retention|not (?:found|available)|out[-_ ]?of[-_ ]?range|ledger.*(?:too old|before|below)/i.test(
+    message,
+  );
+}
+
+/**
  * Sends a message with bounded exponential backoff.
  *
  * If the Telegram API is temporarily unavailable (rate limit, network error,
  * or bad token), we retry a few times with increasing delays. This prevents
  * transient failures from dropping notifications while avoiding infinite
  * retries that would block the poller loop.
+ *
+ * `shouldRetry` is the shutdown escape hatch: once a graceful shutdown starts
+ * the drain must stay bounded, so a failing send gives up on its first error
+ * instead of sleeping through another backoff step.
  */
 async function sendWithRetry(
   send: (text: string) => Promise<void>,
   text: string,
   botToken: string,
   opts?: SendOptions,
+  shouldRetry: () => boolean = () => true,
 ): Promise<void> {
   let attempt = 0;
   const maxRetries = opts?.maxSendRetries ?? DEFAULT_MAX_SEND_RETRIES;
@@ -280,8 +371,8 @@ async function sendWithRetry(
       return;
     } catch (err) {
       attempt++;
-      if (attempt >= maxRetries) {
-        throw err; // Exhausted retries
+      if (attempt >= maxRetries || !shouldRetry()) {
+        throw err; // Exhausted retries, or a shutdown made waiting pointless
       }
       console.warn(
         `[poller] send attempt ${attempt} failed, retrying in ${backoff}ms: ` +
@@ -297,6 +388,7 @@ async function sendWithRetry(
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
   const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
+  const now = deps.now ?? Date.now;
   const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
   const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
@@ -330,6 +422,7 @@ export function createPoller(deps: PollerDeps) {
   const status: PollerStatus = {
     running: false,
     paused: false,
+    stopping: false,
     chainClockAt: null,
     startedAt: 0,
     cycles: 0,
@@ -340,9 +433,12 @@ export function createPoller(deps: PollerDeps) {
     notificationsSent: 0,
     notificationsFailed: 0,
     eventsSkipped: 0,
+    notificationsDropped: 0,
     eventsDeduplicated: 0,
     consecutiveFailures: 0,
     lastError: null,
+    pendingFlush: false,
+    lastFlushAt: null,
     targets: [],
     circuitBreaker: {
       open: false,
@@ -357,6 +453,22 @@ export function createPoller(deps: PollerDeps) {
   let paused = false;
   let inFlight = false;
   let resumePending = false;
+  /** Resolves when the current cycle (including its cursor write) is done. */
+  let cycleSettled: Promise<void> | null = null;
+  let settleCycle: (() => void) | null = null;
+
+  function beginCycleTracking(): void {
+    cycleSettled = new Promise<void>((resolve) => {
+      settleCycle = resolve;
+    });
+  }
+
+  function endCycleTracking(): void {
+    const settle = settleCycle;
+    settleCycle = null;
+    cycleSettled = null;
+    settle?.();
+  }
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
@@ -384,6 +496,8 @@ export function createPoller(deps: PollerDeps) {
         // re-notify the last event the inclusive cursor hands back.
         dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
       }
+      // Memory now equals the file; nothing is waiting to be flushed.
+      status.pendingFlush = false;
       // Resume the chain clock alongside the cursors. Without this a restart
       // between two quiet scans would report `unknown` until the next event
       // happened to land, hiding a perfectly healthy (or long-stalled) chain.
@@ -400,10 +514,19 @@ export function createPoller(deps: PollerDeps) {
     }
   }
 
-  async function saveCursors(): Promise<void> {
+  /**
+   * Record that in-memory cursor state has moved ahead of the file, so a
+   * shutdown knows there is something to flush even if the cycle that moved it
+   * never reaches its own write.
+   */
+  function markDirty(): void {
+    status.pendingFlush = true;
+  }
+
+  async function saveCursors(reason: "cycle" | "shutdown"): Promise<boolean> {
     const payload: CursorFile = {
       version: 1,
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(now()).toISOString(),
       chainClockAt: status.chainClockAt,
       targets: Object.fromEntries(
         [...state.values()].map((t) => [
@@ -424,9 +547,35 @@ export function createPoller(deps: PollerDeps) {
       const tmp = `${config.cursorFile}.tmp`;
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, config.cursorFile);
+      status.pendingFlush = false;
+      status.lastFlushAt = now();
+      return true;
     } catch (err) {
-      console.error(`[poller] could not persist cursor: ${errorMessage(err)}`);
+      // `pendingFlush` is deliberately left as it was: if state was ahead of
+      // the file it stays ahead, so a later cycle — or the shutdown flush —
+      // retries. If nothing had changed, write-then-rename left the old file
+      // intact and there is still nothing to flush.
+      console.error(`[poller] could not persist cursor (${reason}): ${errorMessage(err)}`);
+      return false;
     }
+  }
+
+  // ── Status snapshot ────────────────────────────────────────────────────────
+
+  /**
+   * Write the machine-readable snapshot. Called after every cycle, and on
+   * start/stop, so an operator reading the file always sees the last completed
+   * cycle rather than a stale one from boot.
+   */
+  async function persistStatus(): Promise<void> {
+    await writeStatusFile(config.statusFile, snapshot());
+  }
+
+  function snapshot(): StatusSnapshot {
+    return buildStatusSnapshot(config, {
+      ...status,
+      targets: [...state.values()].map((t) => ({ ...t })),
+    });
   }
 
   // ── One cycle ──────────────────────────────────────────────────────────────
@@ -441,6 +590,7 @@ export function createPoller(deps: PollerDeps) {
     let sentThisCycle = 0;
     let failed = 0;
     let skipped = 0;
+    let droppedForShutdown = 0;
 
     for (const event of events) {
       if (event.payload.name === "unknown") {
@@ -456,7 +606,36 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
-      const text = formatEvent(config, event);
+      // A shutdown keeps the drain bounded: messages that have not started are
+      // dropped, counted, and left to the chain. The cursor still advances past
+      // them below, so the next start does not replay them into the channel.
+      if (status.stopping) {
+        status.notificationsDropped += 1;
+        droppedForShutdown += 1;
+        continue;
+      }
+
+      // Formatting one event must never abort the rest of the batch: remote
+      // event data is untrusted, so a malformed value is a skip, not a throw.
+      // Only safe identifiers are logged — never the raw remote payload.
+      let text: string | null;
+      let extra: SendExtra | undefined;
+      try {
+        text = formatEvent(config, event);
+        if (text !== null) {
+          const reply_markup = explorerKeyboard(config, event);
+          if (reply_markup) extra = { reply_markup };
+        }
+      } catch (err) {
+        status.eventsSkipped += 1;
+        skipped += 1;
+        console.error(
+          `[poller] format failed for ${event.source} event at ledger ${event.ledger}: ` +
+            errorMessage(err),
+          { eventId: event.eventId, reason: "malformed_event" },
+        );
+        continue;
+      }
       if (text === null) {
         status.eventsSkipped += 1;
         skipped += 1;
@@ -475,7 +654,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text, config.botToken, deps.sendOptions);
+        await sendWithRetry((message) => send(message, event.source, extra), text, config.botToken, deps.sendOptions, () => !status.stopping);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
@@ -488,9 +667,17 @@ export function createPoller(deps: PollerDeps) {
         );
       }
 
-      if (sentThisCycle < config.maxNotificationsPerCycle && sendSpacing > 0) {
+      // Rate-limit spacing is the last thing a draining cycle should wait for.
+      if (!status.stopping && sentThisCycle < config.maxNotificationsPerCycle && sendSpacing > 0) {
         await sleep(sendSpacing);
       }
+    }
+
+    if (droppedForShutdown > 0) {
+      console.warn(
+        `[poller] shutdown drain dropped ${droppedForShutdown} unsent notification(s); ` +
+          `the cursor still advances so they are not replayed`,
+      );
     }
 
     return { sent: sentThisCycle, failed, skipped };
@@ -499,13 +686,14 @@ export function createPoller(deps: PollerDeps) {
   async function cycle(): Promise<void> {
     if (inFlight) return;
     inFlight = true;
+    beginCycleTracking();
     status.cycles += 1;
-    status.lastPollAt = Date.now();
+    status.lastPollAt = now();
 
     // ── Circuit breaker check ─────────────────────────────────────────────────────
     if (status.circuitBreaker.open) {
-      const now = Date.now();
-      const timeSinceOpen = status.circuitBreaker.openedAt ? now - status.circuitBreaker.openedAt : Infinity;
+      const nowMs = now();
+      const timeSinceOpen = status.circuitBreaker.openedAt ? nowMs - status.circuitBreaker.openedAt : Infinity;
       
       if (timeSinceOpen >= circuitCooldown) {
         // Cooldown elapsed, attempt to close the circuit
@@ -522,6 +710,7 @@ export function createPoller(deps: PollerDeps) {
         );
         status.targets = [...state.values()].map((t) => ({ ...t }));
         inFlight = false;
+        endCycleTracking();
         return;
       }
     }
@@ -529,130 +718,155 @@ export function createPoller(deps: PollerDeps) {
     let anyOk = false;
     let cycleFailures = 0;
 
-    for (const target of targets) {
-      const current = state.get(target.source);
-      if (!current) continue;
+    try {
+      for (const target of targets) {
+        const current = state.get(target.source);
+        if (!current) continue;
 
-      try {
-        const window = dedup.get(target.source) ?? new EventDedupWindow(0);
-        const scan = await withTimeout(
-          readContractEvents(server, target, {
-            cursor: current.cursor ?? undefined,
-            lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
-            seenEventIds: window.toJSON(),
-            dedupWindow: config.dedupWindow,
-          }),
-          SCAN_TIMEOUT_MS,
-          "RPC scan",
-        );
+        try {
+          const window = dedup.get(target.source) ?? new EventDedupWindow(0);
+          const scan = await withTimeout(
+            readContractEvents(server, target, {
+              cursor: current.cursor ?? undefined,
+              lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
+              seenEventIds: window.toJSON(),
+              dedupWindow: config.dedupWindow,
+            }),
+            SCAN_TIMEOUT_MS,
+            "RPC scan",
+          );
 
-        status.latestLedger = scan.latestLedger;
-        status.oldestLedger = scan.oldestLedger;
-        current.lastError = null;
-        anyOk = true;
+          status.latestLedger = scan.latestLedger;
+          status.oldestLedger = scan.oldestLedger;
+          current.lastError = null;
+          anyOk = true;
 
-        // Advance the chain clock from close times the RPC actually reported.
-        // `at` is 0 when the RPC omitted `ledgerClosedAt`, which is not an
-        // error, and a value outside the plausible window is malformed and must
-        // never be adopted. The update is monotonic: the two contracts are
-        // scanned in turn, so a rescan or reordering must never move the clock
-        // backwards. A quiet or failed scan keeps the last observed value, which
-        // is what makes a long outage show up as a growing skew rather than as
-        // a clock that keeps time on its own.
-        let implausibleCloseTime = false;
-        for (const event of scan.events) {
-          if (event.at === 0) continue;
-          const closedAtMs = event.at * 1_000;
-          if (!isPlausibleChainClock(closedAtMs)) {
-            implausibleCloseTime = true;
-            continue;
+          // Advance the chain clock from close times the RPC actually reported.
+          // `at` is 0 when the RPC omitted `ledgerClosedAt`, which is not an
+          // error, and a value outside the plausible window is malformed and must
+          // never be adopted. The update is monotonic: the two contracts are
+          // scanned in turn, so a rescan or reordering must never move the clock
+          // backwards. A quiet or failed scan keeps the last observed value, which
+          // is what makes a long outage show up as a growing skew rather than as
+          // a clock that keeps time on its own.
+          let implausibleCloseTime = false;
+          for (const event of scan.events) {
+            if (event.at === 0) continue;
+            const closedAtMs = event.at * 1_000;
+            if (!isPlausibleChainClock(closedAtMs)) {
+              implausibleCloseTime = true;
+              continue;
+            }
+            if (status.chainClockAt === null || closedAtMs > status.chainClockAt) {
+              status.chainClockAt = closedAtMs;
+              markDirty();
+            }
           }
-          if (status.chainClockAt === null || closedAtMs > status.chainClockAt) {
-            status.chainClockAt = closedAtMs;
-          }
-        }
-        if (implausibleCloseTime) {
-          // One bounded line per target per cycle: no payload, no remote text.
-          console.warn(
-            `[poller] ${target.source}: ignored an implausible chain close time; chain clock unchanged`,
-          );
-        }
-
-        // Reset circuit breaker on success
-        if (status.circuitBreaker.failureCount > 0) {
-          console.log(
-            `[poller] RPC succeeded, resetting circuit breaker (was at ${status.circuitBreaker.failureCount} failures)`,
-          );
-          status.circuitBreaker.failureCount = 0;
-          status.circuitBreaker.lastFailureAt = null;
-        }
-
-        if (scan.duplicates > 0) {
-          status.eventsDeduplicated += scan.duplicates;
-          console.log(
-            `[poller] ${target.source}: suppressed ${scan.duplicates} duplicate event(s) ` +
-              `from an overlapping page or a resumed cursor`,
-          );
-        }
-
-        let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
-        if (scan.events.length > 0) {
-          console.log(
-            `[poller] ${target.source}: ${scan.events.length} event(s) ` +
-              `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
-          );
-          // Record before notifying: an event is "processed" once it has been
-          // read, so a crash between send and save cannot replay it.
-          for (const event of scan.events) window.add(eventKey(event));
-          delivery = await notify(scan.events);
-        }
-
-        if (scan.lastEventLedger !== null) current.lastEventLedger = scan.lastEventLedger;
-        // The opaque cursor covers the whole returned page, so it cannot be
-        // committed per event. Commit after processing the page, including
-        // deliberate drops, to avoid replaying a permanent Telegram failure.
-        if (scan.cursor) {
-          current.cursor = scan.cursor;
-          if (delivery.failed > 0 || delivery.skipped > 0) {
+          if (implausibleCloseTime) {
+            // One bounded line per target per cycle: no payload, no remote text.
             console.warn(
-              `[poller] ${target.source}: committed cursor after partial delivery ` +
-                `(sent=${delivery.sent}, failed=${delivery.failed}, skipped=${delivery.skipped})`,
+              `[poller] ${target.source}: ignored an implausible chain close time; chain clock unchanged`,
+            );
+          }
+
+          // Reset circuit breaker on success
+          if (status.circuitBreaker.failureCount > 0) {
+            console.log(
+              `[poller] RPC succeeded, resetting circuit breaker (was at ${status.circuitBreaker.failureCount} failures)`,
+            );
+            status.circuitBreaker.failureCount = 0;
+            status.circuitBreaker.lastFailureAt = null;
+          }
+
+          if (scan.duplicates > 0) {
+            status.eventsDeduplicated += scan.duplicates;
+            console.log(
+              `[poller] ${target.source}: suppressed ${scan.duplicates} duplicate event(s) ` +
+                `from an overlapping page or a resumed cursor`,
+            );
+          }
+
+          let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
+          if (scan.events.length > 0) {
+            // Record before notifying: an event is "processed" once it has been
+            // read, so a crash between send and save cannot replay it.
+            for (const event of scan.events) window.add(eventKey(event));
+            markDirty();
+            delivery = await notify(scan.events);
+            const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
+            console.log(
+              `[poller] ${target.source}: ${scan.events.length} event(s) ` +
+                `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)${skippedText}`,
+            );
+          }
+
+          if (scan.lastEventLedger !== null && scan.lastEventLedger !== current.lastEventLedger) {
+            current.lastEventLedger = scan.lastEventLedger;
+            markDirty();
+          }
+          // The opaque cursor covers the whole returned page, so it cannot be
+          // committed per event. Commit after processing the page, including
+          // deliberate drops, to avoid replaying a permanent Telegram failure.
+          if (scan.cursor && scan.cursor !== current.cursor) {
+            current.cursor = scan.cursor;
+            markDirty();
+            if (delivery.failed > 0 || delivery.skipped > 0) {
+              console.warn(
+                `[poller] ${target.source}: committed cursor after partial delivery ` +
+                  `(sent=${delivery.sent}, failed=${delivery.failed}, skipped=${delivery.skipped})`,
+              );
+            }
+          }
+        } catch (err) {
+          cycleFailures++;
+          const message = errorMessage(err);
+          current.lastError = message;
+          status.lastError = { at: now(), message: `${target.source}: ${message}` };
+          console.error(`[poller] ${target.source} scan failed: ${message}`);
+          if (isStaleCursorError(message)) {
+            // Cursor semantics stay loss-free: the cursor is NOT advanced here.
+            // Only bounded metadata is logged — never the cursor file path
+            // contents, tokens, or RPC payloads.
+            console.error(
+              `[poller] ${target.source} cursor is older than the RPC retained window; ` +
+                `delete ${config.cursorFile} to cold-start (no events are skipped until then)`,
             );
           }
         }
-      } catch (err) {
-        cycleFailures++;
-        const message = errorMessage(err);
-        current.lastError = message;
-        status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
-        console.error(`[poller] ${target.source} scan failed: ${message}`);
+      }
+
+      // ── Circuit breaker state update ─────────────────────────────────────────────
+      if (cycleFailures > 0) {
+        status.circuitBreaker.failureCount += cycleFailures;
+        status.circuitBreaker.lastFailureAt = now();
+
+        if (status.circuitBreaker.failureCount >= circuitThreshold && !status.circuitBreaker.open) {
+          status.circuitBreaker.open = true;
+          status.circuitBreaker.openedAt = now();
+          console.error(
+            `[poller] circuit breaker opened after ${status.circuitBreaker.failureCount} failures (threshold: ${circuitThreshold})`,
+          );
+        }
+      }
+
+      if (anyOk) {
+        status.lastSuccessAt = now();
+        status.consecutiveFailures = 0;
+      } else {
+        status.consecutiveFailures += 1;
+      }
+    } finally {
+      // The write and the tracking promise are what a shutdown waits for, so
+      // they run even when the body above threw.
+      try {
+        status.targets = [...state.values()].map((t) => ({ ...t }));
+        await saveCursors("cycle");
+        await persistStatus();
+      } finally {
+        inFlight = false;
+        endCycleTracking();
       }
     }
-
-    // ── Circuit breaker state update ───────────────────────────────────────────────
-    if (cycleFailures > 0) {
-      status.circuitBreaker.failureCount += cycleFailures;
-      status.circuitBreaker.lastFailureAt = Date.now();
-      
-      if (status.circuitBreaker.failureCount >= circuitThreshold && !status.circuitBreaker.open) {
-        status.circuitBreaker.open = true;
-        status.circuitBreaker.openedAt = Date.now();
-        console.error(
-          `[poller] circuit breaker opened after ${status.circuitBreaker.failureCount} failures (threshold: ${circuitThreshold})`,
-        );
-      }
-    }
-
-    if (anyOk) {
-      status.lastSuccessAt = Date.now();
-      status.consecutiveFailures = 0;
-    } else {
-      status.consecutiveFailures += 1;
-    }
-
-    status.targets = [...state.values()].map((t) => ({ ...t }));
-    await saveCursors();
-    inFlight = false;
   }
 
   function schedule(delayMs: number): void {
@@ -671,7 +885,7 @@ export function createPoller(deps: PollerDeps) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
-      status.lastError = { at: Date.now(), message: errorMessage(err) };
+      status.lastError = { at: now(), message: errorMessage(err) };
       console.error(`[poller] cycle threw: ${errorMessage(err)}`);
       inFlight = false;
     }
@@ -690,13 +904,15 @@ export function createPoller(deps: PollerDeps) {
       stopped = false;
       paused = false;
       status.paused = false;
+      status.stopping = false;
       status.running = true;
-      status.startedAt = Date.now();
+      status.startedAt = now();
       status.targets = [...state.values()].map((t) => ({ ...t }));
       console.log(
         `[poller] watching market=${config.marketContractId} squad=${config.squadContractId} ` +
           `every ${config.pollIntervalMs}ms`,
       );
+      await persistStatus();
       void loop();
     },
 
@@ -726,6 +942,7 @@ export function createPoller(deps: PollerDeps) {
       return "resumed";
     },
 
+    /** Immediate stop: no draining, no waiting. Prefer {@link shutdown}. */
     stop(): void {
       stopped = true;
       paused = false;
@@ -734,10 +951,78 @@ export function createPoller(deps: PollerDeps) {
       resumePending = false;
       if (timer) clearTimeout(timer);
       timer = null;
+      // Best-effort: the process may be exiting, but a final snapshot that says
+      // `running: false` is what tells a supervisor the stop was deliberate.
+      void persistStatus();
+    },
+
+    /**
+     * Graceful shutdown: stop scheduling, drop what has not been sent yet, wait
+     * a bounded time for the in-flight cycle, then flush cursor state.
+     *
+     * Bounded on purpose. The cycle can only be waiting on a read or on
+     * Telegram, and both are given a deadline rather than a chance to hang the
+     * deploy. Cursors only ever advance after their events were handed to
+     * Telegram, so flushing at any point is safe: the file a restart resumes
+     * from never skips an event the chain still has to show.
+     */
+    async shutdown(options: ShutdownOptions = {}): Promise<ShutdownResult> {
+      // The last fallback is for configs built by callers that predate the
+      // setting: "no field" must mean the default budget, not "never wait".
+      const budgetMs =
+        options.timeoutMs ?? config.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+      const startedAt = now();
+      const firstRequest = !status.stopping;
+
+      status.stopping = true;
+      stopped = true;
+      paused = false;
+      status.paused = false;
+      resumePending = false;
+      if (timer) clearTimeout(timer);
+      timer = null;
+
+      if (firstRequest) {
+        console.log(
+          `[poller] shutdown requested; draining in-flight work up to ${budgetMs}ms`,
+        );
+      }
+
+      let drained = true;
+      const inFlightCycle = cycleSettled;
+      if (inFlightCycle) {
+        drained = budgetMs > 0 ? await withinDeadline(inFlightCycle, budgetMs) : false;
+        if (!drained) {
+          console.warn(
+            `[poller] cycle still in flight after ${budgetMs}ms; flushing cursors and letting it go`,
+          );
+        }
+      }
+
+      let flushed = true;
+      if (status.pendingFlush) {
+        flushed = await saveCursors("shutdown");
+        console.log(
+          flushed
+            ? `[poller] flushed pending cursor state to ${config.cursorFile}`
+            : `[poller] cursor flush failed; in-memory state kept for the next start`,
+        );
+      } else {
+        console.log("[poller] cursor file already matches memory; nothing to flush");
+      }
+
+      status.running = false;
+      await persistStatus();
+      return { drained, flushed, waitedMs: Math.max(0, now() - startedAt) };
     },
 
     status(): PollerStatus {
       return { ...status, targets: [...state.values()].map((t) => ({ ...t })) };
+    },
+
+    /** Machine-readable snapshot, same shape as the file on disk. */
+    snapshot(): StatusSnapshot {
+      return snapshot();
     },
   };
 }

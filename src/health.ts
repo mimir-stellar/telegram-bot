@@ -39,6 +39,8 @@ export interface HealthReport {
     running: boolean;
     /** Intentional operator pause; process is ready but scheduling is stopped. */
     paused: boolean;
+    /** A graceful shutdown is draining: no new cycles, unsent messages dropped. */
+    stopping: boolean;
     channelPreviewMode: boolean;
     cycles: number;
     lastPollAt: string | null;
@@ -59,8 +61,15 @@ export interface HealthReport {
     eventsSkipped: number;
     /** Events suppressed as already-seen across overlapping pages / resumes. */
     eventsDeduplicated: number;
+    notificationsDropped: number;
     consecutiveFailures: number;
     lastError: { at: string; message: string } | null;
+    /**
+     * In-memory cursor state that is not on disk yet. False after a successful
+     * flush, which is what a shutdown is for.
+     */
+    pendingFlush: boolean;
+    lastFlushAt: string | null;
     targets: Array<{
       source: string;
       /** Public contract id (on-chain). */
@@ -142,6 +151,11 @@ export function buildHealthReport(
   let status: HealthReport["status"];
   if (!poller.running) {
     status = "stopped";
+  } else if (poller.stopping === true) {
+    // A deliberate drain is doing exactly what it was asked to do. It is not a
+    // stale or failing poller, and `poller.stopping` is how clients tell the
+    // difference from an operator pause.
+    status = "ok";
   } else if (poller.paused) {
     // A deliberate operator pause is healthy, not a stale or failing poller.
     status = "ok";
@@ -166,6 +180,7 @@ export function buildHealthReport(
     poller: {
       running: poller.running,
       paused: poller.paused === true,
+      stopping: poller.stopping === true,
       channelPreviewMode: config.channelPreviewMode === true,
       cycles: poller.cycles,
       lastPollAt: iso(poller.lastPollAt),
@@ -178,10 +193,13 @@ export function buildHealthReport(
       notificationsFailed: poller.notificationsFailed,
       eventsSkipped: poller.eventsSkipped,
       eventsDeduplicated: poller.eventsDeduplicated ?? 0,
+      notificationsDropped: poller.notificationsDropped ?? 0,
       consecutiveFailures: poller.consecutiveFailures,
       lastError: poller.lastError
         ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }
         : null,
+      pendingFlush: poller.pendingFlush === true,
+      lastFlushAt: iso(poller.lastFlushAt ?? null),
       targets: poller.targets.map((t) => ({
         source: t.source,
         contractId: t.contractId,
