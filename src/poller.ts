@@ -24,6 +24,7 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
+import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
@@ -55,6 +56,11 @@ export interface PollerStatus {
   eventsSkipped: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
+  /**
+   * Repetitive error lines withheld by the sampler since start. They are
+   * summarized in the log rather than dropped; surfaced here for `/status`.
+   */
+  suppressedLogs: number;
   targets: TargetState[];
   /** RPC circuit breaker state */
   circuitBreaker: {
@@ -242,6 +248,7 @@ export function createPoller(deps: PollerDeps) {
     eventsSkipped: 0,
     consecutiveFailures: 0,
     lastError: null,
+    suppressedLogs: 0,
     targets: [],
     circuitBreaker: {
       open: false,
@@ -249,6 +256,25 @@ export function createPoller(deps: PollerDeps) {
       failureCount: 0,
       lastFailureAt: null,
     },
+  };
+
+  // One key per failure source: a broken market contract must not silence the
+  // squad contract's errors, and a flapping one must not reset the other.
+  const errorSampler = new LogSampler({
+    maxPerWindow: config.logSampleMaxPerWindow,
+    windowMs: config.logSampleWindowMs,
+  });
+
+  /**
+   * Print a repetitive error through the sampler. The first
+   * `LOG_SAMPLE_MAX_PER_WINDOW` lines per key and window are printed verbatim;
+   * repeats are counted; the line that opens the next window carries the number
+   * it held back, so a suppressed run is always reported.
+   */
+  const logSampledError = (key: string, line: string): void => {
+    const sample = errorSampler.record(key);
+    if (!sample.log) return;
+    console.error(`${line}${formatSuppressedRepeats(sample.suppressed, errorSampler.windowMs)}`);
   };
 
   let timer: NodeJS.Timeout | null = null;
@@ -466,7 +492,10 @@ export function createPoller(deps: PollerDeps) {
         const message = errorMessage(err);
         current.lastError = message;
         status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
-        console.error(`[poller] ${target.source} scan failed: ${message}`);
+        logSampledError(
+          `scan:${target.source}`,
+          `[poller] ${target.source} scan failed: ${message}`,
+        );
       }
     }
 
@@ -513,7 +542,7 @@ export function createPoller(deps: PollerDeps) {
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
       status.lastError = { at: Date.now(), message: errorMessage(err) };
-      console.error(`[poller] cycle threw: ${errorMessage(err)}`);
+      logSampledError("cycle", `[poller] cycle threw: ${errorMessage(err)}`);
       inFlight = false;
     }
     if (stopped || paused) return;
@@ -578,7 +607,11 @@ export function createPoller(deps: PollerDeps) {
     },
 
     status(): PollerStatus {
-      return { ...status, targets: [...state.values()].map((t) => ({ ...t })) };
+      return {
+        ...status,
+        suppressedLogs: errorSampler.suppressedTotal(),
+        targets: [...state.values()].map((t) => ({ ...t })),
+      };
     },
   };
 }

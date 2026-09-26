@@ -49,6 +49,8 @@ export interface HealthReport {
     notificationsFailed: number;
     eventsSkipped: number;
     consecutiveFailures: number;
+    /** Repetitive error lines summarized rather than printed since start. */
+    suppressedLogs: number;
     lastError: { at: string; message: string } | null;
     targets: Array<{
       source: string;
@@ -127,6 +129,7 @@ export function buildHealthReport(
       notificationsFailed: poller.notificationsFailed,
       eventsSkipped: poller.eventsSkipped,
       consecutiveFailures: poller.consecutiveFailures,
+      suppressedLogs: poller.suppressedLogs ?? 0,
       lastError: poller.lastError
         ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }
         : null,

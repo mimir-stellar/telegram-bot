@@ -271,9 +271,40 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
   compact, bounded, and the configured bot token is redacted.
+- **A repeating failure** is logged through a sampler: the first
+  `LOG_SAMPLE_MAX_PER_WINDOW` identical errors in a `LOG_SAMPLE_WINDOW_MS`
+  window print in full, later repeats are counted, and the line that opens the
+  next window reports how many were held back. An RPC that is down for hours
+  therefore costs a handful of lines instead of one per cycle. The running total
+  is exposed as `poller.suppressedLogs` on `/health`; `/status` still shows the
+  latest error verbatim.
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
+
+## Log sampling
+
+Operational errors are sampled so a long outage cannot drown the log. Per key —
+`scan:market`, `scan:squad`, and `cycle` — the first `LOG_SAMPLE_MAX_PER_WINDOW`
+identical lines inside a `LOG_SAMPLE_WINDOW_MS` window are printed in full.
+Further repeats are counted, and the line that opens the next window reports how
+many it held back (`suppressed N identical repeats in the previous 300s`). The
+running total is exposed as `poller.suppressedLogs` on `/health`, so a sampled
+log still accounts for every failure. Keys are independent: a noisy market
+contract cannot silence the squad contract's errors, and the text itself is
+still bounded and redacted exactly as before.
+
+Configuration (see `.env.example`):
+
+- `LOG_SAMPLE_MAX_PER_WINDOW` — full lines per key per window (default `3`; `1` logs only the first line of a run)
+- `LOG_SAMPLE_WINDOW_MS` — window length in milliseconds (default `300000`; minimum `1000`)
+
+Sampling is in-memory and resets on restart. It changes log volume only — never
+cursors, sends, retry counts, or the `/status` error text.
+
+**Failure modes:** the sampler is pure bookkeeping keyed by string, so it cannot
+throw into the poll loop. **Rollback:** omit both keys to keep defaults, or raise
+`LOG_SAMPLE_MAX_PER_WINDOW` until nothing is suppressed.
 
 ## Long-running operation
 
@@ -312,7 +343,7 @@ checks (default `http://127.0.0.1:8787`):
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused`. |
+| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
@@ -343,6 +374,7 @@ src/
   config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
   bot.ts                   grammy setup: /start, /help, /status, /contracts, operator pause/resume
   poller.ts                the loop: scan, notify, persist the cursor
+  log-sampler.ts           windowed suppression of repetitive error log lines
   stellar/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
@@ -355,7 +387,7 @@ src/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, log-sampling, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 ### Lockfile reproducibility
 
