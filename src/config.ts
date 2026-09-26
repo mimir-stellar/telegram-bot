@@ -321,6 +321,35 @@ function collector(profile: Record<string, string>) {
   };
 }
 
+function parseNotificationCategories(raw: string | undefined): string[] {
+  const candidates = raw
+    ? raw.split(/[\s,]+/)
+    : [];
+
+  const normalized = [...new Set(
+    candidates
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => value.length > 0),
+  )];
+
+  return normalized;
+}
+
+function notificationCategoriesFrom(): readonly string[] {
+  const envValues = [
+    "NOTIFY_CATEGORIES",
+    "NOTIFICATION_CATEGORIES",
+    "NOTIFY_EVENT_CATEGORIES",
+    "EVENT_CATEGORIES",
+    "CLAIM_CATEGORIES",
+  ]
+    .map((name) => read(name))
+    .filter((value): value is string => value !== undefined && value.trim().length > 0);
+
+  if (envValues.length === 0) return [];
+  return parseNotificationCategories(envValues.join(","));
+}
+
 function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
   return {
     marketContractId: c.contractId("MARKET_CONTRACT_ID"),

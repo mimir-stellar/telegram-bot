@@ -93,6 +93,9 @@ async function main(): Promise<void> {
   console.log(`[boot] network      ${networkLabel(config)} (${config.rpcUrl})`);
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
+  console.log(
+    `[boot] claim filter ${config.notificationCategories.length === 0 ? "all categories" : config.notificationCategories.join(", ")}`,
+  );
   console.log(`[boot] cursor file  ${config.cursorFile}`);
   console.log(`[boot] lock file    ${config.lockFile}`);
   console.log(`[boot] shutdown     ${config.shutdownTimeoutMs}ms drain budget`);

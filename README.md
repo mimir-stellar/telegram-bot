@@ -36,6 +36,20 @@ Admin events (`oracle_changed`, `ownership_transferred`, `fee_policy_*`,
 `fee_accrued`, `agent_attributed`) are decoded far enough to be recognised and
 then skipped — they are logged, not posted.
 
+## Claim category filtering
+
+The notifier can be restricted to a subset of claim categories by setting an
+optional allowlist in `.env`:
+
+```bash
+NOTIFY_CATEGORIES=crypto,politics
+```
+
+When set, only `claim_created` events whose category matches an allowlisted name
+are sent to Telegram; all other notification types continue to flow normally.
+The default (unset or empty) preserves the current behaviour and notifies every
+claim category.
+
 ## Setup
 
 ### 1. Get a bot token
