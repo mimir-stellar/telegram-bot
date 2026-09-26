@@ -355,6 +355,29 @@ src/
 
 ## Development checks
 
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+
+### Lockfile reproducibility
+
+`package-lock.json` is the install of record: deployments rebuild with `npm ci`,
+so the committed lockfile must stay in sync with `package.json` and pin exactly
+what it claims. Two checks enforce that, and CI runs both after `npm ci`:
+
+- `npm run lockfile:check` — offline. The lockfile is `lockfileVersion` 3, its
+  root entry matches `package.json`'s dependency ranges exactly, every package
+  resolves to a `registry.npmjs.org` tarball with a `sha512` integrity hash, and
+  every direct dependency is pinned at the top level. Drift is reported by
+  package name instead of being silently re-resolved.
+- `npm run lockfile:reproduce` — asks npm to regenerate the lockfile from itself
+  in a scratch directory and fails if the resolved package set changes, so a
+  hand-edited or partially-resolved lockfile cannot land. The repository working
+  tree is never written to.
+
+The offline suite runs as part of `npm test` (`tests/lockfile.test.mjs`), so
+drift is caught locally without network access. To change dependencies, edit
+`package.json`, run `npm install` to regenerate the lockfile, and commit both
+files together — a lockfile that no longer matches `package.json` fails
+`npm ci`, `npm run lockfile:check`, and CI.
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile and health suites (`npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
