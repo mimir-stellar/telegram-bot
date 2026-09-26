@@ -77,6 +77,8 @@ export interface StatusTargetSnapshot {
    */
   rewindFromLedger: number | null;
   lastError: string | null;
+  consecutiveFailures: number;
+  nextEligibleAt: number | null;
 }
 
 export interface StatusSnapshot {
@@ -146,6 +148,8 @@ export function buildStatusSnapshot(
       rewindFromLedger:
         typeof target.rewindFromLedger === "number" ? target.rewindFromLedger : null,
       lastError: target.lastError === null ? null : boundText(target.lastError),
+      consecutiveFailures: target.consecutiveFailures ?? 0,
+      nextEligibleAt: target.nextEligibleAt ?? null,
     })),
   };
 }
