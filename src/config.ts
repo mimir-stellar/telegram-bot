@@ -10,30 +10,11 @@
  *   - {@link loadStellarConfig} needs no Telegram credentials, so the chain
  *     reader (`src/stellar/events.ts`) can be run standalone against Testnet.
  *   - {@link loadConfig} is the full bot config.
- *
- * ── Profiles ─────────────────────────────────────────────────────────────────
- *
- * `MIMIR_PROFILE=mock` selects the local Soroban mock profile: it supplies
- * defaults for values the environment does NOT set (loopback RPC, fixture
- * contract ids, an isolated cursor file, placeholder credentials). Explicit
- * environment variables always win, so a profile can never change an existing
- * deployment's configuration. Any other profile name fails fast.
  */
 
 import path from "node:path";
 
 import "dotenv/config";
-
-import {
-  MOCK_BOT_TOKEN,
-  MOCK_CHAT_ID,
-  MOCK_CURSOR_FILE,
-  MOCK_MARKET_CONTRACT_ID,
-  MOCK_NETWORK_PASSPHRASE,
-  MOCK_PROFILE_NAME,
-  MOCK_RPC_DEFAULT_PORT,
-  MOCK_SQUAD_CONTRACT_ID,
-} from "./stellar/mock-constants.js";
 
 export interface StellarConfig {
   marketContractId: string;
@@ -48,10 +29,11 @@ export interface StellarConfig {
 export interface BotConfig extends StellarConfig {
   botToken: string;
   chatId: string;
-  /** Chats allowed to use /status. Empty array means no restriction. */
+  /**
+   * Chats allowed to use bot commands. Empty array means no restriction
+   * (any chat the bot can see may run /start, /help, /status).
+   */
   allowedChatIds: string[];
-  /** Telegram user id allowed to run operator-only commands. Null disables them. */
-  operatorTelegramUserId: string | null;
   pollIntervalMs: number;
   startLookbackLedgers: number;
   cursorFile: string;
@@ -65,18 +47,16 @@ export interface BotConfig extends StellarConfig {
    * successful cycle lands within this window. `0` disables the stale check.
    */
   healthStaleMs: number;
-  /** When true, notifications sent to Telegram are formatted in preview mode. */
-  channelPreviewMode: boolean;
 }
 
 export class ConfigError extends Error {
   readonly problems: string[];
 
-  constructor(problems: string[], hint?: string) {
+  constructor(problems: string[]) {
     super(
       `Invalid configuration (${problems.length} problem${problems.length === 1 ? "" : "s"}):\n` +
         problems.map((p) => `  - ${p}`).join("\n") +
-        `\n\n${hint ?? "Copy .env.example to .env and fill in the missing values."}`,
+        `\n\nCopy .env.example to .env and fill in the missing values.`,
     );
     this.name = "ConfigError";
     this.problems = problems;
@@ -96,47 +76,10 @@ const DEFAULTS = {
   healthPort: 8787,
   // 3× default poll interval — one missed cycle is fine; three is not.
   healthStaleMs: 90_000,
-  channelPreviewMode: false,
 } as const;
 
 /** Strkey for a contract: `C` + 55 base32 characters. */
 const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
-
-/**
- * Defaults each profile supplies for values the environment leaves unset.
- * Profile values never override explicit environment variables.
- */
-const PROFILE_DEFAULTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
-  [MOCK_PROFILE_NAME]: {
-    MARKET_CONTRACT_ID: MOCK_MARKET_CONTRACT_ID,
-    SQUAD_CONTRACT_ID: MOCK_SQUAD_CONTRACT_ID,
-    STELLAR_RPC_URL: `http://127.0.0.1:${MOCK_RPC_DEFAULT_PORT}`,
-    STELLAR_HORIZON_URL: `http://127.0.0.1:${MOCK_RPC_DEFAULT_PORT}/horizon`,
-    STELLAR_NETWORK_PASSPHRASE: MOCK_NETWORK_PASSPHRASE,
-    CURSOR_FILE: MOCK_CURSOR_FILE,
-    BOT_TOKEN: MOCK_BOT_TOKEN,
-    TELEGRAM_CHAT_ID: MOCK_CHAT_ID,
-  },
-};
-
-/** The profile selected by `MIMIR_PROFILE`, or null when unset. Display/boot use. */
-export function activeProfileName(): string | null {
-  return read("MIMIR_PROFILE") ?? null;
-}
-
-/** Profile defaults for the active profile. Unknown names fail fast. */
-function resolveProfileDefaults(): Record<string, string> {
-  const name = read("MIMIR_PROFILE");
-  if (name === undefined) return {};
-  const defaults = PROFILE_DEFAULTS[name];
-  if (!defaults) {
-    throw new ConfigError(
-      [`MIMIR_PROFILE must be "${MOCK_PROFILE_NAME}" when set; got "${name}"`],
-      `Unset MIMIR_PROFILE, or set MIMIR_PROFILE=${MOCK_PROFILE_NAME} for the local mock.`,
-    );
-  }
-  return { ...defaults };
-}
 
 function read(name: string): string | undefined {
   const raw = process.env[name];
@@ -145,18 +88,14 @@ function read(name: string): string | undefined {
   return trimmed === "" ? undefined : trimmed;
 }
 
-function collector(profile: Record<string, string>) {
+function collector() {
   const problems: string[] = [];
-  /** Environment first, then the active profile's defaults. */
-  const get = (name: string): string | undefined => read(name) ?? profile[name];
 
   return {
     problems,
 
-    get,
-
     required(name: string): string {
-      const value = get(name);
+      const value = read(name);
       if (value === undefined) {
         problems.push(`${name} is required but not set`);
         return "";
@@ -175,7 +114,7 @@ function collector(profile: Record<string, string>) {
     },
 
     url(name: string, fallback: string): string {
-      const value = get(name) ?? fallback;
+      const value = read(name) ?? fallback;
       try {
         const parsed = new URL(value);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
@@ -202,16 +141,6 @@ function collector(profile: Record<string, string>) {
       return parsed;
     },
 
-    bool(name: string, fallback: boolean): boolean {
-      const raw = read(name);
-      if (raw === undefined) return fallback;
-      const lower = raw.toLowerCase();
-      if (lower === "true" || lower === "1" || lower === "yes") return true;
-      if (lower === "false" || lower === "0" || lower === "no") return false;
-      problems.push(`${name} must be a boolean (true/false); got "${raw}"`);
-      return fallback;
-    },
-
     chatId(name: string): string {
       const value = this.required(name);
       // Telegram chat ids are integers (channels/supergroups are negative).
@@ -219,6 +148,17 @@ function collector(profile: Record<string, string>) {
       if (value !== "" && !/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
         problems.push(
           `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
+        );
+      }
+      return value;
+    },
+
+    host(name: string, fallback: string): string {
+      const value = read(name) ?? fallback;
+      // Keep this a host, not a URL — the health server binds a TCP listener.
+      if (/[\s/]/.test(value) || value.includes("://")) {
+        problems.push(
+          `${name} must be a hostname or IP (e.g. 127.0.0.1); got "${value}"`,
         );
       }
       return value;
@@ -246,29 +186,7 @@ function collector(profile: Record<string, string>) {
           );
         }
       }
-
       return entries;
-    },
-
-    optionalUserId(name: string): string | null {
-      const value = read(name);
-      if (value === undefined) return null;
-      if (!/^[1-9]\d*$/.test(value) || BigInt(value) > BigInt(Number.MAX_SAFE_INTEGER)) {
-        problems.push(`${name} must be a positive Telegram user id; got "${value}"`);
-        return null;
-      }
-      return value;
-    },
-
-    host(name: string, fallback: string): string {
-      const value = read(name) ?? fallback;
-      // Keep this a host, not a URL — the health server binds a TCP listener.
-      if (/[\s/]/.test(value) || value.includes("://")) {
-        problems.push(
-          `${name} must be a hostname or IP (e.g. 127.0.0.1); got "${value}"`,
-        );
-      }
-      return value;
     },
   };
 }
@@ -279,7 +197,7 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     squadContractId: c.contractId("SQUAD_CONTRACT_ID"),
     rpcUrl: c.url("STELLAR_RPC_URL", DEFAULTS.rpcUrl),
     horizonUrl: c.url("STELLAR_HORIZON_URL", DEFAULTS.horizonUrl),
-    networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
+    networkPassphrase: read("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
     explorerBaseUrl: c.url(
       "STELLAR_EXPLORER_BASE_URL",
       "https://stellar.expert/explorer",
@@ -289,7 +207,7 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
 
 /** Chain-only config. No Telegram credentials required. */
 export function loadStellarConfig(): StellarConfig {
-  const c = collector(resolveProfileDefaults());
+  const c = collector();
   const config = stellarFrom(c);
   if (c.problems.length > 0) throw new ConfigError(c.problems);
   return config;
@@ -297,7 +215,7 @@ export function loadStellarConfig(): StellarConfig {
 
 /** Full bot config: chain + Telegram + poller tuning. */
 export function loadConfig(): BotConfig {
-  const c = collector(resolveProfileDefaults());
+  const c = collector();
   const stellar = stellarFrom(c);
 
   const config: BotConfig = {
@@ -305,10 +223,9 @@ export function loadConfig(): BotConfig {
     botToken: c.required("BOT_TOKEN"),
     chatId: c.chatId("TELEGRAM_CHAT_ID"),
     allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
-    operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
-    cursorFile: path.resolve(process.cwd(), c.get("CURSOR_FILE") ?? DEFAULTS.cursorFile),
+    cursorFile: path.resolve(process.cwd(), read("CURSOR_FILE") ?? DEFAULTS.cursorFile),
     maxNotificationsPerCycle: c.int(
       "MAX_NOTIFICATIONS_PER_CYCLE",
       DEFAULTS.maxNotificationsPerCycle,
@@ -318,16 +235,14 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
-    channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
   return config;
 }
 
-/** `mock` / `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */
+/** `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */
 export function networkLabel(config: StellarConfig): string {
-  if (config.networkPassphrase === MOCK_NETWORK_PASSPHRASE) return "mock";
   if (config.networkPassphrase === "Test SDF Network ; September 2015") return "testnet";
   if (config.networkPassphrase === "Public Global Stellar Network ; September 2015") return "public";
   return "custom";
