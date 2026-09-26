@@ -102,11 +102,14 @@ Do not manually advance the cursor to skip an RPC failure.
 
 Telegram delivery is intentionally lossy. The poller commits the opaque cursor
 after processing the returned page, even when sends are partial. A failed send
-does not hold the cursor back because replaying every missed notification could
-create an unbounded backlog or flood a recovered chat. The log reports the
-sent/failed/skipped counts for that commit.
+does not hold the cursor back — holding it would turn a revoked token into an
+infinite replay, and replaying every missed notification could create an
+unbounded backlog or flood a recovered chat. Instead the formatted message is
+parked on the local dead-letter queue (`DEAD_LETTER_FILE`, default
+`data/dead-letter.json`) and replayed on later cycles once Telegram accepts
+sends again. The log reports the sent/failed/skipped counts for that commit.
 
-The Stellar chain remains the authoritative record.
+Check `/status` for dead-letter depth / replayed / dropped counters. The queue is bounded (`DEAD_LETTER_MAX`); overflow drops the oldest entry. Entries that exhaust `DEAD_LETTER_MAX_ATTEMPTS` are dropped as well. The Stellar chain remains the authoritative record.
 
 ## Stale or corrupt cursor
 

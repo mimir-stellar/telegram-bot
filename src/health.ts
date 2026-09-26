@@ -48,6 +48,9 @@ export interface HealthReport {
     notificationsSent: number;
     notificationsFailed: number;
     eventsSkipped: number;
+    deadLetterDepth: number;
+    deadLetterReplayed: number;
+    deadLetterDropped: number;
     consecutiveFailures: number;
     lastError: { at: string; message: string } | null;
     targets: Array<{
@@ -126,6 +129,9 @@ export function buildHealthReport(
       notificationsSent: poller.notificationsSent,
       notificationsFailed: poller.notificationsFailed,
       eventsSkipped: poller.eventsSkipped,
+      deadLetterDepth: poller.deadLetter.depth,
+      deadLetterReplayed: poller.deadLetter.replayed,
+      deadLetterDropped: poller.deadLetter.dropped,
       consecutiveFailures: poller.consecutiveFailures,
       lastError: poller.lastError
         ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }

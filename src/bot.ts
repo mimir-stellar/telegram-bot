@@ -67,6 +67,7 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
     `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
+    `Dead letter: depth ${status.deadLetter.depth} · replayed ${status.deadLetter.replayed} · dropped ${status.deadLetter.dropped}`,
     "",
     "*Watching*",
   ];
@@ -327,4 +328,3 @@ export async function registerCommands(bot: Bot): Promise<void> {
     console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);
   }
 }
-

@@ -56,6 +56,12 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /** Persisted dead-letter queue for failed Telegram sends. */
+  deadLetterFile: string;
+  /** Maximum entries retained in the dead-letter queue. */
+  deadLetterMax: number;
+  /** Drop a DLQ entry after this many failed enqueue/replay attempts. */
+  deadLetterMaxAttempts: number;
   /** Loopback host for the local HTTP health endpoint. */
   healthHost: string;
   /** TCP port for the health endpoint. `0` disables the listener. */
@@ -92,6 +98,9 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  deadLetterFile: "./data/dead-letter.json",
+  deadLetterMax: 100,
+  deadLetterMaxAttempts: 10,
   healthHost: "127.0.0.1",
   healthPort: 8787,
   // 3× default poll interval — one missed cycle is fine; three is not.
@@ -312,6 +321,16 @@ export function loadConfig(): BotConfig {
     maxNotificationsPerCycle: c.int(
       "MAX_NOTIFICATIONS_PER_CYCLE",
       DEFAULTS.maxNotificationsPerCycle,
+      1,
+    ),
+    deadLetterFile: path.resolve(
+      process.cwd(),
+      read("DEAD_LETTER_FILE") ?? DEFAULTS.deadLetterFile,
+    ),
+    deadLetterMax: c.int("DEAD_LETTER_MAX", DEFAULTS.deadLetterMax, 1),
+    deadLetterMaxAttempts: c.int(
+      "DEAD_LETTER_MAX_ATTEMPTS",
+      DEFAULTS.deadLetterMaxAttempts,
       1,
     ),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
