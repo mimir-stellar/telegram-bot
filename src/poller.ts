@@ -24,6 +24,8 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
+import { Logger } from "./logger.js";
+import { formatEvent } from "./notifications/format.js";
 import { formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
@@ -264,10 +266,11 @@ export function createPoller(deps: PollerDeps) {
     try {
       raw = await readFile(config.cursorFile, "utf8");
     } catch {
-      console.log(
-        `[poller] no cursor file at ${config.cursorFile}; cold start ` +
-          `${config.startLookbackLedgers} ledgers behind the tip`,
-      );
+      Logger.info("poller", {
+        action: "cold_start",
+        cursorFile: config.cursorFile,
+        lookbackLedgers: config.startLookbackLedgers,
+      });
       return;
     }
 
@@ -279,6 +282,14 @@ export function createPoller(deps: PollerDeps) {
         target.cursor = saved.cursor ?? null;
         target.lastEventLedger = saved.lastEventLedger ?? null;
       }
+      Logger.info("poller", {
+        action: "resume",
+        cursorFile: config.cursorFile,
+        targets: [...state.values()].map((t) => ({
+          source: t.source,
+          cursor: t.cursor ?? "none",
+        })),
+      });
       console.log(
         `[poller] resumed from ${config.cursorFile}: ` +
           [...state.values()]
@@ -287,6 +298,11 @@ export function createPoller(deps: PollerDeps) {
       );
     } catch (err) {
       // A corrupt state file must not wedge the bot; a cold start is recoverable.
+      Logger.warn("poller", {
+        action: "cursor_corrupt",
+        error: errMessage(err),
+        cursorFile: config.cursorFile,
+      });
       console.warn(`[poller] cursor file unreadable, starting cold: ${errorMessage(err)}`);
     }
   }
@@ -311,6 +327,11 @@ export function createPoller(deps: PollerDeps) {
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, config.cursorFile);
     } catch (err) {
+      Logger.error("poller", {
+        action: "cursor_save_failed",
+        error: errMessage(err),
+        cursorFile: config.cursorFile,
+      });
       console.error(`[poller] could not persist cursor: ${errorMessage(err)}`);
     }
   }
@@ -331,6 +352,13 @@ export function createPoller(deps: PollerDeps) {
     for (const event of events) {
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
+        Logger.info("poller", {
+          action: "skip_unknown_event",
+          source: event.source,
+          eventName: event.payload.eventName,
+          ledger: event.ledger,
+          reason: event.payload.reason,
+        });
         skipped += 1;
         console.log(
           `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
@@ -351,6 +379,12 @@ export function createPoller(deps: PollerDeps) {
 
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
         status.eventsSkipped += 1;
+        Logger.warn("poller", {
+          action: "notification_cap_reached",
+          maxNotificationsPerCycle: config.maxNotificationsPerCycle,
+          droppedEvent: event.payload.name,
+          ledger: event.ledger,
+        });
         skipped += 1;
         console.warn(
           `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
@@ -367,6 +401,13 @@ export function createPoller(deps: PollerDeps) {
       } catch (err) {
         // All retries exhausted; drop the message but continue processing others.
         status.notificationsFailed += 1;
+        Logger.error("poller", {
+          action: "send_failed",
+          source: event.source,
+          eventName: event.payload.name,
+          ledger: event.ledger,
+          error: errMessage(err),
+        });
         failed += 1;
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
@@ -441,6 +482,14 @@ export function createPoller(deps: PollerDeps) {
 
         let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
         if (scan.events.length > 0) {
+          Logger.info("poller", {
+            action: "events_found",
+            source: target.source,
+            eventCount: scan.events.length,
+            lastEventLedger: scan.lastEventLedger,
+            pages: scan.pages,
+          });
+          await notify(scan.events);
           console.log(
             `[poller] ${target.source}: ${scan.events.length} event(s) ` +
               `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
@@ -466,7 +515,11 @@ export function createPoller(deps: PollerDeps) {
         const message = errorMessage(err);
         current.lastError = message;
         status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
-        console.error(`[poller] ${target.source} scan failed: ${message}`);
+        Logger.error("poller", {
+          action: "scan_failed",
+          source: target.source,
+          error: message,
+        });
       }
     }
 
@@ -512,6 +565,11 @@ export function createPoller(deps: PollerDeps) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
+      status.lastError = { at: Date.now(), message: errMessage(err) };
+      Logger.error("poller", {
+        action: "cycle_threw",
+        error: errMessage(err),
+      });
       status.lastError = { at: Date.now(), message: errorMessage(err) };
       console.error(`[poller] cycle threw: ${errorMessage(err)}`);
       inFlight = false;
@@ -534,10 +592,12 @@ export function createPoller(deps: PollerDeps) {
       status.running = true;
       status.startedAt = Date.now();
       status.targets = [...state.values()].map((t) => ({ ...t }));
-      console.log(
-        `[poller] watching market=${config.marketContractId} squad=${config.squadContractId} ` +
-          `every ${config.pollIntervalMs}ms`,
-      );
+      Logger.info("poller", {
+        action: "start",
+        marketContractId: config.marketContractId,
+        squadContractId: config.squadContractId,
+        pollIntervalMs: config.pollIntervalMs,
+      });
       void loop();
     },
 
