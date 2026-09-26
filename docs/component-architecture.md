@@ -78,6 +78,7 @@ The poller is the central orchestrator that runs a recurring loop to scan contra
 **State management:**
 - Per-target state: `cursor` (opaque string), `lastEventLedger` (number), `lastError` (string)
 - Global counters: `cycles`, `notificationsSent`, `notificationsFailed`, `eventsSkipped`, `consecutiveFailures`
+- Chain clock: `chainClockAt`, the newest close time actually observed (monotonic, persisted with the cursors); skew is derived as `now - chainClockAt`
 
 ### Scanner (`src/stellar/events.ts`)
 
@@ -87,6 +88,7 @@ The scanner handles cursor-paginated event retrieval from Soroban RPC. It is des
 - **Sequential pagination**: Uses opaque cursors; cannot parallelize
 - **Mutual exclusion**: `startLedger`/`endLedger` and `cursor` are mutually exclusive in requests
 - **Retention awareness**: Queries `getHealth()` to get the retained-history floor
+- **Window validation**: The floor and tip are validated before the first request; a start ledger below the floor is clamped up, and a start ledger above the tip or a resume cursor above the tip is refused with a bounded error. A cursor below the floor is still forwarded, so retention stays the RPC's call and its bounded stale rejection surfaces in `/status`
 - **Page termination**: Walk stops when cursor stops moving or reaches chain tip
 - **Bounded scanning**: Limited to `EVENT_MAX_PAGES` (20) pages per scan
 
@@ -127,7 +129,7 @@ The bot uses grammy for Telegram integration with a thin command layer and a sin
 
 **Command handlers:**
 - `/start`, `/help`: Bot information and command list
-- `/status`: Poller state, cursors, counters, last error
+- `/status`: Poller state, chain clock skew, cursors, counters, last error
 - `/health`: Health assessment and operational readiness
 - `/contracts`: Contract IDs and explorer links
 - `/preview`: Preview notification formatting
@@ -150,6 +152,10 @@ Local HTTP endpoint for process supervisors and deploy checks. Bound to loopback
 - **ok**: Poller running and healthy (including intentional pause)
 - **degraded**: Poller running but stale or failing repeatedly
 - **stopped**: Poller not running
+
+**Chain clock:**
+- `poller.chainClockAt`: newest observed chain close time (ISO 8601), or `null`
+- `poller.chainClockSkewMs`: `checkedAt - chainClockAt` in milliseconds; positive while the bot is ahead of the chain, `null` before the first observation
 
 **Safety:**
 - JSON-only responses
@@ -210,6 +216,7 @@ Load from file → Use in RPC request → Receive new cursor → Process events 
 
 - **Corrupt file**: Treated as cold start
 - **RPC-rejected cursor**: Kept unchanged; error visible in `/status`
+- **Out-of-window cursor**: Refused locally with a bounded `LedgerWindowError`; the stored cursor is kept unchanged and no request is sent
 - **Recovery**: Follow incident runbook, not automatic rewind
 
 ### Restart Behavior
