@@ -45,6 +45,19 @@ export interface PollerStatus {
   running: boolean;
   /** Operator pause only prevents new cycles; an in-flight cycle may finish. */
   paused: boolean;
+  /**
+   * Chain clock: unix ms close time of the newest chain event this poller has
+   * observed. `null` before the first scan returns one.
+   *
+   * The chain is the source of truth, so this only ever advances from a
+   * `ledgerClosedAt` the RPC actually reported. A quiet page, a failed scan, a
+   * Telegram outage or an open circuit breaker leaves the last observed value
+   * in place: the skew against the local clock then grows on its own, which is
+   * exactly what an operator needs to see during a long outage. It is saved
+   * with the cursors so a restart resumes the same clock instead of going back
+   * to `unknown`.
+   */
+  chainClockAt: number | null;
   startedAt: number;
   cycles: number;
   lastPollAt: number | null;
@@ -69,7 +82,48 @@ export interface PollerStatus {
 export interface CursorFile {
   version: 1;
   updatedAt: string;
+  /**
+   * Newest observed chain close time (unix ms). Optional and additive: files
+   * written before this field existed load as `null`, and older builds ignore
+   * it, so the on-disk format stays version 1 either way.
+   */
+  chainClockAt?: number | null;
   targets: Record<string, { cursor: string | null; lastEventLedger: number | null }>;
+}
+
+interface CursorTarget {
+  cursor: string | null;
+  lastEventLedger: number | null;
+}
+
+/**
+ * Bounds for a chain close time. Stellar launched in 2015 and the year 2100 is
+ * far past this network's horizon, so anything outside that window is a
+ * malformed `ledgerClosedAt` rather than chain data. The bound matters because
+ * the chain clock is monotonic and persisted: one bogus future value would
+ * otherwise be reported for the rest of the process's life, and then survive a
+ * restart through the cursor file.
+ */
+const CHAIN_CLOCK_MIN_MS = Date.UTC(2015, 0, 1);
+const CHAIN_CLOCK_MAX_MS = Date.UTC(2100, 0, 1);
+
+function isPlausibleChainClock(ms: number): boolean {
+  return Number.isFinite(ms) && ms >= CHAIN_CLOCK_MIN_MS && ms <= CHAIN_CLOCK_MAX_MS;
+}
+
+/**
+ * Shape check for a saved chain clock: a positive, safe, unix-ms timestamp
+ * inside the plausible window above.
+ *
+ * Anything else (a hand-edited file, an older writer, a truncated write) is
+ * dropped and the cursors are kept — a cosmetic field must never cost an
+ * operator their resume position. Files written before this field existed
+ * are `undefined` and load as `null`, i.e. "no chain clock observed yet".
+ */
+function parseChainClock(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return null;
+  return isPlausibleChainClock(value) ? value : null;
 }
 
 /** Tuning knobs for Telegram delivery; defaults suit production, tests shrink them. */
@@ -141,7 +195,7 @@ export function isValidCursorFile(value: unknown): value is CursorFile {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const obj = value as Record<string, unknown>;
   if (obj.version !== 1) return false;
-  if (typeof obj.updatedAt !== "string") return false;
+  if (obj.updatedAt !== undefined && typeof obj.updatedAt !== "string") return false;
   if (obj.targets === null || typeof obj.targets !== "object" || Array.isArray(obj.targets)) {
     return false;
   }
@@ -160,12 +214,36 @@ export function parseCursorFile(raw: string): CursorFile {
   try {
     parsed = JSON.parse(raw) as unknown;
   } catch (err) {
-    throw new Error(`invalid JSON: ${errorMessage(err)}`);
+    throw new Error(`invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
   }
   if (!isValidCursorFile(parsed)) {
     throw new Error("failed schema validation (expected version 1 with targets map)");
   }
-  return parsed;
+
+  const targets: Record<string, CursorTarget> = {};
+  for (const [source, target] of Object.entries(parsed.targets)) {
+    if (
+      target.cursor !== null &&
+      (target.cursor.length === 0 || target.cursor.length > 256)
+    ) {
+      throw new Error(`invalid cursor value for ${source}`);
+    }
+    if (
+      target.lastEventLedger !== null &&
+      (!Number.isSafeInteger(target.lastEventLedger) || target.lastEventLedger < 0)
+    ) {
+      throw new Error(`invalid last event ledger for ${source}`);
+    }
+    targets[source] = { cursor: target.cursor, lastEventLedger: target.lastEventLedger };
+  }
+
+  return {
+    version: 1,
+    updatedAt: parsed.updatedAt ?? "",
+    // Additive field: only present when the file carried it.
+    ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
+    targets,
+  };
 }
 
 /**
@@ -181,16 +259,40 @@ export async function quarantineCorruptCursorFile(
   try {
     await rename(cursorFile, dest);
     console.warn(
-      `[poller] quarantined corrupt cursor file to ${dest} (${reason}); cold start`,
+      `[poller] cursor file unreadable, starting cold: quarantined it to ${dest} (${reason})`,
     );
     return dest;
   } catch (err) {
     console.warn(
-      `[poller] could not quarantine corrupt cursor at ${cursorFile}: ${errorMessage(err)}; ` +
-        `cold start without removing the file (${reason})`,
+      `[poller] cursor file unreadable, starting cold: could not quarantine ${cursorFile}: ` +
+        `${safeErrorMessage(err, [])}; the file was left in place (${reason})`,
     );
     return null;
   }
+}
+
+/** Timeout for each RPC scan request */
+const SCAN_TIMEOUT_MS = 15_000;
+
+/** Timeout for each Telegram send attempt */
+const SEND_TIMEOUT_MS = 10_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+    if (timer.unref) { timer.unref(); }
+    Promise.resolve(promise)
+      .then((val) => {
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
 }
 
 /**
@@ -214,7 +316,7 @@ async function sendWithRetry(
 
   while (true) {
     try {
-      await send(text);
+      await withTimeout(send(text), SEND_TIMEOUT_MS, "Telegram send");
       return;
     } catch (err) {
       attempt++;
@@ -262,6 +364,7 @@ export function createPoller(deps: PollerDeps) {
   const status: PollerStatus = {
     running: false,
     paused: false,
+    chainClockAt: null,
     startedAt: 0,
     cycles: 0,
     lastPollAt: null,
@@ -310,6 +413,10 @@ export function createPoller(deps: PollerDeps) {
         target.cursor = saved.cursor ?? null;
         target.lastEventLedger = saved.lastEventLedger ?? null;
       }
+      // Resume the chain clock alongside the cursors. Without this a restart
+      // between two quiet scans would report `unknown` until the next event
+      // happened to land, hiding a perfectly healthy (or long-stalled) chain.
+      status.chainClockAt = parsed.chainClockAt ?? null;
       console.log(
         `[poller] resumed from ${config.cursorFile}: ` +
           [...state.values()]
@@ -328,6 +435,7 @@ export function createPoller(deps: PollerDeps) {
     const payload: CursorFile = {
       version: 1,
       updatedAt: new Date().toISOString(),
+      chainClockAt: status.chainClockAt,
       targets: Object.fromEntries(
         [...state.values()].map((t) => [
           t.source,
@@ -453,15 +561,46 @@ export function createPoller(deps: PollerDeps) {
       if (!current) continue;
 
       try {
-        const scan = await readContractEvents(server, target, {
-          cursor: current.cursor ?? undefined,
-          lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
-        });
+        const scan = await withTimeout(
+          readContractEvents(server, target, {
+            cursor: current.cursor ?? undefined,
+            lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
+          }),
+          SCAN_TIMEOUT_MS,
+          "RPC scan",
+        );
 
         status.latestLedger = scan.latestLedger;
         status.oldestLedger = scan.oldestLedger;
         current.lastError = null;
         anyOk = true;
+
+        // Advance the chain clock from close times the RPC actually reported.
+        // `at` is 0 when the RPC omitted `ledgerClosedAt`, which is not an
+        // error, and a value outside the plausible window is malformed and must
+        // never be adopted. The update is monotonic: the two contracts are
+        // scanned in turn, so a rescan or reordering must never move the clock
+        // backwards. A quiet or failed scan keeps the last observed value, which
+        // is what makes a long outage show up as a growing skew rather than as
+        // a clock that keeps time on its own.
+        let implausibleCloseTime = false;
+        for (const event of scan.events) {
+          if (event.at === 0) continue;
+          const closedAtMs = event.at * 1_000;
+          if (!isPlausibleChainClock(closedAtMs)) {
+            implausibleCloseTime = true;
+            continue;
+          }
+          if (status.chainClockAt === null || closedAtMs > status.chainClockAt) {
+            status.chainClockAt = closedAtMs;
+          }
+        }
+        if (implausibleCloseTime) {
+          // One bounded line per target per cycle: no payload, no remote text.
+          console.warn(
+            `[poller] ${target.source}: ignored an implausible chain close time; chain clock unchanged`,
+          );
+        }
 
         // Reset circuit breaker on success
         if (status.circuitBreaker.failureCount > 0) {

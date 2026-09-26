@@ -35,6 +35,7 @@ Check:
 * overall readiness and status (`ok`, `degraded`, `stopped`)
 * current chain tip
 * RPC retained-history floor
+* chain clock skew (newest observed chain close time against this host's clock)
 * watched contract IDs
 * last event ledger per contract
 * persisted cursor
@@ -48,6 +49,30 @@ npm run scan
 ```
 
 Use `--from`, `--pages`, or `--show` when a narrower or deeper scan is needed.
+
+## Chain clock skew
+
+`/status` and `GET /health` show how far this host's clock is from the newest
+chain close time the poller has actually observed. `/health` exposes the same
+numbers as `poller.chainClockAt` and `poller.chainClockSkewMs`.
+
+* `in sync` — within one second of the observed chain time.
+* `local clock … ahead of chain` — the usual reading: the observed chain time is
+  older than this host by roughly the poll interval plus ledger close latency.
+* `chain clock … ahead of local` — the observed chain time is in the future
+  relative to this host. Check the host clock (NTP) before anything else.
+* `unknown` — nothing observed yet: a cold start, or every scan so far returned
+  no events for the watched contracts.
+
+The clock only advances from a `ledgerClosedAt` the RPC actually returned, so it
+freezes during RPC failures, an open circuit breaker, an operator pause, or a
+stretch with no events, and the skew then grows on its own. It is saved with the
+cursors, so a restart resumes it instead of reporting `unknown`.
+
+Reading it: growing skew while the cursor still advances, `consecutiveFailures`
+stays at `0`, and the last event ledger is unchanged means the watched contracts
+are quiet, not broken. Growing skew alongside `consecutiveFailures` points at the
+RPC. `chain clock … ahead of local` points at this host's clock.
 
 ## Operator pause and resume
 
@@ -123,6 +148,13 @@ Soroban rejects as stale is different: the poller keeps it unchanged, exposes
 the bounded RPC error in `/status`, and retries the same position. `/resume`
 also leaves it unchanged. This avoids duplicate notifications or skipped chain
 history from a guessed reset.
+
+A cursor the token itself places **ahead of the chain tip** is refused locally
+with a bounded `ahead of the chain tip` error instead of being sent, and the
+stored cursor is kept unchanged. That can be a transient RPC-lag condition and
+clears as the tip advances; if it persists it means the cursor came from a
+different chain (for example a network reset), so treat it as incompatible:
+preserve the file and perform the deliberate cold start above.
 
 Before changing `CURSOR_FILE` or deleting persisted state, preserve the existing file for investigation if possible.
 
