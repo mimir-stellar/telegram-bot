@@ -52,6 +52,7 @@ import {
   decodeEvent,
   dedupeEvents,
   formatUsdc,
+  isAdminPayload,
   sortEvents,
   type ContractSource,
   type DecodedEvent,
@@ -476,9 +477,20 @@ function summarize(event: DecodedEvent): string {
       return `squad #${p.marketId} resolved result=${p.result}`;
     case "claimed":
       return `squad #${p.marketId} ${p.participant} claimed net=${money(p.net)}`;
+    case "oracle_changed":
+      return `oracle changed to ${p.newOracle ?? "unknown"}`;
+    case "ownership_transferred":
+      return `ownership transferred to ${p.newOwner ?? "unknown"}`;
+    case "agent_attributed":
+      return `agent attributed ${p.agent ?? "unknown"}`;
+    case "fee_accrued":
+      return `fee accrued ${p.amount !== undefined ? money(p.amount) : ""} to ${p.recipient ?? "unknown"}`;
+    case "admin":
+      return `admin event ${p.action}`;
     case "unknown":
       return `unknown "${p.eventName}"${p.reason ? ` (${p.reason})` : ""}`;
     default:
+      if (isAdminPayload(p)) return `admin event ${p.name}`;
       return p.name;
   }
 }

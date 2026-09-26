@@ -69,7 +69,7 @@ import {
   resumeCursorProblem,
   type WatchTarget,
 } from "./stellar/events.js";
-import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
+import { isAdminPayload, toAdminAuditRecord, type ContractSource, type DecodedEvent } from "./stellar/decode.js";
 
 export interface TargetState {
   source: ContractSource;
@@ -997,6 +997,18 @@ export function createPoller(deps: PollerDeps) {
     let droppedForShutdown = 0;
 
     for (const event of events) {
+      if (isAdminPayload(event.payload)) {
+        status.eventsSkipped += 1;
+        skipped += 1;
+        const audit = toAdminAuditRecord(event, config);
+        const adminPart = audit?.admin ? ` admin=${boundedLabel(audit.admin, 56)}` : "";
+        console.log(
+          `[poller] logged admin event "${boundedLabel(event.payload.name, 80)}"${adminPart} ` +
+            `at ledger ${event.ledger}`,
+        );
+        continue;
+      }
+
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
         skipped += 1;
