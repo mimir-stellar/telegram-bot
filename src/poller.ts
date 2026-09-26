@@ -56,6 +56,13 @@ export interface PollerStatus {
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
   targets: TargetState[];
+  /** RPC circuit breaker state */
+  circuitBreaker: {
+    open: boolean;
+    openedAt: number | null;
+    failureCount: number;
+    lastFailureAt: number | null;
+  };
 }
 
 interface CursorFile {
@@ -123,7 +130,22 @@ export interface PollerDeps {
   /** Sends one already-formatted MarkdownV2 message. May reject. */
   send: (text: string) => Promise<void>;
   sendOptions?: SendOptions;
+  /** Circuit breaker configuration */
+  circuitBreakerOptions?: CircuitBreakerOptions;
 }
+
+export interface CircuitBreakerOptions {
+  /** Number of consecutive failures before opening the circuit */
+  failureThreshold?: number;
+  /** Milliseconds to wait before attempting to close the circuit */
+  cooldownMs?: number;
+}
+
+/** Default number of consecutive RPC failures before opening the circuit. */
+const DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5;
+
+/** Default cooldown period in milliseconds before attempting to close the circuit. */
+const DEFAULT_CIRCUIT_COOLDOWN_MS = 60_000;
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
 const DEFAULT_SEND_SPACING_MS = 1_500;
@@ -182,6 +204,8 @@ async function sendWithRetry(
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
   const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
+  const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
+  const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
   const boundedLabel = (value: unknown, max = 120): string => {
     const compact = String(value).replace(/\s+/g, " ").trim() || "unknown";
@@ -219,6 +243,12 @@ export function createPoller(deps: PollerDeps) {
     consecutiveFailures: 0,
     lastError: null,
     targets: [],
+    circuitBreaker: {
+      open: false,
+      openedAt: null,
+      failureCount: 0,
+      lastFailureAt: null,
+    },
   };
 
   let timer: NodeJS.Timeout | null = null;
@@ -358,7 +388,32 @@ export function createPoller(deps: PollerDeps) {
     status.cycles += 1;
     status.lastPollAt = Date.now();
 
+    // ── Circuit breaker check ─────────────────────────────────────────────────────
+    if (status.circuitBreaker.open) {
+      const now = Date.now();
+      const timeSinceOpen = status.circuitBreaker.openedAt ? now - status.circuitBreaker.openedAt : Infinity;
+      
+      if (timeSinceOpen >= circuitCooldown) {
+        // Cooldown elapsed, attempt to close the circuit
+        console.log(
+          `[poller] circuit breaker cooldown elapsed (${timeSinceOpen}ms >= ${circuitCooldown}ms), attempting recovery`,
+        );
+        status.circuitBreaker.open = false;
+        status.circuitBreaker.openedAt = null;
+        status.circuitBreaker.failureCount = 0;
+      } else {
+        // Still in cooldown, skip RPC calls
+        console.log(
+          `[poller] circuit breaker open, skipping RPC calls (${Math.round(timeSinceOpen / 1000)}s/${Math.round(circuitCooldown / 1000)}s elapsed)`,
+        );
+        status.targets = [...state.values()].map((t) => ({ ...t }));
+        inFlight = false;
+        return;
+      }
+    }
+
     let anyOk = false;
+    let cycleFailures = 0;
 
     for (const target of targets) {
       const current = state.get(target.source);
@@ -374,6 +429,15 @@ export function createPoller(deps: PollerDeps) {
         status.oldestLedger = scan.oldestLedger;
         current.lastError = null;
         anyOk = true;
+
+        // Reset circuit breaker on success
+        if (status.circuitBreaker.failureCount > 0) {
+          console.log(
+            `[poller] RPC succeeded, resetting circuit breaker (was at ${status.circuitBreaker.failureCount} failures)`,
+          );
+          status.circuitBreaker.failureCount = 0;
+          status.circuitBreaker.lastFailureAt = null;
+        }
 
         let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
         if (scan.events.length > 0) {
@@ -398,10 +462,25 @@ export function createPoller(deps: PollerDeps) {
           }
         }
       } catch (err) {
+        cycleFailures++;
         const message = errorMessage(err);
         current.lastError = message;
         status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
         console.error(`[poller] ${target.source} scan failed: ${message}`);
+      }
+    }
+
+    // ── Circuit breaker state update ───────────────────────────────────────────────
+    if (cycleFailures > 0) {
+      status.circuitBreaker.failureCount += cycleFailures;
+      status.circuitBreaker.lastFailureAt = Date.now();
+      
+      if (status.circuitBreaker.failureCount >= circuitThreshold && !status.circuitBreaker.open) {
+        status.circuitBreaker.open = true;
+        status.circuitBreaker.openedAt = Date.now();
+        console.error(
+          `[poller] circuit breaker opened after ${status.circuitBreaker.failureCount} failures (threshold: ${circuitThreshold})`,
+        );
       }
     }
 
