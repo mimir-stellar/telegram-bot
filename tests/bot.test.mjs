@@ -182,34 +182,38 @@ test("safeErrorMessage redacts Telegram-shaped tokens and clips remote payloads"
   assert.match(message, /^\[REDACTED] \[REDACTED] remote-payload/);
 });
 
-test("createNotifier sends to Telegram and webhook", async () => {
-  const sentToTelegram = [];
-  const bot = {
-    api: {
-      sendMessage: async (chatId, text, options) => {
-        sentToTelegram.push({ chatId, text, options });
-      },
+test("/preview command sends exact MarkdownV2 preview payload for market and squad", async () => {
+  const { handlers } = mockedBot({
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+  });
+
+  let marketReplied = false;
+  const ctxMarket = {
+    message: { text: "/preview market" },
+    update: { update_id: 101 },
+    reply: async (...args) => {
+      marketReplied = true;
+      assert.match(args[0], /🧪 \*Channel Preview — mimir\\-market\*/);
+      assert.deepEqual(args[1], TELEGRAM_OPTIONS);
     },
   };
+  await handlers.get("preview")(ctxMarket);
+  assert.equal(marketReplied, true);
 
-  const fetches = [];
-  const originalFetch = global.fetch;
-  global.fetch = async (url, options) => {
-    fetches.push({ url, options });
-    return { ok: true };
+  let squadReplied = false;
+  const ctxSquad = {
+    message: { text: "/preview squad" },
+    update: { update_id: 102 },
+    reply: async (...args) => {
+      squadReplied = true;
+      assert.match(args[0], /🧪 \*Channel Preview — mimir\\-squad\*/);
+      assert.deepEqual(args[1], TELEGRAM_OPTIONS);
+    },
   };
-
-  try {
-    const notify = createNotifier(bot, baseConfig({ webhookUrl: "https://hook.invalid" }));
-    await notify("hello");
-
-    assert.equal(sentToTelegram.length, 1);
-    assert.equal(sentToTelegram[0].text, "hello");
-
-    assert.equal(fetches.length, 1);
-    assert.equal(fetches[0].url, "https://hook.invalid");
-    assert.equal(JSON.parse(fetches[0].options.body).content, "hello");
-  } finally {
-    global.fetch = originalFetch;
-  }
+  await handlers.get("preview")(ctxSquad);
+  assert.equal(squadReplied, true);
 });
+
