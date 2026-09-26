@@ -204,7 +204,7 @@ test("createPoller migrates a legacy flat cursor file before the first cycle", a
     send: async () => {
       throw new Error("send should not be called with empty pages");
     },
-    now: () => FIXED_NOW,
+    now: () => FIXED_NOW.getTime(),
   });
 
   await poller.start();
@@ -243,7 +243,7 @@ test("createPoller cold-starts on unsupported schema version without crashing", 
     config: makeConfig({ cursorFile }),
     server: makeServer(),
     send: async () => {},
-    now: () => FIXED_NOW,
+    now: () => FIXED_NOW.getTime(),
   });
 
   await poller.start();
