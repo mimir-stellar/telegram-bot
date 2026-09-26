@@ -251,6 +251,8 @@ KV store is a deliberate future step, not something this repo does today.
 
 ## Failure behaviour
 
+For detailed operational behavior, deployment assumptions, and configuration tuning, see the [Configuration and Operational Reference](docs/configuration-reference.md).
+
 This process is meant to stay up for weeks, so a single failure never ends it:
 
 - **A failed RPC call** fails one contract's scan for one cycle. Its cursor is
