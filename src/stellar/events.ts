@@ -41,6 +41,7 @@ import { pathToFileURL } from "node:url";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import { readAuditFile, renderAuditReport, summarizeAudit } from "../audit.js";
+import { DEFAULT_DEDUP_WINDOW, EventDedupWindow, eventKey } from "../dedup.js";
 import { loadStellarConfig, networkLabel } from "../config.js";
 import {
   clampStartLedger,
@@ -49,7 +50,14 @@ import {
   validateLedgerWindow,
   type LedgerWindow,
 } from "./client.js";
-import { decodeEvent, formatUsdc, type ContractSource, type DecodedEvent } from "./decode.js";
+import {
+  decodeEvent,
+  dedupeEvents,
+  formatUsdc,
+  sortEvents,
+  type ContractSource,
+  type DecodedEvent,
+} from "./decode.js";
 
 /** Events per request. The RPC caps this; 200 is well inside it. */
 export const EVENT_PAGE_LIMIT = 200;
@@ -70,6 +78,18 @@ export interface ScanOptions {
   lookbackLedgers?: number | undefined;
   limit?: number | undefined;
   maxPages?: number | undefined;
+  /**
+   * Event ids already processed before this walk — the previous cycle's
+   * window, restored from the cursor file. Seeding them is what stops an
+   * inclusive cursor boundary from re-announcing an event after a resume or a
+   * restart.
+   */
+  seenEventIds?: readonly string[] | undefined;
+  /**
+   * How many recent event ids to retain while suppressing redelivery. `0`
+   * disables deduplication. Defaults to {@link DEFAULT_DEDUP_WINDOW}.
+   */
+  dedupWindow?: number | undefined;
 }
 
 export interface RawScan {
@@ -82,6 +102,8 @@ export interface RawScan {
   /** True when `maxPages` stopped the walk before the tip. */
   truncated: boolean;
   pages: number;
+  /** Events dropped because an earlier page or cycle already returned them. */
+  duplicates: number;
   /** Ledger the walk started from after clamping, or null when resuming. */
   startLedger: number | null;
   /** True when the requested start was below the retained floor and clamped up. */
@@ -93,6 +115,10 @@ export interface RawScan {
  * high 32 bits. Reading it lets the walk know it reached the end of the range
  * from the response it already has, instead of spending another round trip to
  * discover the cursor stopped moving.
+ *
+ * Returns `null` for anything that is not a numeric `<TOID>-…` cursor — an
+ * opaque token the RPC is free to change shape on. Callers must treat `null`
+ * as "unknown position", never as ledger 0.
  */
 export function eventCursorLedger(cursor: string): number | null {
   if (typeof cursor !== "string") return null;
@@ -144,6 +170,12 @@ export async function paginatedGetEvents(
   const window = validateLedgerWindow(await server.getHealth());
   const oldestLedger = window.oldestLedger;
 
+  // One window for the whole walk, pre-seeded with what earlier cycles have
+  // already announced. Pages of a cursor walk can overlap; without this the
+  // same event is both notified twice and re-counted.
+  const dedup = new EventDedupWindow(opts.dedupWindow ?? DEFAULT_DEDUP_WINDOW);
+  for (const id of opts.seenEventIds ?? []) dedup.add(id);
+
   const events: rpc.Api.EventResponse[] = [];
   let cursor: string | undefined = opts.cursor;
   let lastCursor: string | null = opts.cursor ?? null;
@@ -151,6 +183,7 @@ export async function paginatedGetEvents(
   let latestLedger = window.latestLedger;
   let truncated = false;
   let pages = 0;
+  let duplicates = 0;
 
   // Resolve the first request against the window before spending it: a cursor
   // wins over `startLedger` (the RPC rejects both together), and a start ledger
@@ -195,10 +228,16 @@ export async function paginatedGetEvents(
       : await server.getEvents({ filters, startLedger: firstStartLedger, limit });
 
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
-    events.push(...rawEvents);
+    // Drop anything an earlier page (or an earlier cycle) already produced.
+    // Order is preserved: the first occurrence wins, matching the RPC's own
+    // event ordering.
+    for (const event of rawEvents) {
+      if (dedup.add(eventKey(event))) events.push(event);
+      else duplicates += 1;
+    }
     latestLedger = response?.latestLedger ?? latestLedger;
 
-    const nextCursor = response.cursor || "";
+    const nextCursor = typeof response?.cursor === "string" ? response.cursor : "";
     // Out of cursor, or the server stopped moving: nothing left to read.
     if (!nextCursor || nextCursor === previousCursor) break;
 
@@ -221,6 +260,7 @@ export async function paginatedGetEvents(
     oldestLedger,
     truncated,
     pages,
+    duplicates,
     startLedger,
     startClamped,
   };
@@ -251,7 +291,20 @@ export async function readContractEvents(
     opts,
   );
 
-  const events = scan.events.map((event) => decodeEvent(target.source, event));
+  // `decodeEvent` never throws, so a malformed entry degrades to an `unknown`
+  // payload instead of killing the scan. Raw entries that are not objects at
+  // all are skipped — there is nothing to decode and no paging token to keep.
+  const rawEvents = Array.isArray(scan.events) ? scan.events : [];
+  const decoded: DecodedEvent[] = [];
+  for (const event of rawEvents) {
+    if (!event || typeof event !== "object") continue;
+    decoded.push(decodeEvent(target.source, event));
+  }
+
+  // Deterministic order from chain metadata (ledger → transaction index →
+  // operation index → paging token), independent of RPC page splits. Duplicate
+  // paging tokens — the RPC may repeat a page-boundary event — notify once.
+  const events = sortEvents(dedupeEvents(decoded));
   const ledgers = events.map((e) => e.ledger).filter((l) => l > 0);
 
   return {
@@ -263,6 +316,7 @@ export async function readContractEvents(
     oldestLedger: scan.oldestLedger,
     truncated: scan.truncated,
     pages: scan.pages,
+    duplicates: scan.duplicates,
     startLedger: scan.startLedger,
     startClamped: scan.startClamped,
     lastEventLedger: ledgers.length > 0 ? Math.max(...ledgers) : null,
@@ -523,8 +577,8 @@ async function main(): Promise<void> {
     const counts = eventHistogram(scan.events);
 
     console.log(
-      `pages=${scan.pages} events=${scan.events.length} truncated=${scan.truncated} ` +
-        `lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor} ` +
+      `pages=${scan.pages} events=${scan.events.length} duplicates=${scan.duplicates} ` +
+        `truncated=${scan.truncated} lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor} ` +
         `start=${scan.startLedger ?? "cursor"}${scan.startClamped ? " (clamped)" : ""}`,
     );
     for (const [name, count] of Object.entries(counts)) {
