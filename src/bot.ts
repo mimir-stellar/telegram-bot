@@ -17,6 +17,13 @@ import { contractExplorerUrl } from "./stellar/client.js";
 import type { ContractSource } from "./stellar/decode.js";
 import { buildHealthReport, chainClockLabel } from "./health.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
+import {
+  AUDIT_REPORT_MAX_ENTRIES,
+  readAuditFile,
+  renderAuditReport,
+  type AuditFileSummary,
+  type AuditLog,
+} from "./audit.js";
 
 const HELP_BASE = [
   "*Mimir notifier*",
@@ -24,6 +31,7 @@ const HELP_BASE = [
   "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
   "",
   "/status — what I am watching and how far I have read",
+  "/audit — the operator audit report, redacted and bounded (operator only)",
   "/contracts — the contract ids I watch and where to look them up",
   "/health — health assessment and operational readiness",
   "/preview — preview channel notification formatting",
@@ -51,6 +59,20 @@ function ago(timestamp: number | null, nowMs: number = Date.now()): string {
   if (seconds < 60) return `${seconds}s ago`;
   if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
   return `${Math.round(seconds / 3600)}h ago`;
+}
+
+const AUDIT_COMMAND_HINT = "See `npm run audit -- --help` for the standalone report tool.";
+
+/**
+ * Render the audit report for Telegram. The report is plain text — audit lines
+ * are arbitrary redacted strings and MarkdownV2 would mangle them — so nothing
+ * here goes through MarkdownV2 escaping; this message is sent without a parse
+ * mode. Bounded twice over: the file read is capped and only the tail renders.
+ */
+function renderAuditForTelegram(summary: AuditFileSummary, tail: number): string {
+  const header = `*Audit* — ${summary.file}`;
+  const report = renderAuditReport(summary, { tail });
+  return `${header}\n\n${report}\n\n${AUDIT_COMMAND_HINT}`;
 }
 
 function cursorPreview(cursor: string | null): string {
@@ -83,6 +105,14 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
     "",
     "*Watching*",
   ];
+
+  // Only shown after an automatic recovery, so an ordinary /status is unchanged.
+  if (status.cursorRewinds > 0) {
+    lines.push(
+      `Cursors rewound to the retained floor: ${status.cursorRewinds}`,
+      "",
+    );
+  }
 
   for (const target of status.targets) {
     lines.push(
@@ -220,6 +250,10 @@ export function resumeMessage(result: PollerResumeResult): string {
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  /** Live in-memory audit window; renders immediately even before a flush. */
+  audit?: AuditLog | undefined;
+  /** Where the audit JSONL file lives, for the file-backed report. */
+  auditFile?: string | undefined;
   /**
    * Pre-populated bot info. When provided (e.g. in tests) grammy skips the
    * getMe() call so `bot.handleUpdate()` works without a real Telegram token.
@@ -249,6 +283,9 @@ function isOperator(ctx: Context, config: BotConfig): boolean {
   return operatorId !== null && ctx.from?.id.toString() === operatorId;
 }
 
+/** How many recent audit lines `/audit` renders. A chat message is not a file. */
+const AUDIT_TAIL = 10;
+
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
 export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
   const { config, status, pause, resume } = deps;
@@ -273,6 +310,39 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
       return;
     }
     await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
+  });
+
+  bot.command("audit", async (ctx) => {
+    if (!isOperator(ctx, config)) {
+      // Same authorization model as /pause and /resume: the report is only
+      // meant for the operator, so other users get silence, not an error that
+      // would confirm the command exists. The standalone `npm run audit` CLI
+      // is the credential-free path for anyone with machine access.
+      console.warn(`[bot] ignored unauthorized /audit on update ${ctx.update.update_id}`);
+      return;
+    }
+    try {
+      const file = deps.auditFile ?? config.auditFile;
+      const summary = await readAuditFile(file);
+
+      // The in-memory window also holds entries recorded since the last flush;
+      // append any of those the file does not already contain (same entries
+      // serialise identically) so the report is current without duplicates.
+      const seen = new Set(summary.entries.map((e) => JSON.stringify(e)));
+      const live = (deps.audit ? deps.audit.tail(AUDIT_TAIL) : []).filter(
+        (e) => !seen.has(JSON.stringify(e)),
+      );
+
+      const merged: AuditFileSummary = {
+        ...summary,
+        entries: [...summary.entries, ...live].slice(-AUDIT_REPORT_MAX_ENTRIES),
+      };
+      await ctx.reply(renderAuditForTelegram(merged, AUDIT_TAIL), {
+        link_preview_options: { is_disabled: true },
+      });
+    } catch (err) {
+      await ctx.reply(`Audit report failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   });
 
   // Config-only, so this never fails on account of poller or RPC state —
@@ -355,6 +425,7 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "start", description: "What this bot does" },
       { command: "help", description: "Show help" },
       { command: "status", description: "Last-seen ledger and watched contracts" },
+      { command: "audit", description: "Operator audit report (redacted, bounded)" },
       { command: "contracts", description: "Contract ids and explorer links" },
       { command: "health", description: "Health assessment and operational readiness" },
       { command: "preview", description: "Preview channel notification formatting" },

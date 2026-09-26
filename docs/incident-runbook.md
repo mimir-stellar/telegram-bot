@@ -40,7 +40,8 @@ Check:
 * watched contract IDs
 * last event ledger per contract
 * persisted cursor
-* poll/send counters
+* poll/send counters, including automatic floor rewinds (`cursorRewinds`)
+* any target resuming from a floor rewind (`rewindFromLedger`)
 * last error and consecutive failure count
 
 For a read-only chain diagnostic without a Telegram token:
@@ -141,21 +142,44 @@ The Stellar chain remains the authoritative record.
 * The cursor cannot be parsed.
 * The stored cursor is incompatible with the current cursor format.
 * The process reports a cursor-loading problem.
+* `/status` reports `Cursors rewound to the retained floor: N`, or `status.json`
+  / `GET /health` show a non-null `rewindFromLedger`, after a long outage.
 
 ### Recovery
 
-A corrupt cursor is treated as a cold start. A syntactically valid cursor that
-Soroban rejects as stale is different: the poller keeps it unchanged, exposes
-the bounded RPC error in `/status`, and retries the same position. `/resume`
-also leaves it unchanged. This avoids duplicate notifications or skipped chain
-history from a guessed reset.
+A corrupt cursor is quarantined beside the live path and treated as a cold start;
+preserve the quarantined copy for investigation.
+
+A syntactically valid cursor that Soroban rejects as stale is first checked
+against a fresh `getHealth()`:
+
+* If the cursor's ledger is **strictly below** `oldestLedger`, the position it
+  points at is already unrecoverable, so the poller drops it and rescans from
+  `oldestLedger`. This is bounded to `MAX_FLOOR_REWINDS` (3) consecutive
+  automatic rewinds per contract. The count is visible in `/status` and
+  `GET /health` as `cursorRewinds`, and an active recovery is the target's
+  `rewindFromLedger` (also in `status.json` and `GET /health`).
+* If the cursor cannot be placed (an opaque token), sits **inside** the window,
+  or the window cannot be read, it is **kept unchanged** and the bounded RPC
+  error is surfaced. `/resume` never changes a cursor.
+
+A floor rewind loses nothing that is still readable — everything below the floor
+has already left the RPC. It can, however, skip events that expired while the bot
+was down, which the chain still records.
 
 A cursor the token itself places **ahead of the chain tip** is refused locally
 with a bounded `ahead of the chain tip` error instead of being sent, and the
 stored cursor is kept unchanged. That can be a transient RPC-lag condition and
 clears as the tip advances; if it persists it means the cursor came from a
 different chain (for example a network reset), so treat it as incompatible:
-preserve the file and perform the deliberate cold start above.
+preserve the file and perform a deliberate cold start.
+
+If the automatic rewind budget is spent (the process logs that operator action is
+required) or the cursor cannot be placed, treat it as permanently stale: stop
+the notifier, preserve the cursor file for investigation, and deliberately
+cold-start with the configured `START_LOOKBACK_LEDGERS` after checking the
+retained-history floor. A cold start may produce duplicate notifications, but it
+does not replay all retained history.
 
 Before changing `CURSOR_FILE` or deleting persisted state, preserve the existing file for investigation if possible.
 
@@ -317,8 +341,12 @@ curl -s http://127.0.0.1:8787/health | jq .status
 
 Injected failures last until the process stops, so recovery is "restart without
 the flag": the cursor must resume exactly where it was, log lines stay bounded,
-and no token-shaped secret appears anywhere in the output. The same guarantees
-are asserted by `tests/mock-rpc.test.mjs` (`npm run test:mock`).
+and no token-shaped secret appears anywhere in the output. `--stale-cursor`
+rejects any resume cursor the mock has handed out; because that cursor is inside
+the retained window, the poller keeps it (a rewind happens only when a fresh
+`getHealth()` proves the cursor is *below* the floor). The same guarantees are
+asserted by `tests/mock-rpc.test.mjs` (`npm run test:mock`), and the bounded
+rewind path is covered by `tests/cursor-rewind.test.mjs`.
 
 ## Verification
 

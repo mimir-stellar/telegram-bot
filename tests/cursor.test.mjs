@@ -73,7 +73,7 @@ function claimChallenged({ ledger, claimId = 7n, challenger = G, stake = 20_000_
   };
 }
 
-/** An admin event with no decoder — the poller must skip, not crash. */
+/** An admin event — logged as an audit record, skipped for Telegram notifications. */
 function unknownEvent({ ledger = 4_226_898 } = {}) {
   return {
     id: `${toid(ledger)}-0`,

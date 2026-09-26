@@ -41,6 +41,9 @@ import {
   squadFeesClaimedEvent,
   oracleChangedEvent,
   feePolicySetEvent,
+  ownershipTransferredEvent,
+  agentAttributedEvent,
+  feeAccruedEvent,
   emptyTopicsEvent,
   truncatedTopicsEvent,
   wrongValueTypeEvent,
@@ -303,20 +306,46 @@ test("decodes squad fees_claimed", () => {
 // ── Admin / no-notification events ────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
-test("oracle_changed yields unknown payload with eventName set", () => {
+test("oracle_changed decodes into structured admin payload", () => {
   const raw     = oracleChangedEvent();
   const decoded = decodeEvent("market", raw);
 
-  assertUnknown(decoded, "oracle_changed");
-  assert.equal(decoded.payload.eventName, "oracle_changed");
+  assertName(decoded, "oracle_changed");
+  assert.equal(decoded.payload.newOracle, FEE_ADDR);
 });
 
-test("fee_policy_set yields unknown payload", () => {
+test("fee_policy_set decodes into structured admin payload", () => {
   const raw     = feePolicySetEvent();
   const decoded = decodeEvent("market", raw);
 
-  assertUnknown(decoded, "fee_policy_set");
-  assert.equal(decoded.payload.eventName, "fee_policy_set");
+  assertName(decoded, "fee_policy_set");
+  assert.equal(decoded.payload.feeBps, 500);
+});
+
+test("ownership_transferred decodes into structured admin payload", () => {
+  const raw     = ownershipTransferredEvent();
+  const decoded = decodeEvent("market", raw);
+
+  assertName(decoded, "ownership_transferred");
+  assert.equal(decoded.payload.previousOwner, CREATOR);
+  assert.equal(decoded.payload.newOwner, FEE_ADDR);
+});
+
+test("agent_attributed decodes into structured admin payload", () => {
+  const raw     = agentAttributedEvent();
+  const decoded = decodeEvent("market", raw);
+
+  assertName(decoded, "agent_attributed");
+  assert.equal(decoded.payload.agent, CAPTAIN);
+});
+
+test("fee_accrued decodes into structured admin payload", () => {
+  const raw     = feeAccruedEvent();
+  const decoded = decodeEvent("market", raw);
+
+  assertName(decoded, "fee_accrued");
+  assert.equal(decoded.payload.recipient, FEE_ADDR);
+  assert.equal(decoded.payload.amount, 5_000_000n);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
