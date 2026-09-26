@@ -279,4 +279,3 @@ The notifier should remain read-only throughout incident recovery. The chain rem
 4. Do not manually invent cursor strings. If you must force a lookback window, delete only the live cursor file and restart (or rely on the automatic quarantine path).
 
 The chain remains the source of truth; quarantining never signs transactions or skips retained events beyond the configured lookback.
-
