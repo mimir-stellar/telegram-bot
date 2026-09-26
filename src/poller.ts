@@ -26,11 +26,16 @@
  *    notifications that have not been sent yet, waits a bounded time for the
  *    in-flight cycle, and flushes cursors that are still only in memory. The
  *    process then exits with the file matching what a restart resumes from.
- *  - A cursor that fell below the RPC's retained window ("stale cursor") fails
- *    every scan with an RPC error. The cursor is deliberately left untouched —
- *    advancing past an unreadable range would silently skip events — so an
- *    operator must delete the cursor file to cold-start. The failure log says
- *    so explicitly.
+ *  - A cursor that fell below the RPC's retained window ("stale cursor") is
+ *    rewound to the retained floor once a fresh `getHealth()` *proves* the
+ *    cursor sits below it. Everything below the floor is already gone, so
+ *    keeping the cursor would fail every scan forever; rewinding resumes from
+ *    the oldest ledger the RPC still serves. The rewind is bounded (at most
+ *    `MAX_FLOOR_REWINDS` consecutive attempts, then an operator must act) and
+ *    never guesses: an opaque cursor, an ahead-of-tip cursor, or a window that
+ *    cannot be read is left untouched and the bounded RPC error is surfaced.
+ *    The miss below the floor is logged as a bounded ledger count, never as a
+ *    remote payload.
  *
  * ── Event ordering ─────────────────────────────────────────────────────────
  *
@@ -57,7 +62,13 @@ import {
 } from "./instanceLock.js";
 import { explorerKeyboard, formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
-import { readContractEvents, type WatchTarget } from "./stellar/events.js";
+import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
+import {
+  eventCursorLedger,
+  readContractEvents,
+  resumeCursorProblem,
+  type WatchTarget,
+} from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
 export interface TargetState {
@@ -66,6 +77,13 @@ export interface TargetState {
   cursor: string | null;
   /** Highest ledger an event was seen in, from this run or the cursor file. */
   lastEventLedger: number | null;
+  /**
+   * Set only while this target is resuming from the RPC's retained floor after
+   * a stale cursor: the ledger the next scan starts from instead of `cursor`.
+   * Cleared once a scan returns a fresh resume cursor, and persisted so a
+   * restart mid-rewind keeps reading from the floor rather than cold-starting.
+   */
+  rewindFromLedger: number | null;
   lastError: string | null;
 }
 
@@ -108,6 +126,8 @@ export interface PollerStatus {
   notificationsDropped: number;
   /** Events suppressed because they had already been processed (dedup). */
   eventsDeduplicated: number;
+  /** Cursors automatically rewound to the RPC's retained floor this run. */
+  cursorRewinds: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
   /** Absolute path of the exclusive instance lock, or null before acquire. */
@@ -151,6 +171,12 @@ interface CursorTarget {
    * because the window never grows past `EVENT_DEDUP_WINDOW`.
    */
   recentEventIds?: string[];
+  /**
+   * Additive and transient: present only while a target is resuming from the
+   * RPC's retained floor after a stale cursor. Older builds ignore it, and a
+   * malformed value is dropped rather than costing an operator their position.
+   */
+  rewindFromLedger?: number | null;
 }
 
 export type CursorTargetEntry = CursorTarget;
@@ -197,6 +223,21 @@ function parseChainClock(value: unknown): number | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return null;
   return isPlausibleChainClock(value) ? value : null;
+}
+
+/**
+ * Shape check for a saved floor-rewind position: a positive, safe ledger
+ * sequence, or `null` when the target is not resuming from a rewind.
+ *
+ * Like the chain clock, a malformed value (hand-edited file, truncated write)
+ * is dropped rather than failing validation: a transient resume hint must never
+ * cost an operator their resume position. Files written before this field
+ * existed are `undefined` and load as "no rewind pending".
+ */
+function parseRewindFromLedger(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) return null;
+  return value;
 }
 
 /** Tuning knobs for Telegram delivery; defaults suit production, tests shrink them. */
@@ -267,6 +308,14 @@ const DEFAULT_INITIAL_BACKOFF_MS = 1_000;
 
 /** Maximum backoff in milliseconds for Telegram send retries. */
 const DEFAULT_MAX_BACKOFF_MS = 10_000;
+
+/**
+ * Consecutive automatic floor rewinds allowed for one target before the poller
+ * stops and leaves the decision to an operator. One rewind is the normal case;
+ * a repeat means the walk never came back inside the retained window, so a
+ * misbehaving or lying RPC cannot make the poller rewind forever.
+ */
+const MAX_FLOOR_REWINDS = 3;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -360,6 +409,10 @@ export function parseCursorFile(raw: string): CursorFile {
       ...(Array.isArray(target.recentEventIds)
         ? { recentEventIds: target.recentEventIds.filter((id) => typeof id === "string") }
         : {}),
+      // Transient resume hint: carried through only when it parses.
+      ...(parseRewindFromLedger(target.rewindFromLedger) !== null
+        ? { rewindFromLedger: parseRewindFromLedger(target.rewindFromLedger) }
+        : {}),
     };
   }
 
@@ -433,15 +486,18 @@ function normalizeTargetEntry(value: unknown, label: string): CursorTargetEntry 
     throw new Error(`${label}: lastEventLedger must be an integer or null (non-negative)`);
   }
 
-  // The dedup window is additive: carried through only when the file had it.
+  // The dedup window and the floor-rewind hint are additive: carried through
+  // only when the file had them.
   const recent = value.recentEventIds;
-  return Array.isArray(recent)
-    ? {
-        cursor,
-        lastEventLedger,
-        recentEventIds: recent.filter((id): id is string => typeof id === "string"),
-      }
-    : { cursor, lastEventLedger };
+  const rewindFromLedger = parseRewindFromLedger(value.rewindFromLedger);
+  return {
+    cursor,
+    lastEventLedger,
+    ...(Array.isArray(recent)
+      ? { recentEventIds: recent.filter((id): id is string => typeof id === "string") }
+      : {}),
+    ...(rewindFromLedger !== null ? { rewindFromLedger } : {}),
+  };
 }
 
 function normalizeTargets(
@@ -548,6 +604,7 @@ export function buildCursorFile(
     cursor: string | null;
     lastEventLedger: number | null;
     recentEventIds?: string[];
+    rewindFromLedger?: number | null;
   }>,
   updatedAt: string,
   chainClockAt?: number | null,
@@ -563,6 +620,11 @@ export function buildCursorFile(
           cursor: t.cursor,
           lastEventLedger: t.lastEventLedger,
           ...(t.recentEventIds !== undefined ? { recentEventIds: t.recentEventIds } : {}),
+          // Only a live rewind is persisted; a finished target drops the field
+          // so an ordinary cursor file is byte-for-byte unchanged.
+          ...(typeof t.rewindFromLedger === "number"
+            ? { rewindFromLedger: t.rewindFromLedger }
+            : {}),
         } satisfies CursorTarget,
       ]),
     ),
@@ -673,8 +735,23 @@ export function createPoller(deps: PollerDeps) {
   const state = new Map<ContractSource, TargetState>(
     targets.map((t) => [
       t.source,
-      { source: t.source, contractId: t.contractId, cursor: null, lastEventLedger: null, lastError: null },
+      {
+        source: t.source,
+        contractId: t.contractId,
+        cursor: null,
+        lastEventLedger: null,
+        rewindFromLedger: null,
+        lastError: null,
+      },
     ]),
+  );
+
+  // Per-contract consecutive floor-rewind budget. Kept out of `TargetState` so
+  // status output stays plain data. It resets only when a scan comes back
+  // inside the retained window, so an RPC that keeps handing back a
+  // below-floor cursor cannot make the poller rewind forever.
+  const rewindAttempts = new Map<ContractSource, number>(
+    targets.map((t) => [t.source, 0]),
   );
 
   // Per-contract redelivery guard. Kept out of `TargetState` so status output
@@ -699,6 +776,7 @@ export function createPoller(deps: PollerDeps) {
     eventsSkipped: 0,
     notificationsDropped: 0,
     eventsDeduplicated: 0,
+    cursorRewinds: 0,
     consecutiveFailures: 0,
     lastError: null,
     lockFile: null,
@@ -771,6 +849,9 @@ export function createPoller(deps: PollerDeps) {
         if (!target) continue;
         target.cursor = saved.cursor ?? null;
         target.lastEventLedger = saved.lastEventLedger ?? null;
+        // A rewind that was still pending when the process stopped resumes from
+        // the same floor instead of falling back to a lookback cold start.
+        target.rewindFromLedger = saved.rewindFromLedger ?? null;
         // Restore the redelivery window too. Without this a restart would
         // re-notify the last event the inclusive cursor hands back.
         dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
@@ -820,6 +901,7 @@ export function createPoller(deps: PollerDeps) {
         cursor: t.cursor,
         lastEventLedger: t.lastEventLedger,
         recentEventIds: dedup.get(t.source)?.toJSON() ?? [],
+        rewindFromLedger: t.rewindFromLedger,
       })),
       new Date(now()).toISOString(),
       status.chainClockAt,
@@ -969,6 +1051,75 @@ export function createPoller(deps: PollerDeps) {
     return { sent: sentThisCycle, failed, skipped };
   }
 
+  /**
+   * Rewind a stale cursor to the RPC's retained floor — but only when a fresh
+   * `getHealth()` *proves* the cursor sits below it.
+   *
+   * The floor is the oldest ledger the RPC still serves, so everything below it
+   * is already unrecoverable: keeping the cursor would fail every scan forever,
+   * while resuming at the floor loses nothing that is still readable. The
+   * rewind never guesses — an opaque cursor, an ahead-of-tip cursor, or a
+   * window that cannot be read is left untouched and the bounded RPC error is
+   * surfaced. It is bounded by `MAX_FLOOR_REWINDS` per target so a misbehaving
+   * RPC cannot thrash, and every line it logs is a bounded ledger number or a
+   * bounded error string — never a raw payload or a token.
+   */
+  async function rewindFromRetainedFloor(
+    target: WatchTarget,
+    current: TargetState,
+  ): Promise<void> {
+    const cursor = current.cursor;
+    // Nothing to rewind: a cold start or a rewind already in flight.
+    if (cursor === null) return;
+
+    let window: LedgerWindow;
+    try {
+      window = validateLedgerWindow(
+        await withTimeout(Promise.resolve(server.getHealth()), SCAN_TIMEOUT_MS, "RPC health"),
+      );
+    } catch (err) {
+      console.warn(
+        `[poller] ${target.source}: stale cursor; could not read the retained window to rewind ` +
+          `safely (${errorMessage(err)}); cursor left unchanged`,
+      );
+      return;
+    }
+
+    if (resumeCursorProblem(cursor, window) !== "cursor-before-floor") {
+      // Not provably below the floor: keep the cursor. Opaque cursors land here
+      // too, so an unknown cursor shape is forwarded rather than guessed at.
+      console.error(
+        `[poller] ${target.source} cursor could not be placed below the retained floor; ` +
+          `keeping it — delete ${config.cursorFile} to cold-start ` +
+          `(no events are skipped until then)`,
+      );
+      return;
+    }
+
+    const attempts = rewindAttempts.get(target.source) ?? 0;
+    if (attempts >= MAX_FLOOR_REWINDS) {
+      console.error(
+        `[poller] ${target.source}: cursor is below the retained floor ${window.oldestLedger} ` +
+          `and the auto-rewind budget (${MAX_FLOOR_REWINDS}) is spent; operator action required`,
+      );
+      return;
+    }
+
+    const cursorLedger = eventCursorLedger(cursor);
+    const missed = cursorLedger === null ? 0 : Math.max(0, window.oldestLedger - cursorLedger);
+    rewindAttempts.set(target.source, attempts + 1);
+    current.cursor = null;
+    current.lastEventLedger = null;
+    current.rewindFromLedger = window.oldestLedger;
+    status.cursorRewinds += 1;
+    markDirty();
+    console.warn(
+      `[poller] ${target.source}: cursor is ${missed} ledger(s) below the retained floor; ` +
+        `rewinding to the floor ${window.oldestLedger} ` +
+        `(auto-rewind ${attempts + 1}/${MAX_FLOOR_REWINDS})`,
+    );
+  }
+
   async function cycle(): Promise<void> {
     if (inFlight) return;
     inFlight = true;
@@ -1010,12 +1161,18 @@ export function createPoller(deps: PollerDeps) {
         if (!current) continue;
 
         try {
-          const window = dedup.get(target.source) ?? new EventDedupWindow(0);
+          const dedupWindow = dedup.get(target.source) ?? new EventDedupWindow(0);
+          const rewinding = current.rewindFromLedger !== null;
           const scan = await withTimeout(
             readContractEvents(server, target, {
-              cursor: current.cursor ?? undefined,
-              lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
-              seenEventIds: window.toJSON(),
+              // A pending floor rewind resumes by ledger, never by the stale
+              // cursor the RPC already rejected (`cursor` and `startLedger` are
+              // mutually exclusive in one request).
+              cursor: rewinding ? undefined : current.cursor ?? undefined,
+              startLedger: rewinding ? current.rewindFromLedger ?? undefined : undefined,
+              lookbackLedgers:
+                !rewinding && current.cursor === null ? config.startLookbackLedgers : undefined,
+              seenEventIds: dedupWindow.toJSON(),
               dedupWindow: config.dedupWindow,
             }),
             SCAN_TIMEOUT_MS,
@@ -1026,6 +1183,27 @@ export function createPoller(deps: PollerDeps) {
           status.oldestLedger = scan.oldestLedger;
           current.lastError = null;
           anyOk = true;
+
+          if (rewinding) {
+            // The walk is back from the floor: once it hands back a resume
+            // cursor the transient hint is no longer needed.
+            console.log(
+              `[poller] ${target.source}: floor rewind resumed from ledger ` +
+                `${scan.startLedger ?? "unknown"}`,
+            );
+            if (typeof scan.cursor === "string" && scan.cursor.length > 0) {
+              current.rewindFromLedger = null;
+              markDirty();
+            }
+          }
+
+          // Budget reset: only a scan that lands back inside the retained
+          // window counts as recovery. A cursor still below the floor keeps the
+          // budget spent, so a thrashing RPC exhausts it instead of looping.
+          const resumeLedger = scan.cursor ? eventCursorLedger(scan.cursor) : null;
+          if (resumeLedger === null || resumeLedger >= scan.oldestLedger) {
+            rewindAttempts.set(target.source, 0);
+          }
 
           // Advance the chain clock from close times the RPC actually reported.
           // `at` is 0 when the RPC omitted `ledgerClosedAt`, which is not an
@@ -1076,7 +1254,7 @@ export function createPoller(deps: PollerDeps) {
           if (scan.events.length > 0) {
             // Record before notifying: an event is "processed" once it has been
             // read, so a crash between send and save cannot replay it.
-            for (const event of scan.events) window.add(eventKey(event));
+            for (const event of scan.events) dedupWindow.add(eventKey(event));
             markDirty();
             delivery = await notify(scan.events);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
@@ -1110,13 +1288,10 @@ export function createPoller(deps: PollerDeps) {
           status.lastError = { at: now(), message: `${target.source}: ${message}` };
           console.error(`[poller] ${target.source} scan failed: ${message}`);
           if (isStaleCursorError(message)) {
-            // Cursor semantics stay loss-free: the cursor is NOT advanced here.
-            // Only bounded metadata is logged — never the cursor file path
-            // contents, tokens, or RPC payloads.
-            console.error(
-              `[poller] ${target.source} cursor is older than the RPC retained window; ` +
-                `delete ${config.cursorFile} to cold-start (no events are skipped until then)`,
-            );
+            // A stale rejection is the only hint; the rewind itself is gated on
+            // a fresh getHealth() that proves the cursor is below the floor.
+            // Only bounded metadata is logged — never a token or RPC payload.
+            await rewindFromRetainedFloor(target, current);
           }
         }
       }
