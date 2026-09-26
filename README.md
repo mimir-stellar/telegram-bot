@@ -243,6 +243,19 @@ Tests never use this directory: they run against an ephemeral data directory
 created under the OS temp dir and removed afterwards (see
 [docs/contributor-fixtures.md](docs/contributor-fixtures.md)).
 
+For local restart and regression checks without Testnet or Telegram credentials,
+seed that file with a deterministic fixture:
+
+```bash
+npm run seed:cursor                 # writes ./data/cursor.json (refuses overwrite)
+npm run seed:cursor -- --force      # replace an existing file
+npm run seed:cursor -- --empty      # null cursors (file present, cold resume)
+npm run seed:cursor -- --out /tmp/cursor.json
+```
+
+The seeder uses the same write-then-rename discipline as the poller, never reads
+bot tokens or signing keys, and refuses cursor values that look like secrets.
+
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. On
 an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
 at one). On an ephemeral filesystem every restart is a cold start, and events
@@ -343,6 +356,8 @@ src/
   config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
   bot.ts                   grammy setup: /start, /help, /status, /contracts, operator pause/resume
   poller.ts                the loop: scan, notify, persist the cursor
+  dev/
+    seedCursor.ts          credential-free local cursor seeder (npm run seed:cursor)
   stellar/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
@@ -355,6 +370,7 @@ src/
 
 ## Development checks
 
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus notification-format and seeded-cursor tests (including deterministic fuzz cases), `npm run seed:cursor` to write a local cursor fixture, or `npm run build` to produce the production output.
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 ### Lockfile reproducibility
