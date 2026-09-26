@@ -84,6 +84,14 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
     "*Watching*",
   ];
 
+  // Only shown after an automatic recovery, so an ordinary /status is unchanged.
+  if (status.cursorRewinds > 0) {
+    lines.push(
+      `Cursors rewound to the retained floor: ${status.cursorRewinds}`,
+      "",
+    );
+  }
+
   for (const target of status.targets) {
     lines.push(
       `· mimir\\-${target.source} \`${target.contractId}\``,

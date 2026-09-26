@@ -108,7 +108,7 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip counters (plus messages dropped by a shutdown drain) and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip counters (plus messages dropped by a shutdown drain and cursors automatically rewound to the retained floor), and the last error |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
@@ -148,6 +148,7 @@ npm start -- --status          # or: node dist/index.js --status
   "notificationsSent": 11,
   "notificationsFailed": 0,
   "eventsSkipped": 3,
+  "cursorRewinds": 0,
   "consecutiveFailures": 0,
   "lastError": null,
   "targets": [
@@ -156,6 +157,7 @@ npm start -- --status          # or: node dist/index.js --status
       "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
       "cursor": "0018276211125911551-4294967295",
       "lastEventLedger": 4226729,
+      "rewindFromLedger": null,
       "lastError": null
     }
   ]
@@ -281,6 +283,38 @@ Events are also not a source of truth for current state — a claim's stakes and
 status come from the contract's own getters. This bot is a timeline, not an
 index.
 
+### Recovering from a stale cursor
+
+A rolling window means a cursor can outlive the RPC. If the bot is stopped long
+enough (a multi-day outage, a wedged host, a long Telegram outage holding a
+deploy), the persisted cursor can fall **below the retained floor** — everything
+it points at is already gone. Soroban rejects such a read as stale, and holding
+the cursor would fail that contract's scan forever.
+
+The poller now recovers from exactly that case, without guessing:
+
+- On a stale rejection it asks `getHealth()` for a **fresh** window and only acts
+  when the cursor's own ledger places it strictly **below** `oldestLedger`.
+- It then drops the doomed cursor and rescans from `oldestLedger` (a
+  `startLedger` walk, since `cursor` and `startLedger` are mutually exclusive in
+  one request). Everything below the floor was already unreadable, so nothing
+  still retrievable is skipped, and the chain remains the record.
+- The recovery is **bounded**: at most `MAX_FLOOR_REWINDS` (3) consecutive
+  automatic rewinds per contract, then the poller stops and logs that operator
+  action is required. A misbehaving RPC cannot make it thrash.
+- It is **conservative**: an opaque cursor this build cannot place, a cursor
+  ahead of the tip, or a window that cannot be read is left untouched and the
+  bounded RPC error is surfaced. Nothing is rewritten on a hunch.
+- The miss is logged as a bounded ledger count (`cursor is N ledger(s) below the
+  retained floor`), never as a raw RPC payload, and `/status` and `GET /health`
+  expose `cursorRewinds` plus the per-target `rewindFromLedger` while it lasts.
+
+A recovery is observable: `/status` gains a `Cursors rewound to the retained
+floor: N` line once `cursorRewinds > 0`, and `status.json` reports the same
+counter and the active `rewindFromLedger`. The counter is per process, so it
+resets on restart; the position itself is persisted so a restart mid-recovery
+resumes from the same floor.
+
 ## Decoder compatibility contract
 
 The decoder is deliberately forward-compatible at the event boundary:
@@ -341,6 +375,15 @@ and is additive: it is bounded by `EVENT_DEDUP_WINDOW` (default `256`) and older
 cursor files without the field load as an empty window. The `version` and the
 `cursor` / `lastEventLedger` fields are unchanged, so the format stays
 backward-compatible in both directions.
+
+`rewindFromLedger` is a second additive field, written **only while a target is
+recovering from a stale cursor** (see
+[Recovering from a stale cursor](#recovering-from-a-stale-cursor)). It records
+the retained floor the next scan resumes from, so a restart in the middle of a
+recovery keeps reading from that floor instead of cold-starting. It is dropped
+as soon as the floor walk returns a fresh resume cursor, so an ordinary cursor
+file never contains it; files written before it existed load as "no rewind
+pending", and older builds ignore it.
 
 **Compatibility / migration**
 
@@ -411,22 +454,28 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 - **A corrupt cursor file** (invalid JSON or wrong schema) is **quarantined**
   to `data/cursor.json.corrupt.<timestamp>` beside the live path, then treated as
   a cold start; the next successful cycle writes a fresh `cursor.json`, and the
-  quarantined copy is kept for operators instead of being overwritten. A
-  valid but RPC-rejected stale cursor is never silently rewound: the target keeps
-  that cursor, the error becomes visible in `/status`, and scheduled retries or
-  `/resume` use the same position. Recovery follows the incident runbook rather
-  than replacing an opaque cursor with a guessed ledger.
+  quarantined copy is kept for operators instead of being overwritten.
+- **A valid but RPC-rejected stale cursor** (one below the retained floor) is
+  rewound to that floor in bounded steps: the poller confirms the position
+  against a fresh `getHealth()`, drops the unreachable cursor, rescans from
+  `oldestLedger`, and records the recovery in `/status` and `status.json`. It
+  never guesses — an opaque cursor, an ahead-of-tip cursor, or a window that
+  cannot be read is left untouched and the bounded RPC error is surfaced. After
+  `MAX_FLOOR_REWINDS` (3) consecutive rewinds for one contract the poller stops
+  and asks for operator action. See
+  [Recovering from a stale cursor](#recovering-from-a-stale-cursor).
 - **A second concurrent instance** is refused at startup via the exclusive lock
   above. Stale locks from crashed processes are cleared automatically.
 - **A request outside the retained window never reaches the RPC in one piece.**
   The window (`oldestLedger`…`latestLedger`) is validated from `getHealth()`; a
   resume cursor that the token itself places *above* the chain tip is refused
   before it is sent, with a bounded error in `/status` and logs and the stored
-  cursor left unchanged. A cursor *below* the retained floor is deliberately
-  still forwarded: retention is the RPC's call, and its bounded stale rejection
-  is what surfaces in `/status` while the stored cursor stays put. A cursor shape
-  the bot cannot read is forwarded too, so an RPC cursor-format change cannot
-  wedge it.
+  cursor left unchanged. A cursor *below* the retained floor is still forwarded —
+  retention is the RPC's call — and when the RPC rejects it the poller rewinds
+  to the floor (see
+  [Recovering from a stale cursor](#recovering-from-a-stale-cursor)). A cursor
+  shape the bot cannot read is forwarded too, so an RPC cursor-format change
+  cannot wedge it.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
 
@@ -504,7 +553,8 @@ default.
 The notifier is meant to run for weeks through Stellar RPC and Telegram outages.
 Everything it keeps in memory is fixed-size or capped:
 
-- Per-target state is two small records (cursor, last event ledger, last error).
+- Per-target state is one small fixed record (cursor, last event ledger, an
+  optional pending floor-rewind ledger, last error).
 - The chain clock is one timestamp (the newest observed close time) plus its
   derived skew; it never accumulates history.
 - A scan walks at most 20 event pages, and each cycle sends at most
@@ -527,11 +577,13 @@ supervisor that restarts the process and probes `GET /health`. If you suspect a
 leak in production, watch the process RSS over days; a restart is always safe.
 
 **Rollback:** deploy the previous build and start it against the same
-`CURSOR_FILE`. The cursor format is unchanged (version 1): `chainClockAt` is an
-optional additive field that older builds ignore and newer builds load as `null`
-when it is absent, and the chain is the source of truth, so nothing is replayed
-beyond the last saved cursor and nothing needs migrating. Keep a copy of the
-cursor file if you want an exact resume point.
+`CURSOR_FILE`. The cursor format is unchanged (version 1): `chainClockAt` and
+`rewindFromLedger` are optional additive fields that older builds ignore and
+newer builds drop when absent or malformed, and the chain is the source of
+truth, so nothing is replayed beyond the last saved cursor and nothing needs
+migrating. An older build that meets a mid-recovery file simply cold-starts that
+contract from `START_LOOKBACK_LEDGERS` rather than mis-reading it. Keep a copy of
+the cursor file if you want an exact resume point.
 
 ## Health endpoint
 
@@ -544,11 +596,12 @@ checks (default `http://127.0.0.1:8787`):
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
-cursors, whether a target has an error, and the chain clock (`poller.chainClockAt`
-plus `poller.chainClockSkewMs`, the signed difference in milliseconds between the
-bot's clock and the newest chain close time it has observed — positive while the
-bot is ahead). It never includes `BOT_TOKEN`, chat ids, private keys, or
-unbounded remote payloads.
+cursors, whether a target has an error, automatic floor rewinds
+(`poller.cursorRewinds` plus each target's `rewindFromLedger`), and the chain
+clock (`poller.chainClockAt` plus `poller.chainClockSkewMs`, the signed difference
+in milliseconds between the bot's clock and the newest chain close time it has
+observed — positive while the bot is ahead). It never includes `BOT_TOKEN`, chat
+ids, private keys, or unbounded remote payloads.
 
 Configuration (see `.env.example`):
 
