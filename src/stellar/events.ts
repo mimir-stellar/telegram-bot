@@ -152,16 +152,14 @@ export async function paginatedGetEvents(
           limit,
         });
 
+    const rawEvents = Array.isArray(response?.events) ? response.events : [];
     // Drop anything an earlier page (or an earlier cycle) already produced.
     // Order is preserved: the first occurrence wins, matching the RPC's own
     // event ordering.
-    for (const event of response.events) {
+    for (const event of rawEvents) {
       if (dedup.add(eventKey(event))) events.push(event);
       else duplicates += 1;
     }
-    latestLedger = response.latestLedger;
-    const rawEvents = Array.isArray(response?.events) ? response.events : [];
-    events.push(...rawEvents);
     latestLedger = response?.latestLedger ?? latestLedger;
 
     const nextCursor = response.cursor || "";

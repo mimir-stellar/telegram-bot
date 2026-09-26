@@ -36,6 +36,8 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures/cursor-corrupt.txt` | Unreadable cursor sample (cold-start path) |
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
 | `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
+| `tests/dedup.test.mjs` | Inline unit cases for the bounded dedup window (`src/dedup.ts`) |
+| `tests/page-dedup.test.mjs` | Fake-RPC overlapping-page walk + fake-Telegram poller/restart cases |
 | `tests/bot.test.mjs` | Mocked grammy operator-command routing and exact reply payloads |
 | `tests/poller.test.mjs` | Cursor load/advance, RPC and Telegram failure, send cap, stop semantics |
 | `tests/poller-controls.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
@@ -44,8 +46,6 @@ Do not wire `npm run scan` into automated tests.
 | `tests/soak.test.mjs` | Long-run memory/timer/log boundedness under scripted RPC and Telegram failures (mock timers, forced GC, leak control) |
 | `tests/mock-rpc.test.mjs` | Live mock RPC: scanner walks, poller failure drills, cursor safety, log bounds |
 | `tests/mock-profile.test.mjs` | `MIMIR_PROFILE=mock` defaults, explicit-env precedence, unknown-profile failure |
-| `tests/dedup.test.mjs` | Inline unit cases for the bounded dedup window (`src/dedup.ts`) |
-| `tests/page-dedup.test.mjs` | Fake-RPC overlapping-page walk + fake-Telegram poller/restart cases |
 
 ## Event fixture schema
 
@@ -139,10 +139,10 @@ test("resumes", () =>
 | Telegram send error | **commits after partial delivery** | counted as failed | Fake `sendMessage` reject; assert cursor advances and no token appears in the Error message |
 | Corrupt cursor file | cold start | n/a | Use `cursor-corrupt.txt` contents |
 | Burst over cap | advances | extras skipped | Cap `MAX_NOTIFICATIONS_PER_CYCLE` in the fake config |
-| Overlapping page / resumed cursor | advances | duplicate suppressed, counted | Fake RPC returns the same event id twice; assert one send |
-| Restart with a saved window | resumed | boundary event suppressed | Point two pollers at one temp `CURSOR_FILE` |
 | Unauthorized `/pause` or `/resume` | untouched | no command reply | Mock grammy with a different Telegram user id |
 | Operator pause → restart | version-1 cursor unchanged | no replay | Reload a valid cursor fixture; pause must not persist |
+| Overlapping page / resumed cursor | advances | duplicate suppressed, counted | Fake RPC returns the same event id twice; assert one send |
+| Restart with a saved window | resumed | boundary event suppressed | Point two pollers at one temp `CURSOR_FILE` |
 
 ## Failure drills against the local mock
 
