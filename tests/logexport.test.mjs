@@ -13,6 +13,7 @@ import {
 
 function baseConfig(overrides = {}) {
   return {
+    version: "0.1.0",
     marketContractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
     squadContractId: "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
     rpcUrl: "https://example.invalid/rpc",

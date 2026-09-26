@@ -18,6 +18,9 @@ npm test
 `npm test` builds `src/` → `dist/`, then runs every `tests/*.test.mjs` file with
 Node's built-in test runner (the same path CI uses).
 
+CI runs typecheck, build, and the full test suite on every push and pull request.
+No live Testnet RPC access, Telegram credentials, or signing keys are required.
+
 Live Testnet scanning is **manual and separate**:
 
 ```bash
@@ -36,6 +39,7 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
 | `tests/format.test.mjs` | Inline unit cases (MarkdownV2 escape, USDC decimals, send failures) |
 | `tests/logexport.test.mjs` | Log export: redaction, ring bounds, console wiring, secret-leak regressions |
+| `tests/version.test.mjs` | Release version metadata: positive, negative, boundary, restart, and regression coverage for `APP_VERSION`, health report, liveness endpoint, and log export header |
 
 ## Event fixture schema
 
@@ -139,6 +143,24 @@ place (`tests/logexport.test.mjs`):
   MarkdownV2 entities.
 - Capture is in-memory only: a restart starts with an empty ring, and nothing
   is written to `data/` or anywhere else.
+
+## Version metadata
+
+The bot surfaces the version from `package.json` at runtime via the `APP_VERSION`
+constant in `src/config.ts` (read once with `createRequire` at module load, falls
+back to `"unknown"` if the field is absent). It appears in:
+
+- `[boot]` log line — `Mimir Telegram notifier vX.Y.Z`
+- `/status` command header — `running on Stellar testnet (vX.Y.Z)`
+- Log export header — `Mimir notifier log export · vX.Y.Z`
+- `GET /health` JSON body — `"version": "X.Y.Z"`
+- `GET /health/live` JSON body — `"version": "X.Y.Z"`
+
+`tests/version.test.mjs` holds the authoritative test suite for these surfaces.
+The version string is **not** included in `secretsFor()` and must never be added
+there — it is public metadata, not a credential.
+
+When bumping the version in `package.json`, no other files need manual edits.
 
 ## Out of scope for fixtures
 

@@ -12,9 +12,31 @@
  *   - {@link loadConfig} is the full bot config.
  */
 
+import { createRequire } from "node:module";
 import path from "node:path";
 
 import "dotenv/config";
+
+/**
+ * Package version read once at startup from `package.json`. Surfaced in the
+ * health report, `/status`, boot logs, and log exports so operators can
+ * confirm which release is running without a shell session on the host.
+ *
+ * Falls back to `"unknown"` when the field is absent or the file cannot be
+ * loaded (e.g. a custom build that strips the manifest).
+ */
+export const APP_VERSION: string = (() => {
+  try {
+    // createRequire is the idiomatic way to load JSON in ESM without enabling
+    // resolveJsonModule (which would require declaration file emission).
+    const req = createRequire(import.meta.url);
+    const pkg = req("../package.json") as { version?: unknown };
+    const v = pkg.version;
+    return typeof v === "string" && v.length > 0 ? v : "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 export interface StellarConfig {
   marketContractId: string;
@@ -27,6 +49,8 @@ export interface StellarConfig {
 }
 
 export interface BotConfig extends StellarConfig {
+  /** Semver string from `package.json`, or `"unknown"` if unavailable. */
+  version: string;
   botToken: string;
   chatId: string;
   pollIntervalMs: number;
@@ -199,6 +223,7 @@ export function loadConfig(): BotConfig {
 
   const config: BotConfig = {
     ...stellar,
+    version: APP_VERSION,
     botToken: c.required("BOT_TOKEN"),
     chatId: c.chatId("TELEGRAM_CHAT_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),

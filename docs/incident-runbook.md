@@ -20,6 +20,7 @@ Run:
 
 Check:
 
+* current deployed version (shown in the header line)
 * current chain tip
 * RPC retained-history floor
 * watched contract IDs
@@ -176,13 +177,14 @@ Before deployment:
 * `BOT_TOKEN` and `TELEGRAM_CHAT_ID` are supplied through the deployment secret/configuration mechanism.
 * `data/` or `CURSOR_FILE` is persistent.
 * `LOG_BUFFER_LINES` is left at its default (or raised) so post-deploy incidents are diagnosable; set it to `0` only for one-shot tooling.
-* The deployed revision passes typecheck and build checks.
+* The deployed revision passes typecheck, build, and the full test suite (`npm test`).
 * No production credentials are committed.
+* Confirm the expected version appears in `GET /health` (`"version"` field) and in the `[boot]` log line after startup.
 
 After deployment:
 
 * Confirm the process starts successfully.
-* Run `/status`.
+* Run `/status` and verify the version shown in the header matches the deployed revision.
 * Confirm the expected contract IDs and cursor are shown.
 * Confirm the last event ledger advances after new events.
 * Monitor RPC and Telegram errors.

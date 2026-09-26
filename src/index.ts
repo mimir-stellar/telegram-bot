@@ -43,7 +43,7 @@ async function main(): Promise<void> {
   const restoreConsole = attachConsole(logCapture, secretsFor(config));
   process.once("exit", restoreConsole);
 
-  console.log(`[boot] Mimir Telegram notifier`);
+  console.log(`[boot] Mimir Telegram notifier v${config.version}`);
   console.log(`[boot] network      ${networkLabel(config)} (${config.rpcUrl})`);
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);

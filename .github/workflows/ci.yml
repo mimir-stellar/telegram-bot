@@ -27,3 +27,6 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Test
+        run: node --test tests/format.test.mjs tests/health.test.mjs tests/fixtures.test.mjs tests/logexport.test.mjs tests/version.test.mjs

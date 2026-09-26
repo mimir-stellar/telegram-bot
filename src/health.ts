@@ -35,6 +35,8 @@ export interface HealthReport {
   ok: boolean;
   status: "ok" | "degraded" | "stopped";
   service: "mimir-telegram-bot";
+  /** Semver string from `package.json`, or `"unknown"` if unavailable. */
+  version: string;
   network: string;
   uptimeMs: number;
   checkedAt: string;
@@ -108,6 +110,7 @@ export function buildHealthReport(
     ok: status === "ok",
     status,
     service: "mimir-telegram-bot",
+    version: config.version,
     network: networkLabel(config),
     uptimeMs,
     checkedAt: new Date(nowMs).toISOString(),
@@ -182,6 +185,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         ok: true,
         status: "live",
         service: "mimir-telegram-bot",
+        version: config.version,
         checkedAt: new Date(now()).toISOString(),
       });
       return;

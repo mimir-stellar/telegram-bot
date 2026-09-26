@@ -32,7 +32,7 @@ function ago(timestamp: number | null): string {
 
 function statusMessage(config: BotConfig, status: PollerStatus): string {
   const lines: string[] = [
-    `*Status* — ${status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
+    `*Status* — ${status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)} \\(v${escapeMd(config.version)}\\)`,
     "",
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,

@@ -169,7 +169,7 @@ export function renderLogExport(
   now: number = Date.now(),
 ): string {
   const lines: string[] = [];
-  lines.push("Mimir notifier log export");
+  lines.push(`Mimir notifier log export · v${config.version}`);
   // Network label is display-safe (testnet/public/custom) — not the RPC URL,
   // which could name a private endpoint.
   lines.push(`network: ${networkLabel(config)} · log lines kept: ${capture.capacity()}`);
