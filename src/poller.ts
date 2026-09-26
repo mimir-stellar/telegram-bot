@@ -47,7 +47,7 @@
  * the only resume token, in the same `version: 1` format as before.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
@@ -252,54 +252,19 @@ export interface SendOptions {
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
+  /** Sends one already-formatted MarkdownV2 message. May reject. */
+  send: (text: string) => Promise<void>;
   /**
-   * Sends one already-formatted MarkdownV2 message to the chat routed for
-   * `source`, with the event's explorer button when `extra.reply_markup` is
-   * set. May reject.
+   * Monotonic clock used for all timestamps in {@link PollerStatus}.
+   * Defaults to `Date.now`. Inject a fake in tests to make time deterministic.
    */
-  send: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>;
-  /**
-   * Operator audit trail. A fresh one is created when omitted, so the poller
-   * keeps working in callers that do not care about auditing (tests, tooling).
-   */
-  audit?: AuditLog | undefined;
-  /**
-   * Append flushed audit entries to `config.auditFile` each cycle. Enabled by
-   * default; disable for in-memory-only auditing (ephemeral tooling, tests).
-   */
-  persistAudit?: boolean | undefined;
-  sendOptions?: SendOptions;
-  /** Circuit breaker configuration */
-  circuitBreakerOptions?: CircuitBreakerOptions;
-  /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
   now?: () => number;
-}
-
-export interface ShutdownOptions {
   /**
-   * Milliseconds to wait for an in-flight cycle before flushing anyway.
-   * Defaults to `config.shutdownTimeoutMs`; `0` does not wait at all.
+   * Async delay used for send-spacing and retry back-off.
+   * Defaults to a real `setTimeout`-based sleep. Inject a no-op in tests to
+   * avoid waiting for real wall-clock time.
    */
-  timeoutMs?: number;
-}
-
-export interface ShutdownResult {
-  /** False when a cycle was still running when the wait budget expired. */
-  drained: boolean;
-  /**
-   * False only when state was pending and the write failed. True also when
-   * there was nothing to flush — the file then already matches memory.
-   */
-  flushed: boolean;
-  /** Milliseconds spent draining and flushing, on this poller's clock. */
-  waitedMs: number;
-}
-
-export interface CircuitBreakerOptions {
-  /** Number of consecutive failures before opening the circuit */
-  failureThreshold?: number;
-  /** Milliseconds to wait before attempting to close the circuit */
-  cooldownMs?: number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Default number of consecutive RPC failures before opening the circuit. */
@@ -320,47 +285,7 @@ const DEFAULT_INITIAL_BACKOFF_MS = 1_000;
 /** Maximum backoff in milliseconds for Telegram send retries. */
 const DEFAULT_MAX_BACKOFF_MS = 10_000;
 
-/** Maximum time to back off based on Retry-After (1 hour). */
-const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
-
-export function extractRetryAfterMs(err: unknown): number | null {
-  if (!err || typeof err !== "object") return null;
-  const e = err as any;
-
-  let seconds: number | null = null;
-
-  if (typeof e.parameters?.retry_after === "number") {
-    seconds = e.parameters.retry_after;
-  } else {
-    const headers = e.response?.headers || e.headers;
-    if (headers) {
-      let val: any;
-      if (typeof headers.get === "function") {
-        val = headers.get("retry-after") || headers.get("Retry-After");
-      } else {
-        val = headers["retry-after"] || headers["Retry-After"];
-      }
-      if (typeof val === "string" || typeof val === "number") {
-        const parsed = parseInt(String(val), 10);
-        if (!Number.isNaN(parsed)) seconds = parsed;
-      }
-    }
-  }
-
-  if (seconds !== null && seconds > 0) {
-    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
-  }
-  return null;
-}
-/**
- * Consecutive automatic floor rewinds allowed for one target before the poller
- * stops and leaves the decision to an operator. One rewind is the normal case;
- * a repeat means the walk never came back inside the retained window, so a
- * misbehaving or lying RPC cannot make the poller rewind forever.
- */
-const MAX_FLOOR_REWINDS = 3;
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
  * Wait for `promise`, resolving `false` if `timeoutMs` elapses first.
@@ -726,8 +651,7 @@ async function sendWithRetry(
   send: (text: string) => Promise<void>,
   text: string,
   botToken: string,
-  opts?: SendOptions,
-  shouldRetry: () => boolean = () => true,
+  sleep: (ms: number) => Promise<void>,
 ): Promise<void> {
   let attempt = 0;
   const maxRetries = opts?.maxSendRetries ?? DEFAULT_MAX_SEND_RETRIES;
@@ -760,11 +684,8 @@ async function sendWithRetry(
 
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
-  const audit: AuditLog = deps.audit ?? createAuditLog();
-  const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
   const now = deps.now ?? Date.now;
-  const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
-  const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
+  const sleep = deps.sleep ?? defaultSleep;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
   const boundedLabel = (value: unknown, max = 120): string => {
     const compact = String(value).replace(/\s+/g, " ").trim() || "unknown";
@@ -938,27 +859,17 @@ export function createPoller(deps: PollerDeps) {
     }
   }
 
-  /**
-   * Record that in-memory cursor state has moved ahead of the file, so a
-   * shutdown knows there is something to flush even if the cycle that moved it
-   * never reaches its own write.
-   */
-  function markDirty(): void {
-    status.pendingFlush = true;
-  }
-
-  async function saveCursors(reason: "cycle" | "shutdown" | "migration"): Promise<boolean> {
-    const payload = buildCursorFile(
-      [...state.values()].map((t) => ({
-        source: t.source,
-        cursor: t.cursor,
-        lastEventLedger: t.lastEventLedger,
-        recentEventIds: dedup.get(t.source)?.toJSON() ?? [],
-        rewindFromLedger: t.rewindFromLedger,
-      })),
-      new Date(now()).toISOString(),
-      status.chainClockAt,
-    );
+  async function saveCursors(): Promise<void> {
+    const payload: CursorFile = {
+      version: 1,
+      updatedAt: new Date(now()).toISOString(),
+      targets: Object.fromEntries(
+        [...state.values()].map((t) => [
+          t.source,
+          { cursor: t.cursor, lastEventLedger: t.lastEventLedger },
+        ]),
+      ),
+    };
 
     try {
       await mkdir(path.dirname(config.cursorFile), { recursive: true });
@@ -966,11 +877,21 @@ export function createPoller(deps: PollerDeps) {
       // that sends the next start back to the beginning of the retained window.
       const tmp = `${config.cursorFile}.tmp`;
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-      await rename(tmp, config.cursorFile);
-      status.pendingFlush = false;
-      status.lastFlushAt = now();
-      pendingRewrite = false;
-      return true;
+      // On Windows, rename over an existing file throws EPERM. Remove the
+      // destination first so the swap is safe on all platforms. This is a
+      // best-effort remove: if it fails (e.g. the file does not exist yet),
+      // we continue and let rename handle it.
+      try { await unlink(config.cursorFile); } catch { /* does not exist — fine */ }
+      try {
+        await rename(tmp, config.cursorFile);
+      } catch (renameErr) {
+        // Windows sometimes rejects rename even to a fresh path (e.g. antivirus
+        // scan holding the file). Fall back to a direct overwrite, which is
+        // not atomic but still correct for this single-writer process.
+        console.warn(`[poller] rename failed, falling back to direct write: ${errorMessage(renameErr)}`);
+        await writeFile(config.cursorFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+        try { await unlink(tmp); } catch { /* ignore */ }
+      }
     } catch (err) {
       // `pendingFlush` is deliberately left as it was: if state was ahead of
       // the file it stays ahead, so a later cycle — or the shutdown flush —
@@ -1128,7 +1049,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry((message) => send(message, event.source, extra), text, config.botToken, deps.sendOptions, () => !status.stopping);
+        await sendWithRetry(send, text, config.botToken, sleep);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
@@ -1431,6 +1352,12 @@ export function createPoller(deps: PollerDeps) {
             break; // Stop scanning other targets, they will likely hit the same limit
           }
         }
+      } catch (err) {
+        cycleFailures++;
+        const message = errorMessage(err);
+        current.lastError = message;
+        status.lastError = { at: now(), message: `${target.source}: ${message}` };
+        console.error(`[poller] ${target.source} scan failed: ${message}`);
       }
 
       // ── Circuit breaker state update ─────────────────────────────────────────────
@@ -1447,25 +1374,11 @@ export function createPoller(deps: PollerDeps) {
         }
       }
 
-      if (anyOk) {
-        status.lastSuccessAt = now();
-        status.consecutiveFailures = 0;
-      } else {
-        status.consecutiveFailures += 1;
-      }
-    } finally {
-      // The write and the tracking promise are what a shutdown waits for, so
-      // they run even when the body above threw.
-      try {
-        status.targets = [...state.values()].map((t) => ({ ...t }));
-        await saveCursors("cycle");
-        await persistStatus();
-      } finally {
-        inFlight = false;
-        endCycleTracking();
-      }
-      await flushAudit();
-      if (explicitBackoff !== null) return explicitBackoff;
+    if (anyOk) {
+      status.lastSuccessAt = now();
+      status.consecutiveFailures = 0;
+    } else {
+      status.consecutiveFailures += 1;
     }
   }
 
