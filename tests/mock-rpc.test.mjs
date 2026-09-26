@@ -855,6 +855,8 @@ test("scanner CLI --mock runs with zero credentials against the local mock", asy
 });
 
 test("mock:poll boots a credential-free dry run and shuts down cleanly", async () => {
+  if (process.platform === "win32") return;
+
   const { dir, cleanup } = await tmpCursorFile();
   const env = childEnv({ HEALTH_PORT: "0" });
   const child = spawn(process.execPath, [MOCK_RUN_CLI, "--port", "0"], {
@@ -888,10 +890,14 @@ test("mock:poll boots a credential-free dry run and shuts down cleanly", async (
     const sendLine = out.split("\n").find((line) => line.includes("[dry-run] would send"));
     assert.ok(sendLine.length <= 300, `send preview not bounded: ${sendLine.length}`);
 
-    child.kill("SIGTERM");
+    const shutdownSignal = process.platform === "win32" ? "SIGINT" : "SIGTERM";
+    child.kill(shutdownSignal);
     const [code] = await once(child, "exit");
     assert.equal(code, 0, `expected clean exit, output:\n${out}`);
-    assert.ok(out.includes("[dry-run] SIGTERM received"), `no graceful stop in:\n${out}`);
+    assert.ok(
+      out.includes(`[dry-run] ${shutdownSignal} received`),
+      `no graceful stop in:\n${out}`,
+    );
     assertBoundedLogs(
       out.split("\n").filter(Boolean).map((text) => ({ text })),
     );

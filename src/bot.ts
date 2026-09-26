@@ -254,11 +254,11 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
   const { config, status, pause, resume } = deps;
 
   bot.command("start", async (ctx) => {
-    await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, helpMessage(config));
   });
 
   bot.command("help", async (ctx) => {
-    await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, helpMessage(config));
   });
 
   bot.command("status", async (ctx) => {
@@ -282,7 +282,7 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
   });
 
   bot.command("contracts", async (ctx) => {
-    await ctx.reply(contractsMessage(config), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, contractsMessage(config));
   });
 
   bot.command("preview", async (ctx) => {
@@ -297,7 +297,7 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
       console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
       return;
     }
-    await ctx.reply(pauseMessage(pause()), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, pauseMessage(pause()));
   });
 
   bot.command("resume", async (ctx) => {
@@ -305,7 +305,7 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
       console.warn(`[bot] ignored unauthorized /resume on update ${ctx.update.update_id}`);
       return;
     }
-    await ctx.reply(resumeMessage(resume()), TELEGRAM_OPTIONS);
+    await replyWithMarkdownFallback(ctx, config, resumeMessage(resume()));
   });
 }
 

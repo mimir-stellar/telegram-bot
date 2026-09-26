@@ -237,6 +237,16 @@ function diagnostic(value: unknown): string {
     : `${compact.slice(0, MAX_DIAGNOSTIC_LENGTH - 1)}…`;
 }
 
+/** Keep decoder diagnostics useful without copying an unbounded RPC payload. */
+const MAX_DIAGNOSTIC_LENGTH = 200;
+
+function diagnostic(value: unknown): string {
+  const compact = String(value).replace(/\s+/g, " ").trim() || "unknown error";
+  return compact.length <= MAX_DIAGNOSTIC_LENGTH
+    ? compact
+    : `${compact.slice(0, MAX_DIAGNOSTIC_LENGTH - 1)}…`;
+}
+
 // ── Scalar helpers ───────────────────────────────────────────────────────────
 
 class DecodeError extends Error {}
