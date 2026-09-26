@@ -132,7 +132,7 @@ npm start -- --status          # or: node dist/index.js --status
   "generatedAt": "2026-08-21T10:00:00.000Z",
   "uptimeMs": 3600000,
   "running": true,
-  "network": "Testnet",
+  "network": "testnet",
   "rpcUrl": "https://soroban-testnet.stellar.org",
   "chatId": "-…7890",
   "pollIntervalMs": 30000,

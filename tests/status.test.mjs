@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -63,7 +63,7 @@ test("snapshot is machine-readable and carries the documented schema version", (
   assert.equal(snapshot.generatedAt, new Date(1_060_000).toISOString());
   assert.equal(snapshot.uptimeMs, 60_000);
   assert.equal(snapshot.running, true);
-  assert.equal(snapshot.network, "Testnet");
+  assert.equal(snapshot.network, "testnet");
   assert.equal(snapshot.latestLedger, 4226733);
   assert.equal(snapshot.targets.length, 1);
   assert.equal(snapshot.targets[0].cursor, "0018276211125911551-4294967295");
@@ -206,7 +206,7 @@ test("writeStatusFile reports failure instead of throwing", async () => {
   const file = path.join(dir, "status.json");
   try {
     // A directory where the file should be: the rename cannot succeed.
-    await writeFile(path.join(dir, "blocker"), "");
+    await mkdir(path.join(dir, "blocker"));
     const snapshot = buildStatusSnapshot(config, status(), 1_000);
     assert.equal(await writeStatusFile(path.join(dir, "blocker"), snapshot), false);
   } finally {
