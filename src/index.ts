@@ -7,6 +7,7 @@
  */
 
 import { ConfigError, activeProfileName, loadConfig, networkLabel } from "./config.js";
+import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
@@ -53,6 +54,7 @@ async function main(): Promise<void> {
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  console.log(`[boot] flags        ${formatFeatureFlags(config.featureFlags)}`);
   console.log(
     `[boot] operator      ${config.operatorTelegramUserId === null ? "disabled" : "configured"}`,
   );

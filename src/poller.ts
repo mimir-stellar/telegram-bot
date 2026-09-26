@@ -25,6 +25,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
 import { formatEvent, safeErrorMessage } from "./notifications/format.js";
+import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
@@ -338,6 +339,15 @@ export function createPoller(deps: PollerDeps) {
             (event.payload.reason
               ? ` (${boundedLabel(event.payload.reason, 160)})`
               : ""),
+        );
+        continue;
+      }
+
+      if (!isNotificationAllowed(config.featureFlags, event.source, event.payload.name)) {
+        status.eventsSkipped += 1;
+        console.log(
+          `[poller] feature-flag skipped ${event.source} event "${event.payload.name}" ` +
+            `at ledger ${event.ledger} (NOTIFY_* flags)`,
         );
         continue;
       }

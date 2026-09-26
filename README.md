@@ -332,6 +332,7 @@ cursor format or Telegram behaviour.
 **Failure modes:** binding fails only if the port is already taken (process
 exits via the listen error path after logging). Client disconnects and probe
 errors are logged and ignored so they cannot stop the notifier.
+- **Notification feature flags** (`NOTIFY_ENABLED`, `NOTIFY_MARKET`, `NOTIFY_SQUAD`) are coarse kill switches for Telegram posts. Disabled events are skip-logged and the cursor still advances; unset defaults keep prior always-on behavior.
 
 ## Layout
 
