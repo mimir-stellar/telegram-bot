@@ -48,6 +48,9 @@ export interface StellarConfig {
 export interface BotConfig extends StellarConfig {
   botToken: string;
   chatId: string;
+  /** Optional per-contract destinations; absent values use `chatId`. */
+  marketChatId?: string;
+  squadChatId?: string;
   /** Chats allowed to use /status. Empty array means no restriction. */
   allowedChatIds: string[];
   /** Telegram user id allowed to run operator-only commands. Null disables them. */
@@ -65,9 +68,17 @@ export interface BotConfig extends StellarConfig {
    * successful cycle lands within this window. `0` disables the stale check.
    */
   healthStaleMs: number;
+  /**
+   * How long a graceful shutdown waits for an in-flight cycle before flushing
+   * cursor state and giving up on it. `0` skips the wait entirely.
+   */
+  shutdownTimeoutMs: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
 }
+
+/** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
+export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -96,6 +107,9 @@ const DEFAULTS = {
   healthPort: 8787,
   // 3× default poll interval — one missed cycle is fine; three is not.
   healthStaleMs: 90_000,
+  // Long enough for an in-flight read to finish and its cursors to land, short
+  // enough that a deploy is never held open by a wedged RPC.
+  shutdownTimeoutMs: DEFAULT_SHUTDOWN_TIMEOUT_MS,
   channelPreviewMode: false,
 } as const;
 
@@ -236,6 +250,17 @@ function collector(profile: Record<string, string>) {
       return value;
     },
 
+    optionalChatId(name: string, fallback: string): string {
+      const value = read(name) ?? fallback;
+      if (value === "") return value;
+      if (!/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
+        problems.push(
+          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
+        );
+      }
+      return value;
+    },
+
     /**
      * Parses an optional comma-separated list of chat ids / @usernames.
      * Returns an empty array when the variable is absent or empty (= no
@@ -316,6 +341,8 @@ export function loadConfig(): BotConfig {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
     chatId: c.chatId("TELEGRAM_CHAT_ID"),
+    marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
+    squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
     allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
@@ -330,6 +357,7 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
+    shutdownTimeoutMs: c.int("SHUTDOWN_TIMEOUT_MS", DEFAULTS.shutdownTimeoutMs, 0),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
   };
 
