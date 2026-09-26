@@ -175,7 +175,19 @@ function headline(event: DecodedEvent): string | null {
 }
 
 /** The full message, or null when the event is not worth notifying. */
-export function formatEvent(config: StellarConfig, event: DecodedEvent): string | null {
+export function eventAllowedByCategory(
+  config: Pick<StellarConfig, never> & { notificationCategories?: readonly string[] },
+  event: DecodedEvent,
+): boolean {
+  const categories = config.notificationCategories ?? [];
+  if (categories.length === 0 || event.payload.name !== "claim_created") return true;
+
+  const allowed = new Set(categories.map((category) => category.trim().toLowerCase()));
+  return allowed.has(event.payload.category.trim().toLowerCase());
+}
+
+export function formatEvent(config: StellarConfig & { notificationCategories?: readonly string[] }, event: DecodedEvent): string | null {
+  if (!eventAllowedByCategory(config, event)) return null;
   const head = headline(event);
   if (head === null) return null;
   return `${head}\n${footer(config, event)}`;

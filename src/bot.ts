@@ -19,6 +19,8 @@ const HELP_BASE = [
   "",
   "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
   "",
+  "Claim categories are filtered when NOTIFY_CATEGORIES is configured; otherwise all categories are sent\\.",
+  "",
   "/status — what I am watching and how far I have read",
   "/contracts — the contract ids I watch and where to look them up",
   "/help — this message",
@@ -54,6 +56,11 @@ function cursorPreview(cursor: string | null): string {
 }
 
 function statusMessage(config: BotConfig, status: PollerStatus): string {
+  const categorySummary =
+    config.notificationCategories.length === 0
+      ? "all claim categories"
+      : config.notificationCategories.join(", ");
+
   const lines: string[] = [
     `*Status* — ${status.paused ? "paused" : status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
     "",
@@ -61,6 +68,7 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt)}`,
     `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
+    `Claim categories: ${categorySummary}`,
     "",
     "*Watching*",
   ];

@@ -29,6 +29,8 @@ export interface StellarConfig {
 export interface BotConfig extends StellarConfig {
   botToken: string;
   chatId: string;
+  /** Optional allowlist of claim categories to notify about. Empty means allow all. */
+  notificationCategories: readonly string[];
   /** Telegram user id allowed to run operator-only commands. Null disables them. */
   operatorTelegramUserId: string | null;
   pollIntervalMs: number;
@@ -173,6 +175,35 @@ function collector() {
   };
 }
 
+function parseNotificationCategories(raw: string | undefined): string[] {
+  const candidates = raw
+    ? raw.split(/[\s,]+/)
+    : [];
+
+  const normalized = [...new Set(
+    candidates
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => value.length > 0),
+  )];
+
+  return normalized;
+}
+
+function notificationCategoriesFrom(): readonly string[] {
+  const envValues = [
+    "NOTIFY_CATEGORIES",
+    "NOTIFICATION_CATEGORIES",
+    "NOTIFY_EVENT_CATEGORIES",
+    "EVENT_CATEGORIES",
+    "CLAIM_CATEGORIES",
+  ]
+    .map((name) => read(name))
+    .filter((value): value is string => value !== undefined && value.trim().length > 0);
+
+  if (envValues.length === 0) return [];
+  return parseNotificationCategories(envValues.join(","));
+}
+
 function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
   return {
     marketContractId: c.contractId("MARKET_CONTRACT_ID"),
@@ -204,6 +235,7 @@ export function loadConfig(): BotConfig {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
     chatId: c.chatId("TELEGRAM_CHAT_ID"),
+    notificationCategories: notificationCategoriesFrom(),
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
