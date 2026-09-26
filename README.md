@@ -307,6 +307,11 @@ needs migrating. Keep a copy of the cursor file if you want an exact resume poin
 
 ## Health endpoint
 
+Before the poller starts, boot calls Soroban RPC `getHealth()` with bounded
+retries (`STARTUP_HEALTH_DEADLINE_MS` / `STARTUP_HEALTH_RETRY_MS`) so a brief
+RPC outage does not abort startup, while a bad URL still fails within the
+deadline.
+
 The process exposes a **loopback HTTP** probe for supervisors and deploy
 checks (default `http://127.0.0.1:8787`):
 
@@ -324,6 +329,8 @@ Configuration (see `.env.example`):
 - `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
+- `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
+- `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the health module is additive and does not change

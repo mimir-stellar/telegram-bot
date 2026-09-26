@@ -9,7 +9,7 @@
 import { ConfigError, activeProfileName, loadConfig, networkLabel } from "./config.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { startHealthServer } from "./health.js";
-import { createPoller } from "./poller.js";
+import { createPoller, waitForStartupHealth } from "./poller.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
 
@@ -62,11 +62,16 @@ async function main(): Promise<void> {
 
   const server = createRpcServer(config);
 
-  // One read before announcing readiness: a wrong RPC URL should surface now,
-  // not as a mystery in the poll log an interval later.
-  const health = await server.getHealth();
+  // Bounded retries before announcing readiness: a briefly unavailable RPC
+  // (deploy race, Testnet blip) should not fail the whole boot, but a wrong
+  // URL must still surface within STARTUP_HEALTH_DEADLINE_MS.
+  const health = await waitForStartupHealth(server, {
+    deadlineMs: config.startupHealthDeadlineMs,
+    retryMs: config.startupHealthRetryMs,
+  });
   console.log(
-    `[boot] rpc ok, status=${health.status} ledgers ${health.oldestLedger}..${health.latestLedger}`,
+    `[boot] rpc ok (attempts=${health.attempts}), status=${health.status} ` +
+      `ledgers ${health.oldestLedger}..${health.latestLedger}`,
   );
 
   // The bot needs the poller's status and the poller needs the bot's send path,
