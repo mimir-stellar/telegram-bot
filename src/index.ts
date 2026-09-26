@@ -12,6 +12,7 @@ import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
+import { redactError, registerSecrets } from "./redact.js";
 
 /**
  * Installed before anything else can throw, so a rejection during startup is
@@ -21,12 +22,14 @@ function installProcessHandlers(): void {
   // A rejected promise nobody awaited is a bug, but not a reason to stop
   // notifying. Log it and let the poll loop carry on.
   process.on("unhandledRejection", (reason) => {
+    console.error("[error] unhandled rejection:", redactError(reason));
     console.error(`[error] unhandled rejection: ${safeErrorMessage(reason)}`);
   });
 
   // An uncaught exception means state is unknown; exit so the supervisor
   // restarts us. The persisted cursor is what makes that cheap.
   process.on("uncaughtException", (err) => {
+    console.error("[fatal] uncaught exception, exiting for restart:", redactError(err));
     console.error(`[fatal] uncaught exception, exiting for restart: ${safeErrorMessage(err)}`);
     process.exit(1);
   });
@@ -36,6 +39,8 @@ async function main(): Promise<void> {
   installProcessHandlers();
 
   const config = loadConfig();
+  // Never let token / chat id leak via error URLs or stack text.
+  registerSecrets([config.botToken, config.chatId]);
 
   // The mock profile exists for the dry-run entry, not this one: warn loudly
   // so a profile left set in a deployment is noticed before Telegram rejects
@@ -99,6 +104,7 @@ async function main(): Promise<void> {
       onStart: (me) => console.log(`[boot] telegram ok, running as @${me.username}`),
     })
     .catch((err: unknown) => {
+      console.error("[fatal] telegram long-polling failed — check BOT_TOKEN:", redactError(err));
       console.error(
         `[fatal] telegram long-polling failed — check BOT_TOKEN: ` +
           safeErrorMessage(err, [config.botToken]),
@@ -130,6 +136,7 @@ main().catch((err: unknown) => {
     console.error(`\n${err.message}\n`);
     process.exit(1);
   }
+  console.error("[boot] startup failed:", redactError(err));
   console.error(`[boot] startup failed: ${safeErrorMessage(err)}`);
   process.exit(1);
 });

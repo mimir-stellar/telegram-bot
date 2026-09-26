@@ -27,6 +27,7 @@ import type { BotConfig } from "./config.js";
 import { formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
+import { redactError } from "./redact.js";
 
 export interface TargetState {
   source: ContractSource;
@@ -161,6 +162,9 @@ const DEFAULT_MAX_BACKOFF_MS = 10_000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function errMessage(err: unknown): string {
+  return redactError(err);
+}
 
 /**
  * Sends a message with bounded exponential backoff.

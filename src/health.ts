@@ -11,6 +11,7 @@ import type { AddressInfo } from "node:net";
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import { redactText } from "./redact.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -128,7 +129,10 @@ export function buildHealthReport(
       eventsSkipped: poller.eventsSkipped,
       consecutiveFailures: poller.consecutiveFailures,
       lastError: poller.lastError
-        ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }
+        ? {
+            at: new Date(poller.lastError.at).toISOString(),
+            message: redactText(poller.lastError.message),
+          }
         : null,
       targets: poller.targets.map((t) => ({
         source: t.source,

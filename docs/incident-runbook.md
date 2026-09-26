@@ -9,6 +9,7 @@ Operational guidance for recovering the Mimir Telegram notifier from missed noti
 * A notification failure must not alter on-chain state.
 * Cursors must only move according to the poller's existing persistence rules.
 * Logs and status output must not expose bot tokens, private keys, payment proofs, or unbounded remote payloads.
+  Scrubbing is centralized in `src/redact.ts` (regression suite: `tests/redaction.test.mjs`).
 
 Notification text from contract String fields is bounded to 200 Unicode code
 points before MarkdownV2 escaping. An oversized or malformed transaction hash
