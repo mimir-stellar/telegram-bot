@@ -54,13 +54,13 @@ async function main(): Promise<void> {
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
-  console.log(`[boot] lock file    ${config.lockFile}`);
   console.log(
     `[boot] operator      ${config.operatorTelegramUserId === null ? "disabled" : "configured"}`,
   );
   console.log(
     `[boot] preview mode  ${config.channelPreviewMode ? "enabled" : "disabled"}`,
   );
+  console.log(`[boot] lock file    ${config.lockFile}`);
 
   const server = createRpcServer(config);
 
@@ -105,31 +105,23 @@ async function main(): Promise<void> {
       onStart: (me) => console.log(`[boot] telegram ok, running as @${me.username}`),
     })
     .catch((err: unknown) => {
-      console.error("[fatal] telegram long-polling failed — check BOT_TOKEN:", err);
-      void poller.stop().finally(() => process.exit(1));
       console.error(
         `[fatal] telegram long-polling failed — check BOT_TOKEN: ` +
           safeErrorMessage(err, [config.botToken]),
       );
-      process.exit(1);
+      void poller.stop().finally(() => process.exit(1));
     });
 
   const shutdown = (signal: string) => {
     console.log(`[shutdown] ${signal} received, stopping`);
     void (async () => {
       await poller.stop();
+      await healthServer.close().catch((err: unknown) => {
+        console.error(`[shutdown] health server close failed: ${safeErrorMessage(err)}`);
+      });
       await bot.stop();
       process.exit(0);
     })();
-    poller.stop();
-    void healthServer
-      .close()
-      .catch((err: unknown) => {
-        console.error(`[shutdown] health server close failed: ${safeErrorMessage(err)}`);
-      })
-      .finally(() => {
-        void bot.stop().finally(() => process.exit(0));
-      });
   };
 
   process.once("SIGINT", () => shutdown("SIGINT"));
