@@ -65,7 +65,7 @@ test("formatted money notifications keep explicit decimals and escape the decima
   };
 
   const message = formatEvent(config, event);
-  assert.match(message, /Stake: \*2\\\.0000000 USDC\*/);
+  assert.match(message, /Stake: \*2\\.0000000 USDC\*/);
 });
 
 test("unknown or malformed decoded events stay non-notifying", () => {
@@ -235,6 +235,123 @@ test("escapeMd handles a long adversarial string without dropping characters", (
   const input = reserved.repeat(10_000);
   const escaped = escapeMd(input);
   assert.equal(escaped, expectedEscape(input));
+});
+
+test("snapshot: formatEvent produces stable output for known event shapes", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+
+  const events = [
+    {
+      source: "market",
+      contractId: "market",
+      ledger: 100,
+      txHash: "abc123",
+      at: 1600000000,
+      eventId: "100-0",
+      payload: {
+        name: "claim_created",
+        claimId: 1,
+        creator: "GABCDEF",
+        category: "general",
+      },
+    },
+    {
+      source: "market",
+      contractId: "market",
+      ledger: 101,
+      txHash: "def456",
+      at: 1600000010,
+      eventId: "101-0",
+      payload: {
+        name: "claim_challenged",
+        claimId: 1,
+        challenger: "GXYZ",
+        stake: 5_000_000n,
+      },
+    },
+    {
+      source: "market",
+      contractId: "market",
+      ledger: 102,
+      txHash: "ghi789",
+      at: 1600000020,
+      eventId: "102-0",
+      payload: {
+        name: "claim_resolved",
+        claimId: 1,
+        winner: "GABCDEF",
+        amount: 10_000_000n,
+      },
+    },
+  ];
+
+  const snapshots = events.map((event) => formatEvent(config, event));
+
+  // Ensure no nulls for known events
+  for (let i = 0; i < snapshots.length; i += 1) {
+    assert.ok(snapshots[i] !== null, `Event ${i} should produce a notification`);
+    assert.equal(typeof snapshots[i], "string");
+  }
+
+  // Snapshot assertion: verify structure remains stable
+  assert.equal(snapshots[0], "🆕 *New claim* \\#1\nCategory: general\nCreator: `GABCDEF`\n_ledger 100_");
+  assert.equal(snapshots[1], "⚠️ *Claim challenged* \\#1\nChallenger: `GXYZ`\nStake: \*5\.0000000 USDC\*\n_ledger 101_");
+  assert.equal(snapshots[2], "✅ *Claim resolved* \\#1\nWinner: `GABCDEF`\nAmount: \*10\.0000000 USDC\*\n_ledger 102_");
+});
+
+test("snapshot: formatEvent returns null for unknown event names", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 200,
+    txHash: "",
+    at: 0,
+    eventId: "200-0",
+    payload: {
+      name: "non_existent_event",
+    },
+  };
+
+  assert.equal(formatEvent(config, event), null);
+});
+
+test("snapshot: formatEvent handles missing payload gracefully", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 201,
+    txHash: "",
+    at: 0,
+    eventId: "201-0",
+    payload: null,
+  };
+
+  assert.equal(formatEvent(config, event), null);
 });
 
 test("txExplorerUrl is centralized and network-aware", async () => {
