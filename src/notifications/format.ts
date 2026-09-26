@@ -249,6 +249,15 @@ function headline(event: DecodedEvent): string | null {
 
     // Admin events and undecodable shapes get no notification. The poller logs
     // them so a silent bot is distinguishable from an unteachable one.
+    case "oracle_changed":
+    case "ownership_transferred":
+    case "agent_attributed":
+    case "fee_accrued":
+    case "fee_policy_set":
+    case "fee_policy_changed":
+    case "fee_policy_updated":
+    case "fee_policy_removed":
+    case "admin":
     case "unknown":
       return null;
 

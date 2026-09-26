@@ -54,6 +54,7 @@ import {
   decodeEvent,
   dedupeEvents,
   formatUsdc,
+  isAdminPayload,
   sortEvents,
   type ContractSource,
   type DecodedEvent,
@@ -142,9 +143,11 @@ export type ResumeCursorIssue = "cursor-before-floor" | "cursor-after-tip";
  * not understand must still be forwarded to the RPC, so only a cursor this build
  * can *positively* place outside the window is classified at all.
  *
- * `cursor-before-floor` is a retention boundary the RPC owns, so it is
- * classified but still forwarded — the documented contract is that a stale
- * cursor is kept and Soroban's bounded rejection surfaces in `/status`.
+ * `cursor-before-floor` is a retention boundary the RPC owns, so the reader
+ * classifies it but still forwards the cursor — the RPC's bounded stale
+ * rejection stays authoritative. The poller uses the same classification to
+ * decide whether to rewind to the floor, and it only does so when a fresh
+ * `getHealth()` proves the cursor is below it (see `src/poller.ts`).
  * `cursor-after-tip` is impossible for a token this chain minted, so the caller
  * refuses it rather than sending a request that is guaranteed to fail.
  */
@@ -193,8 +196,9 @@ export async function paginatedGetEvents(
 
   if (cursor) {
     // Only a cursor above the tip is refused here. A cursor below the retained
-    // floor is forwarded: retention is the RPC's to judge, and the documented
-    // behaviour is to keep the cursor and surface its bounded stale rejection.
+    // floor is forwarded: retention is the RPC's to judge, and its bounded
+    // stale rejection is what the poller acts on (rewinding only when it can
+    // prove the cursor is below the floor).
     if (resumeCursorProblem(cursor, window) === "cursor-after-tip") {
       const ledger = eventCursorLedger(cursor);
       throw new LedgerWindowError(
@@ -504,9 +508,20 @@ function summarize(event: DecodedEvent): string {
       return `squad #${p.marketId} resolved result=${p.result}`;
     case "claimed":
       return `squad #${p.marketId} ${p.participant} claimed net=${money(p.net)}`;
+    case "oracle_changed":
+      return `oracle changed to ${p.newOracle ?? "unknown"}`;
+    case "ownership_transferred":
+      return `ownership transferred to ${p.newOwner ?? "unknown"}`;
+    case "agent_attributed":
+      return `agent attributed ${p.agent ?? "unknown"}`;
+    case "fee_accrued":
+      return `fee accrued ${p.amount !== undefined ? money(p.amount) : ""} to ${p.recipient ?? "unknown"}`;
+    case "admin":
+      return `admin event ${p.action}`;
     case "unknown":
       return `unknown "${p.eventName}"${p.reason ? ` (${p.reason})` : ""}`;
     default:
+      if (isAdminPayload(p)) return `admin event ${p.name}`;
       return p.name;
   }
 }
