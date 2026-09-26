@@ -47,7 +47,14 @@ import {
   validateLedgerWindow,
   type LedgerWindow,
 } from "./client.js";
-import { decodeEvent, formatUsdc, type ContractSource, type DecodedEvent } from "./decode.js";
+import {
+  decodeEvent,
+  dedupeEvents,
+  formatUsdc,
+  sortEvents,
+  type ContractSource,
+  type DecodedEvent,
+} from "./decode.js";
 
 /** Events per request. The RPC caps this; 200 is well inside it. */
 export const EVENT_PAGE_LIMIT = 200;
@@ -88,8 +95,13 @@ export interface RawScan {
 
 /**
  * A cursor is `<TOID>-<index>`, and a TOID packs the ledger sequence into its
- * high 32 bits. This parser is only an optimization hint: the original opaque
- * cursor is always passed to RPC unchanged, including when this returns null.
+ * high 32 bits. Reading it lets the walk know it reached the end of the range
+ * from the response it already has, instead of spending another round trip to
+ * discover the cursor stopped moving.
+ *
+ * Returns `null` for anything that is not a numeric `<TOID>-…` cursor — an
+ * opaque token the RPC is free to change shape on. Callers must treat `null`
+ * as "unknown position", never as ledger 0.
  */
 export function eventCursorLedger(cursor: string): number | null {
   if (typeof cursor !== "string") return null;
@@ -204,7 +216,7 @@ export async function paginatedGetEvents(
     events.push(...rawEvents);
     latestLedger = response?.latestLedger ?? latestLedger;
 
-    const nextCursor = response.cursor || "";
+    const nextCursor = typeof response?.cursor === "string" ? response.cursor : "";
     // Out of cursor, or the server stopped moving: nothing left to read.
     if (!nextCursor || nextCursor === previousCursor) break;
 
@@ -257,7 +269,20 @@ export async function readContractEvents(
     opts,
   );
 
-  const events = scan.events.map((event) => decodeEvent(target.source, event));
+  // `decodeEvent` never throws, so a malformed entry degrades to an `unknown`
+  // payload instead of killing the scan. Raw entries that are not objects at
+  // all are skipped — there is nothing to decode and no paging token to keep.
+  const rawEvents = Array.isArray(scan.events) ? scan.events : [];
+  const decoded: DecodedEvent[] = [];
+  for (const event of rawEvents) {
+    if (!event || typeof event !== "object") continue;
+    decoded.push(decodeEvent(target.source, event));
+  }
+
+  // Deterministic order from chain metadata (ledger → transaction index →
+  // operation index → paging token), independent of RPC page splits. Duplicate
+  // paging tokens — the RPC may repeat a page-boundary event — notify once.
+  const events = sortEvents(dedupeEvents(decoded));
   const ledgers = events.map((e) => e.ledger).filter((l) => l > 0);
 
   return {
