@@ -353,6 +353,36 @@ src/
     format.ts              decoded event -> MarkdownV2 message
 ```
 
+## Secret scanning
+
+CI runs a small offline scanner (`scripts/scan-secrets.mjs`, `npm run
+scan:secrets`) on every push and pull request. It looks for exactly the shapes
+this repo could leak — a Telegram bot token, a Stellar `S…` secret seed, a PEM
+private-key block, `apiKey=` / `Bearer …` query/header forms, and
+`TOKEN="…"`-style assignments — and fails with an exit 1 report when one is
+found:
+
+```text
+secret scan failed: 1 finding(s) in 1 file(s) — src/scratch.ts (1)
+  src/scratch.ts:3  [telegram-bot-token]  …const t = "[REDACTED]"…
+
+Real finding? Rotate the secret first, then remove it from history.
+False positive? Narrow the pattern or extend the ignore options in scripts/scan-secrets.mjs.
+```
+
+The report never contains the secret itself — only a redacted context — so it is
+safe to paste into an issue. The scan covers tracked **and** untracked-but-not-ignored
+text files, so a token sitting in a new scratch file is caught before it is ever
+staged; git-ignored files (`.env`, `data/`, `dist/`, `node_modules/`) are never
+scanned, so a real local token cannot turn every run red. Its patterns are
+pinned by `tests/secrets.test.mjs`, which also asserts the repo scans clean.
+
+If a real secret ever lands: rotate it at the provider **first** (BotFather
+`/revoke` for a bot token), then remove it from history — deleting the file in a
+follow-up commit is not enough. The scanner is additive: reverting the commit
+that added it removes the CI gate without touching the bot, the poller, the
+cursor format or any configuration.
+
 ## Development checks
 
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
