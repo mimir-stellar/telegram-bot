@@ -328,4 +328,3 @@ export async function registerCommands(bot: Bot): Promise<void> {
     console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);
   }
 }
-

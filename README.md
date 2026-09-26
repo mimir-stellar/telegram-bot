@@ -255,15 +255,6 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 
 - **A failed RPC call** fails one contract's scan for one cycle. Its cursor is
   left untouched, so the next cycle resumes exactly where it stopped.
-- **A failed Telegram send** (after bounded in-cycle retries) parks one message
-  on a local dead-letter queue (`data/dead-letter.json` by default) and the
-  cursor still advances. Holding the cursor back would turn a revoked token or
-  a chat the bot was removed from into an infinite replay. Later cycles replay
-  the queue (oldest first, still under `MAX_NOTIFICATIONS_PER_CYCLE`) so a
-  transient Telegram outage can still deliver. The queue is bounded
-  (`DEAD_LETTER_MAX`); when full, the oldest entry is dropped. The chain remains
-  the record if an entry is dropped or exhausts `DEAD_LETTER_MAX_ATTEMPTS`.
-- **A corrupt cursor file** is treated as a cold start rather than a crash.
 - **A partial notification batch** commits the opaque RPC cursor after the
   returned page has been processed. Unknown events, events beyond
   `MAX_NOTIFICATIONS_PER_CYCLE`, and sends that exhaust three bounded retries
@@ -276,6 +267,14 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   that cursor, the error becomes visible in `/status`, and scheduled retries or
   `/resume` use the same position. Recovery follows the incident runbook rather
   than replacing an opaque cursor with a guessed ledger.
+- **A failed Telegram send** (after bounded in-cycle retries) parks one message
+  on a local dead-letter queue (`data/dead-letter.json` by default) and the
+  cursor still advances. Holding the cursor back would turn a revoked token or
+  a chat the bot was removed from into an infinite replay. Later cycles replay
+  the queue (oldest first, still under `MAX_NOTIFICATIONS_PER_CYCLE`) so a
+  transient Telegram outage can still deliver. The queue is bounded
+  (`DEAD_LETTER_MAX`); when full, the oldest entry is dropped. The chain remains
+  the record if an entry is dropped or exhausts `DEAD_LETTER_MAX_ATTEMPTS`.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
@@ -365,6 +364,29 @@ src/
 
 ## Development checks
 
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+
+### Lockfile reproducibility
+
+`package-lock.json` is the install of record: deployments rebuild with `npm ci`,
+so the committed lockfile must stay in sync with `package.json` and pin exactly
+what it claims. Two checks enforce that, and CI runs both after `npm ci`:
+
+- `npm run lockfile:check` — offline. The lockfile is `lockfileVersion` 3, its
+  root entry matches `package.json`'s dependency ranges exactly, every package
+  resolves to a `registry.npmjs.org` tarball with a `sha512` integrity hash, and
+  every direct dependency is pinned at the top level. Drift is reported by
+  package name instead of being silently re-resolved.
+- `npm run lockfile:reproduce` — asks npm to regenerate the lockfile from itself
+  in a scratch directory and fails if the resolved package set changes, so a
+  hand-edited or partially-resolved lockfile cannot land. The repository working
+  tree is never written to.
+
+The offline suite runs as part of `npm test` (`tests/lockfile.test.mjs`), so
+drift is caught locally without network access. To change dependencies, edit
+`package.json`, run `npm install` to regenerate the lockfile, and commit both
+files together — a lockfile that no longer matches `package.json` fails
+`npm ci`, `npm run lockfile:check`, and CI.
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile and health suites (`npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.

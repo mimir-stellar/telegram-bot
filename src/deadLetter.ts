@@ -53,7 +53,7 @@ export interface DeadLetterQueueOptions {
 const ERROR_TRUNCATE = 200;
 const TEXT_TRUNCATE = 4_000;
 
-function errMessage(err: unknown): string {
+function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
@@ -139,7 +139,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       }
     } catch (err) {
       console.warn(
-        `[dead-letter] unreadable file at ${options.filePath}, starting empty: ${errMessage(err)}`,
+        `[dead-letter] unreadable file at ${options.filePath}, starting empty: ${errorMessage(err)}`,
       );
       entries = [];
     }
@@ -161,7 +161,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, options.filePath);
     } catch (err) {
-      console.error(`[dead-letter] could not persist queue: ${errMessage(err)}`);
+      console.error(`[dead-letter] could not persist queue: ${errorMessage(err)}`);
     }
     syncDepth();
   }
@@ -177,7 +177,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     const existing = entries.find((e) => e.id === id);
     if (existing) {
       existing.attempts += 1;
-      existing.lastError = truncate(errMessage(input.error), ERROR_TRUNCATE);
+      existing.lastError = truncate(errorMessage(input.error), ERROR_TRUNCATE);
       await persist();
       return existing;
     }
@@ -201,7 +201,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       eventName: input.eventName,
       text: truncate(input.text, TEXT_TRUNCATE),
       attempts: 1,
-      lastError: truncate(errMessage(input.error), ERROR_TRUNCATE),
+      lastError: truncate(errorMessage(input.error), ERROR_TRUNCATE),
     };
     entries.push(entry);
     stats.enqueued += 1;
@@ -245,7 +245,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         );
       } catch (err) {
         entry.attempts += 1;
-        entry.lastError = truncate(errMessage(err), ERROR_TRUNCATE);
+        entry.lastError = truncate(errorMessage(err), ERROR_TRUNCATE);
         if (entry.attempts >= options.maxAttempts) {
           stats.dropped += 1;
           console.error(

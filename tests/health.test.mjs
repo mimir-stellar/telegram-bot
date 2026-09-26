@@ -372,4 +372,3 @@ test("registerCommands registers /health command with setMyCommands", async () =
   assert.ok(healthCmd);
   assert.equal(healthCmd.description, "Health assessment and operational readiness");
 });
-
