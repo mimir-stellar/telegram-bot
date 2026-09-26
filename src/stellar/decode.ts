@@ -92,67 +92,27 @@ export type MarketPayload =
   | { name: "withdrawal"; to: string; amount: bigint }
   | { name: "withdrawal_pending"; to: string; amount: bigint };
 
-export type SquadMarketCreatedPayload = {
-  name: "market_created";
-  marketId: number;
-  captain: string;
-  deadline: number;
-  feeBps: number;
-  question: string;
-};
-
-export type SquadDepositedPayload = {
-  name: "deposited";
-  marketId: number;
-  side: number;
-  participant: string;
-  amount: bigint;
-  shares: bigint;
-};
-
-export type SquadWithdrawnPayload = {
-  name: "withdrawn";
-  marketId: number;
-  side: number;
-  participant: string;
-  amount: bigint;
-};
-
-export type SquadResolvedPayload = {
-  name: "resolved";
-  marketId: number;
-  result: number;
-  poolA: bigint;
-  poolB: bigint;
-};
-
-export type SquadClaimedPayload = {
-  name: "claimed";
-  marketId: number;
-  participant: string;
-  gross: bigint;
-  fee: bigint;
-  net: bigint;
-};
-
-export type SquadFeesClaimedPayload = {
-  name: "fees_claimed";
-  recipient: string;
-  amount: bigint;
-};
-
 export type SquadPayload =
-  | SquadMarketCreatedPayload
-  | SquadDepositedPayload
-  | SquadWithdrawnPayload
-  | SquadResolvedPayload
-  | SquadClaimedPayload
-  | SquadFeesClaimedPayload;
-
-export type SquadEvent = EventMeta & {
-  source: "squad";
-  payload: SquadPayload | UnknownPayload;
-};
+  | {
+      name: "market_created";
+      marketId: number;
+      captain: string;
+      deadline: number;
+      feeBps: number;
+      question: string;
+    }
+  | {
+      name: "deposited";
+      marketId: number;
+      side: number;
+      participant: string;
+      amount: bigint;
+      shares: bigint;
+    }
+  | { name: "withdrawn"; marketId: number; side: number; participant: string; amount: bigint }
+  | { name: "resolved"; marketId: number; result: number; poolA: bigint; poolB: bigint }
+  | { name: "claimed"; marketId: number; participant: string; gross: bigint; fee: bigint; net: bigint }
+  | { name: "fees_claimed"; recipient: string; amount: bigint };
 
 /**
  * Anything this bot has no notification for: admin events (`oracle_changed`,
@@ -167,58 +127,70 @@ export interface UnknownPayload {
 
 export type EventPayload = MarketPayload | SquadPayload | UnknownPayload;
 
-export type ClaimCreatedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_created" }> };
-export type ClaimChallengedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_challenged" }> };
-export type ClaimResolvedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_resolved" }> };
-export type ClaimCancelledEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_cancelled" }> };
-export type MarketSettledEvent = EventMeta & { payload: Extract<MarketPayload, { name: "market_settled" }> };
-export type ChallengerPaidEvent = EventMeta & { payload: Extract<MarketPayload, { name: "challenger_paid" }> };
-export type FeeClaimedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "fee_claimed" }> };
-export type WithdrawalEvent = EventMeta & { payload: Extract<MarketPayload, { name: "withdrawal" }> };
-export type WithdrawalPendingEvent = EventMeta & { payload: Extract<MarketPayload, { name: "withdrawal_pending" }> };
-
-export type SquadMarketCreatedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "market_created" }> };
-export type SquadDepositedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "deposited" }> };
-export type SquadWithdrawnEvent = EventMeta & { payload: Extract<SquadPayload, { name: "withdrawn" }> };
-export type SquadResolvedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "resolved" }> };
-export type SquadClaimedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "claimed" }> };
-export type SquadFeesClaimedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "fees_claimed" }> };
-
-export type UnknownMarketEvent = EventMeta & { payload: UnknownPayload };
-
-export type MarketEvent =
-  | ClaimCreatedEvent
-  | ClaimChallengedEvent
-  | ClaimResolvedEvent
-  | ClaimCancelledEvent
-  | MarketSettledEvent
-  | ChallengerPaidEvent
-  | FeeClaimedEvent
-  | WithdrawalEvent
-  | WithdrawalPendingEvent
-  | SquadMarketCreatedEvent
-  | SquadDepositedEvent
-  | SquadWithdrawnEvent
-  | SquadResolvedEvent
-  | SquadClaimedEvent
-  | SquadFeesClaimedEvent
-  | UnknownMarketEvent;
-
-export type DecodedEvent = MarketEvent;
-
-/** Keep decoder diagnostics useful without copying an unbounded RPC payload. */
-const MAX_DIAGNOSTIC_LENGTH = 200;
-
-function diagnostic(value: unknown): string {
-  const compact = String(value).replace(/\s+/g, " ").trim() || "unknown error";
-  return compact.length <= MAX_DIAGNOSTIC_LENGTH
-    ? compact
-    : `${compact.slice(0, MAX_DIAGNOSTIC_LENGTH - 1)}…`;
-}
+export type DecodedEvent = EventMeta & { payload: EventPayload };
 
 // ── Scalar helpers ───────────────────────────────────────────────────────────
 
 class DecodeError extends Error {}
+
+/**
+ * Soft ceiling on a single event's decoded footprint.
+ *
+ * Soroban events can carry arbitrary `String` / `Bytes` values (claim summaries,
+ * evidence hashes, questions). Without a bound, a malicious or buggy contract
+ * could force the notifier to allocate and later JSON-log multi-megabyte
+ * payloads every poll cycle. The cap is measured on the XDR wire form *before*
+ * `scValToNative`, so oversized values never inflate into JS strings.
+ *
+ * 16 KiB is well above any legitimate Mimir event seen on Testnet and well
+ * below Telegram's 4096-char message limit once formatting is applied.
+ */
+export const MAX_DECODED_EVENT_XDR_BYTES = 16_384;
+
+/** Per-topic XDR budget (event name + ids/addresses are tiny). */
+export const MAX_EVENT_TOPIC_XDR_BYTES = 1_024;
+
+/** Hard ceiling on any single decoded string field after native conversion. */
+export const MAX_DECODED_STRING_CHARS = 2_048;
+
+function scValXdrBytes(value: xdr.ScVal | null | undefined): number {
+  if (!value) return 0;
+  try {
+    // Buffer length in Node; Uint8Array elsewhere.
+    const xdrBytes = value.toXDR();
+    return xdrBytes.byteLength ?? (xdrBytes as Buffer).length;
+  } catch {
+    // Unreadable XDR is treated as oversized so decode fails closed.
+    return MAX_DECODED_EVENT_XDR_BYTES + 1;
+  }
+}
+
+function assertEventXdrWithinCap(event: rpc.Api.EventResponse): void {
+  const valueBytes = scValXdrBytes(event.value);
+  if (valueBytes > MAX_DECODED_EVENT_XDR_BYTES) {
+    throw new DecodeError(
+      `event.value XDR ${valueBytes} bytes exceeds cap of ${MAX_DECODED_EVENT_XDR_BYTES}`,
+    );
+  }
+
+  const topics = event.topic ?? [];
+  let topicTotal = 0;
+  for (let i = 0; i < topics.length; i += 1) {
+    const n = scValXdrBytes(topics[i]);
+    if (n > MAX_EVENT_TOPIC_XDR_BYTES) {
+      throw new DecodeError(
+        `event.topic[${i}] XDR ${n} bytes exceeds per-topic cap of ${MAX_EVENT_TOPIC_XDR_BYTES}`,
+      );
+    }
+    topicTotal += n;
+  }
+  if (topicTotal > MAX_DECODED_EVENT_XDR_BYTES) {
+    throw new DecodeError(
+      `event.topic XDR total ${topicTotal} bytes exceeds cap of ${MAX_DECODED_EVENT_XDR_BYTES}`,
+    );
+  }
+}
+
 
 function native(value: xdr.ScVal): unknown {
   return scValToNative(value);
@@ -235,21 +207,9 @@ function big(value: unknown, what: string): bigint {
   throw new DecodeError(`${what}: expected an integer, got ${typeof value}`);
 }
 
-/** Reject negative amounts, returning non-negative bigint. */
-function amount(value: unknown, what: string): bigint {
-  const b = big(value, what);
-  if (b < 0n) {
-    throw new DecodeError(`${what}: expected non-negative amount, got ${b}`);
-  }
-  return b;
-}
-
 /** For ids, deadlines and bps — small enough that `number` is honest. */
 function num(value: unknown, what: string): number {
   const asBig = big(value, what);
-  if (asBig < 0n) {
-    throw new DecodeError(`${what}: expected non-negative integer, got ${asBig}`);
-  }
   if (asBig > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new DecodeError(`${what}: ${asBig} exceeds the safe integer range`);
   }
@@ -257,11 +217,22 @@ function num(value: unknown, what: string): number {
 }
 
 function str(value: unknown, what: string): string {
-  if (typeof value === "string") return value;
-  // A contract `String` normally decodes to a JS string, but bytes-shaped
-  // payloads show up as Buffer on some SDK paths.
-  if (value instanceof Uint8Array) return Buffer.from(value).toString("utf8");
-  throw new DecodeError(`${what}: expected a string, got ${typeof value}`);
+  let s: string;
+  if (typeof value === "string") {
+    s = value;
+  } else if (value instanceof Uint8Array) {
+    // A contract `String` normally decodes to a JS string, but bytes-shaped
+    // payloads show up as Buffer on some SDK paths.
+    s = Buffer.from(value).toString("utf8");
+  } else {
+    throw new DecodeError(`${what}: expected a string, got ${typeof value}`);
+  }
+  if (s.length > MAX_DECODED_STRING_CHARS) {
+    throw new DecodeError(
+      `${what}: string length ${s.length} exceeds cap of ${MAX_DECODED_STRING_CHARS}`,
+    );
+  }
+  return s;
 }
 
 /** An `Address` decodes to its `G…`/`C…` strkey. */
@@ -310,7 +281,7 @@ function decodeMarket(
           topicAt(topics, 2, "claim_challenged.challenger"),
           "claim_challenged.challenger",
         ),
-        stake: amount(fields.stake, "claim_challenged.stake"),
+        stake: big(fields.stake, "claim_challenged.stake"),
       };
 
     case "claim_resolved":
@@ -333,10 +304,10 @@ function decodeMarket(
       return {
         name,
         claimId: num(topicAt(topics, 1, "market_settled.id"), "market_settled.id"),
-        totalPaid: amount(fields.total_paid, "market_settled.total_paid"),
-        totalFees: amount(fields.total_fees, "market_settled.total_fees"),
-        owedToChallengers: amount(fields.owed_to_challengers, "market_settled.owed_to_challengers"),
-        dust: amount(fields.dust, "market_settled.dust"),
+        totalPaid: big(fields.total_paid, "market_settled.total_paid"),
+        totalFees: big(fields.total_fees, "market_settled.total_fees"),
+        owedToChallengers: big(fields.owed_to_challengers, "market_settled.owed_to_challengers"),
+        dust: big(fields.dust, "market_settled.dust"),
       };
 
     case "challenger_paid":
@@ -347,17 +318,17 @@ function decodeMarket(
           topicAt(topics, 2, "challenger_paid.challenger"),
           "challenger_paid.challenger",
         ),
-        stake: amount(fields.stake, "challenger_paid.stake"),
-        gross: amount(fields.gross, "challenger_paid.gross"),
-        fee: amount(fields.fee, "challenger_paid.fee"),
-        net: amount(fields.net, "challenger_paid.net"),
+        stake: big(fields.stake, "challenger_paid.stake"),
+        gross: big(fields.gross, "challenger_paid.gross"),
+        fee: big(fields.fee, "challenger_paid.fee"),
+        net: big(fields.net, "challenger_paid.net"),
       };
 
     case "fee_claimed":
       return {
         name,
         recipient: addr(topicAt(topics, 1, "fee_claimed.recipient"), "fee_claimed.recipient"),
-        amount: amount(fields.amount, "fee_claimed.amount"),
+        amount: big(fields.amount, "fee_claimed.amount"),
       };
 
     case "withdrawal":
@@ -365,7 +336,7 @@ function decodeMarket(
       return {
         name,
         to: addr(topicAt(topics, 1, `${name}.to`), `${name}.to`),
-        amount: amount(fields.amount, `${name}.amount`),
+        amount: big(fields.amount, `${name}.amount`),
       };
 
     default:
@@ -397,8 +368,8 @@ function decodeSquad(
         marketId: num(topicAt(topics, 1, "deposited.market_id"), "deposited.market_id"),
         side: num(topicAt(topics, 2, "deposited.side"), "deposited.side"),
         participant: addr(topicAt(topics, 3, "deposited.participant"), "deposited.participant"),
-        amount: amount(fields.amount, "deposited.amount"),
-        shares: amount(fields.shares, "deposited.shares"),
+        amount: big(fields.amount, "deposited.amount"),
+        shares: big(fields.shares, "deposited.shares"),
       };
 
     case "withdrawn":
@@ -407,7 +378,7 @@ function decodeSquad(
         marketId: num(topicAt(topics, 1, "withdrawn.market_id"), "withdrawn.market_id"),
         side: num(topicAt(topics, 2, "withdrawn.side"), "withdrawn.side"),
         participant: addr(topicAt(topics, 3, "withdrawn.participant"), "withdrawn.participant"),
-        amount: amount(fields.amount, "withdrawn.amount"),
+        amount: big(fields.amount, "withdrawn.amount"),
       };
 
     case "resolved":
@@ -415,8 +386,8 @@ function decodeSquad(
         name,
         marketId: num(topicAt(topics, 1, "resolved.market_id"), "resolved.market_id"),
         result: num(fields.result, "resolved.result"),
-        poolA: amount(fields.pool_a, "resolved.pool_a"),
-        poolB: amount(fields.pool_b, "resolved.pool_b"),
+        poolA: big(fields.pool_a, "resolved.pool_a"),
+        poolB: big(fields.pool_b, "resolved.pool_b"),
       };
 
     case "claimed":
@@ -424,16 +395,16 @@ function decodeSquad(
         name,
         marketId: num(topicAt(topics, 1, "claimed.market_id"), "claimed.market_id"),
         participant: addr(topicAt(topics, 2, "claimed.participant"), "claimed.participant"),
-        gross: amount(fields.gross, "claimed.gross"),
-        fee: amount(fields.fee, "claimed.fee"),
-        net: amount(fields.net, "claimed.net"),
+        gross: big(fields.gross, "claimed.gross"),
+        fee: big(fields.fee, "claimed.fee"),
+        net: big(fields.net, "claimed.net"),
       };
 
     case "fees_claimed":
       return {
         name,
         recipient: addr(topicAt(topics, 1, "fees_claimed.recipient"), "fees_claimed.recipient"),
-        amount: amount(fields.amount, "fees_claimed.amount"),
+        amount: big(fields.amount, "fees_claimed.amount"),
       };
 
     default:
@@ -445,7 +416,6 @@ function decodeSquad(
 
 /** `event.contractId` is a `Contract` on some SDK paths and a string on others. */
 function contractIdOf(event: rpc.Api.EventResponse): string {
-  if (!event || typeof event !== "object") return "";
   const raw: unknown = (event as { contractId?: unknown }).contractId;
   if (typeof raw === "string") return raw;
   if (raw && typeof raw === "object") {
@@ -467,20 +437,18 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
   const meta: EventMeta = {
     source,
     contractId: contractIdOf(event),
-    ledger: Number(event?.ledger ?? 0),
-    txHash: event?.txHash ?? "",
-    at: Math.floor(new Date(event?.ledgerClosedAt ?? 0).getTime() / 1000),
-    eventId: event?.id ?? "",
+    ledger: Number(event.ledger ?? 0),
+    txHash: event.txHash ?? "",
+    at: Math.floor(new Date(event.ledgerClosedAt ?? 0).getTime() / 1000),
+    eventId: event.id ?? "",
   };
 
   let eventName = "";
   try {
-    if (!event || typeof event !== "object") {
-      throw new DecodeError("invalid or missing event object");
-    }
+    // Fail closed on oversized wire payloads before native conversion allocates.
+    assertEventXdrWithinCap(event);
 
-    const rawTopics = Array.isArray(event.topic) ? event.topic : [];
-    const topics = rawTopics.map((t) => {
+    const topics = (event.topic ?? []).map((t) => {
       try {
         return native(t);
       } catch {
@@ -491,17 +459,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     const first = topics[0];
     eventName = typeof first === "string" ? first : "";
 
-    let decodedValue: unknown = undefined;
-    if (event.value !== undefined && event.value !== null) {
-      try {
-        decodedValue = native(event.value);
-      } catch (err) {
-        throw new DecodeError(
-          `malformed event value XDR: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
-
+    const decodedValue = native(event.value);
     const fields = isRecord(decodedValue) ? decodedValue : {};
 
     const payload =
@@ -509,15 +467,20 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
         ? decodeMarket(eventName, topics, fields)
         : decodeSquad(eventName, topics, fields);
 
-    if (payload) return { ...meta, payload } as DecodedEvent;
+    if (payload) return { ...meta, payload };
     return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
   } catch (err) {
+    const rawReason = err instanceof Error ? err.message : String(err);
+    // Reasons are logged by the poller; keep them short and never re-embed
+    // remote payload bytes that triggered the cap.
+    const reason =
+      rawReason.length > 240 ? `${rawReason.slice(0, 240)}…` : rawReason;
     return {
       ...meta,
       payload: {
         name: "unknown",
         eventName,
-        reason: diagnostic(err instanceof Error ? err.message : err),
+        reason,
       },
     };
   }
@@ -532,6 +495,17 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
  * digits makes the display unit unambiguous (`20000000n` -> `"2.0000000"`)
  * without ever converting through a floating-point number.
  */
+
+/**
+ * JSON-safe view of a payload for logs/CLI. Caps total serialized length so a
+ * capped-but-still-large unknown reason cannot blow up log lines.
+ */
+export function summarizePayloadForLog(payload: EventPayload, maxChars = 512): string {
+  const json = JSON.stringify(payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+  if (json.length <= maxChars) return json;
+  return `${json.slice(0, maxChars)}…`;
+}
+
 export function formatUsdc(units: bigint): string {
   const negative = units < 0n;
   const abs = negative ? -units : units;

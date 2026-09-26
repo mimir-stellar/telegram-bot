@@ -39,7 +39,13 @@ import type { rpc } from "@stellar/stellar-sdk";
 
 import { loadStellarConfig, networkLabel } from "../config.js";
 import { createRpcServer } from "./client.js";
-import { decodeEvent, formatUsdc, type ContractSource, type DecodedEvent } from "./decode.js";
+import {
+  decodeEvent,
+  formatUsdc,
+  summarizePayloadForLog,
+  type ContractSource,
+  type DecodedEvent,
+} from "./decode.js";
 
 /** Events per request. The RPC caps this; 200 is well inside it. */
 export const EVENT_PAGE_LIMIT = 200;
@@ -423,6 +429,7 @@ async function main(): Promise<void> {
     for (const event of show > 0 ? scan.events.slice(-show) : []) {
       console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
       console.log(`  ${summarize(event)}`);
+      console.log(`  ${summarizePayloadForLog(event.payload)}`);
       console.log(
         `  ${boundedJson(event.payload)}`,
       );

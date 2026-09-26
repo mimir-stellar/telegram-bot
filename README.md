@@ -164,6 +164,22 @@ exercises the poller's cursor-safety, restart, and bounded-log guarantees end to
 end. `npm test` covers all of it (`tests/mock-*.test.mjs`); run just those with
 `npm run test:mock`.
 
+
+## Decoded event payload caps
+
+Each Soroban event is size-checked **before** native decoding in
+`src/stellar/decode.ts`:
+
+| Cap | Default | Failure mode |
+|---|---|---|
+| Event `value` XDR | 16 KiB (`MAX_DECODED_EVENT_XDR_BYTES`) | Event becomes `unknown` with a short reason; cursor still advances |
+| Per-topic XDR | 1 KiB (`MAX_EVENT_TOPIC_XDR_BYTES`) | Same |
+| Decoded string field | 2048 chars (`MAX_DECODED_STRING_CHARS`) | Same |
+
+Oversized or malformed events never crash the poller and are never re-logged as
+raw remote bytes — only a truncated reason string is kept. No configuration
+change is required; existing cursors remain valid.
+
 ## How the polling works
 
 Soroban's `getEvents` is **not** `eth_getLogs`, and the difference is the whole
