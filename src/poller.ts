@@ -53,6 +53,7 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { SendExtra } from "./bot.js";
+import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
 import { EventDedupWindow, eventKey } from "./dedup.js";
 import {
@@ -257,6 +258,16 @@ export interface PollerDeps {
    * set. May reject.
    */
   send: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>;
+  /**
+   * Operator audit trail. A fresh one is created when omitted, so the poller
+   * keeps working in callers that do not care about auditing (tests, tooling).
+   */
+  audit?: AuditLog | undefined;
+  /**
+   * Append flushed audit entries to `config.auditFile` each cycle. Enabled by
+   * default; disable for in-memory-only auditing (ephemeral tooling, tests).
+   */
+  persistAudit?: boolean | undefined;
   sendOptions?: SendOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
@@ -749,6 +760,7 @@ async function sendWithRetry(
 
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
+  const audit: AuditLog = deps.audit ?? createAuditLog();
   const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
   const now = deps.now ?? Date.now;
   const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
@@ -907,6 +919,11 @@ export function createPoller(deps: PollerDeps) {
       // between two quiet scans would report `unknown` until the next event
       // happened to land, hiding a perfectly healthy (or long-stalled) chain.
       status.chainClockAt = parsed.chainClockAt ?? null;
+      audit.record(
+        auditEntry("cursor_loaded", {
+          detail: [...state.values()].map((t) => `${t.source}@${t.cursor ?? "none"}`).join(" "),
+        }),
+      );
       console.log(
         `[poller] resumed from ${config.cursorFile}: ` +
           [...state.values()]
@@ -960,7 +977,26 @@ export function createPoller(deps: PollerDeps) {
       // retries. If nothing had changed, write-then-rename left the old file
       // intact and there is still nothing to flush.
       console.error(`[poller] could not persist cursor (${reason}): ${errorMessage(err)}`);
+      audit.recordError(err, "cursor_persist_failed");
       return false;
+    }
+  }
+
+  /**
+   * Append buffered audit entries to the JSONL audit trail. Failure to audit
+   * must never take the loop down (or even warn every cycle if the disk is
+   * wedged): log once, drop the batch, keep running.
+   */
+  async function flushAudit(): Promise<void> {
+    const pending = audit.flush();
+    if (deps.persistAudit === false || pending.length === 0) return;
+    // Some callers (tests, tooling) build a partial config with no auditFile.
+    // In-memory auditing still works; there is simply nowhere to persist to.
+    if (typeof config.auditFile !== "string" || config.auditFile === "") return;
+    try {
+      await appendAuditFile(config.auditFile, pending);
+    } catch (err) {
+      console.error(`[poller] could not append audit log: ${errorMessage(err)}`);
     }
   }
 
@@ -1012,6 +1048,14 @@ export function createPoller(deps: PollerDeps) {
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
         skipped += 1;
+        audit.record(
+          auditEntry("event_skipped", {
+            source: event.source,
+            detail:
+              `${event.payload.eventName} at ledger ${event.ledger}` +
+              (event.payload.reason ? `: ${event.payload.reason}` : ""),
+          }),
+        );
         console.log(
           `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
             `at ledger ${event.ledger}` +
@@ -1055,12 +1099,26 @@ export function createPoller(deps: PollerDeps) {
       if (text === null) {
         status.eventsSkipped += 1;
         skipped += 1;
+        audit.record(
+          auditEntry("event_skipped", {
+            source: event.source,
+            detail: `${event.payload.name} at ledger ${event.ledger}: notifiable text was null`,
+          }),
+        );
         continue;
       }
 
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
         status.eventsSkipped += 1;
         skipped += 1;
+        audit.record(
+          auditEntry("cap_reached", {
+            source: event.source,
+            detail:
+              `${event.payload.name} at ledger ${event.ledger} dropped; ` +
+              `cap is ${config.maxNotificationsPerCycle} per cycle`,
+          }),
+        );
         console.warn(
           `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
             `dropping ${event.payload.name} at ledger ${event.ledger}`,
@@ -1077,6 +1135,10 @@ export function createPoller(deps: PollerDeps) {
         // All retries exhausted; drop the message but continue processing others.
         status.notificationsFailed += 1;
         failed += 1;
+        audit.recordError(err, "send_failed", {
+          source: event.source,
+          detail: `${event.payload.name} at ledger ${event.ledger}`,
+        });
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
             errorMessage(err),
@@ -1208,6 +1270,7 @@ export function createPoller(deps: PollerDeps) {
       for (const target of targets) {
         const current = state.get(target.source);
         if (!current) continue;
+        const previousFailed = current.lastError !== null;
 
         try {
           const dedupWindow = dedup.get(target.source) ?? new EventDedupWindow(0);
@@ -1232,6 +1295,15 @@ export function createPoller(deps: PollerDeps) {
           status.oldestLedger = scan.oldestLedger;
           current.lastError = null;
           anyOk = true;
+
+          if (previousFailed) {
+            audit.record(
+              auditEntry("cycle_recovered", {
+                source: target.source,
+                detail: `scan ok after failure; cursor ${current.cursor ?? "none"}`,
+              }),
+            );
+          }
 
           if (rewinding) {
             // The walk is back from the floor: once it hands back a resume
@@ -1335,8 +1407,17 @@ export function createPoller(deps: PollerDeps) {
           const message = errorMessage(err);
           current.lastError = message;
           status.lastError = { at: now(), message: `${target.source}: ${message}` };
+          audit.recordError(err, "cycle_failed", { source: target.source });
           console.error(`[poller] ${target.source} scan failed: ${message}`);
           if (isStaleCursorError(message)) {
+            audit.record(
+              auditEntry("stale_cursor", {
+                source: target.source,
+                detail:
+                  `cursor below the RPC's retained window; ` +
+                  `checking the retained floor before any rewind`,
+              }),
+            );
             // A stale rejection is the only hint; the rewind itself is gated on
             // a fresh getHealth() that proves the cursor is below the floor.
             // Only bounded metadata is logged — never a token or RPC payload.
@@ -1383,6 +1464,7 @@ export function createPoller(deps: PollerDeps) {
         inFlight = false;
         endCycleTracking();
       }
+      await flushAudit();
       if (explicitBackoff !== null) return explicitBackoff;
     }
   }
@@ -1408,6 +1490,8 @@ export function createPoller(deps: PollerDeps) {
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
       status.lastError = { at: now(), message: errorMessage(err) };
+      audit.recordError(err, "cycle_failed");
+      await flushAudit();
       console.error(`[poller] cycle threw: ${errorMessage(err)}`);
       inFlight = false;
     }
@@ -1459,6 +1543,7 @@ export function createPoller(deps: PollerDeps) {
           `every ${config.pollIntervalMs}ms`,
       );
       await persistStatus();
+      await flushAudit();
       void loop();
     },
 
@@ -1575,6 +1660,13 @@ export function createPoller(deps: PollerDeps) {
     /** Machine-readable snapshot, same shape as the file on disk. */
     snapshot(): StatusSnapshot {
       return snapshot();
+    },
+
+    audit,
+
+    /** Persist buffered audit entries now (used on shutdown). */
+    flushAuditFile(): Promise<void> {
+      return flushAudit();
     },
   };
 }

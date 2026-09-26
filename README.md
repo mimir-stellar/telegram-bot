@@ -62,10 +62,10 @@ which covers `/status` and the operator controls below.
 ### 3. Choose an operator (optional)
 
 Set `OPERATOR_TELEGRAM_USER_ID` to the numeric **user** id returned by
-`@userinfobot` to enable `/pause` and `/resume`. The notification
+`@userinfobot` to enable `/audit`, `/pause`, and `/resume`. The notification
 `TELEGRAM_CHAT_ID` is intentionally not accepted as authorization: in a group,
 everyone can send messages from that chat. If this variable is omitted, existing
-deployments continue unchanged and both operator commands are ignored.
+deployments continue unchanged and the operator commands are ignored.
 
 ### 4. Configure and run
 
@@ -109,13 +109,15 @@ looks healthy but notifies nobody.
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
 | `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip counters (plus messages dropped by a shutdown drain and cursors automatically rewound to the retained floor), and the last error |
+| `/audit` | Operator only. The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
 
 Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
-response and cannot mutate poller state. Repeated `/pause` or `/resume` commands
+response and cannot mutate poller state — this includes `/audit`, whose report
+is operator-only. Repeated `/pause` or `/resume` commands
 are idempotent. Control state is process-local: a restart resumes polling and
 loads the existing version-1 cursor file.
 
@@ -205,6 +207,42 @@ stays valid. Each target reports its `startLedger` and `startClamped`, so it is
 clear when a requested `--from` was moved up to the retained floor. Neither mode
 prints bot tokens or signing keys — the scanner never holds them. This is how the
 decoder was verified against the live deployment.
+
+## Operator audit trail
+
+`/status` says what the poller is doing *right now*. The audit trail answers the
+question after a week of unattended running: **what actually happened** — scan
+failures and recoveries, failed Telegram sends, skipped admin events, bursts
+truncated by the per-cycle cap, cursor loads, stale cursors and cursor write
+failures.
+
+It is an append-only JSONL file (`data/audit.jsonl` by default; `AUDIT_FILE`
+changes it, leaving the value empty disables it). The poller appends after every
+cycle, so the trail survives restarts alongside the cursor. Read it two ways:
+
+```bash
+npm run audit                  # report from data/audit.jsonl
+npm run audit -- --tail 50     # render the 50 most recent lines
+npm run audit -- --json        # machine-readable stats only
+npm run audit -- --file p.jsonl
+```
+
+or send `/audit` in the chat as the operator, which merges the live in-memory
+window with the file so entries not yet flushed are still visible.
+
+Everything in the trail is safe to paste into an issue, and this is enforced
+when an entry is recorded, not by caller discipline:
+
+- Free-text details pass redaction first: bot tokens, secret/seed strkeys, URLs
+  and any unrecognized long token are replaced. Public `C…` contract ids and
+  `G…` account ids stay readable — they are chain identifiers `/status` already
+  prints.
+- Details are length-clamped (240 chars). No payloads, payment amounts as log
+  lines, or unbounded remote data are ever stored — the chain is the record.
+- The in-memory window and the report are both bounded, and the report says so
+  when older entries were not shown.
+- Reading never throws on you: an unreadable or unknown-version line is skipped
+  and counted, never fatal.
 
 ## Local mock profile
 
@@ -348,7 +386,9 @@ values are supported without changing cursor or decoder compatibility.
 
 The poller writes its resume position to `data/cursor.json` (write-then-rename,
 so a crash mid-write cannot truncate it). The on-disk document is a **versioned
-schema** (`version: 1` today):
+schema** (`version: 1` today), and the poller appends audit entries to
+`data/audit.jsonl`. Both must survive restarts, so give `data/` the same
+treatment as the cursor:
 
 ```json
 {
@@ -481,6 +521,9 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
   compact, bounded, and the configured bot token is redacted.
+- **An unreadable audit line** (or a failed append) is logged and skipped; the
+  audit trail never throws into the poll loop, and a bad line never takes the
+  report down. An audit file that cannot be read at all reports as empty.
 - **A duplicate event** — the same id from an overlapping page, a resumed
   cursor, or a restart — is suppressed and counted (`eventsDeduplicated`), never
   posted twice. It does not hold the cursor back. Bounded per contract by
@@ -625,9 +668,11 @@ src/
   mock-run.ts              dry run: in-process mock RPC + real poller, log-only sends
   health.ts                local loopback GET /health for supervisors
   config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
-  bot.ts                   grammy setup: /start, /help, /status, /contracts, operator pause/resume
+  bot.ts                   grammy setup: /start, /help, /status, /audit, /contracts, /health, /preview, operator pause/resume
   dedup.ts                 bounded event-id window (reader + poller dedup)
-  poller.ts                the loop: scan, notify, persist the cursor
+  poller.ts                the loop: scan, notify, persist the cursor, flush audit
+  audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
+  audit-cli.ts             entrypoint for `npm run audit`
   instanceLock.ts          exclusive process lock for the cursor owner
   status.ts                machine-readable status snapshot (allowlisted, bounded)
   stellar/
@@ -638,6 +683,9 @@ src/
     mock-constants.ts      mock profile fixture ids, ports, placeholder credentials
   notifications/
     format.ts              decoded event -> MarkdownV2 message
+tests/
+  format.test.mjs          notification formatting (incl. deterministic fuzz)
+  audit.test.mjs           redaction, entries, persistence, report rendering
 ```
 
 ## Deploying on Railway
@@ -684,7 +732,7 @@ truth for IaC; follow Railway's migration guide when the time comes.
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 ### Lockfile reproducibility
 
@@ -707,9 +755,9 @@ drift is caught locally without network access. To change dependencies, edit
 `package.json`, run `npm install` to regenerate the lockfile, and commit both
 files together — a lockfile that no longer matches `package.json` fails
 `npm ci`, `npm run lockfile:check`, and CI.
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile and health suites (`npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
-Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
+Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md).
 
 ## License
 
