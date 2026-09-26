@@ -72,6 +72,12 @@ export interface RawScan {
   /** True when `maxPages` stopped the walk before the tip. */
   truncated: boolean;
   pages: number;
+  /**
+   * Pages whose payload was empty. On Soroban this is common and expected —
+   * an empty page is not end-of-scan — so operators need the count to tell a
+   * healthy long walk from a stuck or truncated one.
+   */
+  emptyPages: number;
 }
 
 /**
@@ -109,6 +115,7 @@ export async function paginatedGetEvents(
   let latestLedger = health.latestLedger;
   let truncated = false;
   let pages = 0;
+  let emptyPages = 0;
 
   for (;;) {
     if (pages >= maxPages) {
@@ -130,6 +137,9 @@ export async function paginatedGetEvents(
           limit,
         });
 
+    events.push(...response.events);
+    if (response.events.length === 0) emptyPages += 1;
+    latestLedger = response.latestLedger;
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     events.push(...rawEvents);
     latestLedger = response?.latestLedger ?? latestLedger;
@@ -150,7 +160,7 @@ export async function paginatedGetEvents(
     cursor = nextCursor;
   }
 
-  return { events, cursor: lastCursor, latestLedger, oldestLedger, truncated, pages };
+  return { events, cursor: lastCursor, latestLedger, oldestLedger, truncated, pages, emptyPages };
 }
 
 export interface WatchTarget {
@@ -190,6 +200,7 @@ export async function readContractEvents(
     oldestLedger: scan.oldestLedger,
     truncated: scan.truncated,
     pages: scan.pages,
+    emptyPages: scan.emptyPages,
     lastEventLedger: ledgers.length > 0 ? Math.max(...ledgers) : null,
   };
 }
@@ -413,8 +424,8 @@ async function main(): Promise<void> {
     const counts = eventHistogram(scan.events);
 
     console.log(
-      `pages=${scan.pages} events=${scan.events.length} truncated=${scan.truncated} ` +
-        `lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor}`,
+      `pages=${scan.pages} emptyPages=${scan.emptyPages} events=${scan.events.length} ` +
+        `truncated=${scan.truncated} lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor}`,
     );
     for (const [name, count] of Object.entries(counts)) {
       console.log(`  ${count.toString().padStart(4)}  ${name}`);
