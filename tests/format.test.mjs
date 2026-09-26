@@ -41,7 +41,7 @@ test("formatUsdc always renders all seven Stellar USDC decimals", () => {
 
 test("formatted money notifications keep explicit decimals and escape the decimal point", () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -70,7 +70,7 @@ test("formatted money notifications keep explicit decimals and escape the decima
 
 test("unknown or malformed decoded events stay non-notifying", () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -112,7 +112,7 @@ test("escapeMd matches the character-wise rule for deterministic fuzz inputs", (
 
 test("formatted untrusted event text reaches Telegram as exact MarkdownV2", async () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -152,7 +152,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
   await createNotifier(fakeBot, config)(message);
   assert.deepEqual(sent, [
     [
-      config.chatId,
+      config.chatIds[0],
       expectedMessage,
       {
         parse_mode: "MarkdownV2",
@@ -164,7 +164,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
 
 test("oversized event fields are clipped safely before MarkdownV2 escaping", () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -194,7 +194,7 @@ test("oversized event fields are clipped safely before MarkdownV2 escaping", () 
 
 test("oversized squad questions are clipped without splitting emoji", () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -227,7 +227,7 @@ test("oversized squad questions are clipped without splitting emoji", () => {
 test("createNotifier preserves Telegram send failures for the poller", async () => {
   const error = new Error("Telegram API unavailable");
   const fakeBot = { api: { sendMessage: async () => Promise.reject(error) } };
-  const notify = createNotifier(fakeBot, { chatId: "-1001234567890" });
+  const notify = createNotifier(fakeBot, { chatIds: ["-1001234567890"] });
   await assert.rejects(notify("message"), error);
 });
 
@@ -279,7 +279,7 @@ test("txExplorerUrl is centralized and network-aware", async () => {
 test("formatEvent prefixes message with [PREVIEW MODE] when channelPreviewMode is enabled", async () => {
   const { formatEvent } = await import("../dist/notifications/format.js");
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -309,7 +309,7 @@ test("formatEvent prefixes message with [PREVIEW MODE] when channelPreviewMode i
 test("formatFallbackEvent formats actionable degraded event notification with redacted reason", async () => {
   const { formatFallbackEvent } = await import("../dist/notifications/format.js");
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",

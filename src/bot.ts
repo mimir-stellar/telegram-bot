@@ -302,10 +302,19 @@ export function createBot(deps: BotDeps): Bot {
   return bot;
 }
 
-/** The poller's send path: one message to the configured chat. */
+/** The poller's send path: messages to all configured chats. */
 export function createNotifier(bot: Bot, config: BotConfig) {
   return async (text: string): Promise<void> => {
-    await bot.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+    const results = await Promise.allSettled(
+      config.chatIds.map(chatId => bot.api.sendMessage(chatId, text, TELEGRAM_OPTIONS))
+    );
+    const errors = results
+      .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+      .map(r => r.reason);
+    
+    if (errors.length > 0) {
+      throw errors[0]; // Throw the first error to satisfy test assertions that expect the exact error
+    }
   };
 }
 

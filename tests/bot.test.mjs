@@ -21,7 +21,7 @@ function baseConfig(overrides = {}) {
     networkPassphrase: "Test SDF Network ; September 2015",
     explorerBaseUrl: "https://example.invalid/explorer",
     botToken: "123456789:TEST-ONLY-TOKEN-NEVER-USE",
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     operatorTelegramUserId: "42",
     pollIntervalMs: 30_000,
     startLookbackLedgers: 60,

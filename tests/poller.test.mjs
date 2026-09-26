@@ -60,7 +60,7 @@ const SQUAD_ID  = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBF4";
 function baseConfig(overrides = {}) {
   return {
     botToken: "fake-token",
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: MARKET_ID,
     squadContractId: SQUAD_ID,
     rpcUrl: "https://soroban-testnet.stellar.org",
