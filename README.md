@@ -62,10 +62,10 @@ which covers `/status` and the operator controls below.
 ### 3. Choose an operator (optional)
 
 Set `OPERATOR_TELEGRAM_USER_ID` to the numeric **user** id returned by
-`@userinfobot` to enable `/pause` and `/resume`. The notification
+`@userinfobot` to enable `/audit`, `/pause`, and `/resume`. The notification
 `TELEGRAM_CHAT_ID` is intentionally not accepted as authorization: in a group,
 everyone can send messages from that chat. If this variable is omitted, existing
-deployments continue unchanged and both operator commands are ignored.
+deployments continue unchanged and the operator commands are ignored.
 
 ### 4. Configure and run
 
@@ -106,14 +106,15 @@ looks healthy but notifies nobody.
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
 | `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
-| `/audit` | The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
+| `/audit` | Operator only. The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
 
 Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
-response and cannot mutate poller state. Repeated `/pause` or `/resume` commands
+response and cannot mutate poller state — this includes `/audit`, whose report
+is operator-only. Repeated `/pause` or `/resume` commands
 are idempotent. Control state is process-local: a restart resumes polling and
 loads the existing version-1 cursor file.
 
@@ -158,8 +159,8 @@ npm run audit -- --json        # machine-readable stats only
 npm run audit -- --file p.jsonl
 ```
 
-or send `/audit` in the chat, which merges the live in-memory window with the
-file so entries not yet flushed are still visible.
+or send `/audit` in the chat as the operator, which merges the live in-memory
+window with the file so entries not yet flushed are still visible.
 
 Everything in the trail is safe to paste into an issue, and this is enforced
 when an entry is recorded, not by caller discipline:

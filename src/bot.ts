@@ -30,7 +30,7 @@ const HELP_BASE = [
   "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
   "",
   "/status — what I am watching and how far I have read",
-  "/audit — the operator audit report, redacted and bounded",
+  "/audit — the operator audit report, redacted and bounded (operator only)",
   "/contracts — the contract ids I watch and where to look them up",
   "/health — health assessment and operational readiness",
   "/preview — preview channel notification formatting",
@@ -284,6 +284,14 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
   });
 
   bot.command("audit", async (ctx) => {
+    if (!isOperator(ctx, config)) {
+      // Same authorization model as /pause and /resume: the report is only
+      // meant for the operator, so other users get silence, not an error that
+      // would confirm the command exists. The standalone `npm run audit` CLI
+      // is the credential-free path for anyone with machine access.
+      console.warn(`[bot] ignored unauthorized /audit on update ${ctx.update.update_id}`);
+      return;
+    }
     try {
       const file = deps.auditFile ?? config.auditFile;
       const summary = await readAuditFile(file);
