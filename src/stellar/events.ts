@@ -86,9 +86,6 @@ export interface RawScan {
   startClamped: boolean;
 }
 
-const MAX_UINT32 = 4_294_967_295n;
-const MAX_UINT64 = 18_446_744_073_709_551_615n;
-
 /**
  * A cursor is `<TOID>-<index>`, and a TOID packs the ledger sequence into its
  * high 32 bits. This parser is only an optimization hint: the original opaque
@@ -96,10 +93,19 @@ const MAX_UINT64 = 18_446_744_073_709_551_615n;
  */
 export function eventCursorLedger(cursor: string): number | null {
   if (typeof cursor !== "string") return null;
-  const toid = cursor.split("-")[0];
-  if (!toid || !/^\d+$/.test(toid)) return null;
+  const match = /^(\d+)-(\d+)$/.exec(cursor);
+  if (!match) return null;
+
+  const toidText = match[1];
+  const indexText = match[2];
+  if (toidText === undefined || indexText === undefined) return null;
+  if (toidText.length > 20 || indexText.length > 10) return null;
+
   try {
-    return Number(BigInt(toid) >> 32n);
+    const toid = BigInt(toidText);
+    const index = BigInt(indexText);
+    if (toid > 18_446_744_073_709_551_615n || index > 4_294_967_295n) return null;
+    return Number(toid >> 32n);
   } catch {
     return null;
   }
