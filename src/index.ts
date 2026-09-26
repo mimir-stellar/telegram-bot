@@ -12,6 +12,7 @@ import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
+import { generateSBOM } from "./sbom.js";
 
 /**
  * Installed before anything else can throw, so a rejection during startup is
@@ -68,6 +69,16 @@ async function main(): Promise<void> {
   console.log(
     `[boot] rpc ok, status=${health.status} ledgers ${health.oldestLedger}..${health.latestLedger}`,
   );
+
+  // Generate SBOM for supply chain transparency and Mimir notifier reliability.
+  // This is a read-only operation that does not affect runtime behavior.
+  try {
+    const sbom = await generateSBOM();
+    console.log(`[boot] sbom generated, sha256=${sbom.sha256}`);
+  } catch (err) {
+    // SBOM generation is best-effort; failure does not prevent the bot from running.
+    console.error(`[warn] sbom generation failed:`, err);
+  }
 
   // The bot needs the poller's status and the poller needs the bot's send path,
   // so one edge of the cycle is late-bound. This one, because it is the only

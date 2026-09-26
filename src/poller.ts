@@ -56,6 +56,8 @@ export interface PollerStatus {
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
   targets: TargetState[];
+  /** SHA-256 digest of the SBOM generated for this deployment image. */
+  sbomDigest: string | null;
   /** RPC circuit breaker state */
   circuitBreaker: {
     open: boolean;
@@ -243,6 +245,7 @@ export function createPoller(deps: PollerDeps) {
     consecutiveFailures: 0,
     lastError: null,
     targets: [],
+    sbomDigest: null,
     circuitBreaker: {
       open: false,
       openedAt: null,
@@ -539,6 +542,14 @@ export function createPoller(deps: PollerDeps) {
           `every ${config.pollIntervalMs}ms`,
       );
       void loop();
+    },
+
+    /**
+     * Attach the SBOM digest for operational reporting.
+     * This is typically set once at startup by the deployment wrapper.
+     */
+    setSbomDigest(digest: string): void {
+      status.sbomDigest = digest;
     },
 
     pause(): PollerPauseResult {
