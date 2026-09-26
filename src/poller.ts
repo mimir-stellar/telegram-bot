@@ -53,6 +53,19 @@ export interface PollerStatus {
    * that have not been sent yet are dropped rather than retried.
    */
   stopping: boolean;
+  /**
+   * Chain clock: unix ms close time of the newest chain event this poller has
+   * observed. `null` before the first scan returns one.
+   *
+   * The chain is the source of truth, so this only ever advances from a
+   * `ledgerClosedAt` the RPC actually reported. A quiet page, a failed scan, a
+   * Telegram outage or an open circuit breaker leaves the last observed value
+   * in place: the skew against the local clock then grows on its own, which is
+   * exactly what an operator needs to see during a long outage. It is saved
+   * with the cursors so a restart resumes the same clock instead of going back
+   * to `unknown`.
+   */
+  chainClockAt: number | null;
   startedAt: number;
   cycles: number;
   lastPollAt: number | null;
@@ -71,17 +84,60 @@ export interface PollerStatus {
   pendingFlush: boolean;
   lastFlushAt: number | null;
   targets: TargetState[];
+  /** RPC circuit breaker state */
+  circuitBreaker: {
+    open: boolean;
+    openedAt: number | null;
+    failureCount: number;
+    lastFailureAt: number | null;
+  };
 }
 
 interface CursorFile {
   version: 1;
   updatedAt: string;
+  /**
+   * Newest observed chain close time (unix ms). Optional and additive: files
+   * written before this field existed load as `null`, and older builds ignore
+   * it, so the on-disk format stays version 1 either way.
+   */
+  chainClockAt?: number | null;
   targets: Record<string, { cursor: string | null; lastEventLedger: number | null }>;
 }
 
 interface CursorTarget {
   cursor: string | null;
   lastEventLedger: number | null;
+}
+
+/**
+ * Bounds for a chain close time. Stellar launched in 2015 and the year 2100 is
+ * far past this network's horizon, so anything outside that window is a
+ * malformed `ledgerClosedAt` rather than chain data. The bound matters because
+ * the chain clock is monotonic and persisted: one bogus future value would
+ * otherwise be reported for the rest of the process's life, and then survive a
+ * restart through the cursor file.
+ */
+const CHAIN_CLOCK_MIN_MS = Date.UTC(2015, 0, 1);
+const CHAIN_CLOCK_MAX_MS = Date.UTC(2100, 0, 1);
+
+function isPlausibleChainClock(ms: number): boolean {
+  return Number.isFinite(ms) && ms >= CHAIN_CLOCK_MIN_MS && ms <= CHAIN_CLOCK_MAX_MS;
+}
+
+/**
+ * Shape check for a saved chain clock: a positive, safe, unix-ms timestamp
+ * inside the plausible window above.
+ *
+ * Anything else (a hand-edited file, an older writer, a truncated write) is
+ * dropped and the cursors are kept — a cosmetic field must never cost an
+ * operator their resume position. Files written before this field existed
+ * are `undefined` and load as `null`, i.e. "no chain clock observed yet".
+ */
+function parseChainClock(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return null;
+  return isPlausibleChainClock(value) ? value : null;
 }
 
 function parseCursorFile(raw: string): CursorFile {
@@ -121,7 +177,12 @@ function parseCursorFile(raw: string): CursorFile {
     };
   }
 
-  return { version: 1, updatedAt: String(candidate.updatedAt ?? ""), targets };
+  return {
+    version: 1,
+    updatedAt: String(candidate.updatedAt ?? ""),
+    chainClockAt: parseChainClock(candidate.chainClockAt),
+    targets,
+  };
 }
 
 /** Tuning knobs for Telegram delivery; defaults suit production, tests shrink them. */
@@ -138,6 +199,8 @@ export interface PollerDeps {
   /** Sends one already-formatted MarkdownV2 message. May reject. */
   send: (text: string) => Promise<void>;
   sendOptions?: SendOptions;
+  /** Circuit breaker configuration */
+  circuitBreakerOptions?: CircuitBreakerOptions;
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
   now?: () => number;
 }
@@ -161,6 +224,19 @@ export interface ShutdownResult {
   /** Milliseconds spent draining and flushing, on this poller's clock. */
   waitedMs: number;
 }
+
+export interface CircuitBreakerOptions {
+  /** Number of consecutive failures before opening the circuit */
+  failureThreshold?: number;
+  /** Milliseconds to wait before attempting to close the circuit */
+  cooldownMs?: number;
+}
+
+/** Default number of consecutive RPC failures before opening the circuit. */
+const DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5;
+
+/** Default cooldown period in milliseconds before attempting to close the circuit. */
+const DEFAULT_CIRCUIT_COOLDOWN_MS = 60_000;
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
 const DEFAULT_SEND_SPACING_MS = 1_500;
@@ -195,6 +271,30 @@ function withinDeadline(promise: Promise<void>, timeoutMs: number): Promise<bool
 }
 
 
+/** Timeout for each RPC scan request */
+const SCAN_TIMEOUT_MS = 15_000;
+
+/** Timeout for each Telegram send attempt */
+const SEND_TIMEOUT_MS = 10_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+    if (timer.unref) { timer.unref(); }
+    Promise.resolve(promise)
+      .then((val) => {
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 /**
  * Sends a message with bounded exponential backoff.
  *
@@ -221,7 +321,7 @@ async function sendWithRetry(
 
   while (true) {
     try {
-      await send(text);
+      await withTimeout(send(text), SEND_TIMEOUT_MS, "Telegram send");
       return;
     } catch (err) {
       attempt++;
@@ -243,6 +343,8 @@ export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
   const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
   const now = deps.now ?? Date.now;
+  const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
+  const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
   const boundedLabel = (value: unknown, max = 120): string => {
     const compact = String(value).replace(/\s+/g, " ").trim() || "unknown";
@@ -269,6 +371,7 @@ export function createPoller(deps: PollerDeps) {
     running: false,
     paused: false,
     stopping: false,
+    chainClockAt: null,
     startedAt: 0,
     cycles: 0,
     lastPollAt: null,
@@ -284,6 +387,12 @@ export function createPoller(deps: PollerDeps) {
     pendingFlush: false,
     lastFlushAt: null,
     targets: [],
+    circuitBreaker: {
+      open: false,
+      openedAt: null,
+      failureCount: 0,
+      lastFailureAt: null,
+    },
   };
 
   let timer: NodeJS.Timeout | null = null;
@@ -332,6 +441,10 @@ export function createPoller(deps: PollerDeps) {
       }
       // Memory now equals the file; nothing is waiting to be flushed.
       status.pendingFlush = false;
+      // Resume the chain clock alongside the cursors. Without this a restart
+      // between two quiet scans would report `unknown` until the next event
+      // happened to land, hiding a perfectly healthy (or long-stalled) chain.
+      status.chainClockAt = parsed.chainClockAt ?? null;
       console.log(
         `[poller] resumed from ${config.cursorFile}: ` +
           [...state.values()]
@@ -357,6 +470,7 @@ export function createPoller(deps: PollerDeps) {
     const payload: CursorFile = {
       version: 1,
       updatedAt: new Date(now()).toISOString(),
+      chainClockAt: status.chainClockAt,
       targets: Object.fromEntries(
         [...state.values()].map((t) => [
           t.source,
@@ -477,7 +591,33 @@ export function createPoller(deps: PollerDeps) {
     status.cycles += 1;
     status.lastPollAt = now();
 
+    // ── Circuit breaker check ─────────────────────────────────────────────────────
+    if (status.circuitBreaker.open) {
+      const nowMs = now();
+      const timeSinceOpen = status.circuitBreaker.openedAt ? nowMs - status.circuitBreaker.openedAt : Infinity;
+      
+      if (timeSinceOpen >= circuitCooldown) {
+        // Cooldown elapsed, attempt to close the circuit
+        console.log(
+          `[poller] circuit breaker cooldown elapsed (${timeSinceOpen}ms >= ${circuitCooldown}ms), attempting recovery`,
+        );
+        status.circuitBreaker.open = false;
+        status.circuitBreaker.openedAt = null;
+        status.circuitBreaker.failureCount = 0;
+      } else {
+        // Still in cooldown, skip RPC calls
+        console.log(
+          `[poller] circuit breaker open, skipping RPC calls (${Math.round(timeSinceOpen / 1000)}s/${Math.round(circuitCooldown / 1000)}s elapsed)`,
+        );
+        status.targets = [...state.values()].map((t) => ({ ...t }));
+        inFlight = false;
+        endCycleTracking();
+        return;
+      }
+    }
+
     let anyOk = false;
+    let cycleFailures = 0;
 
     try {
       for (const target of targets) {
@@ -485,15 +625,56 @@ export function createPoller(deps: PollerDeps) {
         if (!current) continue;
 
         try {
-          const scan = await readContractEvents(server, target, {
-            cursor: current.cursor ?? undefined,
-            lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
-          });
+          const scan = await withTimeout(
+            readContractEvents(server, target, {
+              cursor: current.cursor ?? undefined,
+              lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
+            }),
+            SCAN_TIMEOUT_MS,
+            "RPC scan",
+          );
 
           status.latestLedger = scan.latestLedger;
           status.oldestLedger = scan.oldestLedger;
           current.lastError = null;
           anyOk = true;
+
+          // Advance the chain clock from close times the RPC actually reported.
+          // `at` is 0 when the RPC omitted `ledgerClosedAt`, which is not an
+          // error, and a value outside the plausible window is malformed and must
+          // never be adopted. The update is monotonic: the two contracts are
+          // scanned in turn, so a rescan or reordering must never move the clock
+          // backwards. A quiet or failed scan keeps the last observed value, which
+          // is what makes a long outage show up as a growing skew rather than as
+          // a clock that keeps time on its own.
+          let implausibleCloseTime = false;
+          for (const event of scan.events) {
+            if (event.at === 0) continue;
+            const closedAtMs = event.at * 1_000;
+            if (!isPlausibleChainClock(closedAtMs)) {
+              implausibleCloseTime = true;
+              continue;
+            }
+            if (status.chainClockAt === null || closedAtMs > status.chainClockAt) {
+              status.chainClockAt = closedAtMs;
+              markDirty();
+            }
+          }
+          if (implausibleCloseTime) {
+            // One bounded line per target per cycle: no payload, no remote text.
+            console.warn(
+              `[poller] ${target.source}: ignored an implausible chain close time; chain clock unchanged`,
+            );
+          }
+
+          // Reset circuit breaker on success
+          if (status.circuitBreaker.failureCount > 0) {
+            console.log(
+              `[poller] RPC succeeded, resetting circuit breaker (was at ${status.circuitBreaker.failureCount} failures)`,
+            );
+            status.circuitBreaker.failureCount = 0;
+            status.circuitBreaker.lastFailureAt = null;
+          }
 
           let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
           if (scan.events.length > 0) {
@@ -522,10 +703,25 @@ export function createPoller(deps: PollerDeps) {
             }
           }
         } catch (err) {
+          cycleFailures++;
           const message = errorMessage(err);
           current.lastError = message;
           status.lastError = { at: now(), message: `${target.source}: ${message}` };
           console.error(`[poller] ${target.source} scan failed: ${message}`);
+        }
+      }
+
+      // ── Circuit breaker state update ─────────────────────────────────────────────
+      if (cycleFailures > 0) {
+        status.circuitBreaker.failureCount += cycleFailures;
+        status.circuitBreaker.lastFailureAt = now();
+
+        if (status.circuitBreaker.failureCount >= circuitThreshold && !status.circuitBreaker.open) {
+          status.circuitBreaker.open = true;
+          status.circuitBreaker.openedAt = now();
+          console.error(
+            `[poller] circuit breaker opened after ${status.circuitBreaker.failureCount} failures (threshold: ${circuitThreshold})`,
+          );
         }
       }
 

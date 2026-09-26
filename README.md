@@ -105,7 +105,7 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip counters (plus messages dropped by a shutdown drain) and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip counters (plus messages dropped by a shutdown drain) and the last error |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
@@ -133,8 +133,10 @@ npm run scan -- --json --show 20 # JSON including 20 decoded events per contract
 Human mode prints the ledger window, an event-name histogram, and the decoded
 payloads. With `--json`, stdout is a single `mimir-scan-v1` document (bigints as
 decimal strings) and progress goes to stderr, so `npm run scan -- --json | jq`
-stays valid. Neither mode prints bot tokens or signing keys — the scanner never
-holds them. This is how the decoder was verified against the live deployment.
+stays valid. Each target reports its `startLedger` and `startClamped`, so it is
+clear when a requested `--from` was moved up to the retained floor. Neither mode
+prints bot tokens or signing keys — the scanner never holds them. This is how the
+decoder was verified against the live deployment.
 
 ## Local mock profile
 
@@ -176,6 +178,10 @@ design of `src/stellar/events.ts`:
 - The RPC keeps only a **rolling window** of events (~120,960 ledgers, roughly a
   week, on Testnet). A `startLedger` below the retained floor is an *error*, not
   an empty result, so the floor is clamped from `getHealth()` first.
+- The window from `getHealth()` is **validated before the first request**: an
+  inverted or malformed window fails with a bounded error, a start ledger below
+  the floor is clamped up to it, and `npm run scan -- --from <future>` is refused
+  rather than silently reading a different range.
 - **An empty page does not mean the scan is finished.** One request covers a
   bounded slice of ledgers and returns whatever was in it — frequently nothing —
   plus a cursor to continue from. Terminating on a short page (the correct
@@ -269,10 +275,25 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   that cursor, the error becomes visible in `/status`, and scheduled retries or
   `/resume` use the same position. Recovery follows the incident runbook rather
   than replacing an opaque cursor with a guessed ledger.
+- **A request outside the retained window never reaches the RPC in one piece.**
+  The window (`oldestLedger`…`latestLedger`) is validated from `getHealth()`; a
+  resume cursor that the token itself places *above* the chain tip is refused
+  before it is sent, with a bounded error in `/status` and logs and the stored
+  cursor left unchanged. A cursor *below* the retained floor is deliberately
+  still forwarded: retention is the RPC's call, and its bounded stale rejection
+  is what surfaces in `/status` while the stored cursor stays put. A cursor shape
+  the bot cannot read is forwarded too, so an RPC cursor-format change cannot
+  wedge it.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
   compact, bounded, and the configured bot token is redacted.
+- **A long Stellar outage** freezes the chain clock at the newest close time the
+  RPC actually reported. `/status` and `GET /health` then show a growing skew
+  rather than a clock that keeps time on its own, so a stalled chain and a
+  wrong local clock stay distinguishable. The clock is saved with the cursors,
+  so a restart resumes it instead of reporting `unknown`, and an event without
+  a `ledgerClosedAt` never counts as a chain time.
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
@@ -333,6 +354,8 @@ The notifier is meant to run for weeks through Stellar RPC and Telegram outages.
 Everything it keeps in memory is fixed-size or capped:
 
 - Per-target state is two small records (cursor, last event ledger, last error).
+- The chain clock is one timestamp (the newest observed close time) plus its
+  derived skew; it never accumulates history.
 - A scan walks at most 20 event pages, and each cycle sends at most
   `MAX_NOTIFICATIONS_PER_CYCLE` messages; the rest are counted as skipped.
 - Error text is redacted (bot token) and clipped before it reaches `/status`,
@@ -353,9 +376,11 @@ supervisor that restarts the process and probes `GET /health`. If you suspect a
 leak in production, watch the process RSS over days; a restart is always safe.
 
 **Rollback:** deploy the previous build and start it against the same
-`CURSOR_FILE`. The cursor format is unchanged (version 1) and the chain is the
-source of truth, so nothing is replayed beyond the last saved cursor and nothing
-needs migrating. Keep a copy of the cursor file if you want an exact resume point.
+`CURSOR_FILE`. The cursor format is unchanged (version 1): `chainClockAt` is an
+optional additive field that older builds ignore and newer builds load as `null`
+when it is absent, and the chain is the source of truth, so nothing is replayed
+beyond the last saved cursor and nothing needs migrating. Keep a copy of the
+cursor file if you want an exact resume point.
 
 ## Health endpoint
 
@@ -368,8 +393,11 @@ checks (default `http://127.0.0.1:8787`):
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
-cursors, and whether a target has an error. It never includes `BOT_TOKEN`,
-chat ids, private keys, or unbounded remote payloads.
+cursors, whether a target has an error, and the chain clock (`poller.chainClockAt`
+plus `poller.chainClockSkewMs`, the signed difference in milliseconds between the
+bot's clock and the newest chain close time it has observed — positive while the
+bot is ahead). It never includes `BOT_TOKEN`, chat ids, private keys, or
+unbounded remote payloads.
 
 Configuration (see `.env.example`):
 
@@ -407,7 +435,30 @@ src/
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile and health suites (`npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+
+### Lockfile reproducibility
+
+`package-lock.json` is the install of record: deployments rebuild with `npm ci`,
+so the committed lockfile must stay in sync with `package.json` and pin exactly
+what it claims. Two checks enforce that, and CI runs both after `npm ci`:
+
+- `npm run lockfile:check` — offline. The lockfile is `lockfileVersion` 3, its
+  root entry matches `package.json`'s dependency ranges exactly, every package
+  resolves to a `registry.npmjs.org` tarball with a `sha512` integrity hash, and
+  every direct dependency is pinned at the top level. Drift is reported by
+  package name instead of being silently re-resolved.
+- `npm run lockfile:reproduce` — asks npm to regenerate the lockfile from itself
+  in a scratch directory and fails if the resolved package set changes, so a
+  hand-edited or partially-resolved lockfile cannot land. The repository working
+  tree is never written to.
+
+The offline suite runs as part of `npm test` (`tests/lockfile.test.mjs`), so
+drift is caught locally without network access. To change dependencies, edit
+`package.json`, run `npm install` to regenerate the lockfile, and commit both
+files together — a lockfile that no longer matches `package.json` fails
+`npm ci`, `npm run lockfile:check`, and CI.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile and health suites (`npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
 
