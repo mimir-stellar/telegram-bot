@@ -28,6 +28,19 @@ function ago(timestamp: number | null): string {
   return `${Math.round(seconds / 3600)}h ago`;
 }
 
+/**
+ * Clip an error string before including it in a Telegram message.
+ *
+ * RPC and Telegram errors can return arbitrarily large response bodies.
+ * A 4 096-character Telegram message cap is the hard limit, but even a few
+ * hundred characters per error line is more than enough to act on. Clipping
+ * also prevents log-injection if an adversarial RPC returns a crafted body.
+ */
+function clipError(msg: string, max = 200): string {
+  const trimmed = msg.trim();
+  return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max - 1)}…`;
+}
+
 function statusMessage(config: BotConfig, status: PollerStatus): string {
   const lines: string[] = [
     `*Status* — ${status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
@@ -46,13 +59,14 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
       `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
       `  cursor: \`${target.cursor ?? "none (cold start)"}\``,
     );
-    if (target.lastError) lines.push(`  last error: ${escapeMd(target.lastError)}`);
+    // Clip target error — it comes from an RPC response and may be unbounded.
+    if (target.lastError) lines.push(`  last error: ${escapeMd(clipError(target.lastError))}`);
   }
 
   if (status.lastError) {
     lines.push(
       "",
-      `Last error \\(${ago(status.lastError.at)}\\): ${escapeMd(status.lastError.message)}`,
+      `Last error \\(${ago(status.lastError.at)}\\): ${escapeMd(clipError(status.lastError.message))}`,
     );
   }
   if (status.consecutiveFailures > 0) {

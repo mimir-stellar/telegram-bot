@@ -31,6 +31,18 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  /**
+   * If > 0, the poller warns when the cursor file has not been updated for
+   * this many milliseconds — useful for detecting a bot that is polling but
+   * failing to persist (e.g. ephemeral filesystem). 0 disables the check.
+   */
+  cursorMaxAgeMs: number;
+  /**
+   * If > 0, the poll loop enters a slow-down backoff after this many
+   * consecutive fully-failed cycles (all targets failed). 0 disables the cap.
+   * The bot never exits; backoff is 10× `pollIntervalMs` until one succeeds.
+   */
+  maxConsecutiveFailures: number;
 }
 
 export class ConfigError extends Error {
@@ -56,6 +68,8 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  cursorMaxAgeMs: 0,
+  maxConsecutiveFailures: 0,
 } as const;
 
 /** Strkey for a contract: `C` + 55 base32 characters. */
@@ -170,6 +184,8 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    cursorMaxAgeMs: c.int("CURSOR_MAX_AGE_MS", DEFAULTS.cursorMaxAgeMs, 0),
+    maxConsecutiveFailures: c.int("MAX_CONSECUTIVE_FAILURES", DEFAULTS.maxConsecutiveFailures, 0),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
