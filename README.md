@@ -208,6 +208,98 @@ clear when a requested `--from` was moved up to the retained floor. Neither mode
 prints bot tokens or signing keys — the scanner never holds them. This is how the
 decoder was verified against the live deployment.
 
+## Cursor-range replay
+
+Replay reads a fixed ledger range from the chain and optionally re-posts the
+events to Telegram. It is one-shot: it exits when the range is exhausted and
+**never writes a cursor file** — the live poller's cursor state is untouched.
+
+```bash
+npm run replay -- --from 4226500                 # dry-run: decode only, no send
+npm run replay -- --from 4226500 --to 4226800    # bounded range
+npm run replay -- --from 4226500 --send          # send to Telegram (needs BOT_TOKEN)
+npm run replay -- --from 4226500 --contract market  # one contract only
+npm run replay -- --from 4226500 --json          # machine-readable mimir-replay-v1
+npm run replay -- --from 4226500 --pages 5       # walk at most 5 pages per contract
+npm run replay -- --from 4226500 --cap 10        # cap at 10 notifications per contract
+npm run replay:mock -- --from 4226500            # local mock profile, no credentials
+```
+
+**Flags:**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--from <ledger\|cursor>` | (required) | Start of the range — a ledger number or an opaque RPC cursor |
+| `--to <ledger>` | chain tip | End of the range (inclusive). Clamped to the tip when above it |
+| `--send` | off | Actually post to Telegram; requires `BOT_TOKEN` and `TELEGRAM_CHAT_ID` |
+| `--contract market\|squad` | both | Scan only the named contract |
+| `--pages <n>` | 20 | Page budget per contract |
+| `--cap <n>` | `MAX_NOTIFICATIONS_PER_CYCLE` | Maximum notifications per contract per run |
+| `--show <n>` | 0 | Include the last *n* decoded events per target in the report |
+| `--json` | off | Machine-readable `mimir-replay-v1` JSON on stdout; progress on stderr |
+| `--mock` | off | `MIMIR_PROFILE=mock`: local RPC, fixture contracts, no credentials needed |
+
+**Default mode is dry-run.** Events are decoded and counted; nothing is posted to
+Telegram. Add `--send` to deliver notifications. The run always exits with code
+`0` on completion, `1` on a fatal RPC or config error, and `2` on a bad flag.
+
+**Cursor clamping.** `--from` below the RPC's retained floor is moved up to the
+floor with a warning. `--to` above the chain tip is clamped to the tip. A `--to`
+before `--from` is a usage error (exit 2). Neither clamp changes the live
+poller's cursor.
+
+**Bounded output.** Admin events (`oracle_changed`, `ownership_transferred`, …)
+are logged at the progress level and not sent. Unknown or malformed events are
+logged and skipped. Send failures are counted as skipped and do not abort the
+run. No bot token or private key ever appears in progress output or the JSON
+report.
+
+**JSON report shape** (`--json` stdout, one document, ends with `\n`):
+
+```json
+{
+  "format": "mimir-replay-v1",
+  "network": "testnet",
+  "rpcUrl": "https://soroban-testnet.stellar.org",
+  "fromLedger": 4226500,
+  "toLedger": 4226800,
+  "dryRun": true,
+  "targets": [
+    {
+      "source": "market",
+      "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+      "fromLedger": 4226500,
+      "toLedger": 4226800,
+      "startLedger": 4226500,
+      "startClamped": false,
+      "pages": 3,
+      "events": 2,
+      "sent": 0,
+      "skipped": 0,
+      "capped": 0,
+      "adminLogged": 0,
+      "duplicates": 0,
+      "truncated": false,
+      "lastEventLedger": 4226729,
+      "cursor": "0018276211125911551-4294967295",
+      "eventLog": []
+    }
+  ],
+  "totals": {
+    "events": 2,
+    "sent": 0,
+    "skipped": 0,
+    "capped": 0,
+    "adminLogged": 0,
+    "duplicates": 0
+  }
+}
+```
+
+`bigint` amounts are serialized as decimal strings (same convention as
+`mimir-scan-v1`), so `npm run replay -- --json | jq` is valid. Progress and
+warnings always go to stderr.
+
 ## Operator audit trail
 
 `/status` says what the poller is doing *right now*. The audit trail answers the
@@ -744,6 +836,7 @@ src/
   poller.ts                the loop: scan, notify, persist the cursor, flush audit
   audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
   audit-cli.ts             entrypoint for `npm run audit`
+  replay-cli.ts            entrypoint for `npm run replay` (cursor-range replay)
   instanceLock.ts          exclusive process lock for the cursor owner
   status.ts                machine-readable status snapshot (allowlisted, bounded)
   dev/
@@ -752,6 +845,7 @@ src/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
     decode.ts              typed decoding of both contracts' events
+    replay.ts              cursor-range replay engine + runReplayCli() (npm run replay)
     mock-rpc.ts            local Soroban mock: scenario, pagination, failure injection
     mock-constants.ts      mock profile fixture ids, ports, placeholder credentials
   notifications/
@@ -759,6 +853,7 @@ src/
 tests/
   format.test.mjs          notification formatting (incl. deterministic fuzz)
   audit.test.mjs           redaction, entries, persistence, report rendering
+  replay.test.mjs          cursor-range replay: dry-run, send, clamp, security, cursor-safety
 ```
 
 ## Deploying on Railway
