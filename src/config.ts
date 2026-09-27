@@ -62,6 +62,7 @@ export interface BotConfig extends StellarConfig {
   lockFile: string;
   statusFile: string;
   maxNotificationsPerCycle: number;
+  csvOutputFile: string;
   /** Append-only JSONL audit trail (see src/audit.ts). Empty disables it. */
   auditFile: string;
   /**
@@ -115,6 +116,7 @@ const DEFAULTS = {
   lockFile: "./data/poller.lock",
   statusFile: "./data/status.json",
   maxNotificationsPerCycle: 20,
+  csvOutputFile: "./data/scanner_output.csv",
   auditFile: "./data/audit.jsonl",
   dedupWindow: 256,
   healthHost: "127.0.0.1",
@@ -378,6 +380,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    csvOutputFile: path.resolve(process.cwd(), read("CSV_OUTPUT_FILE") ?? DEFAULTS.csvOutputFile),
     // Resolved like the cursor file: relative paths anchor to the process cwd.
     auditFile: path.resolve(process.cwd(), read("AUDIT_FILE") ?? DEFAULTS.auditFile),
     // 0 is the documented escape hatch: no redelivery suppression.
