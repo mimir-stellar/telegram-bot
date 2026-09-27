@@ -47,7 +47,7 @@
  * the only resume token, in the same `version: 1` format as before.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
@@ -1506,6 +1506,17 @@ export function createPoller(deps: PollerDeps) {
 
   return {
     async start(): Promise<void> {
+      // Verify persistent volume availability before touching anything else.
+      const cursorDir = path.dirname(config.cursorFile);
+      try {
+        await mkdir(cursorDir, { recursive: true });
+        const probeFile = path.join(cursorDir, `.volume-probe.${process.pid}.${Date.now()}`);
+        await writeFile(probeFile, "", "utf8");
+        await unlink(probeFile).catch(() => {});
+      } catch (err) {
+        throw new Error(`Persistent volume is not writable: ${errorMessage(err)}`);
+      }
+
       // Refuse a second live process before touching the cursor or Telegram.
       // Configs built without a lock path keep it next to the cursor it guards.
       const lockFile = config.lockFile ?? path.join(path.dirname(config.cursorFile), "poller.lock");
