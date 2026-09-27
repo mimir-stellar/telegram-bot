@@ -45,6 +45,11 @@ export interface StellarConfig {
   explorerBaseUrl: string;
 }
 
+export interface TelegramRoute {
+  chatId: string;
+  channelPreviewMode: boolean;
+}
+
 export interface BotConfig extends StellarConfig {
   botToken: string;
   chatId: string;
@@ -85,6 +90,8 @@ export interface BotConfig extends StellarConfig {
   shutdownTimeoutMs: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
+  /** Per-chat notification preferences. */
+  routes: TelegramRoute[];
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
@@ -252,8 +259,8 @@ function collector(profile: Record<string, string>) {
       return fallback;
     },
 
-    chatId(name: string): string {
-      const value = this.required(name);
+    chatId(name: string, required: boolean = true): string {
+      const value = required ? this.required(name) : (get(name) ?? "");
       // Telegram chat ids are integers (channels/supergroups are negative).
       // A @channelusername also works for public channels, so both are allowed.
       if (value !== "" && !/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
@@ -262,6 +269,42 @@ function collector(profile: Record<string, string>) {
         );
       }
       return value;
+    },
+
+    routes(name: string): TelegramRoute[] | undefined {
+      const value = read(name);
+      if (value === undefined) return undefined;
+      try {
+        const parsed = JSON.parse(value);
+        if (!Array.isArray(parsed)) {
+          problems.push(`${name} must be a JSON array; got "${value}"`);
+          return undefined;
+        }
+        const parsedRoutes: TelegramRoute[] = [];
+        for (let i = 0; i < parsed.length; i++) {
+          const r = parsed[i];
+          if (typeof r !== "object" || r === null) {
+            problems.push(`${name}[${i}] must be an object`);
+            continue;
+          }
+          if (typeof r.chatId !== "string" || (!/^-?\d+$/.test(r.chatId) && !/^@[A-Za-z0-9_]{4,}$/.test(r.chatId))) {
+            problems.push(`${name}[${i}].chatId must be a numeric chat id or @channelusername`);
+          }
+          let preview = false;
+          if (r.channelPreviewMode !== undefined) {
+            if (typeof r.channelPreviewMode !== "boolean") {
+              problems.push(`${name}[${i}].channelPreviewMode must be a boolean`);
+            } else {
+              preview = r.channelPreviewMode;
+            }
+          }
+          parsedRoutes.push({ chatId: String(r.chatId), channelPreviewMode: preview });
+        }
+        return parsedRoutes;
+      } catch {
+        problems.push(`${name} must be valid JSON; got "${value}"`);
+        return undefined;
+      }
     },
 
     optionalChatId(name: string, fallback: string): string {
@@ -360,10 +403,15 @@ export function loadConfig(): BotConfig {
   const c = collector(resolveProfileDefaults());
   const stellar = stellarFrom(c);
 
+  const rawRoutes = c.routes("TELEGRAM_ROUTES");
+  const fallbackChatId = c.chatId("TELEGRAM_CHAT_ID", rawRoutes === undefined);
+  const fallbackChannelPreviewMode = c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode);
+  const routes = rawRoutes ?? (fallbackChatId ? [{ chatId: fallbackChatId, channelPreviewMode: fallbackChannelPreviewMode }] : []);
+
   const config: BotConfig = {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
-    chatId: c.chatId("TELEGRAM_CHAT_ID"),
+    chatId: fallbackChatId,
     marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
     squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
     allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
@@ -387,7 +435,8 @@ export function loadConfig(): BotConfig {
     healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
     shutdownTimeoutMs: c.int("SHUTDOWN_TIMEOUT_MS", DEFAULTS.shutdownTimeoutMs, 0),
-    channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
+    channelPreviewMode: fallbackChannelPreviewMode,
+    routes,
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);

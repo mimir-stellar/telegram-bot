@@ -15,7 +15,7 @@ import { InstanceLockError } from "./instanceLock.js";
 import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
-import type { ContractSource } from "./stellar/decode.js";
+
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
 import { boundText } from "./status.js";
@@ -124,7 +124,7 @@ async function main(): Promise<void> {
   // The bot needs the poller's status and the poller needs the bot's send path,
   // so one edge of the cycle is late-bound. This one, because it is the only
   // one that is a single function reference.
-  let notify: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void> = async () => {
+  let notify: (chatId: string, text: string, extra?: SendExtra) => Promise<void> = async () => {
     throw new Error("telegram notifier not ready");
   };
 
@@ -137,7 +137,7 @@ async function main(): Promise<void> {
   const poller = createPoller({
     config,
     server,
-    send: (text, source, extra) => notify(text, source, extra),
+    send: (chatId, text, extra) => notify(chatId, text, extra),
     audit,
   });
   const bot = createBot({
@@ -147,7 +147,7 @@ async function main(): Promise<void> {
     pause: () => poller.pause(),
     resume: () => poller.resume(),
   });
-  notify = createNotifier(bot, config);
+  notify = createNotifier(bot);
 
   // Local-only health HTTP for supervisors. Starts before Telegram long-poll
   // so a deploy probe can see the process even while grammy is connecting.

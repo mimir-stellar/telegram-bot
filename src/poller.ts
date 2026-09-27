@@ -257,7 +257,7 @@ export interface PollerDeps {
    * `source`, with the event's explorer button when `extra.reply_markup` is
    * set. May reject.
    */
-  send: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>;
+  send: (chatId: string, text: string, extra?: SendExtra) => Promise<void>;
   /**
    * Operator audit trail. A fresh one is created when omitted, so the poller
    * keeps working in callers that do not care about auditing (tests, tooling).
@@ -1026,6 +1026,12 @@ export function createPoller(deps: PollerDeps) {
     skipped: number;
   }
 
+function getDestinations(config: BotConfig, source: ContractSource) {
+  if (config.routes && config.routes.length > 0) return config.routes;
+  const chatId = source === "market" ? config.marketChatId || config.chatId : source === "squad" ? config.squadChatId || config.chatId : config.chatId;
+  return [{ chatId, channelPreviewMode: config.channelPreviewMode }];
+}
+
   async function notify(events: DecodedEvent[]): Promise<NotificationResult> {
     let sentThisCycle = 0;
     let failed = 0;
@@ -1078,36 +1084,6 @@ export function createPoller(deps: PollerDeps) {
       // Formatting one event must never abort the rest of the batch: remote
       // event data is untrusted, so a malformed value is a skip, not a throw.
       // Only safe identifiers are logged — never the raw remote payload.
-      let text: string | null;
-      let extra: SendExtra | undefined;
-      try {
-        text = formatEvent(config, event);
-        if (text !== null) {
-          const reply_markup = explorerKeyboard(config, event);
-          if (reply_markup) extra = { reply_markup };
-        }
-      } catch (err) {
-        status.eventsSkipped += 1;
-        skipped += 1;
-        console.error(
-          `[poller] format failed for ${event.source} event at ledger ${event.ledger}: ` +
-            errorMessage(err),
-          { eventId: event.eventId, reason: "malformed_event" },
-        );
-        continue;
-      }
-      if (text === null) {
-        status.eventsSkipped += 1;
-        skipped += 1;
-        audit.record(
-          auditEntry("event_skipped", {
-            source: event.source,
-            detail: `${event.payload.name} at ledger ${event.ledger}: notifiable text was null`,
-          }),
-        );
-        continue;
-      }
-
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
         status.eventsSkipped += 1;
         skipped += 1;
@@ -1126,27 +1102,66 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
-      try {
-        // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry((message) => send(message, event.source, extra), text, config.botToken, deps.sendOptions, () => !status.stopping);
-        status.notificationsSent += 1;
-        sentThisCycle += 1;
-      } catch (err) {
-        // All retries exhausted; drop the message but continue processing others.
-        status.notificationsFailed += 1;
-        failed += 1;
-        audit.recordError(err, "send_failed", {
-          source: event.source,
-          detail: `${event.payload.name} at ledger ${event.ledger}`,
-        });
-        console.error(
-          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
-            errorMessage(err),
+      const destinations = getDestinations(config, event.source);
+      let eventHandled = false;
+
+      for (const dest of destinations) {
+        let text: string | null = null;
+        let extra: SendExtra | undefined;
+        try {
+          text = formatEvent({ ...config, channelPreviewMode: dest.channelPreviewMode }, event);
+          if (text !== null) {
+            const reply_markup = explorerKeyboard(config, event);
+            if (reply_markup) extra = { reply_markup };
+          }
+        } catch (err) {
+          console.error(
+            `[poller] format failed for ${event.source} event at ledger ${event.ledger}: ` +
+              errorMessage(err),
+            { eventId: event.eventId, reason: "malformed_event" },
+          );
+          continue; // Try next destination
+        }
+        
+        if (text === null) {
+          continue;
+        }
+
+        eventHandled = true;
+
+        try {
+          // Use bounded retry for Telegram sends to handle transient failures
+          await sendWithRetry((message) => send(dest.chatId, message, extra), text, config.botToken, deps.sendOptions, () => !status.stopping);
+          status.notificationsSent += 1;
+          sentThisCycle += 1;
+        } catch (err) {
+          // All retries exhausted; drop the message but continue processing others.
+          status.notificationsFailed += 1;
+          failed += 1;
+          audit.recordError(err, "send_failed", {
+            source: event.source,
+            detail: `${event.payload.name} at ledger ${event.ledger} to chat ${dest.chatId}`,
+          });
+          console.error(
+            `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} to chat ${dest.chatId} after retries: ` +
+              errorMessage(err),
+          );
+        }
+      }
+
+      if (!eventHandled) {
+        status.eventsSkipped += 1;
+        skipped += 1;
+        audit.record(
+          auditEntry("event_skipped", {
+            source: event.source,
+            detail: `${event.payload.name} at ledger ${event.ledger}: notifiable text was null`,
+          }),
         );
       }
 
       // Rate-limit spacing is the last thing a draining cycle should wait for.
-      if (!status.stopping && sentThisCycle < config.maxNotificationsPerCycle && sendSpacing > 0) {
+      if (!status.stopping && sentThisCycle > 0 && sentThisCycle < config.maxNotificationsPerCycle && sendSpacing > 0) {
         await sleep(sendSpacing);
       }
     }

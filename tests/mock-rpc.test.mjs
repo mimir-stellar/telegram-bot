@@ -640,7 +640,7 @@ test("Telegram send failures: bounded retries, drop, cursor advances, token reda
     const text = cap.text();
     assert.match(text, /send attempt 1 failed, retrying in 1000ms: /);
     assert.match(text, /send attempt 2 failed, retrying in 2000ms: /);
-    assert.match(text, /send failed for claim_challenged at ledger 995 after retries: /);
+    assert.match(text, /send failed for claim_challenged at ledger 995 to chat -1001234567890 after retries: /);
     assert.ok(text.includes("[REDACTED]"), "token must be redacted in the failure line");
     assertBoundedLogs(cap.lines);
   } finally {

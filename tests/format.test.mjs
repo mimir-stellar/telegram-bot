@@ -149,7 +149,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
   };
 
   assert.equal(message, expectedMessage);
-  await createNotifier(fakeBot, config)(message);
+  await createNotifier(fakeBot)(config.chatId, message);
   assert.deepEqual(sent, [
     [
       config.chatId,
@@ -231,7 +231,7 @@ test("createNotifier preserves Telegram send failures for the poller", async () 
   await assert.rejects(notify("message"), error);
 });
 
-test("createNotifier routes named contract sources and preserves the legacy fallback", async () => {
+test("createNotifier passes chat ID directly to Telegram", async () => {
   const sent = [];
   const fakeBot = {
     api: {
@@ -241,20 +241,14 @@ test("createNotifier routes named contract sources and preserves the legacy fall
       },
     },
   };
-  const notify = createNotifier(fakeBot, {
-    chatId: "-1001234567890",
-    marketChatId: "-1001111111111",
-    squadChatId: "@mimir_squad",
-  });
+  const notify = createNotifier(fakeBot);
 
-  await notify("market event", "market");
-  await notify("squad event", "squad");
-  await notify("legacy event");
+  await notify("-1001111111111", "market event");
+  await notify("@mimir_squad", "squad event");
 
   assert.deepEqual(sent.map(([chatId, text]) => [chatId, text]), [
     ["-1001111111111", "market event"],
     ["@mimir_squad", "squad event"],
-    ["-1001234567890", "legacy event"],
   ]);
 });
 

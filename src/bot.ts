@@ -14,7 +14,7 @@ import { escapeMd, previewMessage, safeErrorMessage, type ExplorerKeyboard } fro
 export { previewMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
-import type { ContractSource } from "./stellar/decode.js";
+
 import { buildHealthReport, chainClockLabel } from "./health.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
 import {
@@ -404,13 +404,8 @@ export interface SendExtra {
  * The poller's send path: route each contract's messages to its named chat,
  * with the event's explorer button when `extra.reply_markup` is set.
  */
-export function createNotifier(bot: Bot, config: BotConfig) {
-  return async (text: string, source?: ContractSource, extra?: SendExtra): Promise<void> => {
-    const chatId = source === "market"
-      ? config.marketChatId ?? config.chatId
-      : source === "squad"
-        ? config.squadChatId ?? config.chatId
-        : config.chatId;
+export function createNotifier(bot: Bot) {
+  return async (chatId: string, text: string, extra?: SendExtra): Promise<void> => {
     await bot.api.sendMessage(chatId, text, {
       ...TELEGRAM_OPTIONS,
       ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
