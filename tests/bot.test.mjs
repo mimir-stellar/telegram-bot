@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
+import { auditEntry, createAuditLog } from "../dist/audit.js";
 import {
   registerCommandHandlers,
   resumeMessage,
@@ -157,6 +161,82 @@ test("operator controls are disabled when no operator id is configured", async (
   assert.deepEqual(replies, []);
 });
 
+test("operator /audit renders the report from the live in-memory window", async () => {
+  const auditFile = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "mimir-audit-gate-")),
+    "audit.jsonl",
+  );
+  const audit = createAuditLog();
+  audit.record(auditEntry("boot", { detail: "test boot entry" }));
+
+  const { handlers } = mockedBot({
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+    audit,
+    auditFile,
+  });
+  const { ctx, replies } = commandContext(42, 81);
+
+  await handlers.get("audit")(ctx);
+
+  assert.equal(replies.length, 1);
+  const [text, options] = replies[0];
+  assert.match(text, /^\*Audit\* — /);
+  assert.match(text, /boot/);
+  assert.equal(options.parse_mode, undefined);
+
+  fs.rmSync(path.dirname(auditFile), { recursive: true, force: true });
+});
+
+test("non-operator /audit is silently ignored without reading the file or replying", async () => {
+  const auditFile = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "mimir-audit-gate-")),
+    "audit.jsonl",
+  );
+  let auditReadCalls = 0;
+  const audit = {
+    record: () => undefined,
+    tail: () => {
+      auditReadCalls += 1;
+      return [];
+    },
+    flush: () => [],
+  };
+
+  const { handlers } = mockedBot({
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+    audit,
+    auditFile,
+  });
+  const { ctx, replies } = commandContext(43, 82);
+
+  await withoutWarnings(() => handlers.get("audit")(ctx));
+
+  assert.deepEqual(replies, []);
+  assert.equal(auditReadCalls, 0);
+
+  fs.rmSync(path.dirname(auditFile), { recursive: true, force: true });
+});
+
+test("operator controls disabled means /audit is ignored even for the right user id", async () => {
+  const { handlers } = mockedBot({
+    config: baseConfig({ operatorTelegramUserId: null }),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+  });
+  const { ctx, replies } = commandContext(42, 83);
+
+  await withoutWarnings(() => handlers.get("audit")(ctx));
+
+  assert.deepEqual(replies, []);
+});
+
 test("idempotent and shutdown resume results have bounded exact replies", () => {
   assert.equal(resumeMessage("already-running"), "*Polling is already running*");
   assert.equal(
@@ -178,3 +258,39 @@ test("safeErrorMessage redacts Telegram-shaped tokens and clips remote payloads"
   assert.equal(message.length, 240);
   assert.match(message, /^\[REDACTED] \[REDACTED] remote-payload/);
 });
+
+test("/preview command sends exact MarkdownV2 preview payload for market and squad", async () => {
+  const { handlers } = mockedBot({
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+  });
+
+  let marketReplied = false;
+  const ctxMarket = {
+    message: { text: "/preview market" },
+    update: { update_id: 101 },
+    reply: async (...args) => {
+      marketReplied = true;
+      assert.match(args[0], /🧪 \*Channel Preview — mimir\\-market\*/);
+      assert.deepEqual(args[1], TELEGRAM_OPTIONS);
+    },
+  };
+  await handlers.get("preview")(ctxMarket);
+  assert.equal(marketReplied, true);
+
+  let squadReplied = false;
+  const ctxSquad = {
+    message: { text: "/preview squad" },
+    update: { update_id: 102 },
+    reply: async (...args) => {
+      squadReplied = true;
+      assert.match(args[0], /🧪 \*Channel Preview — mimir\\-squad\*/);
+      assert.deepEqual(args[1], TELEGRAM_OPTIONS);
+    },
+  };
+  await handlers.get("preview")(ctxSquad);
+  assert.equal(squadReplied, true);
+});
+
