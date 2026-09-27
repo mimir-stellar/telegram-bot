@@ -224,9 +224,17 @@ export function createPoller(deps: PollerDeps) {
   /**
    * Apply a parsed CursorFile to the in-memory state map.
    * Returns a description of what was loaded for logging.
+   *
+   * `oldestLedger` is the RPC's current retention floor. Pass `null` when the
+   * health check failed — staleness cannot be determined and no cursor is
+   * discarded (the first scan will surface an out-of-window error naturally).
    */
-  function applyCursorFile(parsed: CursorFile, oldestLedger: number): string {
-    const staleCutoff = oldestLedger - config.cursorStaleLedgerMargin;
+  function applyCursorFile(parsed: CursorFile, oldestLedger: number | null): string {
+    // When health is unknown we cannot compute a cutoff, so we skip the check
+    // entirely. An out-of-window cursor will produce an RPC error on the first
+    // scan, which is already handled gracefully per the failure policy.
+    const staleCutoff =
+      oldestLedger !== null ? oldestLedger - config.cursorStaleLedgerMargin : null;
     const applied: string[] = [];
     const stale: string[] = [];
 
@@ -238,12 +246,12 @@ export function createPoller(deps: PollerDeps) {
 
       // Check staleness: if the cursor's embedded ledger is below the RPC's
       // oldest retained ledger (with margin), it would cause an RPC error.
-      if (cursor !== null) {
+      if (cursor !== null && staleCutoff !== null) {
         const cursorLedger = eventCursorLedger(cursor);
         if (cursorLedger !== null && cursorLedger < staleCutoff) {
           stale.push(
             `${source} cursor at ledger ${cursorLedger} is below retained floor ` +
-              `${oldestLedger} (margin ${config.cursorStaleLedgerMargin})`,
+              `${String(oldestLedger)} (margin ${config.cursorStaleLedgerMargin})`,
           );
           // Leave cursor null → cold start for this target
           continue;
@@ -264,9 +272,9 @@ export function createPoller(deps: PollerDeps) {
 
   async function loadCursors(): Promise<void> {
     // We need the RPC's retained floor to check staleness. If getHealth fails,
-    // proceed without the check — a stale cursor will surface as an RPC error
-    // on the first scan, which is already handled gracefully.
-    let oldestLedger = 0;
+    // pass null — the staleness check is skipped and a stale cursor will surface
+    // as an RPC error on the first scan, which is already handled gracefully.
+    let oldestLedger: number | null = null;
     try {
       const health = await server.getHealth();
       oldestLedger = health.oldestLedger;
