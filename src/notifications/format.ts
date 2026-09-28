@@ -284,6 +284,182 @@ export function formatEvent(
   }
 }
 
+/** Telegram's hard caption/message ceiling; the plain text stays well under it. */
+const MAX_PLAIN_TEXT_LENGTH = 4000;
+
+function plainUsdc(units: bigint): string {
+  return `${formatUsdc(units)} USDC`;
+}
+
+function plainWho(address: string): string {
+  return shortAddress(address);
+}
+
+function plainFooter(config: StellarConfig, event: DecodedEvent): string {
+  const url = eventExplorerUrl(config, event);
+  const ledger = `ledger ${event.ledger}`;
+  // Raw URL, not Markdown link syntax: with no parse_mode the brackets would
+  // render literally, while a bare URL stays readable and copyable.
+  return url ? `${ledger}\ntx: ${url}` : ledger;
+}
+
+/**
+ * The plain-text headline for an event, or null when there is nothing to say.
+ *
+ * Dedicated formatter, not a Markdown stripper: each case mirrors {@link headline}
+ * field-for-field (same identities, amounts, bounded clips) but emits no
+ * MarkdownV2 syntax at all, so Telegram cannot reject it for entity parsing.
+ */
+function plainHeadline(event: DecodedEvent): string | null {
+  const p = event.payload;
+
+  switch (p.name) {
+    // ── mimir-market ────────────────────────────────────────────────────────
+    case "claim_created":
+      return (
+        `New claim #${p.claimId}\n` +
+        `Category: ${clip(p.category)}\n` +
+        `Creator: ${plainWho(p.creator)}`
+      );
+
+    case "claim_challenged":
+      return (
+        `Claim #${p.claimId} challenged\n` +
+        `Stake: ${plainUsdc(p.stake)}\n` +
+        `Challenger: ${plainWho(p.challenger)}`
+      );
+
+    case "claim_resolved":
+      return (
+        `Claim #${p.claimId} resolved — winner: ${winnerSideLabel(p.winnerSide)}\n` +
+        `Confidence: ${String(p.confidence)}%` +
+        (p.summary ? `\n${clip(p.summary)}` : "")
+      );
+
+    case "claim_cancelled":
+      return `Claim #${p.claimId} cancelled — stakes returned`;
+
+    case "market_settled":
+      return (
+        `Claim #${p.claimId} settled\n` +
+        `Paid out: ${plainUsdc(p.totalPaid)} · fees ${plainUsdc(p.totalFees)}\n` +
+        `Owed to challengers: ${plainUsdc(p.owedToChallengers)}`
+      );
+
+    case "challenger_paid":
+      return (
+        `Challenger paid on claim #${p.claimId}\n` +
+        `${plainWho(p.challenger)} staked ${plainUsdc(p.stake)} → net ${plainUsdc(p.net)}\n` +
+        `Gross ${plainUsdc(p.gross)} · fee ${plainUsdc(p.fee)}`
+      );
+
+    case "fee_claimed":
+      return `Fees claimed — ${plainUsdc(p.amount)} to ${plainWho(p.recipient)}`;
+
+    case "withdrawal":
+      return `Withdrawal — ${plainUsdc(p.amount)} to ${plainWho(p.to)}`;
+
+    case "withdrawal_pending":
+      return `Withdrawal parked — ${plainUsdc(p.amount)} claimable by ${plainWho(p.to)}`;
+
+    // ── mimir-squad ─────────────────────────────────────────────────────────
+    case "market_created":
+      return (
+        `New squad market #${p.marketId}\n` +
+        `${clip(p.question)}\n` +
+        `Captain: ${plainWho(p.captain)} · fee ${String(p.feeBps)} bps · ` +
+        `deadline ${new Date(p.deadline * 1000).toISOString()}`
+      );
+
+    case "deposited":
+      return (
+        `Squad #${p.marketId} — ${plainUsdc(p.amount)} on ${squadSideLabel(p.side)}\n` +
+        `Participant: ${plainWho(p.participant)}`
+      );
+
+    case "withdrawn":
+      return (
+        `Squad #${p.marketId} — ${plainWho(p.participant)} pulled ${plainUsdc(p.amount)} ` +
+        `from ${squadSideLabel(p.side)}`
+      );
+
+    case "resolved":
+      return (
+        `Squad #${p.marketId} resolved — ${squadSideLabel(p.result)}\n` +
+        `Pools: A ${plainUsdc(p.poolA)} · B ${plainUsdc(p.poolB)}`
+      );
+
+    case "claimed":
+      return (
+        `Squad payout on #${p.marketId}\n` +
+        `${plainWho(p.participant)} → net ${plainUsdc(p.net)} ` +
+        `(gross ${plainUsdc(p.gross)}, fee ${plainUsdc(p.fee)})`
+      );
+
+    case "fees_claimed":
+      return `Squad fees claimed — ${plainUsdc(p.amount)} to ${plainWho(p.recipient)}`;
+
+    // Same set as `headline`: admin events and undecodable shapes get nothing.
+    case "oracle_changed":
+    case "ownership_transferred":
+    case "agent_attributed":
+    case "fee_accrued":
+    case "fee_policy_set":
+    case "fee_policy_changed":
+    case "fee_policy_updated":
+    case "fee_policy_removed":
+    case "admin":
+    case "unknown":
+      return null;
+
+    default:
+      return null;
+  }
+}
+
+/**
+ * Clip a finished plain-text message without splitting a Unicode code point.
+ */
+function clipPlainText(text: string, max = MAX_PLAIN_TEXT_LENGTH): string {
+  const characters = Array.from(text);
+  return characters.length <= max ? text : `${characters.slice(0, max - 1).join("")}…`;
+}
+
+/**
+ * The plain-text notification for an event, or null when it is not notifiable.
+ *
+ * Same information as {@link formatEvent} (identity, amounts, ledger, explorer
+ * URL when valid) with no Markdown of any kind. Sent without a `parse_mode`,
+ * so Telegram delivers it even when the MarkdownV2 rendering is rejected.
+ * Never throws and never returns an empty string: malformed input degrades to
+ * a minimal bounded line rather than crashing the notifier.
+ */
+export function formatPlainTextEvent(
+  config: StellarConfig,
+  event: DecodedEvent,
+): string | null {
+  try {
+    const head = plainHeadline(event);
+    if (head === null) return null;
+    const body = `${head}\n${plainFooter(config, event)}`.trim();
+    if (!body) return minimalPlainTextEvent(event);
+    return clipPlainText(body);
+  } catch {
+    return minimalPlainTextEvent(event);
+  }
+}
+
+/** Last-resort bounded line when even the plain-text formatter cannot render. */
+function minimalPlainTextEvent(event: DecodedEvent): string {
+  const source = typeof event?.source === "string" ? event.source : "unknown";
+  const ledger =
+    typeof event?.ledger === "number" && Number.isFinite(event.ledger)
+      ? `ledger ${event.ledger}`
+      : "ledger unknown";
+  const eventId = typeof event?.eventId === "string" && event.eventId ? ` (${event.eventId})` : "";
+  return clipPlainText(`Mimir event (${source}) — ${ledger}${eventId}`);
+}
+
 /**
  * Fallback message when an event payload is malformed or an error occurs during formatting.
  */
