@@ -9,11 +9,20 @@
 
 import { readFile } from "node:fs/promises";
 
-import { ConfigError, activeProfileName, loadConfig, networkLabel } from "./config.js";
+import {
+  ConfigError,
+  activeProfileName,
+  configProvenance,
+  formatProvenanceSummary,
+  loadConfig,
+  networkLabel,
+} from "./config.js";
+import { formatFeatureFlags } from "./notifications/featureFlags.js";
+import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
 import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
 import { startHealthServer } from "./health.js";
-import { createPoller } from "./poller.js";
+import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
@@ -35,6 +44,13 @@ function installProcessHandlers(): void {
   process.on("uncaughtException", (err) => {
     console.error(`[fatal] uncaught exception, exiting for restart: ${safeErrorMessage(err)}`);
     process.exit(1);
+  });
+}
+
+/** Redacted shutdown marker: what stopped the process, and nothing else. */
+function auditShutdownEntry(signal: string) {
+  return auditEntry("shutdown", {
+    detail: `stopped by ${signal === "SIGTERM" ? "SIGTERM" : "SIGINT"}`,
   });
 }
 
@@ -94,6 +110,8 @@ async function main(): Promise<void> {
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  console.log(`[boot] flags        ${formatFeatureFlags(config.featureFlags)}`);
+  console.log(`[boot] audit file   ${config.auditFile}`);
   console.log(`[boot] lock file    ${config.lockFile}`);
   console.log(`[boot] shutdown     ${config.shutdownTimeoutMs}ms drain budget`);
   console.log(
@@ -103,13 +121,27 @@ async function main(): Promise<void> {
     `[boot] preview mode  ${config.channelPreviewMode ? "enabled" : "disabled"}`,
   );
 
+  // Which setting came from where, then anything an operator can act on. Names
+  // and origins only: a value never reaches this log, so a boot log can be
+  // pasted into a ticket without redaction.
+  const provenance = configProvenance();
+  console.log(`[boot] config       ${formatProvenanceSummary(provenance)}`);
+  for (const warning of provenance.warnings) {
+    console.warn(`[boot] config       ${warning}`);
+  }
+
   const server = createRpcServer(config);
 
-  // One read before announcing readiness: a wrong RPC URL should surface now,
-  // not as a mystery in the poll log an interval later.
-  const health = await server.getHealth();
+  // Bounded retries before announcing readiness: a briefly unavailable RPC
+  // (deploy race, Testnet blip) should not fail the whole boot, but a wrong
+  // URL must still surface within STARTUP_HEALTH_DEADLINE_MS.
+  const health = await waitForStartupHealth(server, {
+    deadlineMs: config.startupHealthDeadlineMs,
+    retryMs: config.startupHealthRetryMs,
+  });
   console.log(
-    `[boot] rpc ok, status=${health.status} ledgers ${health.oldestLedger}..${health.latestLedger}`,
+    `[boot] rpc ok (attempts=${health.attempts}), status=${health.status} ` +
+      `ledgers ${health.oldestLedger}..${health.latestLedger}`,
   );
 
   // The bot needs the poller's status and the poller needs the bot's send path,
@@ -119,10 +151,22 @@ async function main(): Promise<void> {
     throw new Error("telegram notifier not ready");
   };
 
-  const poller = createPoller({ config, server, send: (text, source, extra) => notify(text, source, extra) });
+  const audit = createAuditLog();
+  audit.record(
+    auditEntry("boot", {
+      detail: `network=${networkLabel(config)} poll=${config.pollIntervalMs}ms`,
+    }),
+  );
+  const poller = createPoller({
+    config,
+    server,
+    send: (text, source, extra) => notify(text, source, extra),
+    audit,
+  });
   const bot = createBot({
     config,
     status: () => poller.status(),
+    audit,
     pause: () => poller.pause(),
     resume: () => poller.resume(),
   });
@@ -172,6 +216,10 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log(`[shutdown] ${signal} received, draining`);
 
+    // A clean-stop marker closes the audit window: anything after it belongs to
+    // the next run, which is how an operator tells a crash from a restart.
+    poller.audit.record(auditShutdownEntry(signal));
+
     // The drain is already bounded by SHUTDOWN_TIMEOUT_MS; this covers the
     // teardown after it (health socket, grammy stop) so a wedged close cannot
     // outlive the deploy. The cursor flush happens before either, so an exit
@@ -209,6 +257,9 @@ async function main(): Promise<void> {
           `[shutdown] telegram stop failed: ${safeErrorMessage(err, [config.botToken])}`,
         );
       }
+
+      // Flush last so entries recorded while stopping are persisted.
+      await poller.flushAuditFile().catch(() => undefined);
       process.exit(0);
     })();
   };

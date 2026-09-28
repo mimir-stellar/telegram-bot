@@ -171,8 +171,9 @@ test("resumeCursorProblem: floor and tip cursors are accepted boundaries", () =>
 });
 
 test("resumeCursorProblem: a cursor below the floor is classified as stale", () => {
-  // Classified, but deliberately still forwarded: retention is the RPC's call
-  // and the bot must not rewrite the stored cursor (see the scan test below).
+  // Classified, but the reader still forwards it: retention is the RPC's call.
+  // The poller decides whether to rewind, and only after a fresh `getHealth()`
+  // proves the cursor is below the floor (see the scan test below).
   assert.equal(resumeCursorProblem(makeCursor(899), WINDOW), "cursor-before-floor");
 });
 
@@ -206,8 +207,8 @@ test("paginatedGetEvents: a stale cursor is forwarded so the RPC's rejection is 
   const server = makeServer(WINDOW, [{ events: [], cursor: makeCursor(1000), latestLedger: 1000 }]);
 
   // Below the floor is a retention judgement the RPC owns: the cursor is not
-  // rewritten or dropped locally. It is sent, and the RPC's bounded stale
-  // rejection is what the poller surfaces while keeping the cursor unchanged.
+  // rewritten or dropped locally. It is sent on, and the poller decides whether
+  // to rewind only after a fresh `getHealth()` confirms it is below the floor.
   const scan = await paginatedGetEvents(server, [], { cursor });
 
   assert.equal(server.requests.length, 1);

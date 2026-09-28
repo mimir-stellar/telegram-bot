@@ -38,9 +38,11 @@ Check:
 * RPC retained-history floor
 * chain clock skew (newest observed chain close time against this host's clock)
 * watched contract IDs
+* configuration provenance (`/health` -> `.config`, or the boot `[boot] config` line): which source supplied each setting, with no values
 * last event ledger per contract
 * persisted cursor
-* poll/send counters
+* poll/send counters, including automatic floor rewinds (`cursorRewinds`)
+* any target resuming from a floor rewind (`rewindFromLedger`)
 * last error and consecutive failure count
 
 For a read-only chain diagnostic without a Telegram token:
@@ -141,21 +143,46 @@ The Stellar chain remains the authoritative record.
 * The cursor cannot be parsed.
 * The stored cursor is incompatible with the current cursor format.
 * The process reports a cursor-loading problem.
+* `/status` reports `Cursors rewound to the retained floor: N`, or `status.json`
+  / `GET /health` show a non-null `rewindFromLedger`, after a long outage.
+* `GET /health` returns `503` and a target has `cursorStale: true`, even if the
+  other watched contract is scanning successfully.
 
 ### Recovery
 
-A corrupt cursor is treated as a cold start. A syntactically valid cursor that
-Soroban rejects as stale is different: the poller keeps it unchanged, exposes
-the bounded RPC error in `/status`, and retries the same position. `/resume`
-also leaves it unchanged. This avoids duplicate notifications or skipped chain
-history from a guessed reset.
+A corrupt cursor is quarantined beside the live path and treated as a cold start;
+preserve the quarantined copy for investigation.
+
+A syntactically valid cursor that Soroban rejects as stale is first checked
+against a fresh `getHealth()`:
+
+* If the cursor's ledger is **strictly below** `oldestLedger`, the position it
+  points at is already unrecoverable, so the poller drops it and rescans from
+  `oldestLedger`. This is bounded to `MAX_FLOOR_REWINDS` (3) consecutive
+  automatic rewinds per contract. The count is visible in `/status` and
+  `GET /health` as `cursorRewinds`, and an active recovery is the target's
+  `rewindFromLedger` (also in `status.json` and `GET /health`).
+* If the cursor cannot be placed (an opaque token), sits **inside** the window,
+  or the window cannot be read, it is **kept unchanged** and the bounded RPC
+  error is surfaced. `/resume` never changes a cursor.
+
+A floor rewind loses nothing that is still readable — everything below the floor
+has already left the RPC. It can, however, skip events that expired while the bot
+was down, which the chain still records.
 
 A cursor the token itself places **ahead of the chain tip** is refused locally
 with a bounded `ahead of the chain tip` error instead of being sent, and the
 stored cursor is kept unchanged. That can be a transient RPC-lag condition and
 clears as the tip advances; if it persists it means the cursor came from a
 different chain (for example a network reset), so treat it as incompatible:
-preserve the file and perform the deliberate cold start above.
+preserve the file and perform a deliberate cold start.
+
+If the automatic rewind budget is spent (the process logs that operator action is
+required) or the cursor cannot be placed, treat it as permanently stale: stop
+the notifier, preserve the cursor file for investigation, and deliberately
+cold-start with the configured `START_LOOKBACK_LEDGERS` after checking the
+retained-history floor. A cold start may produce duplicate notifications, but it
+does not replay all retained history.
 
 Before changing `CURSOR_FILE` or deleting persisted state, preserve the existing file for investigation if possible.
 
@@ -255,6 +282,40 @@ When investigating:
 
 Do not modify on-chain state or attempt to repair an event by writing to the Mimir contracts.
 
+## Configuration looks applied but is not
+
+### Symptoms
+
+* Telegram answers `401 Unauthorized` for a token that is set in `.env`.
+* Notifications arrive in a chat nobody configured, or in none at all.
+* A value edited in `.env` has no effect after a restart.
+
+### Recovery
+
+Ask the running process where its configuration came from. The report contains
+key names and origins only — never a value — so it is safe to attach to a ticket:
+
+```bash
+curl -s http://127.0.0.1:8787/health | jq .config
+```
+
+* `envFile.present: false` — the process never found `.env`. The file resolves
+  against the working directory, so a supervisor that starts the bot elsewhere
+  silently runs on defaults; start it from the directory holding the file.
+* `envFile.suppliedKeys: 0` with `present: true` — the file was read but supplied
+  none of the known settings. Check for a typo'd key name.
+* `entries[].source: "profile-default"` for `BOT_TOKEN` — `MIMIR_PROFILE=mock` is
+  active and placeholder credentials are in use.
+* `emptyDeclaration: true` — the variable is declared with no value, so a profile
+  or built-in default wins. This is the most common "I set it and nothing
+  changed".
+* `source: "process-env"` where a file value was expected — a variable already
+  set by the platform, systemd, or the shell wins over `.env`; the file is never
+  allowed to overwrite it.
+
+Fix the source, not the symptom: restart only once the report names the source
+you intended for that setting.
+
 ## Safe rollback
 
 For a deployment containing only documentation or operational changes:
@@ -285,6 +346,9 @@ After deployment:
 
 * Confirm the process starts successfully.
 * Run `/status`.
+* Confirm the `[boot] config` line (or `/health` `.config`) shows the sources you
+  intended — for a deployment with a `.env`, `envFile.present: true` and the
+  bot token's source reported as `env-file`, not `profile-default`.
 * Confirm the expected contract IDs and cursor are shown.
 * Confirm the last event ledger advances after new events.
 * Monitor RPC and Telegram errors.
@@ -298,6 +362,11 @@ Never log:
 * payment proofs
 * unrestricted remote API responses
 * sensitive authentication data
+
+Configuration provenance reports are the exception that proves the rule: the
+boot `[boot] config` line and the `/health` `config` section name settings and
+their sources, so they can be shared verbatim. They are built so that a value —
+token, chat id, or otherwise — cannot appear in them.
 
 When reporting an incident, include only the minimum information needed to identify the failure, such as contract, ledger, cursor state, error category, and timestamp.
 
@@ -317,8 +386,12 @@ curl -s http://127.0.0.1:8787/health | jq .status
 
 Injected failures last until the process stops, so recovery is "restart without
 the flag": the cursor must resume exactly where it was, log lines stay bounded,
-and no token-shaped secret appears anywhere in the output. The same guarantees
-are asserted by `tests/mock-rpc.test.mjs` (`npm run test:mock`).
+and no token-shaped secret appears anywhere in the output. `--stale-cursor`
+rejects any resume cursor the mock has handed out; because that cursor is inside
+the retained window, the poller keeps it (a rewind happens only when a fresh
+`getHealth()` proves the cursor is *below* the floor). The same guarantees are
+asserted by `tests/mock-rpc.test.mjs` (`npm run test:mock`), and the bounded
+rewind path is covered by `tests/cursor-rewind.test.mjs`.
 
 ## Verification
 

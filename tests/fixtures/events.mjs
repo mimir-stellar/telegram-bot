@@ -409,6 +409,45 @@ export function feePolicySetEvent(overrides = {}) {
   };
 }
 
+/** ownership_transferred — admin event. */
+export function ownershipTransferredEvent(overrides = {}) {
+  return {
+    ...baseMeta({ ...overrides, contractId: MARKET_CONTRACT }),
+    topic: [
+      sym("ownership_transferred"),
+      addrVal(overrides.newOwner ?? FEE_ADDR),
+    ],
+    value: scMap([
+      ["previous_owner", addrVal(overrides.previousOwner ?? CREATOR)],
+      ["new_owner", addrVal(overrides.newOwner ?? FEE_ADDR)],
+    ]),
+  };
+}
+
+/** agent_attributed — admin event. */
+export function agentAttributedEvent(overrides = {}) {
+  return {
+    ...baseMeta({ ...overrides, contractId: MARKET_CONTRACT }),
+    topic: [
+      sym("agent_attributed"),
+      addrVal(overrides.agent ?? CAPTAIN),
+    ],
+    value: scMap([]),
+  };
+}
+
+/** fee_accrued — admin event. */
+export function feeAccruedEvent(overrides = {}) {
+  return {
+    ...baseMeta({ ...overrides, contractId: MARKET_CONTRACT }),
+    topic: [
+      sym("fee_accrued"),
+      addrVal(overrides.recipient ?? FEE_ADDR),
+    ],
+    value: scMap([["amount", i128(overrides.amount ?? 5_000_000n)]]),
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Malformed / boundary fixtures for negative-path tests
 // ═══════════════════════════════════════════════════════════════════════════════

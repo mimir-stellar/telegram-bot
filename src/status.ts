@@ -71,6 +71,13 @@ export interface StatusTargetSnapshot {
   contractId: string;
   cursor: string | null;
   lastEventLedger: number | null;
+  /**
+   * Ledger a target is resuming from after an automatic floor rewind, or null.
+   * A bounded ledger number, never a cursor, token, or remote payload.
+   */
+  rewindFromLedger: number | null;
+  /** RPC rejected this target's cursor as stale; true until a scan succeeds. */
+  cursorStale: boolean;
   lastError: string | null;
 }
 
@@ -94,6 +101,8 @@ export interface StatusSnapshot {
   notificationsSent: number;
   notificationsFailed: number;
   eventsSkipped: number;
+  /** Cursors automatically rewound to the RPC's retained floor this run. */
+  cursorRewinds: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
   targets: StatusTargetSnapshot[];
@@ -126,6 +135,7 @@ export function buildStatusSnapshot(
     notificationsSent: status.notificationsSent,
     notificationsFailed: status.notificationsFailed,
     eventsSkipped: status.eventsSkipped,
+    cursorRewinds: status.cursorRewinds ?? 0,
     consecutiveFailures: status.consecutiveFailures,
     lastError: status.lastError
       ? { at: status.lastError.at, message: boundText(status.lastError.message) }
@@ -135,6 +145,9 @@ export function buildStatusSnapshot(
       contractId: target.contractId,
       cursor: target.cursor === null ? null : boundText(target.cursor, MAX_CURSOR_CHARS),
       lastEventLedger: target.lastEventLedger,
+      rewindFromLedger:
+        typeof target.rewindFromLedger === "number" ? target.rewindFromLedger : null,
+      cursorStale: target.cursorStale === true,
       lastError: target.lastError === null ? null : boundText(target.lastError),
     })),
   };
