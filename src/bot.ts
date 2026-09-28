@@ -360,7 +360,7 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
         link_preview_options: { is_disabled: true },
       });
     } catch (err) {
-      await ctx.reply(`Audit report failed: ${err instanceof Error ? err.message : String(err)}`);
+      await ctx.reply(`Audit report failed: ${safeErrorMessage(err, [config.botToken])}`);
     }
   });
 
@@ -504,7 +504,10 @@ export function createNotifier(bot: Bot, config: BotConfig) {
       // text, tokens, or remote payloads.
       console.warn(
         `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
-          `retrying as plain text: ${safeErrorMessage(err)}`,
+          `retrying as plain text: ${safeErrorMessage(
+            err,
+            typeof config.botToken === "string" ? [config.botToken] : [],
+          )}`,
       );
       await bot.api.sendMessage(chatId, fallback, {
         ...PLAIN_TEXT_OPTIONS,

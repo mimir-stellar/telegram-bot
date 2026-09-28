@@ -70,7 +70,10 @@ export function safeErrorMessage(error: unknown, secrets: readonly string[] = []
 
   // Also cover a Telegram token embedded in an upstream error when the
   // caller does not have the configured value (for example in a unit test).
-  message = message.replace(/\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]");
+  message = message.replace(
+    /(?<![A-Za-z0-9_-])\d{6,12}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g,
+    "[REDACTED]",
+  );
 
   const compact = message.replace(/\s+/g, " ").trim() || "unknown error";
   return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
