@@ -25,6 +25,7 @@
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
 import type { StellarConfig } from "../config.js";
+import { eventKey } from "../dedup.js";
 import { txExplorerUrl } from "./client.js";
 
 /** Which of the two Mimir contracts an event came from. */
@@ -990,22 +991,25 @@ export function sortEvents<T extends EventMeta>(events: readonly T[]): T[] {
 }
 
 /**
- * Drop within-scan duplicates by paging token (`eventId`). The RPC may repeat
- * the boundary event across pages; the first occurrence wins and input order
- * is preserved. Events with no paging token cannot be identified and are all
- * kept — identity is never invented.
+ * Drop within-scan duplicates using the canonical {@link eventKey} derivation
+ * shared with the raw-layer window and the replay CLI, so one event cannot be
+ * identified one way here and another way there. The RPC may repeat the
+ * boundary event across pages; the first occurrence wins and input order is
+ * preserved. Decoded events carry no `topic`, so the composite branch is
+ * unreachable here — an event without a paging token yields `null`, is kept,
+ * and identity is never invented.
  */
 export function dedupeEvents<T extends EventMeta>(events: readonly T[]): T[] {
   const seen = new Set<string>();
   const out: T[] = [];
   for (const event of events) {
-    const id = event.eventId;
-    if (!id) {
+    const key = eventKey(event);
+    if (key === null) {
       out.push(event);
       continue;
     }
-    if (seen.has(id)) continue;
-    seen.add(id);
+    if (seen.has(key)) continue;
+    seen.add(key);
     out.push(event);
   }
   return out;

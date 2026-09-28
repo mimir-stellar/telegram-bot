@@ -101,6 +101,8 @@ export interface StatusSnapshot {
   notificationsSent: number;
   notificationsFailed: number;
   eventsSkipped: number;
+  /** Suppressed by the bounded dedup window as already-processed. */
+  eventsDeduplicated: number;
   /** Cursors automatically rewound to the RPC's retained floor this run. */
   cursorRewinds: number;
   consecutiveFailures: number;
@@ -135,6 +137,7 @@ export function buildStatusSnapshot(
     notificationsSent: status.notificationsSent,
     notificationsFailed: status.notificationsFailed,
     eventsSkipped: status.eventsSkipped,
+    eventsDeduplicated: status.eventsDeduplicated ?? 0,
     cursorRewinds: status.cursorRewinds ?? 0,
     consecutiveFailures: status.consecutiveFailures,
     lastError: status.lastError

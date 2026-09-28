@@ -99,7 +99,7 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Chain clock skew: ${escapeMd(chainClockLabel(status.chainClockAt, nowMs))}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
-    `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}` +
+    `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped} · deduped ${status.eventsDeduplicated ?? 0}` +
       (status.notificationsDropped
         ? ` · dropped during shutdown ${status.notificationsDropped}`
         : ""),

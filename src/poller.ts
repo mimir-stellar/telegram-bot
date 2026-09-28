@@ -55,7 +55,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 import type { SendExtra } from "./bot.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
-import { EventDedupWindow, eventKey } from "./dedup.js";
+import { EventDedupWindow } from "./dedup.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -1488,10 +1488,15 @@ export function createPoller(deps: PollerDeps) {
           }
 
           let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
+          // Record what the walk read BEFORE notifying: an event is
+          // "processed" once it is read, so a crash between send and save
+          // cannot replay it. The keys come from the reader's own window —
+          // derived from raw responses, where topic content still exists —
+          // because a decoded event alone cannot always re-derive the same
+          // key (it carries no `topic`), and an id-less event would otherwise
+          // never be recorded.
+          for (const id of scan.seenEventIds) dedupWindow.add(id);
           if (scan.events.length > 0) {
-            // Record before notifying: an event is "processed" once it has been
-            // read, so a crash between send and save cannot replay it.
-            for (const event of scan.events) dedupWindow.add(eventKey(event));
             markDirty();
             delivery = await notify(scan.events);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";

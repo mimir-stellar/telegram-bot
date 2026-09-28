@@ -105,6 +105,17 @@ export interface RawScan {
   pages: number;
   /** Events dropped because an earlier page or cycle already returned them. */
   duplicates: number;
+  /**
+   * The dedup window AFTER this walk: the ids seeded via `seenEventIds` plus
+   * the key of every identified event read, oldest-first. Persist this to
+   * suppress the redelivery the inclusive cursor hands back next cycle.
+   *
+   * Keys are derived from the RAW responses here — where `topic` content still
+   * exists — because a decoded event alone cannot always re-derive the same
+   * key (it carries no `topic`). Entries whose key could not be derived are
+   * absent by construction: those events are passed through undeduplicated.
+   */
+  seenEventIds: string[];
   /** Ledger the walk started from after clamping, or null when resuming. */
   startLedger: number | null;
   /** True when the requested start was below the retained floor and clamped up. */
@@ -265,6 +276,7 @@ export async function paginatedGetEvents(
     truncated,
     pages,
     duplicates,
+    seenEventIds: dedup.toJSON(),
     startLedger,
     startClamped,
   };
@@ -321,6 +333,7 @@ export async function readContractEvents(
     truncated: scan.truncated,
     pages: scan.pages,
     duplicates: scan.duplicates,
+    seenEventIds: scan.seenEventIds,
     startLedger: scan.startLedger,
     startClamped: scan.startClamped,
     lastEventLedger: ledgers.length > 0 ? Math.max(...ledgers) : null,

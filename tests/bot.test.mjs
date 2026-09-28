@@ -117,6 +117,33 @@ test("operator /resume sends the exact MarkdownV2 payload and calls poller resum
   ]);
 });
 
+test("/status surfaces the dedup counter and never the bot token", async () => {
+  const { handlers } = mockedBot({
+    config: baseConfig({ allowedChatIds: [] }),
+    status: () =>
+      baseStatus({ cycles: 5, notificationsSent: 3, eventsSkipped: 1, eventsDeduplicated: 4 }),
+  });
+  const replies = [];
+  const ctx = {
+    from: { id: 42 },
+    chat: { id: -1001234567890 },
+    update: { update_id: 74 },
+    reply: async (...args) => {
+      replies.push(args);
+    },
+  };
+
+  await handlers.get("status")(ctx);
+
+  assert.equal(replies.length, 1);
+  const [[text, options]] = replies;
+  assert.deepEqual(options, TELEGRAM_OPTIONS);
+  assert.ok(text.includes("Cycles: 5"), "cycle counts remain visible");
+  assert.ok(text.includes("deduped 4"), "the dedup counter is actionable in /status");
+  assert.doesNotMatch(text, /TEST-ONLY-TOKEN/, "bot token must never appear");
+  assert.doesNotMatch(text, /123456789/, "token prefix must never appear");
+});
+
 test("non-operator /resume is ignored without mutating state or replying", async () => {
   let resumeCalls = 0;
   const { handlers } = mockedBot({

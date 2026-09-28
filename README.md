@@ -108,7 +108,7 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip counters (plus messages dropped by a shutdown drain and cursors automatically rewound to the retained floor), and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip/dedup counters (plus messages dropped by a shutdown drain and cursors automatically rewound to the retained floor), and the last error |
 | `/audit` | Operator only. The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
@@ -150,6 +150,7 @@ npm start -- --status          # or: node dist/index.js --status
   "notificationsSent": 11,
   "notificationsFailed": 0,
   "eventsSkipped": 3,
+  "eventsDeduplicated": 0,
   "cursorRewinds": 0,
   "consecutiveFailures": 0,
   "lastError": null,
@@ -399,12 +400,34 @@ unguarded, one on-chain event becomes two identical chat messages.
 The reader and the poller therefore share a small, bounded **dedup window**
 (`src/dedup.ts`): the ids of the most recently processed events per contract,
 oldest evicted first. A redelivery inside that window is dropped and counted
-instead of posted — visible as `duplicates=` in `npm run scan` output and as
-`eventsDeduplicated` on `/health`. The window is seeded into every scan from the
-cursor file, so the guard survives a restart, and it never grows with chain
-history: an event older than the window can legitimately be announced again,
-which is the accepted trade-off for O(1) memory and a cursor file that stays
-small. Set `EVENT_DEDUP_WINDOW=0` to disable suppression.
+instead of posted — visible as `duplicates=` in `npm run scan` output, as
+`eventsDeduplicated` on `GET /health` and in `status.json`, and as `deduped` in
+`/status`. The window is seeded into every scan from the cursor file, so the
+guard survives a restart, and it never grows with chain history: an event older
+than the window can legitimately be announced again, which is the accepted
+trade-off for O(1) memory and a cursor file that stays small. Set
+`EVENT_DEDUP_WINDOW=0` to disable suppression.
+
+**One event, one key.** Window membership is decided by a single canonical key
+(`eventKey()` in `src/dedup.ts`), derived in strict order:
+
+1. The RPC's own paging token `id` (`<TOID>-<index>`) when present — unique per
+   event and stable across pagination; used verbatim so ids persisted by older
+   releases keep working unchanged.
+2. The same token under the name `eventId`.
+3. A content-derived composite `v2:<ledger>:<txHash>:<txIndex>:<opIndex>:<digest>`
+   when a response omits both — chain positions plus a fixed-length SHA-256
+   digest of the topic XDR. Two events share this key only when every
+   identity-bearing field agrees, so events emitted by the same transaction
+   (even the same operation) are never falsely merged.
+4. Otherwise `null`: no `txHash`, or topic content that cannot be encoded
+   deterministically. Those events pass through **undeduplicated** rather than
+   risk suppressing a real one — a duplicate is recoverable, a wrongly dropped
+   event is not.
+
+The scanner, the poller, and `npm run replay` all route through this one
+function, so an event is never identified one way in one place and another way
+somewhere else.
 
 This is suppression, not backfilling. A dropped duplicate does **not** hold the
 cursor back — the chain remains the record and the walk still advances.
@@ -515,9 +538,15 @@ treatment as the cursor:
 `recentEventIds` is the persisted **dedup window** (see
 [Overlapping pages and duplicate events](#overlapping-pages-and-duplicate-events))
 and is additive: it is bounded by `EVENT_DEDUP_WINDOW` (default `256`) and older
-cursor files without the field load as an empty window. The `version` and the
-`cursor` / `lastEventLedger` fields are unchanged, so the format stays
-backward-compatible in both directions.
+cursor files without the field load as an empty window. Entries are the
+canonical dedup keys: mostly raw RPC paging tokens, but a `v2:` prefix marks a
+content-derived composite for a response that arrived without one. Both forms
+round-trip as opaque strings across restarts, and mixed generations coexist
+harmlessly — a file written by an older release may still hold its
+`<ledger>:<txHash>:<count>` strings, which simply age out of the bounded window
+as new keys are added. No schema bump and no migration are involved. The
+`version` and the `cursor` / `lastEventLedger` fields are unchanged, so the
+format stays backward-compatible in both directions.
 
 `rewindFromLedger` is a second additive field, written **only while a target is
 recovering from a stale cursor** (see
@@ -847,7 +876,7 @@ src/
   health.ts                local loopback GET /health for supervisors
   config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
   bot.ts                   grammy setup: /start, /help, /status, /audit, /contracts, /health, /preview, operator pause/resume
-  dedup.ts                 bounded event-id window (reader + poller dedup)
+  dedup.ts                 canonical event dedup keys (eventKey) + bounded window
   poller.ts                the loop: scan, notify, persist the cursor, flush audit
   audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
   audit-cli.ts             entrypoint for `npm run audit`
