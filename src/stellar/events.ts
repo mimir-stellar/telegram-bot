@@ -55,6 +55,7 @@ import {
   dedupeEvents,
   formatUsdc,
   isAdminPayload,
+  shortAddress,
   sortEvents,
   type ContractSource,
   type DecodedEvent,
@@ -491,31 +492,31 @@ function summarize(event: DecodedEvent): string {
   const money = (v: bigint) => `${formatUsdc(v)} USDC`;
   switch (p.name) {
     case "claim_created":
-      return `claim #${p.claimId} created by ${p.creator} [${p.category}]`;
+      return `claim #${p.claimId} created by ${shortAddress(p.creator)} [${p.category}]`;
     case "claim_challenged":
-      return `claim #${p.claimId} challenged by ${p.challenger} for ${money(p.stake)}`;
+      return `claim #${p.claimId} challenged by ${shortAddress(p.challenger)} for ${money(p.stake)}`;
     case "claim_resolved":
       return `claim #${p.claimId} resolved winner_side=${p.winnerSide} confidence=${p.confidence}`;
     case "market_settled":
       return `claim #${p.claimId} settled paid=${money(p.totalPaid)} fees=${money(p.totalFees)}`;
     case "challenger_paid":
-      return `claim #${p.claimId} paid ${p.challenger} net=${money(p.net)}`;
+      return `claim #${p.claimId} paid ${shortAddress(p.challenger)} net=${money(p.net)}`;
     case "market_created":
-      return `squad market #${p.marketId} by ${p.captain}: ${p.question}`;
+      return `squad market #${p.marketId} by ${shortAddress(p.captain)}: ${p.question}`;
     case "deposited":
-      return `squad #${p.marketId} side=${p.side} ${p.participant} deposited ${money(p.amount)}`;
+      return `squad #${p.marketId} side=${p.side} ${shortAddress(p.participant)} deposited ${money(p.amount)}`;
     case "resolved":
       return `squad #${p.marketId} resolved result=${p.result}`;
     case "claimed":
-      return `squad #${p.marketId} ${p.participant} claimed net=${money(p.net)}`;
+      return `squad #${p.marketId} ${shortAddress(p.participant)} claimed net=${money(p.net)}`;
     case "oracle_changed":
-      return `oracle changed to ${p.newOracle ?? "unknown"}`;
+      return `oracle changed to ${p.newOracle ? shortAddress(p.newOracle) : "unknown"}`;
     case "ownership_transferred":
-      return `ownership transferred to ${p.newOwner ?? "unknown"}`;
+      return `ownership transferred to ${p.newOwner ? shortAddress(p.newOwner) : "unknown"}`;
     case "agent_attributed":
-      return `agent attributed ${p.agent ?? "unknown"}`;
+      return `agent attributed ${p.agent ? shortAddress(p.agent) : "unknown"}`;
     case "fee_accrued":
-      return `fee accrued ${p.amount !== undefined ? money(p.amount) : ""} to ${p.recipient ?? "unknown"}`;
+      return `fee accrued ${p.amount !== undefined ? money(p.amount) : ""} to ${p.recipient ? shortAddress(p.recipient) : "unknown"}`;
     case "admin":
       return `admin event ${p.action}`;
     case "unknown":
