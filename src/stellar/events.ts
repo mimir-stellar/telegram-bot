@@ -59,6 +59,7 @@ import {
   type ContractSource,
   type DecodedEvent,
 } from "./decode.js";
+import { formatRpcTiming, RpcTiming, type RpcTimingSummary } from "./metrics.js";
 
 /** Events per request. The RPC caps this; 200 is well inside it. */
 export const EVENT_PAGE_LIMIT = 200;
@@ -109,6 +110,11 @@ export interface RawScan {
   startLedger: number | null;
   /** True when the requested start was below the retained floor and clamped up. */
   startClamped: boolean;
+  /**
+   * Privacy-safe timing for every RPC await in this walk (counts + ms only;
+   * never a request/response payload). One `health` request, then one per page.
+   */
+  timing: RpcTimingSummary;
 }
 
 /**
@@ -170,7 +176,11 @@ export async function paginatedGetEvents(
   const limit = Math.max(1, opts.limit ?? EVENT_PAGE_LIMIT);
   const maxPages = Math.max(1, opts.maxPages ?? EVENT_MAX_PAGES);
 
-  const window = validateLedgerWindow(await server.getHealth());
+  // Time every RPC await in this walk (the health probe + each page) so the
+  // scan output can report how long the network cost, not just how many pages
+  // it took. Bounded to counts and milliseconds; no payload is retained.
+  const timing = new RpcTiming();
+  const window = validateLedgerWindow(await timing.measure("health", () => server.getHealth()));
   const oldestLedger = window.oldestLedger;
 
   // One window for the whole walk, pre-seeded with what earlier cycles have
@@ -227,9 +237,11 @@ export async function paginatedGetEvents(
 
     // The two request shapes are a discriminated union on `cursor`, so they are
     // built separately rather than spread into one object.
-    const response: rpc.Api.GetEventsResponse = cursor
-      ? await server.getEvents({ filters, cursor, limit })
-      : await server.getEvents({ filters, startLedger: firstStartLedger, limit });
+    const response: rpc.Api.GetEventsResponse = await timing.measure("events", () =>
+      cursor
+        ? server.getEvents({ filters, cursor, limit })
+        : server.getEvents({ filters, startLedger: firstStartLedger, limit }),
+    );
 
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     // Drop anything an earlier page (or an earlier cycle) already produced.
@@ -267,6 +279,7 @@ export async function paginatedGetEvents(
     duplicates,
     startLedger,
     startClamped,
+    timing: timing.summary(),
   };
 }
 
@@ -323,6 +336,7 @@ export async function readContractEvents(
     duplicates: scan.duplicates,
     startLedger: scan.startLedger,
     startClamped: scan.startClamped,
+    timing: scan.timing,
     lastEventLedger: ledgers.length > 0 ? Math.max(...ledgers) : null,
   };
 }
@@ -388,6 +402,8 @@ export interface ScanJsonTarget {
   startLedger: number | null;
   /** True when the requested start was below the retained floor and clamped up. */
   startClamped: boolean;
+  /** RPC request timing for this contract's walk (counts + ms only). */
+  rpcTiming?: RpcTimingSummary;
   histogram: Record<string, number>;
   /** Last N decoded events (controlled by `--show`); never includes secrets. */
   events: ScanJsonEvent[];
@@ -398,6 +414,8 @@ export interface ScanJsonReport {
   network: string;
   rpcUrl: string;
   ledgers: { oldest: number; latest: number };
+  /** Timing for the startup health probe; per-target timing lives on each target. */
+  rpcTiming?: RpcTimingSummary;
   targets: ScanJsonTarget[];
 }
 
@@ -427,6 +445,7 @@ export function buildScanJsonTarget(scan: ContractScan, show: number): ScanJsonT
     cursor: scan.cursor,
     startLedger: scan.startLedger ?? null,
     startClamped: scan.startClamped ?? false,
+    rpcTiming: scan.timing,
     histogram: eventHistogram(scan.events),
     // slice(-0) would return everything, so show=0 must be special-cased
     events: (limit > 0 ? scan.events.slice(-limit) : []).map((event) => ({
@@ -444,6 +463,7 @@ export function buildScanJsonReport(input: {
   rpcUrl: string;
   oldestLedger: number;
   latestLedger: number;
+  rpcTiming?: RpcTimingSummary;
   targets: ScanJsonTarget[];
 }): ScanJsonReport {
   return {
@@ -451,6 +471,7 @@ export function buildScanJsonReport(input: {
     network: input.network,
     rpcUrl: input.rpcUrl,
     ledgers: { oldest: input.oldestLedger, latest: input.latestLedger },
+    rpcTiming: input.rpcTiming,
     targets: input.targets,
   };
 }
@@ -548,7 +569,8 @@ async function main(): Promise<void> {
   const from = flag("from");
   const asJson = hasFlag("json");
 
-  const health = await server.getHealth();
+  const probeTiming = new RpcTiming();
+  const health = await probeTiming.measure("health", () => server.getHealth());
   const network = networkLabel(config);
 
   // When `--json` is set, stdout is reserved for one JSON document. Progress
@@ -558,6 +580,7 @@ async function main(): Promise<void> {
   if (!asJson) {
     console.log(`RPC        ${config.rpcUrl} (${network})`);
     console.log(`ledgers    oldest=${health.oldestLedger} latest=${health.latestLedger}`);
+    console.log(formatRpcTiming(probeTiming.summary()));
   } else {
     progress(
       `scanning ${network} ledgers oldest=${health.oldestLedger} latest=${health.latestLedger}`,
@@ -596,6 +619,7 @@ async function main(): Promise<void> {
         `truncated=${scan.truncated} lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor} ` +
         `start=${scan.startLedger ?? "cursor"}${scan.startClamped ? " (clamped)" : ""}`,
     );
+    console.log(`  ${formatRpcTiming(scan.timing)}`);
     for (const [name, count] of Object.entries(counts)) {
       console.log(`  ${count.toString().padStart(4)}  ${name}`);
     }
@@ -615,6 +639,7 @@ async function main(): Promise<void> {
       rpcUrl: config.rpcUrl,
       oldestLedger: health.oldestLedger,
       latestLedger: health.latestLedger,
+      rpcTiming: probeTiming.summary(),
       targets: jsonTargets,
     });
     process.stdout.write(formatScanJson(report));
