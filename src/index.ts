@@ -176,7 +176,7 @@ async function main(): Promise<void> {
   // so a deploy probe can see the process even while grammy is connecting.
   const healthServer = startHealthServer({ config, status: () => poller.status() });
 
-  await registerCommands(bot);
+  await registerCommands(bot, config);
 
   // Lock first: refuse a second live instance before Telegram long-polling starts.
   // That keeps a duplicate process from racing the cursor or fighting getUpdates.

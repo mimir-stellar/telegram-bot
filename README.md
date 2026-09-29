@@ -115,6 +115,14 @@ looks healthy but notifies nobody.
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
 
+`/start`, `/help`, and Telegram's command menu are generated from the same
+command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
+the help and menu omit `/audit`, `/pause`, and `/resume`; configured operator
+commands are labelled "Operator only". Help uses static metadata, so it remains
+available when the poller or RPC is unhealthy. Adding a command requires its
+metadata and handler in `src/bot.ts`; TypeScript checks that every registry entry
+has a handler. This changes no cursor files or deployment settings.
+
 Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
 response and cannot mutate poller state — this includes `/audit`, whose report
 is operator-only. Repeated `/pause` or `/resume` commands
