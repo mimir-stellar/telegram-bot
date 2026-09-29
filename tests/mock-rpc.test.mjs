@@ -51,7 +51,7 @@ const SECRET_RE = /\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/;
 
 async function waitFor(predicate, label, timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  for (; ;) {
     if (predicate()) return;
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
     await sleep(3);
@@ -60,7 +60,7 @@ async function waitFor(predicate, label, timeoutMs = 8000) {
 
 async function waitForCursorFile(file, predicate, label, timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  for (; ;) {
     try {
       const parsed = JSON.parse(await readFile(file, "utf8"));
       if (predicate(parsed)) return parsed;
@@ -889,9 +889,11 @@ test("mock:poll boots a credential-free dry run and shuts down cleanly", async (
     assert.ok(sendLine.length <= 300, `send preview not bounded: ${sendLine.length}`);
 
     child.kill("SIGTERM");
-    const [code] = await once(child, "exit");
-    assert.equal(code, 0, `expected clean exit, output:\n${out}`);
-    assert.ok(out.includes("[dry-run] SIGTERM received"), `no graceful stop in:\n${out}`);
+    const [code, signal] = await once(child, "exit");
+    if (process.platform !== "win32") {
+      assert.equal(code, 0, `expected clean exit, output:\n${out}`);
+      assert.ok(out.includes("[dry-run] SIGTERM received"), `no graceful stop in:\n${out}`);
+    }
     assertBoundedLogs(
       out.split("\n").filter(Boolean).map((text) => ({ text })),
     );

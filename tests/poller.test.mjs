@@ -55,7 +55,7 @@ function makeCursor(ledger, tx = 1) {
 
 const ADDR = "GBMGZ4WXIR2YQMJTLKJMCTVF3LGVQHSNXKGN6JD5MSHH4SLIRM4IR2Y";
 const MARKET_ID = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-const SQUAD_ID  = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBF4";
+const SQUAD_ID = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBF4";
 
 function baseConfig(overrides = {}) {
   return {
@@ -116,7 +116,7 @@ function makeFakeServer(healthOrError, scanResults = new Map()) {
 function makeTestPoller({ config, server, send, fileSystem = {} } = {}) {
   const cfg = config ?? baseConfig();
   const srv = server ?? makeFakeServer({ status: "healthy", oldestLedger: 4000, latestLedger: 5000 });
-  const sendFn = send ?? (async () => {});
+  const sendFn = send ?? (async () => { });
 
   // Patch the poller module's file I/O by injecting fakes into the dependency
   // injection seam. Since createPoller inlines the fs calls, we need a different
@@ -147,7 +147,7 @@ test("poller: cold start — status shows both cursors null before first cycle",
   const poller = createPoller({
     config: baseConfig(),
     server: makeFakeServer({ status: "healthy", oldestLedger: 4000, latestLedger: 5000 }),
-    send: async () => {},
+    send: async () => { },
     // No cursor file — cold start
     _cursorFileContent: null,
     _disableCursorWrite: true,
@@ -207,7 +207,7 @@ test("poller: after a successful scan, cursor is updated in status", async () =>
   const tmpCursorPath = dataDir.file("poller-test-cursor.json");
   const config = baseConfig({ cursorFile: tmpCursorPath });
 
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
 
   // Run one cycle manually: we cannot easily call cycle() directly since it's
   // internal, but start() immediately fires the loop.
@@ -236,7 +236,7 @@ test("poller: corrupt cursor file triggers cold start, does not throw", async ()
 
   const config = baseConfig({ cursorFile, pollIntervalMs: 9_999_999 });
   const server = makeFakeServer({ status: "healthy", oldestLedger: 4000, latestLedger: 5000 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
 
   await poller.start(); // must not reject
   poller.stop();
@@ -258,7 +258,7 @@ test("poller: corrupt cursor JSON results in cold start (cursors remain null aft
     },
   };
 
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
 
   // Before start, both cursors are null.
   const before = poller.status();
@@ -274,7 +274,7 @@ test("poller: corrupt cursor JSON results in cold start (cursors remain null aft
 
   // Cursors may be set by the first cycle OR remain null from cold start.
   // The important invariant is: no exception was thrown.
-  await unlink(tmpPath).catch(() => {});
+  await unlink(tmpPath).catch(() => { });
 });
 
 test("poller: missing cursor file results in cold start, not an error", async () => {
@@ -293,7 +293,7 @@ test("poller: missing cursor file results in cold start, not an error", async ()
 
   let threw = false;
   try {
-    const poller = createPoller({ config, server, send: async () => {} });
+    const poller = createPoller({ config, server, send: async () => { } });
     await poller.start();
     await new Promise((r) => setTimeout(r, 10));
     poller.stop();
@@ -352,7 +352,7 @@ test("poller: consecutiveFailures increments when ALL targets fail", async () =>
   };
 
   const config = baseConfig({ cursorFile: dataDir.file("all-fail.json"), pollIntervalMs: 9_999_999 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 80));
@@ -382,7 +382,7 @@ test("poller: consecutiveFailures resets when any target succeeds", async () => 
 
   // Use a fast interval so two cycles can complete quickly
   const config = baseConfig({ cursorFile: dataDir.file("reset-failures.json"), pollIntervalMs: 30 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
 
   await poller.start();
   // Wait for two full cycles to run
@@ -406,7 +406,7 @@ test("poller: getHealth failure propagates to target error and increments consec
   };
 
   const config = baseConfig({ cursorFile: dataDir.file("health-fail.json"), pollIntervalMs: 9_999_999 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 50));
@@ -621,7 +621,7 @@ test("poller: stop() prevents further cycles after the current one completes", a
 
   // Short poll interval so the timer would fire quickly if stop() didn't work.
   const config = baseConfig({ cursorFile: dataDir.file("stop.json"), pollIntervalMs: 20 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 10));
@@ -645,7 +645,7 @@ test("poller: status().running is false after stop()", async () => {
       return { events: [], cursor: makeCursor(5000), latestLedger: 5000 };
     },
   };
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
   await poller.start();
   assert.equal(poller.status().running, true);
   poller.stop();
@@ -665,7 +665,7 @@ test("poller: start() sets startedAt and increments cycles on first poll", async
   };
 
   const before = Date.now();
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
   await poller.start();
   await new Promise((r) => setTimeout(r, 50));
   poller.stop();
@@ -695,7 +695,7 @@ test("poller: failed market scan does not update market cursor but squad cursor 
   };
 
   const config = baseConfig({ cursorFile: dataDir.file("iso.json"), pollIntervalMs: 9_999_999 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 80));
@@ -723,7 +723,7 @@ test("poller: status() returns a snapshot, not a live reference", async () => {
     },
   };
 
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
   await poller.start();
   await new Promise((r) => setTimeout(r, 50));
   poller.stop();
@@ -747,7 +747,7 @@ test("poller: targets list has exactly two entries (market and squad)", async ()
     },
   };
 
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({ config, server, send: async () => { } });
   await poller.start();
   await new Promise((r) => setTimeout(r, 50));
   poller.stop();
@@ -756,4 +756,84 @@ test("poller: targets list has exactly two entries (market and squad)", async ()
   assert.equal(st.targets.length, 2);
   const sources = st.targets.map((t) => t.source).sort();
   assert.deepEqual(sources, ["market", "squad"]);
+});
+
+// ── Page Cap (maxPagesPerCycle) ───────────────────────────────────────────────
+
+test("poller: global page cap defers remaining targets when exhausted", async () => {
+  const tip = 5000;
+
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+    },
+    async getEvents(req) {
+      return { events: [], cursor: makeCursor(tip), latestLedger: tip };
+    },
+  };
+
+  // Set cap to 1 page total per cycle.
+  const config = baseConfig({
+    cursorFile: dataDir.file("pagecap.json"),
+    pollIntervalMs: 9_999_999,
+    maxPagesPerCycle: 1,
+  });
+
+  const poller = createPoller({ config, server, send: async () => { } });
+
+  await poller.start();
+  await new Promise((r) => setTimeout(r, 80));
+  poller.stop();
+
+  const st = poller.status();
+  const market = st.targets.find(t => t.source === "market");
+  const squad = st.targets.find(t => t.source === "squad");
+
+  // Market gets processed (uses 1 page), squad is deferred.
+  assert.ok(market.cursor !== null, "market cursor should advance");
+  assert.equal(squad.cursor, null, "squad cursor should remain null because page cap exhausted");
+});
+
+test("poller: deferred targets are picked up when first target finishes backlog", async () => {
+  const tip = 5000;
+  const tipCursor = makeCursor(tip);
+
+  let marketCalls = 0;
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+    },
+    async getEvents(req) {
+      const contractId = req.filters?.[0]?.contractIds?.[0];
+      if (contractId === MARKET_ID) {
+        marketCalls++;
+        if (marketCalls === 1) {
+          // Cycle 1: first request for market returns a non-tip cursor so it makes a 2nd request
+          return { events: [], cursor: makeCursor(4900), latestLedger: tip };
+        }
+      }
+      return { events: [], cursor: tipCursor, latestLedger: tip };
+    },
+  };
+
+  // 2 pages cap per cycle.
+  const config = baseConfig({
+    cursorFile: dataDir.file("pagecap-resume.json"),
+    pollIntervalMs: 20,
+    maxPagesPerCycle: 2,
+  });
+
+  const poller = createPoller({ config, server, send: async () => { } });
+
+  // Before starting, we manually call the first cycle so we can freeze it.
+  await poller.start();
+  // Wait enough time for at least 2 cycles to run
+  await new Promise((r) => setTimeout(r, 150));
+  poller.stop();
+
+  const st = poller.status();
+  const squad = st.targets.find(t => t.source === "squad");
+
+  assert.ok(st.cycles >= 2, `should run at least 2 cycles, ran ${st.cycles}`);
+  assert.ok(squad.cursor !== null, "squad cursor should eventually advance when market stops eating all pages");
 });

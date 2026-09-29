@@ -170,7 +170,7 @@ async function sendWithRetry(
       }
       console.warn(
         `[poller] send attempt ${attempt} failed, retrying in ${backoff}ms: ` +
-          safeErrorMessage(err, [botToken]),
+        safeErrorMessage(err, [botToken]),
       );
       await sleep(backoff);
       // Exponential backoff with cap
@@ -236,7 +236,7 @@ export function createPoller(deps: PollerDeps) {
     } catch {
       console.log(
         `[poller] no cursor file at ${config.cursorFile}; cold start ` +
-          `${config.startLookbackLedgers} ledgers behind the tip`,
+        `${config.startLookbackLedgers} ledgers behind the tip`,
       );
       return;
     }
@@ -251,9 +251,9 @@ export function createPoller(deps: PollerDeps) {
       }
       console.log(
         `[poller] resumed from ${config.cursorFile}: ` +
-          [...state.values()]
-            .map((t) => `${t.source}@${cursorPreview(t.cursor)}`)
-            .join(" "),
+        [...state.values()]
+          .map((t) => `${t.source}@${cursorPreview(t.cursor)}`)
+          .join(" "),
       );
     } catch (err) {
       // A corrupt state file must not wedge the bot; a cold start is recoverable.
@@ -304,10 +304,10 @@ export function createPoller(deps: PollerDeps) {
         skipped += 1;
         console.log(
           `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
-            `at ledger ${event.ledger}` +
-            (event.payload.reason
-              ? ` (${boundedLabel(event.payload.reason, 160)})`
-              : ""),
+          `at ledger ${event.ledger}` +
+          (event.payload.reason
+            ? ` (${boundedLabel(event.payload.reason, 160)})`
+            : ""),
         );
         continue;
       }
@@ -324,7 +324,7 @@ export function createPoller(deps: PollerDeps) {
         skipped += 1;
         console.warn(
           `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
-            `dropping ${event.payload.name} at ledger ${event.ledger}`,
+          `dropping ${event.payload.name} at ledger ${event.ledger}`,
         );
         continue;
       }
@@ -340,7 +340,7 @@ export function createPoller(deps: PollerDeps) {
         failed += 1;
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
-            errorMessage(err),
+          errorMessage(err),
         );
       }
 
@@ -359,16 +359,28 @@ export function createPoller(deps: PollerDeps) {
     status.lastPollAt = Date.now();
 
     let anyOk = false;
+    let pagesRemaining = config.maxPagesPerCycle ?? 40;
 
     for (const target of targets) {
       const current = state.get(target.source);
       if (!current) continue;
 
+      if (pagesRemaining <= 0) {
+        console.warn(
+          `[poller] global page cap (${config.maxPagesPerCycle}) reached; deferring ${target.source} to next cycle`
+        );
+        anyOk = true;
+        continue;
+      }
+
       try {
         const scan = await readContractEvents(server, target, {
           cursor: current.cursor ?? undefined,
           lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
+          maxPages: Math.max(1, pagesRemaining),
         });
+
+        pagesRemaining -= scan.pages;
 
         status.latestLedger = scan.latestLedger;
         status.oldestLedger = scan.oldestLedger;
@@ -379,7 +391,7 @@ export function createPoller(deps: PollerDeps) {
         if (scan.events.length > 0) {
           console.log(
             `[poller] ${target.source}: ${scan.events.length} event(s) ` +
-              `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
+            `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
           );
           delivery = await notify(scan.events);
         }
@@ -393,7 +405,7 @@ export function createPoller(deps: PollerDeps) {
           if (delivery.failed > 0 || delivery.skipped > 0) {
             console.warn(
               `[poller] ${target.source}: committed cursor after partial delivery ` +
-                `(sent=${delivery.sent}, failed=${delivery.failed}, skipped=${delivery.skipped})`,
+              `(sent=${delivery.sent}, failed=${delivery.failed}, skipped=${delivery.skipped})`,
             );
           }
         }
@@ -457,7 +469,7 @@ export function createPoller(deps: PollerDeps) {
       status.targets = [...state.values()].map((t) => ({ ...t }));
       console.log(
         `[poller] watching market=${config.marketContractId} squad=${config.squadContractId} ` +
-          `every ${config.pollIntervalMs}ms`,
+        `every ${config.pollIntervalMs}ms`,
       );
       void loop();
     },

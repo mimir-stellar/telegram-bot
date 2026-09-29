@@ -56,6 +56,7 @@ export interface BotConfig extends StellarConfig {
   startLookbackLedgers: number;
   cursorFile: string;
   maxNotificationsPerCycle: number;
+  maxPagesPerCycle: number;
   /** Loopback host for the local HTTP health endpoint. */
   healthHost: string;
   /** TCP port for the health endpoint. `0` disables the listener. */
@@ -92,6 +93,7 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   maxNotificationsPerCycle: 20,
+  maxPagesPerCycle: 40,
   healthHost: "127.0.0.1",
   healthPort: 8787,
   // 3× default poll interval — one missed cycle is fine; three is not.
@@ -314,6 +316,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
+    maxPagesPerCycle: c.int("MAX_PAGES_PER_CYCLE", DEFAULTS.maxPagesPerCycle, 1),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),
