@@ -135,11 +135,11 @@ does not hold the cursor back because replaying every missed notification could
 create an unbounded backlog or flood a recovered chat. The log reports the
 sent/failed/skipped counts for that commit.
 
-Each individual Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default
-`10000`). A send that exceeds this budget is aborted and counted as a failure
-for that event; the poller continues with the remaining events in the page and
-commits the cursor under the normal rules. The timeout applies per send, not to
-the whole cycle, so a slow chat cannot stall scanning or the shutdown drain.
+Each individual Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS`
+(default `10000`). A send that exceeds the timeout is aborted, counted as a
+failed send, and does not block the rest of the cycle. The cursor still
+advances under the normal rules above, so a timed-out send is treated like any
+other delivery failure: lossy, bounded, and never a reason to hold the cursor.
 
 The Stellar chain remains the authoritative record.
 
@@ -221,10 +221,6 @@ Send a second `SIGTERM`/`SIGINT` only if the drain is genuinely stuck: it exits
 immediately (`130`/`143`) and skips the flush. The cursor file itself cannot be
 truncated by that, because it is written to a temporary file and renamed.
 
-An in-flight Telegram send is subject to `TELEGRAM_SEND_TIMEOUT_MS` during the
-drain as well; a send that times out is dropped and counted like any other
-shutdown drop, and the flush proceeds.
-
 After a drain, `GET /health` reports `poller.stopping` and `poller.pendingFlush`.
 `pendingFlush: true` after the process should have exited means the flush did
 not land — check disk permissions and the persistent volume before restarting.
@@ -272,10 +268,9 @@ If Telegram rate limits are observed:
 3. Do not disable the notification cap to compensate.
 4. Allow subsequent polling cycles to continue normally.
 
-If `/status` shows repeated send timeouts rather than rate-limit responses,
-confirm the chat is reachable and that `TELEGRAM_SEND_TIMEOUT_MS` is not set
-below the observed round-trip time. Raising the timeout does not change the
-per-cycle notification cap and does not hold the cursor back.
+Send timeouts (`TELEGRAM_SEND_TIMEOUT_MS`) surface as send errors in
+`/status`; a burst of timeouts usually means Telegram is slow or unreachable,
+not that the cap is wrong. Do not raise the cap to compensate.
 
 Do not manually replay large event ranges into Telegram.
 
@@ -332,10 +327,6 @@ curl -s http://127.0.0.1:8787/health | jq .config
 Fix the source, not the symptom: restart only once the report names the source
 you intended for that setting.
 
-`TELEGRAM_SEND_TIMEOUT_MS` follows the same provenance rules as other settings:
-check `/health` `.config` to confirm whether the value came from the environment,
-`.env`, or a profile default before changing it.
-
 ## Safe rollback
 
 For a deployment containing only documentation or operational changes:
@@ -361,6 +352,9 @@ Before deployment:
 * `data/` or `CURSOR_FILE` is persistent — on Railway, a volume attached at `/app/data` (see `railway.json`).
 * The deployed revision passes typecheck and build checks.
 * No production credentials are committed.
+* `TELEGRAM_SEND_TIMEOUT_MS` is set to a value appropriate for the deployment
+  (default `10000`); lower it for latency-sensitive chats, raise it only if
+  Telegram is consistently slow and the cycle budget allows it.
 
 After deployment:
 
@@ -373,8 +367,6 @@ After deployment:
 * Confirm the last event ledger advances after new events.
 * Monitor RPC and Telegram errors.
 
-* Confirm `/status` shows no sustained send timeouts under normal chat latency.
-
 ## Security and logging
 
 Never log:
@@ -384,6 +376,9 @@ Never log:
 * payment proofs
 * unrestricted remote API responses
 * sensitive authentication data
+
+Send timeout logs include only the chat id, the bounded error category, and
+the elapsed time — never the message body or the bot token.
 
 Configuration provenance reports are the exception that proves the rule: the
 boot `[boot] config` line and the `/health` `config` section name settings and
@@ -402,8 +397,8 @@ local mock profile — loopback only, no bot token, no Testnet, and an isolated
 npm run mock:poll -- --fail-events error   # RPC failure drill (see "RPC failures")
 npm run mock:poll -- --stale-cursor        # stale cursor drill (see "Stale or corrupt cursor")
 npm run mock:poll -- --malformed           # undecodable event drill
+npm run mock:poll -- --slow-send           # Telegram send timeout drill
 npm run mock:poll                          # healthy dry run; sends are logged, not delivered
-npm run mock:poll -- --send-timeout        # per-send timeout drill; sends are aborted and counted
 curl -s http://127.0.0.1:8787/health | jq .status
 ```
 
@@ -416,9 +411,9 @@ the retained window, the poller keeps it (a rewind happens only when a fresh
 asserted by `tests/mock-rpc.test.mjs` (`npm run test:mock`), and the bounded
 rewind path is covered by `tests/cursor-rewind.test.mjs`.
 
-The `--send-timeout` drill uses a fake Telegram sender and a fake clock so the
-per-send timeout path is exercised without live Telegram calls; the cursor must
-still advance under the normal commit rules.
+`--slow-send` makes the fake Telegram sender hang past
+`TELEGRAM_SEND_TIMEOUT_MS`; the send is aborted, counted as a failure, and the
+cursor still advances. Covered by `tests/telegram-timeout.test.mjs`.
 
 ## Verification
 

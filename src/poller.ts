@@ -258,21 +258,9 @@ export interface SendOptions {
   maxSendRetries?: number;
   initialBackoffMs?: number;
   maxBackoffMs?: number;
-  /**
-   * Hard per-send timeout in milliseconds. A single Telegram send that does
-   * not settle within this bound is treated as a failed attempt so one hung
-   * request cannot stall the whole poll cycle. Defaults to
-   * {@link DEFAULT_SEND_TIMEOUT_MS}.
-   */
+  /** Per-attempt timeout for a single Telegram send. Defaults to `SEND_TIMEOUT_MS`. */
   sendTimeoutMs?: number;
 }
-
-/**
- * Default per-send timeout. Telegram normally answers in well under a second;
- * a request that has not settled after this long is treated as failed so the
- * cycle can move on and the retry/backoff policy can take over.
- */
-export const DEFAULT_SEND_TIMEOUT_MS = 15_000;
 
 export interface PollerDeps {
   config: BotConfig;
@@ -360,6 +348,9 @@ const DEFAULT_INITIAL_BACKOFF_MS = 1_000;
 /** Maximum backoff in milliseconds for Telegram send retries. */
 const DEFAULT_MAX_BACKOFF_MS = 10_000;
 
+/** Default per-attempt timeout for a single Telegram send. */
+export const DEFAULT_SEND_TIMEOUT_MS = 10_000;
+
 /** Maximum time to back off based on Retry-After (1 hour). */
 const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 
@@ -392,6 +383,18 @@ export function extractRetryAfterMs(err: unknown): number | null {
   }
   return null;
 }
+
+/**
+ * True when an error came from {@link withTimeout} rather than from the
+ * underlying send. A timeout is retryable: the request may have been accepted
+ * but the response never arrived, so a bounded retry is the right call. The
+ * marker is a stable prefix so callers can distinguish it from a transport
+ * error without parsing the whole message.
+ */
+export function isSendTimeoutError(err: unknown): boolean {
+  return err instanceof Error && err.message.startsWith("Telegram send timed out after ");
+}
+
 /**
  * Consecutive automatic floor rewinds allowed for one target before the poller
  * stops and leaves the decision to an operator. One rewind is the normal case;
@@ -862,10 +865,11 @@ async function sendWithRetry(
   const maxRetries = opts?.maxSendRetries ?? DEFAULT_MAX_SEND_RETRIES;
   let backoff = opts?.initialBackoffMs ?? DEFAULT_INITIAL_BACKOFF_MS;
   const maxBackoff = opts?.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
+  const sendTimeoutMs = opts?.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
 
   while (true) {
     try {
-      await withTimeout(send(text), SEND_TIMEOUT_MS, "Telegram send");
+      await withTimeout(send(text), sendTimeoutMs, "Telegram send");
       return;
     } catch (err) {
       attempt++;
@@ -877,7 +881,9 @@ async function sendWithRetry(
       const delay = retryAfterMs !== null ? retryAfterMs : backoff;
       
       console.warn(
-        `[poller] send attempt ${attempt} failed, retrying in ${delay}ms: ` +
+        `[poller] send attempt ${attempt} failed` +
+          (isSendTimeoutError(err) ? ` (timed out after ${sendTimeoutMs}ms)` : "") +
+          `, retrying in ${delay}ms: ` +
           safeErrorMessage(err, [botToken]),
       );
       await sleep(delay);
@@ -891,6 +897,7 @@ export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
   const audit: AuditLog = deps.audit ?? createAuditLog();
   const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
+  const sendTimeoutMs = deps.sendOptions?.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
   const now = deps.now ?? Date.now;
   const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
   const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
@@ -1345,7 +1352,9 @@ export function createPoller(deps: PollerDeps) {
           detail: `${event.payload.name} at ledger ${event.ledger}`,
         });
         console.error(
-          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
+          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries` +
+            (isSendTimeoutError(err) ? ` (last attempt timed out after ${sendTimeoutMs}ms)` : "") +
+            `: ` +
             errorMessage(err),
         );
       }

@@ -1,3 +1,4 @@
+
 /**
  * Tests for src/poller.ts
  *
@@ -73,6 +74,7 @@ function baseConfig(overrides = {}) {
     startLookbackLedgers: 60,
     cursorFile: dataDir.file("unused-cursor.json"),
     maxNotificationsPerCycle: 5,
+    shutdownTimeoutMs: 5_000,
     ...overrides,
   };
 }
