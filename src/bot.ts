@@ -9,6 +9,7 @@
 
 import { Bot, type Context } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
+import { performance } from "node:perf_hooks";
 
 import { escapeMd, previewMessage, safeErrorMessage, type ExplorerKeyboard } from "./notifications/format.js";
 import { formatFeatureFlags } from "./notifications/featureFlags.js";
@@ -328,7 +329,17 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
       );
       return;
     }
-    await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
+    const startedAt = performance.now();
+    let sent = false;
+    try {
+      await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
+      sent = true;
+    } finally {
+      const latencyMs = Math.max(0, performance.now() - startedAt);
+      console.info(
+        `[bot] /status ${sent ? "sent" : "failed"} in ${latencyMs.toFixed(1)}ms`,
+      );
+    }
   });
 
   bot.command("audit", async (ctx) => {
