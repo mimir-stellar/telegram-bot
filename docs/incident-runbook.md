@@ -135,11 +135,11 @@ does not hold the cursor back because replaying every missed notification could
 create an unbounded backlog or flood a recovered chat. The log reports the
 sent/failed/skipped counts for that commit.
 
-Each individual Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS`
-(default `10000`). A send that exceeds the timeout is aborted, counted as a
-failed send, and does not block the rest of the cycle. The cursor still
-advances under the normal rules above, so a timed-out send is treated like any
-other delivery failure: lossy, bounded, and never a reason to hold the cursor.
+Each individual Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default
+`10000`). A send that exceeds this deadline is aborted and counted as a failure
+for that event; the poller continues with the remaining events in the page and
+commits the cursor under the normal rules. The timeout applies per send, not to
+the whole cycle, so a single slow request cannot stall the poller indefinitely.
 
 The Stellar chain remains the authoritative record.
 
@@ -154,6 +154,8 @@ The Stellar chain remains the authoritative record.
   / `GET /health` show a non-null `rewindFromLedger`, after a long outage.
 * `GET /health` returns `503` and a target has `cursorStale: true`, even if the
   other watched contract is scanning successfully.
+* `/status` shows send errors clustered around a single slow event, with the
+  remaining events in the same page still delivered.
 
 ### Recovery
 
@@ -162,6 +164,10 @@ preserve the quarantined copy for investigation.
 
 A syntactically valid cursor that Soroban rejects as stale is first checked
 against a fresh `getHealth()`:
+
+Timing out an individual send does not change cursor behavior: the cursor still
+advances only after the returned page is processed, and a timed-out send is
+treated exactly like any other failed send.
 
 * If the cursor's ledger is **strictly below** `oldestLedger`, the position it
   points at is already unrecoverable, so the poller drops it and rescans from
@@ -268,9 +274,10 @@ If Telegram rate limits are observed:
 3. Do not disable the notification cap to compensate.
 4. Allow subsequent polling cycles to continue normally.
 
-Send timeouts (`TELEGRAM_SEND_TIMEOUT_MS`) surface as send errors in
-`/status`; a burst of timeouts usually means Telegram is slow or unreachable,
-not that the cap is wrong. Do not raise the cap to compensate.
+If sends are timing out rather than being rate limited, confirm
+`TELEGRAM_SEND_TIMEOUT_MS` is set to a value appropriate for the deployment's
+network path before raising it; the default is chosen to keep a single slow
+send from delaying the rest of the cycle.
 
 Do not manually replay large event ranges into Telegram.
 
@@ -352,9 +359,6 @@ Before deployment:
 * `data/` or `CURSOR_FILE` is persistent — on Railway, a volume attached at `/app/data` (see `railway.json`).
 * The deployed revision passes typecheck and build checks.
 * No production credentials are committed.
-* `TELEGRAM_SEND_TIMEOUT_MS` is set to a value appropriate for the deployment
-  (default `10000`); lower it for latency-sensitive chats, raise it only if
-  Telegram is consistently slow and the cycle budget allows it.
 
 After deployment:
 
@@ -377,9 +381,6 @@ Never log:
 * unrestricted remote API responses
 * sensitive authentication data
 
-Send timeout logs include only the chat id, the bounded error category, and
-the elapsed time — never the message body or the bot token.
-
 Configuration provenance reports are the exception that proves the rule: the
 boot `[boot] config` line and the `/health` `config` section name settings and
 their sources, so they can be shared verbatim. They are built so that a value —
@@ -397,7 +398,6 @@ local mock profile — loopback only, no bot token, no Testnet, and an isolated
 npm run mock:poll -- --fail-events error   # RPC failure drill (see "RPC failures")
 npm run mock:poll -- --stale-cursor        # stale cursor drill (see "Stale or corrupt cursor")
 npm run mock:poll -- --malformed           # undecodable event drill
-npm run mock:poll -- --slow-send           # Telegram send timeout drill
 npm run mock:poll                          # healthy dry run; sends are logged, not delivered
 curl -s http://127.0.0.1:8787/health | jq .status
 ```
@@ -410,10 +410,6 @@ the retained window, the poller keeps it (a rewind happens only when a fresh
 `getHealth()` proves the cursor is *below* the floor). The same guarantees are
 asserted by `tests/mock-rpc.test.mjs` (`npm run test:mock`), and the bounded
 rewind path is covered by `tests/cursor-rewind.test.mjs`.
-
-`--slow-send` makes the fake Telegram sender hang past
-`TELEGRAM_SEND_TIMEOUT_MS`; the send is aborted, counted as a failure, and the
-cursor still advances. Covered by `tests/telegram-timeout.test.mjs`.
 
 ## Verification
 

@@ -259,7 +259,14 @@ poller's cursor.
 
 **Bounded output.** Admin events (`oracle_changed`, `ownership_transferred`, …)
 are logged at the progress level and not sent. Unknown or malformed events are
-logged and skipped. Send failures are counted as skipped and do not abort the
+logged and skipped. Send failures are retried on the next cycle; each individual
+Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default 15000) so a
+stalled or rate-limited Telegram endpoint cannot wedge the poller. A send that
+exceeds the timeout is counted as a failure, logged with the target and event
+name (never the token or payload), and the cursor is not advanced past it, so
+the event is retried after a restart. Cursor files remain version-1 and
+compatible with existing deployments; no configuration change is required to
+keep current behavior.ailures are counted as skipped and do not abort the
 run. No bot token or private key ever appears in progress output or the JSON
 report.
 
@@ -699,12 +706,6 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
   compact, bounded, and the configured bot token is redacted.
-- **A single Telegram send** is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default
-  `10000`, `0` disables). A send that exceeds the deadline is aborted, counted
-  as failed, and isolated to that routed chat and event — the cycle continues,
-  the cursor still advances, and the chain remains the record. This keeps one
-  wedged `sendMessage` from stalling the poll loop through a long Telegram
-  outage. The timeout is per send, not per cycle.
 - **An unreadable audit line** (or a failed append) is logged and skipped; the
   audit trail never throws into the poll loop, and a bad line never takes the
   report down. An audit file that cannot be read at all reports as empty.
@@ -775,11 +776,6 @@ Configuration is additive: `SHUTDOWN_TIMEOUT_MS` is optional (see
 format is unchanged — a deployment that omits the new key gets the `10000` ms
 default.
 
-`TELEGRAM_SEND_TIMEOUT_MS` is likewise additive and optional: it bounds each
-individual Telegram send, defaults to `10000` ms, and `0` disables the bound.
-No existing variable is renamed, no cursor format changes, and a deployment
-that omits the key gets the default.
-
 ## Long-running operation
 
 The notifier is meant to run for weeks through Stellar RPC and Telegram outages.
@@ -794,8 +790,6 @@ Everything it keeps in memory is fixed-size or capped:
 - Error text is redacted (bot token) and clipped before it reaches `/status`,
   `/health`, or logs; unknown or malformed events are logged as one bounded line.
 - At most one poll timer is pending, and `stop()` leaves none behind.
-- Each Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS`, so a hung
-  `sendMessage` cannot hold a cycle open past its deadline.
 
 `tests/soak.test.mjs` enforces this offline: it drives about 1,700 poll cycles
 through a scripted fake RPC (outages, stale-cursor rejections, malformed and
@@ -902,7 +896,6 @@ Configuration (see `.env.example`):
 - A stale cursor rejection independently makes `GET /health` return `503` until its target scans successfully; `HEALTH_STALE_MS` does not disable this cursor alert.
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
-- `TELEGRAM_SEND_TIMEOUT_MS` — per-send deadline for Telegram `sendMessage` (default `10000`; `0` disables). A timed-out send is counted as failed and does not hold the cursor back.
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the target alert is additive, does not change the
@@ -945,7 +938,6 @@ tests/
   format.test.mjs          notification formatting (incl. deterministic fuzz)
   audit.test.mjs           redaction, entries, persistence, report rendering
   replay.test.mjs          cursor-range replay: dry-run, send, clamp, security, cursor-safety
-  poller-send-timeout.test.mjs  per-send Telegram timeout: positive, negative, boundary, restart
 ```
 
 ## Deploying on Railway

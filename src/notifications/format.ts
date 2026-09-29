@@ -65,6 +65,44 @@ function describeError(error: unknown): string {
 }
 
 /**
+ * Telegram send timeout budget, in milliseconds.
+ *
+ * Individual sends are bounded so a single stalled request cannot wedge the
+ * poller: the cursor must advance (or the batch must be retried) on a
+ * predictable schedule, not on Telegram's liveness. Kept here, next to the
+ * error formatting, so the poller and its tests share one source of truth.
+ */
+export const TELEGRAM_SEND_TIMEOUT_MS = 10_000;
+
+/**
+ * True when a thrown value looks like a timeout/abort rather than a Telegram
+ * API rejection. Recognises `AbortError`, `TimeoutError`, and the common
+ * `ETIMEDOUT`/`ECONNRESET`/`UND_ERR_*` shapes surfaced by fetch/undici, so the
+ * poller can log "timed out" instead of a generic failure and retry the batch.
+ */
+export function isTimeoutError(error: unknown): boolean {
+  if (error instanceof Error) {
+    if (error.name === "AbortError" || error.name === "TimeoutError") return true;
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(code)) {
+      return true;
+    }
+    return /timed? ?out/i.test(error.message);
+  }
+  if (error !== null && typeof error === "object") {
+    const record = error as { name?: unknown; code?: unknown; message?: unknown };
+    if (record.name === "AbortError" || record.name === "TimeoutError") return true;
+    if (typeof record.code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(record.code)) {
+      return true;
+    }
+    if (typeof record.message === "string" && /timed? ?out/i.test(record.message)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Keep operational errors actionable without copying remote payloads or the
  * bot token into logs and status messages.
  */
@@ -79,7 +117,9 @@ export function safeErrorMessage(error: unknown, secrets: readonly string[] = []
   // credentials into a log, `/status`, or `/health`.
   const message = redactText(collapsed, { secrets });
 
-  const compact = message.trim() || "unknown error";
+  // A timeout is labelled explicitly so operators can tell a stalled Telegram
+  // send from an API rejection without parsing the raw error text.
+  const compact = message.trim() || (isTimeoutError(error) ? "send timed out" : "unknown error");
   return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
 }
 
@@ -504,8 +544,7 @@ export function formatFallbackEvent(
   const contract = escapeMd(shortAddress(event.contractId ?? "unknown"));
   const ledger = escapeMd(String(event.ledger ?? "unknown"));
   const safeReason = escapeMd(safeErrorMessage(reason));
-  const url = eventExplorerUrl(config, event);
-  const txPart = url ? ` · [tx](${url})` : "";
+  const txPart = event.txHash ? ` · [tx](${txExplorerUrl(config, event.txHash)})` : "";
   return NOTIFICATION_MD.fallbackEvent(source, contract, ledger, safeReason, txPart);
 }
 

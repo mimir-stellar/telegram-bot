@@ -40,8 +40,8 @@ export const MAX_ERROR_CHARS = 300;
 /** Longest cursor string kept. Real cursors are `<TOID>-<index>`, far shorter. */
 export const MAX_CURSOR_CHARS = 128;
 
-/** Longest Telegram send timeout (ms) that will be reported in the snapshot. */
-export const MAX_SEND_TIMEOUT_MS = 600_000;
+/** Longest send-duration string kept. Real values are short, e.g. `1234ms`. */
+export const MAX_SEND_DURATION_CHARS = 32;
 
 /**
  * Collapse whitespace and truncate. Applied to every string that originates
@@ -83,12 +83,10 @@ export interface StatusTargetSnapshot {
   cursorStale: boolean;
   lastError: string | null;
   /**
-   * Consecutive Telegram send timeouts for this target, reset on a successful
-   * send. Bounded counter, never a token or remote payload.
+   * Bounded description of the most recent per-send timeout, or null. Never a
+   * token, chat id, or remote payload — only a coarse reason and duration.
    */
-  sendTimeouts: number;
-  /** Wall-clock ms of the most recent Telegram send timeout, or null. */
-  lastSendTimeoutAt: number | null;
+  lastSendTimeout: string | null;
 }
 
 export interface StatusSnapshot {
@@ -117,12 +115,12 @@ export interface StatusSnapshot {
   cursorRewinds: number;
   consecutiveFailures: number;
   /**
-   * Per-send Telegram timeout in ms, as configured. Bounded to a sane ceiling
-   * so a misconfigured value cannot be persisted as an unbounded number.
+   * Count of individual Telegram sends aborted by the per-send timeout this
+   * run. Bounded integer; never includes tokens or message bodies.
    */
-  telegramSendTimeoutMs: number;
-  /** Total Telegram sends that timed out this run. */
-  telegramSendTimeouts: number;
+  sendTimeouts: number;
+  /** Bounded description of the most recent per-send timeout, or null. */
+  lastSendTimeout: string | null;
   lastError: { at: number; message: string } | null;
   targets: StatusTargetSnapshot[];
 }
@@ -157,11 +155,10 @@ export function buildStatusSnapshot(
     eventsDeduplicated: status.eventsDeduplicated ?? 0,
     cursorRewinds: status.cursorRewinds ?? 0,
     consecutiveFailures: status.consecutiveFailures,
-    telegramSendTimeoutMs: Math.min(
-      MAX_SEND_TIMEOUT_MS,
-      Math.max(0, Math.floor(config.telegramSendTimeoutMs ?? 0)),
-    ),
-    telegramSendTimeouts: status.telegramSendTimeouts ?? 0,
+    sendTimeouts: status.sendTimeouts ?? 0,
+    lastSendTimeout: status.lastSendTimeout
+      ? boundText(status.lastSendTimeout, MAX_SEND_DURATION_CHARS)
+      : null,
     lastError: status.lastError
       ? { at: status.lastError.at, message: boundText(status.lastError.message) }
       : null,
@@ -174,9 +171,10 @@ export function buildStatusSnapshot(
         typeof target.rewindFromLedger === "number" ? target.rewindFromLedger : null,
       cursorStale: target.cursorStale === true,
       lastError: target.lastError === null ? null : boundText(target.lastError),
-      sendTimeouts: Math.max(0, Math.floor(target.sendTimeouts ?? 0)),
-      lastSendTimeoutAt:
-        typeof target.lastSendTimeoutAt === "number" ? target.lastSendTimeoutAt : null,
+      lastSendTimeout:
+        target.lastSendTimeout === null || target.lastSendTimeout === undefined
+          ? null
+          : boundText(target.lastSendTimeout, MAX_SEND_DURATION_CHARS),
     })),
   };
 }
