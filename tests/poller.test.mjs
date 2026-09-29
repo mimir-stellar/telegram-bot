@@ -28,8 +28,11 @@
  */
 
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { writeFile } from "node:fs/promises";
 import { createPoller } from "../dist/poller.js";
 import { createTempDataDir } from "./helpers/temp-data.mjs";
 
