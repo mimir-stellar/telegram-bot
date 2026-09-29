@@ -504,7 +504,8 @@ export function formatFallbackEvent(
   const contract = escapeMd(shortAddress(event.contractId ?? "unknown"));
   const ledger = escapeMd(String(event.ledger ?? "unknown"));
   const safeReason = escapeMd(safeErrorMessage(reason));
-  const txPart = event.txHash ? ` · [tx](${txExplorerUrl(config, event.txHash)})` : "";
+  const txUrl = eventExplorerUrl(config, event);
+  const txPart = txUrl ? ` · [tx](${txUrl})` : "";
   return NOTIFICATION_MD.fallbackEvent(source, contract, ledger, safeReason, txPart);
 }
 

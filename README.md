@@ -259,21 +259,9 @@ poller's cursor.
 
 **Bounded output.** Admin events (`oracle_changed`, `ownership_transferred`, …)
 are logged at the progress level and not sent. Unknown or malformed events are
-logged and skipped. Send failures are bounded: each individual Telegram send is
-subject to a timeout (`TELEGRAM_SEND_TIMEOUT_MS`, default 15000) so a hung or
-slow Telegram endpoint cannot stall the poller indefinitely. A timed-out send is
-counted as a failure, logged with the target and a redacted error, and does not
-advance the cursor past the event — the next cycle retries it. The poller never
-holds signing keys and never posts bot tokens, private keys, or payment proofs.
-Send failures are counted as skipped and do not abort the run. No bot token or
-private key ever appears in progress output or the JSON report.
-
-The same timeout applies to the live poller's notification path: every
-individual Telegram send is wrapped in `TELEGRAM_SEND_TIMEOUT_MS` (default
-15000), so one slow or hung endpoint cannot hold a poll cycle open. A timed-out
-send is counted as failed, logged with the target and a redacted error, and the
-cursor is not advanced past the event — the next cycle retries it. Set the
-variable to `0` to disable the timeout (not recommended for production).
+logged and skipped. Send failures are counted as skipped and do not abort the
+run. No bot token or private key ever appears in progress output or the JSON
+report.
 
 **JSON report shape** (`--json` stdout, one document, ends with `\n`):
 
@@ -680,15 +668,10 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   the chain is the record; the poller logs the sent/failed/skipped commit decision.
   A rejected inline keyboard (or a malformed MarkdownV2 payload) fails the same
   way as any other send. Events without a usable transaction hash are still
-  sent, just without the explorer button. A send that exceeds
-  `TELEGRAM_SEND_TIMEOUT_MS` (default 15000) is aborted, counted as failed, and
-  logged with the target and a redacted error; the cursor is not advanced past
-  the event, so the next cycle retries it.
-- **A hung Telegram send** is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default
-  15000, `0` disables). The send is aborted, counted as failed, and logged with
-  the target and a redacted error; the cursor is not advanced past the event, so
-  the next cycle retries it. This keeps a single slow endpoint from stalling the
-  poller or the shutdown drain.
+  sent, just without the explorer button.
+  Each individual Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS`
+  (default `10000`, `0` disables); a send that exceeds it is counted as failed
+  and the cycle continues, so a hung Telegram call cannot stall the poller.
 - **A corrupt cursor file** (invalid JSON or wrong schema) is **quarantined**
   to `data/cursor.json.corrupt.<timestamp>` beside the live path, then treated as
   a cold start; the next successful cycle writes a fresh `cursor.json`, and the
@@ -788,6 +771,8 @@ Configuration is additive: `SHUTDOWN_TIMEOUT_MS` is optional (see
 `.env.example`), no existing variable is renamed, and the version-1 cursor
 format is unchanged — a deployment that omits the new key gets the `10000` ms
 default.
+`TELEGRAM_SEND_TIMEOUT_MS` follows the same rule: optional, additive, and
+defaulting to `10000` ms when unset, so existing deployments are unaffected.
 
 ## Long-running operation
 
@@ -802,6 +787,8 @@ Everything it keeps in memory is fixed-size or capped:
   `MAX_NOTIFICATIONS_PER_CYCLE` messages; the rest are counted as skipped.
 - Error text is redacted (bot token) and clipped before it reaches `/status`,
   `/health`, or logs; unknown or malformed events are logged as one bounded line.
+- Each Telegram send is wrapped in a bounded timeout
+  (`TELEGRAM_SEND_TIMEOUT_MS`, default `10000`), so a hung send cannot wedge a cycle.
 - At most one poll timer is pending, and `stop()` leaves none behind.
 
 `tests/soak.test.mjs` enforces this offline: it drives about 1,700 poll cycles
@@ -909,6 +896,7 @@ Configuration (see `.env.example`):
 - A stale cursor rejection independently makes `GET /health` return `503` until its target scans successfully; `HEALTH_STALE_MS` does not disable this cursor alert.
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
+- `TELEGRAM_SEND_TIMEOUT_MS` — per-send timeout for Telegram delivery (default `10000`; `0` disables)
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the target alert is additive, does not change the
@@ -1021,6 +1009,7 @@ drift is caught locally without network access. To change dependencies, edit
 `package.json`, run `npm install` to regenerate the lockfile, and commit both
 files together — a lockfile that no longer matches `package.json` fails
 `npm ci`, `npm run lockfile:check`, and CI.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile, config-provenance, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md).
 
