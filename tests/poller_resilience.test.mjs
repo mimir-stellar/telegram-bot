@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
-import tmp from "node:os";
+import * as tmp from "node:os";
 import path from "node:path";
 import { xdr, nativeToScVal } from "@stellar/stellar-sdk";
 
 import { createPoller } from "../dist/poller.js";
 
-const VALID_ACCOUNT = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const VALID_ACCOUNT = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 const CURSOR_1999 = `${1999n << 32n}-1`;
 
 function mockConfig(cursorFile) {
@@ -18,7 +18,7 @@ function mockConfig(cursorFile) {
     squadContractId: "CCONTRACTSQUAD",
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
-    networkPassphrase: "Test SDF Network ; September 2015",
+    networkPassphrase: "Test DF Network ; September 2015",
     explorerBaseUrl: "https://stellar.expert/explorer",
     cursorFile,
     pollIntervalMs: 10000,
@@ -70,6 +70,64 @@ test("poller initializes and handles cold start when cursor file is missing", as
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
+test("poller times out individual Telegram sends without stalling cursor", async () => {
+  const dir = await mkdtemp(path.join(tmp.tmpdir(), "poller-test-"));
+  const cursorFile = path.join(dir, "cursor.json");
+  const config = mockConfig(cursorFile);
+
+  const topics = [
+    xdr.ScVal.scvSymbol("claim_created"),
+    nativeToScVal(1),
+    nativeToScVal(VALID_ACCOUNT),
+  ];
+  const value = nativeToScVal({ category: "crypto" });
+
+  const server = mockServer( {
+    getEvents: async (req) => {
+      if (req.cursor) {
+        return { events: [], latestLedger: 2000, cursor: req.cursor };
+      }
+      return {
+        events: [
+          {
+            contractId: req.filters?.[0]?.contractIds?.[0] ?? "CCONTRACTMARKET",
+            ledger: 100,
+            txHash: "0x1234",
+            ledgerClosedAt: "2026-01-01T00:00:00Z",
+            id: "100-1",
+            topic: topics,
+            value,
+          },
+        ],
+        latestLedger: 2000,
+        cursor: CURSOR_1999,
+      };
+    },
+  });
+
+  const send = () =>
+    new Promise(() => {
+      // Never resolves: simulates a hung Telegram send.
+    });
+
+  const poller = createPoller({
+    config,
+    server,
+    send,
+    sendOptions: { sendSpacingMs: 0, initialBackoffMs: 10, sendTimeoutMs: 50 },
+  });
+  await poller.start();
+  await new Promise((r) => setTimeout(r, 300));
+
+  const status = poller.status();
+  assert.ok(status.notificationsFailed >= 1, "timed-out send should count as failure");
+  const marketTarget = status.targets.find((t) => t.source === "market");
+  assert.equal(marketTarget.cursor, CURSOR_1999, "cursor should advance despite send timeout");
+
+  poller.stop();
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+});
+
 test("poller persists cursor upon successful cycle and reloads upon restart", async () => {
   const dir = await mkdtemp(path.join(tmp.tmpdir(), "poller-test-"));
   const cursorFile = path.join(dir, "cursor.json");
@@ -105,7 +163,7 @@ test("poller persists cursor upon successful cycle and reloads upon restart", as
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
-test("poller continues and does not lose cursor state during transient RPC failures", async () => {
+test("poller continues and does not lose cursor state during transient HPC failures", async () => {
   const dir = await mkdtemp(path.join(tmp.tmpdir(), "poller-test-"));
   const cursorFile = path.join(dir, "cursor.json");
   const config = { ...mockConfig(cursorFile), pollIntervalMs: 50 };
@@ -148,7 +206,7 @@ test("poller logs and handles Telegram send retries/failures without stalling cu
   ];
   const value = nativeToScVal({ category: "crypto" });
 
-  const server = mockServer({
+  const server = mockServer( {
     getEvents: async (req) => {
       if (req.cursor) {
         return { events: [], latestLedger: 2000, cursor: req.cursor };
@@ -316,7 +374,6 @@ test("poller circuit breaker resets on successful RPC before threshold", async (
     getHealth: async () => ({ oldestLedger: 1000, latestLedger: 2000 }),
     getEvents: async () => {
       callCount++;
-      // Fail first call, succeed second
       if (callCount === 1) {
         throw new Error("RPC timeout");
       }
@@ -328,15 +385,15 @@ test("poller circuit breaker resets on successful RPC before threshold", async (
     config,
     server,
     send: async () => {},
-    circuitBreakerOptions: { failureThreshold: 3, cooldownMs: 1000 },
+    circuitBreakerOptions: { failureThreshold: 3, cooldownMs: 500 },
   });
 
   await poller.start();
-  await new Promise((r) => setTimeout(r, 80));
+  await new Promise((r) => setTimeout(r, 150));
 
   const status = poller.status();
-  assert.equal(status.circuitBreaker.open, false, "circuit breaker should not open");
-  assert.equal(status.circuitBreaker.failureCount, 0, "failure count should reset after success");
+  assert.equal(status.circuitBreaker.open, false, "circuit breaker should remain closed");
+  assert.equal(status.circuitBreaker.failureCount, 0, "failure count should reset after successful RPC");
 
   poller.stop();
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });

@@ -1,3 +1,5 @@
+
+
 # Incident Runbook
 
 Operational guidance for recovering the Mimir Telegram notifier from missed notifications, without treating Telegram as the source of truth.
@@ -11,12 +13,21 @@ Operational guidance for recovering the Mimir Telegram notifier from missed noti
 * A shutdown flush may only persist cursors the poller already advanced; it never invents a resume position.
 * Logs and status output must not expose bot tokens, private keys, payment proofs, or unbounded remote payloads.
   Scrubbing is centralized in `src/redact.ts` (regression suite: `tests/redaction.test.mjs`).
+* Each Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default `10000`). A
+  timed-out send is counted as a failure and never blocks the poll cycle indefinitely.
+  The timeout applies per individual send, not per cycle, so a slow chat cannot
+  extend the poll interval beyond one send's bound.
 
 Notification text from contract String fields is bounded to 200 Unicode code
 points before MarkdownV2 escaping. An oversized or malformed transaction hash
 does not receive an explorer link. The original event is still decoded and the
 cursor follows the normal poller rules; truncation affects only the Telegram
 presentation, not chain data or persisted cursor state.
+
+The send timeout path is covered by `tests/telegram-timeout.test.mjs`; keep that
+suite green when changing `TELEGRAM_SEND_TIMEOUT_MS` handling in `src/poller.ts`.
+The same path can be drilled locally with `npm run mock:poll -- --slow-send`,
+which uses a fake Telegram sender and never contacts the live API.
 
 ## Quick health check
 
@@ -43,6 +54,7 @@ Check:
 * last event ledger per contract
 * persisted cursor
 * poll/send counters, including automatic floor rewinds (`cursorRewinds`)
+* per-send timeout count (`sendTimeouts`) and the configured send timeout
 * any target resuming from a floor rewind (`rewindFromLedger`)
 * last error and consecutive failure count
 
@@ -135,6 +147,19 @@ does not hold the cursor back because replaying every missed notification could
 create an unbounded backlog or flood a recovered chat. The log reports the
 sent/failed/skipped counts for that commit.
 
+Each individual send is wrapped in a bounded timeout
+(`TELEGRAM_SEND_TIMEOUT_MS`, default `10000`). A send that exceeds the timeout
+is aborted, counted as a failed send, and logged with a bounded reason; the
+poller continues with the next notification and the cursor still follows the
+normal commit rules. Timed-out sends are visible in `/status` as
+`sendTimeouts` and are never retried in a way that could stall the cycle.
+
+A timed-out send must not be retried inside the same cycle; the next cycle
+resumes from the committed cursor and the chain remains authoritative.
+The timeout is a per-send bound: a cycle that sends N notifications can spend at
+most N × `TELEGRAM_SEND_TIMEOUT_MS` on Telegram, and the shutdown drain still
+caps the whole cycle at `SHUTDOWN_TIMEOUT_MS`.
+
 The Stellar chain remains the authoritative record.
 
 ## Stale or corrupt cursor
@@ -208,6 +233,10 @@ Never replace a cursor with an arbitrary ledger or cursor value unless the repos
 4. Any cursor state still only in memory is flushed to `CURSOR_FILE`, then the
    health endpoint and the Telegram long-poll are closed and the process exits
    `0`.
+
+An in-flight Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS`; a send
+still pending when the drain deadline passes is dropped and counted like any
+other shutdown drop. It never extends the drain past `SHUTDOWN_TIMEOUT_MS`.
 5. If that teardown itself wedges, the process exits `1` after
    `SHUTDOWN_TIMEOUT_MS + 10000` ms. The flush has already happened by then.
 
@@ -262,6 +291,13 @@ If Telegram rate limits are observed:
 3. Do not disable the notification cap to compensate.
 4. Allow subsequent polling cycles to continue normally.
 
+If `/status` shows a rising `sendTimeouts` count, confirm the Telegram API is
+reachable and that `TELEGRAM_SEND_TIMEOUT_MS` is not set below the expected
+round-trip latency. Do not raise the timeout to mask a persistent outage.
+Timed-out sends are logged with a bounded reason and the affected chat id is
+never included in the log line; only the contract, ledger, and reason category
+are emitted.
+
 Do not manually replay large event ranges into Telegram.
 
 ## Malformed or unexpected events
@@ -313,6 +349,10 @@ curl -s http://127.0.0.1:8787/health | jq .config
 * `source: "process-env"` where a file value was expected — a variable already
   set by the platform, systemd, or the shell wins over `.env`; the file is never
   allowed to overwrite it.
+* `TELEGRAM_SEND_TIMEOUT_MS` reported as `profile-default` — the send timeout is
+  using the built-in default; set it explicitly if the deployment needs a different bound.
+* `TELEGRAM_SEND_TIMEOUT_MS` reported as `env-file` but `/status` still shows the
+  default — the value is declared empty in `.env`; see `emptyDeclaration` above.
 
 Fix the source, not the symptom: restart only once the report names the source
 you intended for that setting.
@@ -340,6 +380,9 @@ Before deployment:
 * `.env` contains valid configuration without exposing secrets in source control.
 * `BOT_TOKEN` and `TELEGRAM_CHAT_ID` are supplied through the deployment secret/configuration mechanism.
 * `data/` or `CURSOR_FILE` is persistent — on Railway, a volume attached at `/app/data` (see `railway.json`).
+* `TELEGRAM_SEND_TIMEOUT_MS` is set to a value appropriate for the deployment's Telegram latency.
+  The default `10000` ms is a safe starting point; lower it only if the deployment
+  has measured, consistently fast Telegram round trips.
 * The deployed revision passes typecheck and build checks.
 * No production credentials are committed.
 
@@ -352,6 +395,7 @@ After deployment:
   bot token's source reported as `env-file`, not `profile-default`.
 * Confirm the expected contract IDs and cursor are shown.
 * Confirm the last event ledger advances after new events.
+* Confirm `/status` shows `sendTimeouts` at `0` during steady state.
 * Monitor RPC and Telegram errors.
 
 ## Security and logging
@@ -363,6 +407,8 @@ Never log:
 * payment proofs
 * unrestricted remote API responses
 * sensitive authentication data
+* raw Telegram error bodies from a timed-out send — log only the bounded reason
+  category and the affected contract/ledger, never the remote payload.
 
 Configuration provenance reports are the exception that proves the rule: the
 boot `[boot] config` line and the `/health` `config` section name settings and
@@ -381,6 +427,7 @@ local mock profile — loopback only, no bot token, no Testnet, and an isolated
 npm run mock:poll -- --fail-events error   # RPC failure drill (see "RPC failures")
 npm run mock:poll -- --stale-cursor        # stale cursor drill (see "Stale or corrupt cursor")
 npm run mock:poll -- --malformed           # undecodable event drill
+npm run mock:poll -- --slow-send           # Telegram send timeout drill
 npm run mock:poll                          # healthy dry run; sends are logged, not delivered
 curl -s http://127.0.0.1:8787/health | jq .status
 ```
@@ -393,6 +440,12 @@ the retained window, the poller keeps it (a rewind happens only when a fresh
 `getHealth()` proves the cursor is *below* the floor). The same guarantees are
 asserted by `tests/mock-rpc.test.mjs` (`npm run test:mock`), and the bounded
 rewind path is covered by `tests/cursor-rewind.test.mjs`.
+
+`--slow-send` makes the fake Telegram sender hang past `TELEGRAM_SEND_TIMEOUT_MS`
+so the send timeout path can be exercised without live Telegram calls; the
+timeout is covered by `tests/telegram-timeout.test.mjs`.
+The drill asserts that a timed-out send is counted in `sendTimeouts`, does not
+stall the cycle, and does not appear in logs with any token-shaped value.
 
 ## Verification
 
@@ -411,6 +464,9 @@ npm run scan
 ```
 
 The notifier should remain read-only throughout incident recovery. The chain remains the source of truth even when Telegram delivery is unavailable.
+The send timeout is a presentation-layer bound only: it never changes cursor
+persistence, never rewinds a cursor, and never causes a replay of already
+committed events.
 
 ## Corrupt cursor file
 

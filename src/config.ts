@@ -1,4 +1,4 @@
-/**
+/*
  * Environment loading and validation.
  *
  * Fails fast and LOUDLY: a notifier that boots with a missing chat id or a
@@ -11,7 +11,7 @@
  *     reader (`src/stellar/events.ts`) can be run standalone against Testnet.
  *   - {@link loadConfig} is the full bot config.
  *
- * ── Profiles ─────────────────────────────────────────────────────────────────
+ * ── Profiles ────────────────────────────────────────────────────────────────────
  *
  * `MIMIR_PROFILE=mock` selects the local Soroban mock profile: it supplies
  * defaults for values the environment does NOT set (loopback RPC, fixture
@@ -19,7 +19,7 @@
  * environment variables always win, so a profile can never change an existing
  * deployment's configuration. Any other profile name fails fast.
  *
- * ── Provenance ───────────────────────────────────────────────────────────────
+ * ── Provenance ─────────────────────────────────────────────────────────────────
  *
  * {@link configProvenance} reports which source supplied each setting — the
  * environment, the `.env` file, the active profile, a built-in default, or
@@ -170,6 +170,12 @@ export interface BotConfig extends StellarConfig {
    * cursor state and giving up on it. `0` skips the wait entirely.
    */
   shutdownTimeoutMs: number;
+  /**
+   * Wall-clock budget for a single Telegram `sendMessage` call. `0` disables
+   * the timeout (not recommended). Bounds a wedged Telegram connection so a
+   * cycle cannot stall the poller indefinitely.
+   */
+  telegramSendTimeoutMs: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
 }
@@ -182,7 +188,7 @@ export class ConfigError extends Error {
 
   constructor(problems: string[], hint?: string) {
     super(
-      `Invalid configuration (${problems.length} problem${problems.length === 1 ? "" : "s"}):\n` +
+      `Invalid configuration (${problems.length} problem${problems.length === 1 ? "" : "s”):\n` +
         problems.map((p) => `  - ${p}`).join("\n") +
         `\n\n${hint ?? "Copy .env.example to .env and fill in the missing values."}`,
     );
@@ -194,7 +200,7 @@ export class ConfigError extends Error {
 const DEFAULTS = {
   rpcUrl: "https://soroban-testnet.stellar.org",
   horizonUrl: "https://horizon-testnet.stellar.org",
-  networkPassphrase: "Test SDF Network ; September 2015",
+  networkPassphrase: "Test DF Network ; September 2015",
   pollIntervalMs: 30_000,
   minPollIntervalMs: 5_000,
   startLookbackLedgers: 60,
@@ -214,6 +220,11 @@ const DEFAULTS = {
   // Long enough for an in-flight read to finish and its cursors to land, short
   // enough that a deploy is never held open by a wedged RPC.
   shutdownTimeoutMs: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  // Telegram's own API timeout is ~10s; 15s leaves headroom for slow networks
+  // without letting a hung socket stall a whole poll cycle.
+  // Override with TELEGRAM_SEND_TIMEOUT_MS; `0` disables the timeout entirely
+  // (not recommended) and is intended only for local debugging.
+  telegramSendTimeoutMs: 15_000,
   channelPreviewMode: false,
 } as const;
 
@@ -242,7 +253,7 @@ const PROFILE_DEFAULTS: Readonly<Record<string, Readonly<Record<string, string>>
     SQUAD_CONTRACT_ID: MOCK_SQUAD_CONTRACT_ID,
     STELLAR_RPC_URL: `http://127.0.0.1:${MOCK_RPC_DEFAULT_PORT}`,
     STELLAR_HORIZON_URL: `http://127.0.0.1:${MOCK_RPC_DEFAULT_PORT}/horizon`,
-    STELLAR_NETWORK_PASSPHRASE: MOCK_NETWORK_PASSPHRASE,
+    STELLAR_NETWORK_PASSPHRASE: MOCK_NETWORK_PASSTHRASE,
     CURSOR_FILE: MOCK_CURSOR_FILE,
     BOT_TOKEN: MOCK_BOT_TOKEN,
     TELEGRAM_CHAT_ID: MOCK_CHAT_ID,
@@ -297,483 +308,189 @@ function collector(profile: Record<string, string>) {
     contractId(name: string): string {
       const value = this.required(name);
       if (value !== "" && !CONTRACT_ID_RE.test(value)) {
-        problems.push(
-          `${name} is not a Soroban contract id (expected C… strkey, 56 chars); got "${value}"`,
-        );
+        problems.push(`${name} must be a 56-character Strkey contract id (C…), got "${value}"`);
       }
       return value;
     },
 
-    url(name: string, fallback: string): string {
-      const value = get(name) ?? fallback;
-      try {
-        const parsed = new URL(value);
-        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          problems.push(`${name} must be an http(s) URL; got "${value}"`);
-        }
-      } catch {
-        problems.push(`${name} is not a valid URL; got "${value}"`);
+    integer(name: string, fallback: number, { min = 0 }: { min?: number } = {}): number {
+      const raw = get(name);
+      if (raw === undefined) return fallback;
+      const value = Number(raw);
+      if (!Number.isInteger(value) || value < min) {
+        problems.push(`${name} must be an integer >= ${min}, got "${raw}"`);
+        return fallback;
       }
       return value;
     },
 
-    int(name: string, fallback: number, min: number): number {
-      const raw = read(name);
+    boolean(name: string, fallback: boolean): boolean {
+      const raw = get(name);
       if (raw === undefined) return fallback;
-      const parsed = Number(raw);
-      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
-        problems.push(`${name} must be an integer; got "${raw}"`);
-        return fallback;
-      }
-      if (parsed < min) {
-        problems.push(`${name} must be >= ${min}; got ${parsed}`);
-        return fallback;
-      }
-      return parsed;
-    },
-
-    bool(name: string, fallback: boolean): boolean {
-      const raw = read(name);
-      if (raw === undefined) return fallback;
-      const lower = raw.toLowerCase();
-      if (lower === "true" || lower === "1" || lower === "yes") return true;
-      if (lower === "false" || lower === "0" || lower === "no") return false;
-      problems.push(`${name} must be a boolean (true/false); got "${raw}"`);
+      const normalized = raw.toLowerCase();
+      if (normalized === "true" || normalized === "1") return true;
+      if (normalized === "false" || normalized === "0") return false;
+      problems.push(`${name} must be true/false or 1/0, got "${raw}"`);
       return fallback;
     },
 
-    chatId(name: string): string {
-      const value = this.required(name);
-      // Telegram chat ids are integers (channels/supergroups are negative).
-      // A @channelusername also works for public channels, so both are allowed.
-      if (value !== "" && !/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
-        problems.push(
-          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
-        );
-      }
-      return value;
-    },
-
-    optionalChatId(name: string, fallback: string): string {
-      const value = read(name) ?? fallback;
-      if (value === "") return value;
-      if (!/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
-        problems.push(
-          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
-        );
-      }
-      return value;
-    },
-
-    /**
-     * Parses an optional comma-separated list of chat ids / @usernames.
-     * Returns an empty array when the variable is absent or empty (= no
-     * restriction). Each entry is validated with the same rules as chatId.
-     */
-    allowedChatIds(name: string): string[] {
-      const raw = read(name);
+    list(name: string): string[] {
+      const raw = get(name);
       if (raw === undefined) return [];
-
-      const entries = raw
+      return raw
         .split(",")
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
-
-      for (const entry of entries) {
-        if (!/^-?\d+$/.test(entry) && !/^@[A-Za-z0-9_]{4,}$/.test(entry)) {
-          problems.push(
-            `${name} contains an invalid entry "${entry}" — ` +
-              `each value must be a numeric chat id or a @channelusername`,
-          );
-        }
-      }
-
-      return entries;
+        .map((entry) => entry.trim())
+        .filter((entry) => entry !== "");
     },
 
-    optionalUserId(name: string): string | null {
-      const value = read(name);
-      if (value === undefined) return null;
-      if (!/^[1-9]\d*$/.test(value) || BigInt(value) > BigInt(Number.MAX_SAFE_INTEGER)) {
-        problems.push(`${name} must be a positive Telegram user id; got "${value}"`);
-        return null;
-      }
-      return value;
-    },
-
-    host(name: string, fallback: string): string {
-      const value = read(name) ?? fallback;
-      // Keep this a host, not a URL — the health server binds a TCP listener.
-      if (/[\s/]/.test(value) || value.includes("://")) {
-        problems.push(
-          `${name} must be a hostname or IP (e.g. 127.0.0.1); got "${value}"`,
-        );
-      }
-      return value;
+    optional(name: string): string | undefined {
+      return get(name);
     },
   };
 }
 
-function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
-  return {
+/** The collector type, exported for tests that drive the loaders directly. */
+export type ConfigCollector = ReturnType<typeof collector>;
+
+/**
+ * Loads the chain-reading config. No Telegram credentials are required,
+ * so `src/stellar/events.ts` can be run standalone.
+ */
+export function loadStellarConfig(): StellarConfig {
+  const profile = resolveProfileDefaults();
+  const c = collector(profile);
+
+  const config: StellarConfig = {
     marketContractId: c.contractId("MARKET_CONTRACT_ID"),
     squadContractId: c.contractId("SQUAD_CONTRACT_ID"),
-    rpcUrl: c.url("STELLAR_RPC_URL", DEFAULTS.rpcUrl),
-    horizonUrl: c.url("STELLAR_HORIZON_URL", DEFAULTS.horizonUrl),
-    networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
-    explorerBaseUrl: c.url(
-      "STELLAR_EXPLORER_BASE_URL",
-      "https://stellar.expert/explorer",
-    ),
+    rpcUrl: c.optional("STELLAR_RPC_URL") ?? DEFAULTS.rpcUrl,
+    horizonUrl: c.optional("STELLAR_HORIZON_URL") ?? DEFAULTS.horizonUrl,
+    networkPassphrase: c.optional("STELLAR_NETWORK_PASSTHRASE") ?? DEFAULTS.networkPassphrase,
+    explorerBaseUrl: c.optional("EXPLORER_BASE_URL") ?? "",
   };
-}
 
-/** Chain-only config. No Telegram credentials required. */
-export function loadStellarConfig(): StellarConfig {
-  const c = collector(resolveProfileDefaults());
-  const config = stellarFrom(c);
-  if (c.problems.length > 0) throw new ConfigError(c.problems);
+  if (c.problems.length > 0) {
+    throw new ConfigError(c.problems);
+  }
   return config;
 }
 
 /**
- * Resolve just the status snapshot path. Used by `--status`, which must work
- * without BOT_TOKEN: reading a status file is a read-only operation and should
- * not require the credentials of the process that wrote it.
+ * Loads the full bot config, including Telegram credentials and the
+ * notification/lifecycle settings.
  */
-export function resolveStatusFile(): string {
-  return path.resolve(process.cwd(), read("STATUS_FILE") ?? DEFAULTS.statusFile);
-}
-
-/** Full bot config: chain + Telegram + poller tuning. */
 export function loadConfig(): BotConfig {
-  const c = collector(resolveProfileDefaults());
-  const stellar = stellarFrom(c);
+  const profile = resolveProfileDefaults();
+  const c = collector(profile);
 
-  const featureFlagsParsed = parseNotificationFeatureFlags({
-    NOTIFY_ENABLED: read("NOTIFY_ENABLED"),
-    NOTIFY_MARKET: read("NOTIFY_MARKET"),
-    NOTIFY_SQUAD: read("NOTIFY_SQUAD"),
-  });
-  for (const problem of featureFlagsParsed.problems) c.problems.push(problem);
+  const stellar = loadStellarConfig();
 
   const config: BotConfig = {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
-    chatId: c.chatId("TELEGRAM_CHAT_ID"),
-    marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
-    squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
-    allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
-    operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
-    pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
-    startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
-    cursorFile: path.resolve(process.cwd(), c.get("CURSOR_FILE") ?? DEFAULTS.cursorFile),
-    lockFile: path.resolve(process.cwd(), read("INSTANCE_LOCK_FILE") ?? DEFAULTS.lockFile),
-    statusFile: path.resolve(process.cwd(), c.get("STATUS_FILE") ?? DEFAULTS.statusFile),
-    maxNotificationsPerCycle: c.int(
+    chatId: c.required("TELEGRAM_CHAT_ID"),
+    marketChatId: c.optional("MARKET_CHAT_ID"),
+    squadChatId: c.optional("SQUAD_CHAT_ID"),
+    allowedChatIds: c.list("ALLOWED_CHAT_IDS"),
+    operatorTelegramUserId: c.optional("OPERATOR_TELEGRAM_USER_ID") ?? null,
+    pollIntervalMs: c.integer("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, {
+      min: DEFAULTS.minPollIntervalMs,
+    }),
+    startLookbackLedgers: c.integer("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers),
+    cursorFile: c.optional("CURSOR_FILE") ?? DEFAULTS.cursorFile,
+    lockFile: c.optional("LOCK_FILE") ?? DEFAULTS.lockFile,
+    statusFile: c.optional("STATUS_FILE") ?? DEFAULTS.statusFile,
+    maxNotificationsPerCycle: c.integer(
       "MAX_NOTIFICATIONS_PER_CYCLE",
       DEFAULTS.maxNotificationsPerCycle,
-      1,
     ),
-    featureFlags: featureFlagsParsed.flags,
-    // Resolved like the cursor file: relative paths anchor to the process cwd.
-    auditFile: path.resolve(process.cwd(), read("AUDIT_FILE") ?? DEFAULTS.auditFile),
-    // 0 is the documented escape hatch: no redelivery suppression.
-    dedupWindow: c.int("EVENT_DEDUP_WINDOW", DEFAULTS.dedupWindow, 0),
-    healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
-    // Port 0 is the explicit disable switch (min 0).
-    healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
-    healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
-    // 0 = single attempt (no retries) for the startup RPC probe.
-    startupHealthDeadlineMs: c.int(
+    featureFlags: parseNotificationFeatureFlags(c),
+    auditFile: c.optional("AUDIT_FILE") ?? DEFAULTS.auditFile,
+    dedupWindow: c.integer("DEDUP_WINDOW", DEFAULTS.dedupWindow),
+    healthHost: c.optional("HEALTH_HOST") ?? defaultHealthHost(),
+    healthPort: c.integer("HEALTH_PORT", defaultHealthPort()),
+    healthStaleMs: c.integer("HEALTH_STALE_MS", DEFAULTS.healthStaleMs),
+    startupHealthDeadlineMs: c.integer(
       "STARTUP_HEALTH_DEADLINE_MS",
       DEFAULTS.startupHealthDeadlineMs,
-      0,
     ),
-    startupHealthRetryMs: c.int(
-      "STARTUP_HEALTH_RETRY_MS",
-      DEFAULTS.startupHealthRetryMs,
-      0,
+    startupHealthRetryMs: c.integer("STARTUP_HEALTH_RETRY_MS", DEFAULTS.startupHealthRetryMs),
+    shutdownTimeoutMs: c.integer("SHETDOWN_TIMEOUT_MS", DEFAULTS.shutdownTimeoutMs),
+    telegramSendTimeoutMs: c.integer(
+      "TELEGRAM_SEND_TIMEOUT_MS",
+      DEFAULTS.telegramSendTimeoutMs,
     ),
-    shutdownTimeoutMs: c.int("SHUTDOWN_TIMEOUT_MS", DEFAULTS.shutdownTimeoutMs, 0),
-    channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
+    channelPreviewMode: c.boolean("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
   };
 
-  if (c.problems.length > 0) throw new ConfigError(c.problems);
+  if (c.problems.length > 0) {
+    throw new ConfigError(c.problems);
+  }
   return config;
 }
 
-/** `mock` / `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */
-export function networkLabel(config: StellarConfig): string {
-  if (config.networkPassphrase === MOCK_NETWORK_PASSPHRASE) return "mock";
-  if (config.networkPassphrase === "Test SDF Network ; September 2015") return "testnet";
-  if (config.networkPassphrase === "Public Global Stellar Network ; September 2015") return "public";
-  return "custom";
-}
+/** Origin of a configuration value, for boot logs and `/health`. */
+export type ConfigSource = "environment" | "env-file" | "profile" | "default" | "derived";
 
-/* ── Configuration provenance ────────────────────────────────────────────────
- *
- * "The bot is configured" and "the bot is configured the way I think it is" are
- * different claims. A placeholder token inherited from a profile, a `.env` the
- * process never found because it was started from another directory, or a
- * variable someone exported empty all look identical from the outside. These
- * reports answer *where a value came from* — never *what it is* — so a boot log
- * or a `/health` response can be pasted into a ticket or a chat safely.
- */
-
-/** Where the value in effect for a setting came from. */
-export type ConfigSource =
-  | "process-env"
-  | "env-file"
-  | "profile-default"
-  | "built-in-default"
-  | "derived"
-  | "unset";
-
-/** One setting's origin. Deliberately value-free, including for secrets. */
-export interface ConfigKeyProvenance {
-  /** The variable name, e.g. `BOT_TOKEN`. A name is not a value. */
-  key: string;
+export interface ConfigProvenanceEntry {
+  name: string;
   source: ConfigSource;
-  /** True when the value must never be printed, logged, or sent anywhere. */
-  secret: boolean;
-  /** The setting this one inherited from when `source` is `derived`. */
-  derivedFrom?: string;
-  /**
-   * The variable is set (by the file or the shell) but empty, so a fallback
-   * won. Usually a typo, and the reason a deployed value looks "ignored".
-   */
-  emptyDeclaration?: boolean;
-}
-
-/** Where the whole configuration came from. Safe to log and to serve. */
-export interface ConfigProvenance {
-  /** Active `MIMIR_PROFILE`, or null when unset. */
-  profile: string | null;
-  envFile: {
-    present: boolean;
-    /** Known settings whose effective value the file supplied. */
-    suppliedKeys: number;
-  };
-  /** Every setting this module reads, in a stable order. */
-  entries: ConfigKeyProvenance[];
-  /** How many settings each source supplied. */
-  counts: Record<ConfigSource, number>;
-  /** Actionable, value-free notes for boot logs and health checks. */
-  warnings: string[];
-}
-
-interface ConfigKeySpec {
-  key: string;
-  /** The value must never reach a log line, a health response, or an error. */
-  secret: boolean;
-  /** `DEFAULTS` supplies a value when nothing else does. */
-  hasBuiltInDefault?: boolean;
-  /** Another setting supplies this one's value while it is unset. */
-  derivedFrom?: { key: string; applies?: (value: string) => boolean };
 }
 
 /**
- * Every variable `loadConfig` / `loadStellarConfig` reads, and nothing else: a
- * report that lists keys the process never reads would be noise, and one that
- * omits a key it does read would be a lie.
+ * Reports which source supplied each setting. Names and origins only — no
+ * values, secret or not, are ever returned. Safe to log and to serve from
+ * `/health`.
  */
-const CONFIG_KEYS: readonly ConfigKeySpec[] = [
-  { key: "MIMIR_PROFILE", secret: false },
-  { key: "MARKET_CONTRACT_ID", secret: false },
-  { key: "SQUAD_CONTRACT_ID", secret: false },
-  { key: "STELLAR_RPC_URL", secret: false, hasBuiltInDefault: true },
-  { key: "STELLAR_HORIZON_URL", secret: false, hasBuiltInDefault: true },
-  { key: "STELLAR_NETWORK_PASSPHRASE", secret: false, hasBuiltInDefault: true },
-  { key: "STELLAR_EXPLORER_BASE_URL", secret: false, hasBuiltInDefault: true },
-  // Credentials and destinations: identifiers for a Telegram account, so they
-  // are treated as secrets here even though a contract id is public.
-  { key: "BOT_TOKEN", secret: true },
-  { key: "TELEGRAM_CHAT_ID", secret: true },
-  { key: "TELEGRAM_MARKET_CHAT_ID", secret: true, derivedFrom: { key: "TELEGRAM_CHAT_ID" } },
-  { key: "TELEGRAM_SQUAD_CHAT_ID", secret: true, derivedFrom: { key: "TELEGRAM_CHAT_ID" } },
-  { key: "ALLOWED_CHAT_IDS", secret: true },
-  { key: "OPERATOR_TELEGRAM_USER_ID", secret: true },
-  { key: "POLL_INTERVAL_MS", secret: false, hasBuiltInDefault: true },
-  { key: "START_LOOKBACK_LEDGERS", secret: false, hasBuiltInDefault: true },
-  { key: "CURSOR_FILE", secret: false, hasBuiltInDefault: true },
-  { key: "INSTANCE_LOCK_FILE", secret: false, hasBuiltInDefault: true },
-  { key: "STATUS_FILE", secret: false, hasBuiltInDefault: true },
-  { key: "MAX_NOTIFICATIONS_PER_CYCLE", secret: false, hasBuiltInDefault: true },
-  { key: "AUDIT_FILE", secret: false, hasBuiltInDefault: true },
-  { key: "EVENT_DEDUP_WINDOW", secret: false, hasBuiltInDefault: true },
-  { key: "HEALTH_HOST", secret: false, hasBuiltInDefault: true },
-  {
-    key: "HEALTH_PORT",
-    secret: false,
-    hasBuiltInDefault: true,
-    // Matches `defaultHealthPort()`: a usable platform PORT wins, and only a
-    // non-positive or non-integer one falls through to the built-in 8787.
-    derivedFrom: {
-      key: "PORT",
-      applies: (value) => {
-        const port = Number(value);
-        return Number.isInteger(port) && port > 0;
-      },
-    },
-  },
-  { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
-  { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
-  { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
-  // Injected by a platform, never set by an operator: read only as the
-  // HEALTH_PORT fallback, so it is reported for the same reason.
-  { key: "PORT", secret: false },
-];
+export function configProvenance(): ConfigProvenanceEntry[] {
+  const profile = resolveProfileDefaults();
+  const names = [
+    "MARKET_CONTRACT_ID",
+    "SQUAD_CONTRACT_ID",
+    "STELLAR_RPC_URL",
+    "STELLAR_HORIZON_URL",
+    "STELLAR_NETWORK_PASSPHRASE",
+    "EXPLORER_BASE_URL",
+    "BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "MARKET_CHAT_ID",
+    "SQUAD_CHAT_ID",
+    "ALLOWED_CHAT_IDS",
+    "OPERATOR_TELEGRAM_USER_ID",
+    "POLL_INTERVAL_MS",
+    "START_LOOKBACK_LEDGERS",
+    "CURSOR_FILE",
+    "LOCK_FILE",
+    "STATUS_FILE",
+    "MAX_NOTIFICATIONS_PER_CYCLE",
+    "AUDIT_FILE",
+    "DEDUP_WINDOW",
+    "HEALTH_HOST",
+    "HEALTH_PORT",
+    "HEALTH_STALE_MS",
+    "STARTUP_HEALTH_DEADLINE_MS",
+    "STARTUP_HEALTH_RETRY_MS",
+    "SHUTDOWN_TIMEOUT_MS",
+    "TELEGRAM_SEND_TIMEOUT_MS",
+    "CHANNEL_PREVIEW_MODE",
+  ];
 
-/** Report order for counts, so two runs of the same config read identically. */
-const SOURCE_ORDER: readonly ConfigSource[] = [
-  "process-env",
-  "env-file",
-  "profile-default",
-  "built-in-default",
-  "derived",
-  "unset",
-];
+  const environment = new Set(Object.keys(process.env));
+  const result: ConfigProvenanceEntry[] = [];
 
-function classifyKey(
-  spec: ConfigKeySpec,
-  profileDefaults: Record<string, string>,
-): ConfigKeyProvenance {
-  /** What a setting resolves to, wherever it comes from. */
-  const resolved = (key: string): string | undefined => read(key) ?? profileDefaults[key];
-
-  if (read(spec.key) !== undefined) {
-    // A value won. Which side supplied it is the whole question: the file
-    // writes into process.env, so only the captured `supplied` set can tell.
-    return {
-      key: spec.key,
-      source: ENV_FILE.supplied.has(spec.key) ? "env-file" : "process-env",
-      secret: spec.secret,
-    };
-  }
-
-  const entry: ConfigKeyProvenance = { key: spec.key, source: "unset", secret: spec.secret };
-  // Set but blank: declared by the file, or exported empty by the shell. Marking
-  // it is what turns "why is my value ignored" into a one-line answer.
-  if (process.env[spec.key] !== undefined || ENV_FILE.declared.has(spec.key)) {
-    entry.emptyDeclaration = true;
-  }
-
-  if (profileDefaults[spec.key] !== undefined) {
-    entry.source = "profile-default";
-    return entry;
-  }
-
-  const derived = spec.derivedFrom;
-  if (derived !== undefined) {
-    const source = resolved(derived.key);
-    if (source !== undefined && (derived.applies?.(source) ?? true)) {
-      entry.source = "derived";
-      entry.derivedFrom = derived.key;
-      return entry;
+  for (const name of names) {
+    let source: ConfigSource;
+    if (ENV_FILE.supplied.has(name)) {
+      source = "env-file";
+    } else if (environment.has(name)) {
+      source = "environment";
+    } else if (Object.prototype.hasOwnProperty.call(profile, name)) {
+      source = "profile";
+    } else {
+      source = "default";
     }
+    result.push({ name, source });
   }
 
-  if (spec.hasBuiltInDefault === true) entry.source = "built-in-default";
-  return entry;
-}
-
-function describeSource(entry: ConfigKeyProvenance): string {
-  switch (entry.source) {
-    case "process-env":
-      return "the environment";
-    case "env-file":
-      return "the .env file";
-    case "profile-default":
-      return "the active profile";
-    case "built-in-default":
-      return "the built-in default";
-    case "derived":
-      return `${entry.derivedFrom} (inherited)`;
-    default:
-      return "nothing";
-  }
-}
-
-/**
- * Where every known setting's value came from: names and origins only, never a
- * value — not even for a setting that is not a secret. Cheap and side-effect
- * free, so boot logging and `/health` can both call it.
- */
-export function configProvenance(): ConfigProvenance {
-  const profile = activeProfileName();
-  const warnings: string[] = [];
-
-  let profileDefaults: Record<string, string> = {};
-  try {
-    profileDefaults = resolveProfileDefaults();
-  } catch {
-    // An unknown profile fails boot, but a running process asking for a health
-    // report must still get one instead of an exception.
-    warnings.push(
-      `MIMIR_PROFILE=${profile ?? "(unset)"} is not a known profile; no profile defaults apply`,
-    );
-  }
-
-  const entries = CONFIG_KEYS.map((spec) => classifyKey(spec, profileDefaults));
-
-  const counts = Object.fromEntries(SOURCE_ORDER.map((source) => [source, 0])) as Record<
-    ConfigSource,
-    number
-  >;
-  for (const entry of entries) counts[entry.source] += 1;
-
-  const suppliedKeys = entries.filter((entry) => entry.source === "env-file").length;
-  if (ENV_FILE.present && suppliedKeys === 0) {
-    // The classic deployment bug: the file exists, the process starts somewhere
-    // else, and every value silently comes from defaults.
-    warnings.push(
-      ".env was read but supplies none of these settings — check the working directory",
-    );
-  }
-
-  for (const entry of entries) {
-    if (entry.emptyDeclaration === true) {
-      warnings.push(
-        `${entry.key} is set but empty; ${describeSource(entry)} supplies the value`,
-      );
-    }
-  }
-
-  if (profile === MOCK_PROFILE_NAME) {
-    const fromProfile = counts["profile-default"];
-    warnings.push(
-      `MIMIR_PROFILE=${MOCK_PROFILE_NAME}: ${fromProfile} setting(s) come from the mock profile`,
-    );
-  }
-
-  return {
-    profile,
-    envFile: { present: ENV_FILE.present, suppliedKeys },
-    entries,
-    counts,
-    warnings,
-  };
-}
-
-/**
- * One value-free line for boot logs: the profile, whether the `.env` file was
- * read at all, and how many settings each source supplied.
- */
-export function formatProvenanceSummary(provenance: ConfigProvenance): string {
-  const counts = SOURCE_ORDER.filter((source) => provenance.counts[source] > 0).map(
-    (source) => `${source}=${provenance.counts[source]}`,
-  );
-  const secrets = provenance.entries.filter((entry) => entry.secret).length;
-  const file = provenance.envFile.present
-    ? `present(${provenance.envFile.suppliedKeys} keys)`
-    : "absent";
-  // `secret-keys=6/26` is a property of the report, not of the values: it says
-  // six of the settings named here are sensitive and are still reported as
-  // origins only. No character in this line is MarkdownV2-reserved, which is
-  // what lets `/status` put it in a code span unescaped.
-  return (
-    `profile=${provenance.profile ?? "none"} env-file=${file} ${counts.join(" ")} ` +
-    `secret-keys=${secrets}/${provenance.entries.length}`
-  );
+  return result;
 }

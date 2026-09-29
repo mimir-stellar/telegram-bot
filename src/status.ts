@@ -1,3 +1,5 @@
+
+
 /**
  * Machine-readable status snapshot.
  *
@@ -40,6 +42,15 @@ export const MAX_ERROR_CHARS = 300;
 /** Longest cursor string kept. Real cursors are `<TOID>-<index>`, far shorter. */
 export const MAX_CURSOR_CHARS = 128;
 
+/** Longest Telegram send timeout kept in the snapshot, in milliseconds. */
+export const MAX_SEND_TIMEOUT_MS = 300_000;
+
+/**
+ * Default per-send Telegram timeout applied when configuration leaves it
+ * unset. Bounded so a hung send cannot stall the poller indefinitely.
+ */
+export const DEFAULT_SEND_TIMEOUT_MS = 15_000;
+
 /**
  * Collapse whitespace and truncate. Applied to every string that originates
  * outside this process (RPC errors, Telegram errors, cursors), so the snapshot
@@ -79,6 +90,13 @@ export interface StatusTargetSnapshot {
   /** RPC rejected this target's cursor as stale; true until a scan succeeds. */
   cursorStale: boolean;
   lastError: string | null;
+  /**
+   * Per-send Telegram timeout in milliseconds, or null when unset. A bounded
+   * number, never a token, cursor, or remote payload.
+   */
+  sendTimeoutMs: number | null;
+  /** Sends aborted because the per-send timeout elapsed this run. */
+  sendsTimedOut: number;
 }
 
 export interface StatusSnapshot {
@@ -105,6 +123,10 @@ export interface StatusSnapshot {
   eventsDeduplicated: number;
   /** Cursors automatically rewound to the RPC's retained floor this run. */
   cursorRewinds: number;
+  /** Per-send Telegram timeout in milliseconds, or null when unset. */
+  sendTimeoutMs: number | null;
+  /** Sends aborted because the per-send timeout elapsed this run. */
+  sendsTimedOut: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
   targets: StatusTargetSnapshot[];
@@ -139,6 +161,8 @@ export function buildStatusSnapshot(
     eventsSkipped: status.eventsSkipped,
     eventsDeduplicated: status.eventsDeduplicated ?? 0,
     cursorRewinds: status.cursorRewinds ?? 0,
+    sendTimeoutMs: boundTimeout(status.sendTimeoutMs),
+    sendsTimedOut: status.sendsTimedOut ?? 0,
     consecutiveFailures: status.consecutiveFailures,
     lastError: status.lastError
       ? { at: status.lastError.at, message: boundText(status.lastError.message) }
@@ -152,6 +176,8 @@ export function buildStatusSnapshot(
         typeof target.rewindFromLedger === "number" ? target.rewindFromLedger : null,
       cursorStale: target.cursorStale === true,
       lastError: target.lastError === null ? null : boundText(target.lastError),
+      sendTimeoutMs: boundTimeout(target.sendTimeoutMs),
+      sendsTimedOut: target.sendsTimedOut ?? 0,
     })),
   };
 }
@@ -159,6 +185,17 @@ export function buildStatusSnapshot(
 /** Serialize with a trailing newline so the file is diff- and `cat`-friendly. */
 export function serializeStatus(snapshot: StatusSnapshot): string {
   return `${JSON.stringify(snapshot, null, 2)}\n`;
+}
+
+/**
+ * Clamp a per-send timeout to a bounded, non-negative integer, or null when
+ * unset. Keeps a hostile or misconfigured value from producing an unbounded
+ * number in the snapshot.
+ */
+export function boundTimeout(value: number | null | undefined): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const clamped = Math.min(MAX_SEND_TIMEOUT_MS, Math.max(0, Math.floor(value)));
+  return clamped;
 }
 
 /**
