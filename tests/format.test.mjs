@@ -482,6 +482,33 @@ test("formatFallbackEvent formats actionable degraded event notification with re
 });
     explorerBaseUrl: "https://stellar.expert/explorer",
   };
+  const longSummary = "evidence ".repeat(100); // 900 chars
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 52,
+    txHash: "",
+    at: 0,
+    eventId: "52-0",
+    payload: {
+      name: "claim_resolved",
+      claimId: 3,
+      winnerSide: 2,
+      summary: longSummary,
+      confidence: 95,
+      evidenceHash: "abc123",
+    },
+  };
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  // The raw summary should not appear verbatim past 200 chars in the output
+  assert.ok(
+    !message.includes("evidence ".repeat(30)),
+    "Summary was not truncated in the notification output",
+  );
+});
+    explorerBaseUrl: "https://stellar.expert/explorer",
+  };
   const big = "z".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 10);
   const notify = createNotifier(fakeBot, { chatId: "-1001" });
   await assert.rejects(notify(big), error);

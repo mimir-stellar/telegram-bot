@@ -182,6 +182,7 @@ async function main(): Promise<void> {
     }
   }
 
+  const server = createRpcServer(config);
   const server = await createRpcServer(config);
 
   // Bounded retries before announcing readiness: a briefly unavailable RPC

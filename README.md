@@ -737,6 +737,11 @@ version is treated as a cold start (warning logged) rather than silently
 misread. This protects against reading a file written by a future release after
 a downgrade.
 
+**Deployment note:** a flat file is fine for v0 but it must survive restarts. On
+an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
+at one). On an ephemeral filesystem every restart is a cold start, and events
+that happened while the bot was down are never posted. Swapping this for a real
+KV store is a deliberate future step, not something this repo does today.
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. At startup, the poller verifies persistent-volume availability and cursor-file permissions by testing write access to the configured `CURSOR_FILE` directory and read/write access to any existing cursor file. If persistent-volume or file-permission verification fails, the poller logs an actionable warning and falls back to in-memory cursor management without crashing, ensuring operational continuity while surfacing volume warnings via `/status` and `/health`. On an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE` at one). On an ephemeral filesystem every restart is a cold start, and events that happened while the bot was down are never posted. Swapping this for a real KV store is a deliberate future step, not something this repo does today.
 
 ## Single-instance lock

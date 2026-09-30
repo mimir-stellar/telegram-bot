@@ -2294,6 +2294,8 @@ for (const event of knownEvents) {
       }
 
         if (scan.lastEventLedger !== null) current.lastEventLedger = scan.lastEventLedger;
+        // Advance last — see the failure policy at the top of this file.
+        if (scan.cursor) current.cursor = scan.cursor;
         // The opaque cursor covers the whole returned page, so it cannot be
         // committed per event. Commit after processing the page, including
         // deliberate drops, to avoid replaying a permanent Telegram failure.
