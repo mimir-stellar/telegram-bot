@@ -98,6 +98,27 @@ export type LedgerWindowProblem =
   | "start-after-tip"
   | "cursor-after-tip";
 
+/** Why the RPC network passphrase cannot be verified. */
+export type NetworkPassphraseProblem = "mismatch" | "missing" | "malformed";
+
+/**
+ * Raised when the RPC's reported network passphrase does not match the
+ * configured value. This is a safety-critical misconfiguration: either the
+ * RPC is pointed at the wrong network, or the configuration itself is wrong.
+ *
+ * The error message is bounded and never contains the actual passphrases,
+ * so it can be surfaced in logs and status output without leaking secrets.
+ */
+export class NetworkPassphraseMismatchError extends Error {
+  readonly problem: NetworkPassphraseProblem;
+
+  constructor(problem: NetworkPassphraseProblem, message: string) {
+    super(message);
+    this.name = "NetworkPassphraseMismatchError";
+    this.problem = problem;
+  }
+}
+
 /**
  * Raised for a ledger-window bound that is invalid before any request is sent.
  *
@@ -185,4 +206,68 @@ export function clampStartLedger(
     return { startLedger: window.oldestLedger, clamped: true };
   }
   return { startLedger: requested, clamped: false };
+}
+
+// ── Network passphrase verification ──────────────────────────────────────────
+//
+// Verify that the RPC's reported network passphrase matches the configured
+// value. A mismatch indicates a serious misconfiguration: either the RPC is
+// pointed at the wrong network (Testnet vs Public), or the STELLAR_NETWORK_PASSPHRASE
+// env var is wrong. This check runs once at boot as part of the startup health
+// sequence, so the bot fails fast before it can silently emit notifications on
+// the wrong network.
+
+/**
+ * Validate that the RPC reports a network passphrase matching the
+ * configured value.
+ *
+ * Throws a bounded {@link NetworkPassphraseMismatchError} when the RPC's
+ * passphrase does not match the configured value, is missing, or is not a string.
+ * The error message never includes the actual passphrases, so it is safe to
+ * surface in logs and status output without leaking secrets.
+ *
+ * @param server The Soroban RPC server (from {@link createRpcServer})
+ * @param config The bot configuration (contains STELLAR_NETWORK_PASSPHRASE)
+ * @throws {NetworkPassphraseMismatchError} When passphrase validation fails
+ */
+export async function validateNetworkPassphrase(
+  server: rpc.Server,
+  config: StellarConfig,
+): Promise<void> {
+  let network: unknown;
+  try {
+    network = await server.getNetwork();
+  } catch (err) {
+    throw new NetworkPassphraseMismatchError(
+      "missing",
+      `getNetwork failed: ${boundedRemoteError(err)}`,
+    );
+  }
+
+  const rpcPassphrase = (network as Record<string, unknown>)?.passphrase;
+  if (typeof rpcPassphrase !== "string") {
+    throw new NetworkPassphraseMismatchError(
+      "malformed",
+      `RPC getNetwork returned a malformed passphrase (expected a string; got ${typeof rpcPassphrase})`,
+    );
+  }
+
+  if (rpcPassphrase !== config.networkPassphrase) {
+    throw new NetworkPassphraseMismatchError(
+      "mismatch",
+      `RPC network passphrase does not match the configured value (configured=${config.networkPassphrase.length} chars, received=${rpcPassphrase.length} chars)`,
+    );
+  }
+}
+
+/** Render an untrusted remote error without echoing an unbounded payload. */
+function boundedRemoteError(err: unknown): string {
+  const msg =
+    err instanceof Error
+      ? err.message
+      : typeof err === "string"
+        ? err
+        : String(err || "unknown error");
+  const bounded = msg.replace(/\s+/g, " ").trim();
+  return bounded.length <= 100 ? bounded : `${bounded.slice(0, 99)}…`;
 }

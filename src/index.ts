@@ -25,7 +25,7 @@ import { startHealthServer } from "./health.js";
 import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
 import { safeErrorMessage } from "./notifications/format.js";
-import { createRpcServer } from "./stellar/client.js";
+import { createRpcServer, validateNetworkPassphrase } from "./stellar/client.js";
 import { boundText } from "./status.js";
 import { redactUrl, registerSecrets } from "./redact.js";
 
@@ -149,6 +149,20 @@ async function main(): Promise<void> {
     `[boot] rpc ok (attempts=${health.attempts}), status=${health.status} ` +
       `ledgers ${health.oldestLedger}..${health.latestLedger}`,
   );
+
+  // Verify that the RPC's network passphrase matches the configured value.
+  // This is a safety-critical check: a mismatch indicates either the RPC is
+  // pointed at the wrong network, or the configuration is wrong. Fail fast
+  // rather than silently emitting notifications on the wrong network.
+  try {
+    await validateNetworkPassphrase(server, config);
+    console.log(`[boot] network passphrase verified`);
+  } catch (err) {
+    console.error(
+      `[fatal] network passphrase verification failed: ${safeErrorMessage(err)}`,
+    );
+    process.exit(1);
+  }
 
   // The bot needs the poller's status and the poller needs the bot's send path,
   // so one edge of the cycle is late-bound. This one, because it is the only
