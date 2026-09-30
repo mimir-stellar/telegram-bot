@@ -15,27 +15,80 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
-import { networkLabel } from "../config.js";
 
-export function createRpcServer(config: StellarConfig): rpc.Server {
-  return new rpc.Server(config.rpcUrl, {
+/** Soroban contract strkey: `C` + 55 base32 characters. */
+const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
+
+/**
+ * Validate that a contract ID is a well-formed Soroban strkey.
+ * Returns true if valid; throws an error with a descriptive message if not.
+ * Kept as a runtime check so the poller can catch misconfigurations early
+ * before a scan attempt and log actionable diagnostics.
+ */
+export function validateContractId(contractId: string, fieldName: string = "contract ID"): boolean {
+  const trimmed = contractId.trim();
+  if (trimmed === "") {
+    throw new Error(`${fieldName} is empty`);
+  }
+  if (!CONTRACT_ID_PATTERN.test(trimmed)) {
+    throw new Error(
+      `${fieldName} is not a valid Soroban contract ID (expected C… strkey, 56 chars); got "${trimmed}"`,
+    );
+  }
+  return true;
+}
+
+export class RpcPassphraseError extends Error {
+  constructor(expected: string, actual: string) {
+    super(
+      `RPC network passphrase mismatch: expected "${expected}" but RPC reported "${actual}". ` +
+      `Check STELLAR_RPC_URL and STELLAR_NETWORK_PASSPHRASE configuration.`,
+    );
+    this.name = "RpcPassphraseError";
+  }
+}
+
+/**
+ * Create an RPC server and verify its network passphrase matches the configured value.
+ * This fail-fast check at boot prevents silent misconfigurations where the bot reads
+ * events from the wrong network.
+ *
+ * Throws RpcPassphraseError if the passphrase does not match.
+ */
+export async function createRpcServer(config: StellarConfig): Promise<rpc.Server> {
+  const server = new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
     timeout: 15000,
   });
+
+  // Verify the RPC's passphrase matches the configured one. This is a fail-fast
+  // check that prevents configuration errors from silently producing wrong results.
+  const network = await server.getNetwork();
+  if (network.passphrase !== config.networkPassphrase) {
+    throw new RpcPassphraseError(config.networkPassphrase, network.passphrase);
+  }
+
+  return server;
 }
 
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */
 export const DEFAULT_EXPLORER_BASE_URL = "https://stellar.expert/explorer";
 
 /**
- * Resolve the explorer network path segment from the configured passphrase.
- * Custom / unknown networks fall back to `testnet` so links stay usable in
- * local quickstart deployments.
+ * Resolve the explorer network path segment from the configured network name.
+ * `futurenet` and `custom` fall back to `testnet` so links remain usable in
+ * local and non-standard deployments. Falls back to passphrase inference when
+ * the `network` field is absent (e.g. in tests that predate multi-network support).
  */
 export function explorerNetworkSegment(config: StellarConfig): "public" | "testnet" {
-  const label = networkLabel(config);
-  return label === "public" ? "public" : "testnet";
+  const net = config.network ?? inferFromPassphrase(config.networkPassphrase);
+  return net === "mainnet" ? "public" : "testnet";
+}
+
+function inferFromPassphrase(passphrase: string): string {
+  if (passphrase === "Public Global Stellar Network ; September 2015") return "mainnet";
+  return "testnet";
 }
 
 function explorerBase(config: StellarConfig): string {
@@ -50,7 +103,7 @@ function explorerPart(value: string): string {
 /** Explorer link for a transaction hash, used in notification footers. */
 export function txExplorerUrl(config: StellarConfig, txHash: string): string {
   const hash = txHash.trim();
-  if (!hash) return "";
+  if (!hash || !/^[a-fA-F0-9]{64}$/.test(hash)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/tx/${explorerPart(hash)}`;
 }
@@ -58,7 +111,7 @@ export function txExplorerUrl(config: StellarConfig, txHash: string): string {
 /** Explorer link for a classic / contract account. */
 export function accountExplorerUrl(config: StellarConfig, address: string): string {
   const id = address.trim();
-  if (!id) return "";
+  if (!id || !/^[GC][A-Z2-7]{55}$/.test(id)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/account/${explorerPart(id)}`;
 }
@@ -66,7 +119,7 @@ export function accountExplorerUrl(config: StellarConfig, address: string): stri
 /** Explorer link for a Soroban contract id, used by /contracts. */
 export function contractExplorerUrl(config: StellarConfig, contractId: string): string {
   const id = contractId.trim();
-  if (!id) return "";
+  if (!id || !/^C[A-Z2-7]{55}$/.test(id)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/contract/${explorerPart(id)}`;
 }
