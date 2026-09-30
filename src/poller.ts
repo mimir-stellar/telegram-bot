@@ -7,6 +7,8 @@
  *
  *  - A failed RPC call fails ONE contract's scan for ONE cycle. Its cursor is
  *    left untouched, so the next cycle picks up exactly where it stopped.
+ *  - Each contract is paced independently. A slow or failing contract does not
+ *    block the scanning of other contracts.
  *  - A scan cursor is committed after its returned page has been processed,
  *    even when delivery was partial. Unknown events, the per-cycle cap, and
  *    exhausted Telegram retries are deliberate drops. Holding the cursor back
@@ -47,21 +49,27 @@
  * the only resume token, in the same `version: 1` format as before.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
 
+import type { BotConfig } from "./config.js";
+import { clip, formatEvent } from "./notifications/format.js";
+import { eventCursorLedger, readContractEvents, type WatchTarget } from "./stellar/events.js";
+import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
+import type { Metrics } from "./metrics.js";
 import type { SendExtra } from "./bot.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
-import { EventDedupWindow, eventKey } from "./dedup.js";
+import { EventDedupWindow } from "./dedup.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
   type InstanceLockHandle,
 } from "./instanceLock.js";
-import { explorerKeyboard, formatEvent, safeErrorMessage } from "./notifications/format.js";
+import { explorerKeyboard, formatEvent, formatPlainTextEvent, safeErrorMessage } from "./notifications/format.js";
+import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import {
@@ -85,7 +93,17 @@ export interface TargetState {
    * restart mid-rewind keeps reading from the floor rather than cold-starting.
    */
   rewindFromLedger: number | null;
+  /** RPC has rejected this target's cursor as stale; clears after a successful scan. */
+  cursorStale: boolean;
   lastError: string | null;
+  /**
+   * Consecutive successful cycles in which this target's cursor did not move
+   * while the cursor was still behind the tip. Reset the moment the cursor
+   * advances or catches up, so sitting idle at the tip never counts.
+   */
+  cyclesWithoutAdvance: number;
+  /** True once {@link CURSOR_STALL_CYCLES} non-advancing cycles have fired. */
+  cursorStalled: boolean;
 }
 
 export type PollerPauseResult = "paused" | "already-paused" | "stopped";
@@ -247,56 +265,51 @@ export interface SendOptions {
   maxSendRetries?: number;
   initialBackoffMs?: number;
   maxBackoffMs?: number;
+  /**
+   * Per-attempt timeout for a single Telegram send, in milliseconds. A send
+   * that does not settle within this window is treated as a failed attempt so
+   * one hung HTTP request cannot stall the whole poll cycle. Defaults to
+   * {@link DEFAULT_SEND_TIMEOUT_MS}.
+   */
+  sendTimeoutMs?: number;
 }
 
-interface CursorTarget {
-  cursor: string | null;
-  lastEventLedger: number | null;
-}
-
-function parseCursorFile(raw: string): CursorFile {
-  const parsed: unknown = JSON.parse(raw);
-  if (typeof parsed !== "object" || parsed === null) {
-    throw new Error("cursor root must be an object");
-  }
-
-  const candidate = parsed as Partial<CursorFile>;
-  if (candidate.version !== 1 || typeof candidate.targets !== "object" || candidate.targets === null) {
-    throw new Error("unsupported cursor format; expected version 1");
-  }
-
-  const targets: Record<string, CursorTarget> = {};
-  for (const [source, value] of Object.entries(candidate.targets)) {
-    if (typeof value !== "object" || value === null) {
-      throw new Error(`invalid cursor target ${source}`);
-    }
-    const target = value as Partial<CursorTarget>;
-    if (
-      target.cursor !== null &&
-      (typeof target.cursor !== "string" || target.cursor.length === 0 || target.cursor.length > 256)
-    ) {
-      throw new Error(`invalid cursor value for ${source}`);
-    }
-    if (
-      target.lastEventLedger !== null &&
-      (typeof target.lastEventLedger !== "number" ||
-        !Number.isSafeInteger(target.lastEventLedger) ||
-        target.lastEventLedger < 0)
-    ) {
-      throw new Error(`invalid last event ledger for ${source}`);
-    }
-    targets[source] = {
-      cursor: target.cursor ?? null,
-      lastEventLedger: target.lastEventLedger ?? null,
-    };
-  }
-
-  return { version: 1, updatedAt: String(candidate.updatedAt ?? ""), targets };
-}
+/**
+ * Default per-attempt Telegram send timeout. Chosen to be comfortably longer
+ * than a healthy Telegram round trip but short enough that a hung socket is
+ * abandoned well before the next poll cycle would be due.
+ */
+export const DEFAULT_SEND_TIMEOUT_MS = 15_000 as const;
 
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
+  /** Sends one already-formatted MarkdownV2 message. May reject. */
+  send: (text: string) => Promise<void>;
+  /**
+   * Optional metrics registry. When provided, the poller increments counters
+   * on every observable event. When absent (e.g. in tests that don't need it),
+   * the poller behaves identically but emits no metrics.
+   */
+  metrics?: Metrics | undefined;
+}
+
+/**
+ * How many ledgers a cursor can lag behind the retained floor before the poller
+ * warns. Events in the gap are already gone — this threshold makes the operator
+ * aware before the lag grows indefinitely.
+ *
+ * 10 % of the approximate Testnet window (~120 960 ledgers ≈ a week).
+ */
+const STALE_CURSOR_LEDGER_LAG = 12_096;
+
+/**
+ * Consecutive-failure thresholds at which a structured warning is emitted.
+ * The thresholds are deliberately non-linear so that short transient glitches
+ * (1–4 cycles) are silent, a medium outage (5+) is visible, and a long outage
+ * (10+) is highlighted loudly.
+ */
+const CONSECUTIVE_FAILURE_THRESHOLDS = [5, 10, 25, 50, 100];
   /**
    * Sends one already-formatted MarkdownV2 message to the chat routed for
    * `source`, with the event's explorer button when `extra.reply_markup` is
@@ -355,6 +368,21 @@ const DEFAULT_CIRCUIT_COOLDOWN_MS = 60_000;
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
 const DEFAULT_SEND_SPACING_MS = 1_500;
+
+/**
+ * Successful cycles with an unchanged cursor, while still behind the tip,
+ * before a stall is reported. At the default 30s interval this is ~2.5 minutes
+ * without progress — long enough that a burst of quiet ledgers is not a stall,
+ * short enough that an operator hears about a wedged `getEvents` walk quickly.
+ */
+export const CURSOR_STALL_CYCLES = 5;
+
+/**
+ * Minimum tip-minus-cursor ledger gap for an unchanged cursor to count as
+ * stalled. A gap of 0–1 is a bot sitting on the tip between ledgers, which is
+ * the healthy idle case.
+ */
+export const CURSOR_STALL_MIN_LAG_LEDGERS = 2;
 
 /** Maximum number of retry attempts for a single Telegram send. */
 const DEFAULT_MAX_SEND_RETRIES = 3;
@@ -755,6 +783,95 @@ function isStaleCursorError(message: string): boolean {
   );
 }
 
+
+/** Minimal RPC health surface used at boot (fakeable in tests). */
+export interface RpcHealthProbe {
+  getHealth: () => Promise<{
+    status: string;
+    latestLedger: number;
+    oldestLedger: number;
+  }>;
+}
+
+export interface StartupHealthOptions {
+  /** Wall-clock budget for retries from the first attempt. */
+  deadlineMs: number;
+  /** Delay between failed attempts (capped by remaining deadline). */
+  retryMs: number;
+  /** Optional clock for deterministic tests. */
+  now?: () => number;
+  /** Optional sleeper for deterministic tests. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Retry `getHealth()` until it succeeds or the deadline elapses.
+ *
+ * Used at process startup so a briefly unavailable RPC (deploy race, Testnet
+ * blip) does not fail the whole boot, while a permanently wrong URL still
+ * surfaces within a bounded window. Never logs tokens or full remote bodies.
+ */
+export async function waitForStartupHealth(
+  rpc: RpcHealthProbe,
+  options: StartupHealthOptions,
+): Promise<{
+  status: string;
+  latestLedger: number;
+  oldestLedger: number;
+  attempts: number;
+}> {
+  const now = options.now ?? Date.now;
+  const sleepFn = options.sleep ?? sleep;
+  const deadlineMs = Math.max(0, options.deadlineMs);
+  const retryMs = Math.max(0, options.retryMs);
+  const startedAt = now();
+  const deadlineAt = startedAt + deadlineMs;
+
+  let attempts = 0;
+  let lastError: unknown;
+
+  while (true) {
+    attempts += 1;
+    try {
+      const health = await rpc.getHealth();
+      if (attempts > 1) {
+        console.log(
+          `[poller] startup RPC health ok after ${attempts} attempt(s) ` +
+            `(${Math.max(0, now() - startedAt)}ms): status=${health.status} ` +
+            `ledgers ${health.oldestLedger}..${health.latestLedger}`,
+        );
+      }
+      return {
+        status: health.status,
+        latestLedger: health.latestLedger,
+        oldestLedger: health.oldestLedger,
+        attempts,
+      };
+    } catch (err) {
+      lastError = err;
+      const remaining = deadlineAt - now();
+      if (remaining <= 0 || retryMs <= 0) {
+        break;
+      }
+      const waitMs = Math.min(retryMs, remaining);
+      console.warn(
+        `[poller] startup RPC health attempt ${attempts} failed; ` +
+          `retrying in ${waitMs}ms (deadline ${deadlineMs}ms): ${safeErrorMessage(err)}`,
+      );
+      await sleepFn(waitMs);
+      if (now() >= deadlineAt) {
+        break;
+      }
+    }
+  }
+
+  throw new Error(
+    `RPC startup health check failed after ${attempts} attempt(s) ` +
+      `within ${deadlineMs}ms deadline: ${safeErrorMessage(lastError)}`,
+  );
+}
+
+
 /**
  * Sends a message with bounded exponential backoff.
  *
@@ -805,6 +922,7 @@ async function sendWithRetry(
 
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
+  const metrics = deps.metrics;
   const audit: AuditLog = deps.audit ?? createAuditLog();
   const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
   const now = deps.now ?? Date.now;
@@ -834,7 +952,10 @@ export function createPoller(deps: PollerDeps) {
         cursor: null,
         lastEventLedger: null,
         rewindFromLedger: null,
+        cursorStale: false,
         lastError: null,
+        cyclesWithoutAdvance: 0,
+        cursorStalled: false,
       },
     ]),
   );
@@ -934,6 +1055,28 @@ export function createPoller(deps: PollerDeps) {
     }
 
     try {
+      const parsed = JSON.parse(raw) as Partial<CursorFile>;
+
+      // Version guard: if the field is absent or not 1, the file was written
+      // by a different version of this code. Cold-starting is safer than
+      // silently misreading an unknown layout.
+      if (parsed.version === undefined) {
+        console.warn(
+          `[poller] cursor file at ${config.cursorFile} has no version field; ` +
+            `cold-starting rather than risking a misread. Delete the file to suppress this.`,
+        );
+        return;
+      }
+      if (parsed.version !== 1) {
+        console.warn(
+          `[poller] cursor file version ${String(parsed.version)} is not supported ` +
+            `(expected 1); cold-starting. Delete the file or downgrade to the matching release.`,
+        );
+        return;
+      }
+
+      for (const [source, saved] of Object.entries(parsed.targets ?? {})) {
+        const target = state.get(source as ContractSource);
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
       const parsed = result.file;
       for (const [source, saved] of Object.entries(parsed.targets)) {
@@ -945,6 +1088,7 @@ export function createPoller(deps: PollerDeps) {
         // A rewind that was still pending when the process stopped resumes from
         // the same floor instead of falling back to a lookback cold start.
         target.rewindFromLedger = saved.rewindFromLedger ?? null;
+        target.cursorStale = target.rewindFromLedger !== null;
         // Restore the redelivery window too. Without this a restart would
         // re-notify the last event the inclusive cursor hands back.
         dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
@@ -1027,6 +1171,31 @@ export function createPoller(deps: PollerDeps) {
     }
   }
 
+  // ── Stale cursor detection ─────────────────────────────────────────────────
+
+  /**
+   * Warn when a persisted cursor points to a ledger that has already fallen
+   * behind the retained floor. Events in that gap will never be delivered.
+   * This can happen after a long outage or an accidental ephemeral filesystem.
+   */
+  function checkStaleCursors(oldestLedger: number): void {
+    for (const target of state.values()) {
+      if (!target.cursor) continue;
+      const cursorLedger = eventCursorLedger(target.cursor);
+      if (cursorLedger === null) continue;
+
+      const lag = oldestLedger - cursorLedger;
+      if (lag > STALE_CURSOR_LEDGER_LAG) {
+        console.warn(
+          `[poller] STALE CURSOR — ${target.source} cursor is at ledger ${cursorLedger}, ` +
+            `but the RPC only retains from ledger ${oldestLedger} ` +
+            `(${lag} ledgers behind, ~${Math.round((lag * 5) / 60)} minutes of events lost). ` +
+            `Events in the gap will not be posted. ` +
+            `Delete ${config.cursorFile} to cold-start and resume from the current tip.`,
+        );
+        metrics?.staleCursorEvents.inc();
+      }
+    }
   /**
    * Append buffered audit entries to the JSONL audit trail. Failure to audit
    * must never take the loop down (or even warn every cycle if the disk is
@@ -1063,6 +1232,57 @@ export function createPoller(deps: PollerDeps) {
     });
   }
 
+  /**
+   * Track whether a target's cursor is making progress.
+   *
+   * An unchanged cursor is only interesting when the walk is *behind* the tip:
+   * a bot sitting within {@link CURSOR_STALL_MIN_LAG_LEDGERS} of `latestLedger`
+   * is simply up to date, and a cold start that has not handed back a cursor yet
+   * has nothing to compare against. Anything else means the RPC kept returning
+   * the same resume token while the chain moved on, which is a pagination fault
+   * rather than a quiet chain. The warning fires once per stall, not every cycle.
+   */
+  function trackCursorAdvance(
+    target: TargetState,
+    previousCursor: string | null,
+    latestLedger: number,
+  ): void {
+    const cursor = target.cursor;
+    if (!cursor) {
+      target.cyclesWithoutAdvance = 0;
+      target.cursorStalled = false;
+      return;
+    }
+
+    const cursorLedger = eventCursorLedger(cursor);
+    const lag = cursorLedger === null ? 0 : latestLedger - cursorLedger;
+    const behindTip = lag >= CURSOR_STALL_MIN_LAG_LEDGERS;
+    const advanced = previousCursor !== cursor;
+    // The first cursor after a cold start is progress, not a stall.
+    const firstAssignment = previousCursor === null;
+
+    if (firstAssignment || advanced || !behindTip) {
+      target.cyclesWithoutAdvance = 0;
+      target.cursorStalled = false;
+      return;
+    }
+
+    target.cyclesWithoutAdvance += 1;
+    if (target.cyclesWithoutAdvance < CURSOR_STALL_CYCLES) return;
+
+    if (!target.cursorStalled) {
+      console.warn(
+        `[poller] CURSOR STALLED — ${target.source} cursor has not advanced for ` +
+          `${target.cyclesWithoutAdvance} successful cycles while ${lag} ledgers behind ` +
+          `tip ${latestLedger}` +
+          (cursorLedger !== null ? ` (cursor ledger ${cursorLedger})` : "") +
+          `. Check RPC getEvents pagination; cursor file ${config.cursorFile} is intact. ` +
+          `The bot will keep retrying; the chain remains the record.`,
+      );
+    }
+    target.cursorStalled = true;
+  }
+
   // ── One cycle ──────────────────────────────────────────────────────────────
 
   interface NotificationResult {
@@ -1078,6 +1298,18 @@ export function createPoller(deps: PollerDeps) {
     let droppedForShutdown = 0;
 
     for (const event of events) {
+      metrics?.eventsDecoded.inc();
+
+      if (event.payload.name === "unknown") {
+        status.eventsSkipped += 1;
+        metrics?.eventsSkipped.inc();
+        // Clip the event name and reason: these come from remote contract data
+        // and must not produce unbounded log output.
+        const safeName = clip(event.payload.eventName ?? "", 80);
+        const safeReason = event.payload.reason ? ` (${clip(event.payload.reason, 120)})` : "";
+        console.log(
+          `[poller] skipped ${event.source} event "${safeName}" ` +
+            `at ledger ${event.ledger}${safeReason}`,
       if (isAdminPayload(event.payload)) {
         status.eventsSkipped += 1;
         skipped += 1;
@@ -1111,6 +1343,16 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
+      if (!isNotificationAllowed(config.featureFlags, event.source, event.payload.name)) {
+        status.eventsSkipped += 1;
+        skipped += 1;
+        console.log(
+          `[poller] feature-flag skipped ${event.source} event "${boundedLabel(event.payload.name, 80)}" ` +
+            `at ledger ${event.ledger} (NOTIFY_* flags)`,
+        );
+        continue;
+      }
+
       // A shutdown keeps the drain bounded: messages that have not started are
       // dropped, counted, and left to the chain. The cursor still advances past
       // them below, so the next start does not replay them into the channel.
@@ -1129,7 +1371,18 @@ export function createPoller(deps: PollerDeps) {
         text = formatEvent(config, event);
         if (text !== null) {
           const reply_markup = explorerKeyboard(config, event);
-          if (reply_markup) extra = { reply_markup };
+          // Plain-text twin for the MarkdownV2 parse fallback in createNotifier.
+          // Same event, no Markdown of any kind; the notifier sends it at most
+          // once, only when Telegram rejects the entities. Cursor accounting
+          // below is unchanged: either path counts as sent, neither as skipped.
+          const plainText = formatPlainTextEvent(config, event);
+          const eventRef = { eventId: event.eventId, ledger: event.ledger, source: event.source };
+          if (reply_markup || plainText !== null) {
+            extra = {
+              ...(reply_markup ? { reply_markup } : {}),
+              ...(plainText !== null ? { plainText, eventRef } : {}),
+            };
+          }
         }
       } catch (err) {
         status.eventsSkipped += 1;
@@ -1143,6 +1396,7 @@ export function createPoller(deps: PollerDeps) {
       }
       if (text === null) {
         status.eventsSkipped += 1;
+        metrics?.eventsSkipped.inc();
         skipped += 1;
         audit.record(
           auditEntry("event_skipped", {
@@ -1155,6 +1409,16 @@ export function createPoller(deps: PollerDeps) {
 
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
         status.eventsSkipped += 1;
+        metrics?.eventsSkipped.inc();
+        // Log clearly that the cap was reached, not just that an event was dropped.
+        if (sentThisCycle === config.maxNotificationsPerCycle) {
+          console.warn(
+            `[poller] MAX_NOTIFICATIONS_PER_CYCLE cap (${config.maxNotificationsPerCycle}) reached ` +
+              `this cycle — remaining events skipped. ` +
+              `Raise MAX_NOTIFICATIONS_PER_CYCLE or wait for the next cycle. ` +
+              `Cursor still advances; the chain is the record.`,
+          );
+        }
         skipped += 1;
         audit.record(
           auditEntry("cap_reached", {
@@ -1175,10 +1439,12 @@ export function createPoller(deps: PollerDeps) {
         // Use bounded retry for Telegram sends to handle transient failures
         await sendWithRetry((message) => send(message, event.source, extra), text, config.botToken, deps.sendOptions, () => !status.stopping);
         status.notificationsSent += 1;
+        metrics?.notificationsSent.inc();
         sentThisCycle += 1;
       } catch (err) {
         // All retries exhausted; drop the message but continue processing others.
         status.notificationsFailed += 1;
+        metrics?.notificationsFailed.inc();
         failed += 1;
         audit.recordError(err, "send_failed", {
           source: event.source,
@@ -1190,6 +1456,10 @@ export function createPoller(deps: PollerDeps) {
         );
       }
 
+      // Pace sends to stay under Telegram's ~20 messages/minute limit.
+      // interSendDelayMs is configurable via INTER_SEND_DELAY_MS.
+      if (sentThisCycle < config.maxNotificationsPerCycle && config.interSendDelayMs > 0) {
+        await sleep(config.interSendDelayMs);
       // Rate-limit spacing is the last thing a draining cycle should wait for.
       if (!status.stopping && sentThisCycle < config.maxNotificationsPerCycle && sendSpacing > 0) {
         await sleep(sendSpacing);
@@ -1281,6 +1551,8 @@ export function createPoller(deps: PollerDeps) {
     let explicitBackoff: number | null = null;
     beginCycleTracking();
     status.cycles += 1;
+    status.lastPollAt = Date.now();
+    metrics?.pollCycles.inc();
     status.lastPollAt = now();
 
     // ── Circuit breaker check ─────────────────────────────────────────────────────
@@ -1312,6 +1584,9 @@ export function createPoller(deps: PollerDeps) {
     let cycleFailures = 0;
 
     try {
+      // Pace each contract independently: scan them sequentially but do not let
+      // a failure in one block the others. This ensures that if the "squad"
+      // contract is unreachable, the "market" contract is still polled.
       for (const target of targets) {
         const current = state.get(target.source);
         if (!current) continue;
@@ -1320,6 +1595,9 @@ export function createPoller(deps: PollerDeps) {
         try {
           const dedupWindow = dedup.get(target.source) ?? new EventDedupWindow(0);
           const rewinding = current.rewindFromLedger !== null;
+          // Read before the scan: the scan is what assigns the new cursor, and
+          // an unchanged value is exactly what a stall looks like.
+          const previousCursor = current.cursor;
           const scan = await withTimeout(
             readContractEvents(server, target, {
               // A pending floor rewind resumes by ledger, never by the stale
@@ -1336,9 +1614,18 @@ export function createPoller(deps: PollerDeps) {
             "RPC scan",
           );
 
+        status.latestLedger = scan.latestLedger;
+        status.oldestLedger = scan.oldestLedger;
+        current.lastError = null;
+        anyOk = true;
+        metrics?.rpcRequests.inc();
+
+        // Warn if this cursor is already behind the RPC's retention window.
+        checkStaleCursors(scan.oldestLedger);
           status.latestLedger = scan.latestLedger;
           status.oldestLedger = scan.oldestLedger;
           current.lastError = null;
+          current.cursorStale = false;
           anyOk = true;
 
           if (previousFailed) {
@@ -1417,10 +1704,15 @@ export function createPoller(deps: PollerDeps) {
           }
 
           let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
+          // Record what the walk read BEFORE notifying: an event is
+          // "processed" once it is read, so a crash between send and save
+          // cannot replay it. The keys come from the reader's own window —
+          // derived from raw responses, where topic content still exists —
+          // because a decoded event alone cannot always re-derive the same
+          // key (it carries no `topic`), and an id-less event would otherwise
+          // never be recorded.
+          for (const id of scan.seenEventIds) dedupWindow.add(id);
           if (scan.events.length > 0) {
-            // Record before notifying: an event is "processed" once it has been
-            // read, so a crash between send and save cannot replay it.
-            for (const event of scan.events) dedupWindow.add(eventKey(event));
             markDirty();
             delivery = await notify(scan.events);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
@@ -1447,14 +1739,20 @@ export function createPoller(deps: PollerDeps) {
               );
             }
           }
+
+          trackCursorAdvance(current, previousCursor, scan.latestLedger);
         } catch (err) {
           cycleFailures++;
           const message = errorMessage(err);
+          const staleCursor = isStaleCursorError(message);
           current.lastError = message;
+          if (staleCursor) current.cursorStale = true;
           status.lastError = { at: now(), message: `${target.source}: ${message}` };
           audit.recordError(err, "cycle_failed", { source: target.source });
-          console.error(`[poller] ${target.source} scan failed: ${message}`);
-          if (isStaleCursorError(message)) {
+          console.error(
+            `[poller] ${target.source} scan failed${staleCursor ? " (stale cursor)" : ""}: ${message}`,
+          );
+          if (staleCursor) {
             audit.record(
               auditEntry("stale_cursor", {
                 source: target.source,
@@ -1478,6 +1776,15 @@ export function createPoller(deps: PollerDeps) {
         }
       }
 
+        if (scan.lastEventLedger !== null) current.lastEventLedger = scan.lastEventLedger;
+        // Advance last — see the failure policy at the top of this file.
+        if (scan.cursor) current.cursor = scan.cursor;
+      } catch (err) {
+        const message = errMessage(err);
+        current.lastError = message;
+        status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
+        metrics?.rpcErrors.inc();
+        console.error(`[poller] ${target.source} scan failed: ${message}`);
       // ── Circuit breaker state update ─────────────────────────────────────────────
       if (cycleFailures > 0) {
         status.circuitBreaker.failureCount += cycleFailures;
@@ -1492,6 +1799,14 @@ export function createPoller(deps: PollerDeps) {
         }
       }
 
+    if (anyOk) {
+      status.lastSuccessAt = Date.now();
+      status.consecutiveFailures = 0;
+      metrics?.consecutiveFailures.set(0);
+    } else {
+      status.consecutiveFailures += 1;
+      metrics?.consecutiveFailures.set(status.consecutiveFailures);
+      emitCircuitBreakerWarning();
       if (anyOk) {
         status.lastSuccessAt = now();
         status.consecutiveFailures = 0;
@@ -1522,6 +1837,26 @@ export function createPoller(deps: PollerDeps) {
     }, delayMs);
   }
 
+  /**
+   * Emit a structured warning at each consecutive-failure threshold.
+   * The warning is emitted exactly once per threshold crossing (not every cycle),
+   * which makes it grep-able and avoids log spam during a long outage.
+   */
+  function emitCircuitBreakerWarning(): void {
+    const n = status.consecutiveFailures;
+    if (!CONSECUTIVE_FAILURE_THRESHOLDS.includes(n)) return;
+
+    const lastMsg = status.lastError?.message ?? "unknown";
+    // Clip the error message: it could contain unbounded RPC response text.
+    const safeMsg = clip(lastMsg, 200);
+    console.warn(
+      `[poller] CONSECUTIVE FAILURES: ${n} full cycles failed in a row. ` +
+        `Last error: ${safeMsg}. ` +
+        `Check RPC connectivity (${config.rpcUrl}) and Telegram bot status. ` +
+        `The cursor is safe; the bot will resume automatically when the error clears.`,
+    );
+  }
+
   async function loop(): Promise<void> {
     if (stopped || paused || inFlight) return;
     let nextDelay = config.pollIntervalMs;
@@ -1534,6 +1869,10 @@ export function createPoller(deps: PollerDeps) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
+      metrics?.consecutiveFailures.set(status.consecutiveFailures);
+      emitCircuitBreakerWarning();
+      status.lastError = { at: Date.now(), message: errMessage(err) };
+      console.error(`[poller] cycle threw: ${errMessage(err)}`);
       status.lastError = { at: now(), message: errorMessage(err) };
       audit.recordError(err, "cycle_failed");
       await flushAudit();
@@ -1551,6 +1890,17 @@ export function createPoller(deps: PollerDeps) {
 
   return {
     async start(): Promise<void> {
+      // Verify persistent volume availability before touching anything else.
+      const cursorDir = path.dirname(config.cursorFile);
+      try {
+        await mkdir(cursorDir, { recursive: true });
+        const probeFile = path.join(cursorDir, `.volume-probe.${process.pid}.${Date.now()}`);
+        await writeFile(probeFile, "", "utf8");
+        await unlink(probeFile).catch(() => {});
+      } catch (err) {
+        throw new Error(`Persistent volume is not writable: ${errorMessage(err)}`);
+      }
+
       // Refuse a second live process before touching the cursor or Telegram.
       // Configs built without a lock path keep it next to the cursor it guards.
       const lockFile = config.lockFile ?? path.join(path.dirname(config.cursorFile), "poller.lock");
