@@ -83,7 +83,6 @@ test("snapshot reports the dedup counter, defaulting to zero when the poller has
   assert.equal(snapshot.eventsDeduplicated, 7);
   assert.equal(typeof snapshot.eventsDeduplicated, "number");
 });
-
 test("snapshot exposes a stale cursor as a per-target boolean", () => {
   const target = { ...status().targets[0], cursorStale: true };
   const snapshot = buildStatusSnapshot(config, status({ targets: [target] }), 1_060_000);

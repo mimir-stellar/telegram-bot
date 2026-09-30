@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { auditEntry, createAuditLog } from "../dist/audit.js";
 import {
+  createNotifier,
   registerCommandHandlers,
   resumeMessage,
 } from "../dist/bot.js";
@@ -25,7 +26,7 @@ function baseConfig(overrides = {}) {
     networkPassphrase: "Test SDF Network ; September 2015",
     explorerBaseUrl: "https://example.invalid/explorer",
     botToken: "123456789:TEST-ONLY-TOKEN-NEVER-USE",
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     operatorTelegramUserId: "42",
     pollIntervalMs: 30_000,
     startLookbackLedgers: 60,
@@ -34,6 +35,8 @@ function baseConfig(overrides = {}) {
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
+    webhookUrl: null,
+    telegramWebhookUrl: null,
     ...overrides,
   };
 }

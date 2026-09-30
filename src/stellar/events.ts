@@ -47,9 +47,11 @@ import {
   clampStartLedger,
   createRpcServer,
   LedgerWindowError,
+  validateContractId,
   validateLedgerWindow,
   type LedgerWindow,
 } from "./client.js";
+import type { LedgerTip } from "./ledger-cache.js";
 import {
   decodeEvent,
   dedupeEvents,
@@ -94,6 +96,13 @@ export interface ScanOptions {
    * disables deduplication. Defaults to {@link DEFAULT_DEDUP_WINDOW}.
    */
   dedupWindow?: number | undefined;
+  /**
+   * Chain tip cached by the caller for this poll cycle. When set the walk does
+   * not call `getHealth()`; the caller owns refreshing it per cycle (see
+   * {@link import("./ledger-cache.js").LedgerCache}). Omitted means a one-shot
+   * scan — the `scan` CLI, a test — fetches its own tip.
+   */
+  ledgerTip?: LedgerTip | undefined;
 }
 
 export interface RawScan {
@@ -130,6 +139,9 @@ export interface RawScan {
   timing: RpcTimingSummary;
 }
 
+const MAX_UINT32 = 4_294_967_295n;
+const MAX_UINT64 = 18_446_744_073_709_551_615n;
+
 /**
  * A cursor is `<TOID>-<index>`, and a TOID packs the ledger sequence into its
  * high 32 bits. Reading it lets the walk know it reached the end of the range
@@ -142,10 +154,19 @@ export interface RawScan {
  */
 export function eventCursorLedger(cursor: string): number | null {
   if (typeof cursor !== "string") return null;
-  const toid = cursor.split("-")[0];
-  if (!toid || !/^\d+$/.test(toid)) return null;
+  const match = /^(\d+)-(\d+)$/.exec(cursor);
+  if (!match) return null;
+
+  const toidText = match[1];
+  const indexText = match[2];
+  if (toidText === undefined || indexText === undefined) return null;
+  if (toidText.length > 20 || indexText.length > 10) return null;
+
   try {
-    return Number(BigInt(toid) >> 32n);
+    const toid = BigInt(toidText);
+    const index = BigInt(indexText);
+    if (toid > 18_446_744_073_709_551_615n || index > 4_294_967_295n) return null;
+    return Number(toid >> 32n);
   } catch {
     return null;
   }
@@ -202,9 +223,17 @@ export async function paginatedGetEvents(
   const dedup = new EventDedupWindow(opts.dedupWindow ?? DEFAULT_DEDUP_WINDOW);
   for (const id of opts.seenEventIds ?? []) dedup.add(id);
 
-  const events: rpc.Api.EventResponse[] = [];
   let cursor: string | undefined = opts.cursor;
-  let lastCursor: string | null = opts.cursor ?? null;
+  if (cursor) {
+    const cLedger = eventCursorLedger(cursor);
+    if (cLedger !== null && cLedger < oldestLedger) {
+      console.error(`[scanner] cursor ledger ${cLedger} is older than retained window ${oldestLedger}, discarding`);
+      cursor = undefined;
+    }
+  }
+
+  const events: rpc.Api.EventResponse[] = [];
+  let lastCursor: string | null = cursor ?? null;
   let previousCursor = "";
   let latestLedger = window.latestLedger;
   let truncated = false;
@@ -240,6 +269,7 @@ export async function paginatedGetEvents(
   }
 
   const firstStartLedger = startLedger ?? window.oldestLedger;
+  let emptyPages = 0;
 
   for (;;) {
     if (pages >= maxPages) {
@@ -256,6 +286,8 @@ export async function paginatedGetEvents(
         : server.getEvents({ filters, startLedger: firstStartLedger, limit }),
     );
 
+    if (response.events.length === 0) emptyPages += 1;
+    latestLedger = response.latestLedger;
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     // Drop anything an earlier page (or an earlier cycle) already produced.
     // Order is preserved: the first occurrence wins, matching the RPC's own
@@ -289,6 +321,7 @@ export async function paginatedGetEvents(
     oldestLedger,
     truncated,
     pages,
+    emptyPages,
     duplicates,
     seenEventIds: dedup.toJSON(),
     startLedger,
@@ -300,22 +333,28 @@ export async function paginatedGetEvents(
 export interface WatchTarget {
   source: ContractSource;
   contractId: string;
+  version?: string;
 }
 
 export interface ContractScan extends Omit<RawScan, "events"> {
   source: ContractSource;
   contractId: string;
+  version: string;
   events: DecodedEvent[];
   /** Highest ledger among the returned events, or null when there were none. */
   lastEventLedger: number | null;
 }
 
-/** Scan one contract and decode everything it returned. */
+/** Scan one contract and decode everything it returned for the configured version. */
 export async function readContractEvents(
   server: rpc.Server,
   target: WatchTarget,
   opts: ScanOptions = {},
 ): Promise<ContractScan> {
+  // Validate contract ID at scan time so misconfigurations surface early
+  // with an actionable error tied to the specific target.
+  validateContractId(target.contractId, `${target.source} contract ID`);
+
   const scan = await paginatedGetEvents(
     server,
     [{ type: "contract", contractIds: [target.contractId] }],
@@ -341,6 +380,7 @@ export async function readContractEvents(
   return {
     source: target.source,
     contractId: target.contractId,
+    version,
     events,
     cursor: scan.cursor,
     latestLedger: scan.latestLedger,
@@ -358,6 +398,13 @@ export async function readContractEvents(
 
 // ── Standalone verification CLI ───────────────────────────────────────────────
 //
+//   npm run scan                         # both contracts, from the retained floor
+//   npm run scan -- --pages 40           # walk further
+//   npm run scan -- --show 5             # print 5 decoded events per contract (capped at 200)
+//   npm run scan -- --from 123456        # explicit start ledger
+//   npm run scan -- --contract market    # scan only the market contract
+//   npm run scan -- --contract squad     # scan only the squad contract
+//   npm run scan -- --help               # show this help
 //   npm run scan                  # both contracts, from the retained floor
 //   npm run scan -- --pages 40    # walk further
 //   npm run scan -- --show 5      # print 5 decoded events per contract
@@ -379,12 +426,51 @@ export async function readContractEvents(
 // The same built binary also renders the operator audit report (npm run audit,
 // src/audit-cli.ts): report from data/audit.jsonl, --tail, --json, --file.
 
+const SCAN_SHOW_MAX = 200;
+
+const HELP_TEXT = `
+Usage: npm run scan [-- <options>]
+
+Options:
+  --pages <n>         Maximum pages to fetch per contract (default: ${EVENT_MAX_PAGES})
+  --show <n>          Decoded events to print per contract (default: 3, max: ${SCAN_SHOW_MAX})
+  --from <ledger>     Start from this ledger instead of the retained floor
+  --contract <name>   Scan only one contract: "market" or "squad"
+  --help              Show this message
+
+Examples:
+  npm run scan
+  npm run scan -- --pages 40
+  npm run scan -- --show 20
+  npm run scan -- --from 4226500
+  npm run scan -- --contract market --show 10
+
+No BOT_TOKEN required — reads live Testnet data using the public Soroban RPC.
+`.trim();
+
 function flag(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`);
   if (index === -1) return undefined;
   return process.argv[index + 1];
 }
 
+function flagBool(name: string): boolean {
+  return process.argv.includes(`--${name}`);
+}
+
+function flagInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = flag(name);
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+    console.error(`[scan] --${name}: expected an integer, got "${raw}"`);
+    process.exit(1);
+  }
+  if (parsed < min || parsed > max) {
+    console.error(`[scan] --${name}: must be between ${min} and ${max}, got ${parsed}`);
+    process.exit(1);
+  }
+  return parsed;
 /** True when `--name` appears anywhere in argv (boolean CLI switches). */
 export function hasFlag(name: string): boolean {
   return process.argv.includes(`--${name}`);
@@ -525,6 +611,10 @@ export async function runAuditCli(): Promise<void> {
 function summarize(event: DecodedEvent): string {
   const p = event.payload;
   const money = (v: bigint) => `${formatUsdc(v)} USDC`;
+  const text = (value: string, max = 200): string => {
+    const compact = value.replace(/\s+/g, " ").trim();
+    return compact.length <= max ? compact : `${compact.slice(0, max - 1)}…`;
+  };
   switch (p.name) {
     case "claim_created":
       return `claim #${p.claimId} created by ${shortAddress(p.creator)} [${p.category}]`;
@@ -562,7 +652,18 @@ function summarize(event: DecodedEvent): string {
   }
 }
 
+function boundedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => {
+    if (typeof item !== "string") return typeof item === "bigint" ? item.toString() : item;
+    const compact = item.replace(/\s+/g, " ").trim();
+    return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
+  });
+}
+
 async function main(): Promise<void> {
+  if (flagBool("help") || flagBool("h")) {
+    console.log(HELP_TEXT);
+    return;
   // `--mock` opts into the local mock profile before config is read. An
   // explicit MIMIR_PROFILE in the environment still wins; blank counts as unset.
   if (process.argv.includes("--mock") && !process.env.MIMIR_PROFILE?.trim()) {
@@ -571,9 +672,21 @@ async function main(): Promise<void> {
 
   const config = loadStellarConfig();
   const server = createRpcServer(config);
-  const pages = Number(flag("pages") ?? EVENT_MAX_PAGES);
-  const show = Number(flag("show") ?? 3);
+  const pages = flagInt("pages", EVENT_MAX_PAGES, 1, 1000);
+  const show = flagInt("show", 3, 0, SCAN_SHOW_MAX);
   const from = flag("from");
+  const contractArg = flag("contract");
+
+  // Validate --contract early so the error is clear before any network call.
+  const validContracts = ["market", "squad"] as const;
+  type ContractArg = (typeof validContracts)[number];
+  if (contractArg !== undefined && !(validContracts as readonly string[]).includes(contractArg)) {
+    console.error(
+      `[scan] --contract: expected "market" or "squad", got "${contractArg}"\n` +
+        `Run with --help for usage.`,
+    );
+    process.exit(1);
+  }
   const asJson = hasFlag("json");
 
   const probeTiming = new RpcTiming();
@@ -594,11 +707,14 @@ async function main(): Promise<void> {
     );
   }
 
-  const targets: WatchTarget[] = [
+  const allTargets: WatchTarget[] = [
     { source: "market", contractId: config.marketContractId },
     { source: "squad", contractId: config.squadContractId },
   ];
 
+  const targets = contractArg
+    ? allTargets.filter((t) => t.source === (contractArg as ContractArg))
+    : allTargets;
   const jsonTargets: ScanJsonTarget[] = [];
 
   for (const target of targets) {
@@ -622,7 +738,7 @@ async function main(): Promise<void> {
     const counts = eventHistogram(scan.events);
 
     console.log(
-      `pages=${scan.pages} events=${scan.events.length} duplicates=${scan.duplicates} ` +
+      `pages=${scan.pages} emptyPages=${scan.emptyPages} events=${scan.events.length} duplicates=${scan.duplicates} ` +
         `truncated=${scan.truncated} lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor} ` +
         `start=${scan.startLedger ?? "cursor"}${scan.startClamped ? " (clamped)" : ""}`,
     );
@@ -631,6 +747,8 @@ async function main(): Promise<void> {
       console.log(`  ${count.toString().padStart(4)}  ${name}`);
     }
 
+    const toShow = scan.events.slice(-show);
+    for (const event of toShow) {
     for (const event of show > 0 ? scan.events.slice(-show) : []) {
       console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
       console.log(`  ${summarize(event)}`);
