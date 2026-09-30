@@ -16,7 +16,8 @@ npm test
 ```
 
 `npm test` builds `src/` → `dist/`, then runs every `tests/*.test.mjs` file with
-Node's built-in test runner (the same path CI uses).
+Node's built-in test runner (the same path CI uses). To run only the local-mock
+suites: `npm run test:mock`.
 
 CI runs typecheck, build, and the full test suite on every push and pull request.
 No live Testnet RPC access, Telegram credentials, or signing keys are required.
@@ -35,11 +36,22 @@ Do not wire `npm run scan` into automated tests.
 | --- | --- |
 | `tests/fixtures/events.json` | Decoded event cases for `formatEvent` / notifier fakes |
 | `tests/fixtures/cursor-valid.json` | Well-formed `data/cursor.json` shape for restart docs |
+| `tests/fixtures/cursor-stale.json` | Cursor that fell below the RPC's retained window (restart gap) |
 | `tests/fixtures/cursor-corrupt.txt` | Unreadable cursor sample (cold-start path) |
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
-| `tests/format.test.mjs` | Inline unit cases (MarkdownV2 escape, USDC decimals, send failures) |
-| `tests/logexport.test.mjs` | Log export: redaction, ring bounds, console wiring, secret-leak regressions |
-| `tests/version.test.mjs` | Release version metadata: positive, negative, boundary, restart, and regression coverage for `APP_VERSION`, health report, liveness endpoint, and log export header |
+| `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
+| `tests/dedup.test.mjs` | Inline unit cases for the canonical key (`eventKey`: RPC id → `eventId` → `v2:` content-derived composite → `null`) and the bounded window (`src/dedup.ts`), including restart/mixed-format round-trips |
+| `tests/page-dedup.test.mjs` | Fake-RPC overlapping-page walk (id-based and id-less keys, malformed-XDR pages) + fake-Telegram poller/restart cases |
+| `tests/bot.test.mjs` | Mocked grammy operator-command routing and exact reply payloads |
+| `tests/poller.test.mjs` | Cursor load/advance, RPC and Telegram failure, send cap, stop semantics, graceful-shutdown flush, drain deadline, shutdown notification drop |
+| `tests/poller-controls.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
+| `tests/cursor-restart.test.mjs` | Stale cursors, unwritable data dir, restart round-trip |
+| `tests/ledger-window.test.mjs` | Ledger-window bounds: clamping, out-of-window cursors, malformed-XDR scanner safety, restart |
+| `tests/helpers/temp-data.mjs` | Ephemeral data directory helper shared by persistence tests |
+| `tests/soak.test.mjs` | Long-run memory/timer/log boundedness under scripted RPC and Telegram failures (mock timers, forced GC, leak control) |
+| `tests/mock-rpc.test.mjs` | Live mock RPC: scanner walks, poller failure drills, cursor safety, log bounds |
+| `tests/mock-profile.test.mjs` | `MIMIR_PROFILE=mock` defaults, explicit-env precedence, unknown-profile failure |
+| `tests/config.test.mjs` | Env loading and validation, including the `SHUTDOWN_TIMEOUT_MS` drain budget |
 
 ## Event fixture schema
 
@@ -90,7 +102,7 @@ Rules:
 | `positive` | Happy-path notification for a known market/squad event | `notify` |
 | `negative` | Malformed / unknown / admin-shaped payload → no chat message | `skip` |
 | `boundary` | Clipping, reserved MarkdownV2 chars, zero/max amounts | `notify` or `skip` |
-| `restart` | Documents cursor resume / corrupt-file cold start (see cursor fixtures) | n/a in format suite |
+| `restart` | Documents cursor resume, restart-gap detection and corrupt-file cold start (see cursor fixtures) | n/a in format suite |
 
 `expect: "notify"` requires a non-null MarkdownV2 string from `formatEvent`.
 `expect: "skip"` requires `null` (or an `unknown` payload that the poller would
@@ -100,15 +112,34 @@ log and not post).
 
 - **Valid cursor** (`cursor-valid.json`): version `1`, per-target opaque
   `cursor` string + `lastEventLedger`. Matches what the poller write-then-renames
-  under `CURSOR_FILE` (default `./data/cursor.json`).
+  under `CURSOR_FILE` (default `./data/cursor.json`). New files also carry an
+  additive, bounded `recentEventIds` dedup window; a file without it is still
+  valid and loads with an empty window. Entries are opaque key strings: raw
+  RPC paging tokens, `v2:` content-derived composites, or keys written by
+  older releases — all round-trip unchanged.
 - **Corrupt cursor** (`cursor-corrupt.txt`): not JSON. The poller must treat this
   as a **cold start**, not a crash — leave the in-memory cursor null and begin
   `START_LOOKBACK_LEDGERS` behind tip.
 
-When you add persistence tests:
+When you add persistence tests, use the **ephemeral data directory** helper in
+`tests/helpers/temp-data.mjs` instead of hand-rolled `/tmp` paths:
 
-- Point `CURSOR_FILE` at a path under `os.tmpdir()`.
-- Always unlink the temp file in `finally`, including after failed assertions.
+```js
+import { createTempDataDir, withTempDataDir } from "./helpers/temp-data.mjs";
+
+test("resumes", () =>
+  withTempDataDir(async (dir) => {
+    const cursorFile = dir.file("cursor.json"); // fresh dir under os.tmpdir()
+    // ...write fixtures, start a poller with { cursorFile }, assert...
+  })); // directory is removed even if an assertion throws
+```
+
+- `createTempDataDir(prefix)` returns `{ root, file(name), cleanup() }`; for a
+  whole file, create one at module level and call `test.after(() => dir.cleanup())`.
+- Never point tests at the repo `data/` directory or at fixed `/tmp/...` names:
+  they collide across runs and leak state into later ones.
+- Let a poller finish its cycle (wait for its cursor save) before cleanup, or a
+  late write can recreate the directory.
 - Never commit a real runtime `data/cursor.json` from a live bot.
 
 ## Failure-mode expectations (keep fixtures aligned)
@@ -116,9 +147,44 @@ When you add persistence tests:
 | Failure | Cursor | Notification | Fixture tip |
 | --- | --- | --- | --- |
 | RPC error for one contract | **unchanged** for that target | none that cycle | Fake rejected `readContractEvents`; assert cursor string identical |
-| Telegram send error | **still advances** | counted as failed | Fake `sendMessage` reject; assert no token in the Error message |
+| Ledger-window violation (start ledger or cursor **above** the tip) | **unchanged** | none that cycle | Fake `getHealth` window plus an out-of-window value; assert a bounded `LedgerWindowError` and that no `getEvents` request is sent |
+| Cursor **below** the retained floor (stale) | **unchanged** | none that cycle | Fake `getHealth` window plus a stale cursor; assert the cursor is forwarded and the RPC's bounded stale rejection is surfaced |
+| Cursor below the floor, RPC answers with an **empty page** (no error) | **rewound** to the floor | retained window delivered late | Fake `getHealth` window plus a cursor walk that hands back the same cursor; assert one restart gap is recorded and the walk resumes at the floor |
+| Cursor string with no readable ledger | **unchanged**, flagged `cursorUnreadable` | none that cycle | Pass a non-TOID cursor; assert no gap is recorded and the token is forwarded |
+| Telegram send error | **commits after partial delivery** | counted as failed | Fake `sendMessage` reject; assert cursor advances and no token appears in the Error message |
 | Corrupt cursor file | cold start | n/a | Use `cursor-corrupt.txt` contents |
 | Burst over cap | advances | extras skipped | Cap `MAX_NOTIFICATIONS_PER_CYCLE` in the fake config |
+| Graceful shutdown mid-cycle | **flushed** if the cycle advanced it, untouched otherwise | the in-flight send finishes; the rest are dropped and counted | Fake a second target that blocks after the first advanced; assert the file the restarted poller loads |
+| Shutdown deadline expires | whatever was already on disk — never clobbered | the abandoned cycle may lose its remaining sends | Fake a server that never resolves; assert the file is byte-identical and no `.tmp` is left behind |
+| Unauthorized `/pause` or `/resume` | untouched | no command reply | Mock grammy with a different Telegram user id |
+| Operator pause → restart | version-1 cursor unchanged | no replay | Reload a valid cursor fixture; pause must not persist |
+| Overlapping page / resumed cursor | advances | duplicate suppressed, counted | Fake RPC returns the same event id twice; assert one send |
+| Id-less redelivery (event without an RPC `id`) | advances | duplicate suppressed via `v2:` composite, counted | Fake RPC returns the same id-less event twice; assert one send and a `v2:` key in `recentEventIds` |
+| Id-less events in one transaction | advances | **both** delivered, never merged | Two events sharing ledger/tx/topic-count with different topic content; assert two sends |
+| Malformed XDR / non-object RPC entries | advances | `unknown` payloads skipped, non-objects dropped | Page containing `null`, a primitive, and garbage XDR; assert the scan completes without throwing |
+| Restart with a saved window | resumed | boundary event suppressed | Point two pollers at one temp `CURSOR_FILE` |
+
+## Failure drills against the local mock
+
+The table above is enforced against fakes in unit tests **and** against a real
+HTTP server: `src/stellar/mock-rpc.ts` implements the Soroban JSON-RPC surface
+(cursor pagination, empty pages, retained floor, mutual exclusion) plus
+injected failures, so the same expectations can be rehearsed end to end with
+the `MIMIR_PROFILE=mock` profile — loopback only, no credentials, isolated
+`data/cursor.mock.json`:
+
+```bash
+npm run mock:rpc -- --fail-events error   # every scan fails until the process restarts
+npm run mock:poll -- --stale-cursor       # cursors rejected once the poller has one
+npm run mock:poll -- --malformed          # undecodable event must skip, not crash
+npm run scan:mock                         # scanner --mock against a running mock:rpc
+```
+
+`tests/mock-rpc.test.mjs` drives the real `createPoller` against
+`startMockRpc()` on an ephemeral port and asserts the failure-mode table above:
+cursor unchanged across RPC failures and stale-cursor rejections, cursor
+advancing past Telegram failures, skipped events, and cap drops, restart
+without replay, bounded redacted logs, and the version-1 cursor file shape.
 
 ## Adding a new fixture case
 
@@ -143,24 +209,6 @@ place (`tests/logexport.test.mjs`):
   MarkdownV2 entities.
 - Capture is in-memory only: a restart starts with an empty ring, and nothing
   is written to `data/` or anywhere else.
-
-## Version metadata
-
-The bot surfaces the version from `package.json` at runtime via the `APP_VERSION`
-constant in `src/config.ts` (read once with `createRequire` at module load, falls
-back to `"unknown"` if the field is absent). It appears in:
-
-- `[boot]` log line — `Mimir Telegram notifier vX.Y.Z`
-- `/status` command header — `running on Stellar testnet (vX.Y.Z)`
-- Log export header — `Mimir notifier log export · vX.Y.Z`
-- `GET /health` JSON body — `"version": "X.Y.Z"`
-- `GET /health/live` JSON body — `"version": "X.Y.Z"`
-
-`tests/version.test.mjs` holds the authoritative test suite for these surfaces.
-The version string is **not** included in `secretsFor()` and must never be added
-there — it is public metadata, not a credential.
-
-When bumping the version in `package.json`, no other files need manual edits.
 
 ## Out of scope for fixtures
 
