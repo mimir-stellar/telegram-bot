@@ -176,6 +176,10 @@ export interface BotConfig extends StellarConfig {
   telegramSendTimeoutMs: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
+  /** When true, link previews are enabled for market contract notifications. */
+  linkPreviewMarket: boolean;
+  /** When true, link previews are enabled for squad contract notifications. */
+  linkPreviewSquad: boolean;
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
@@ -226,6 +230,9 @@ const DEFAULTS = {
   // enough for a normal API round-trip on a slow link.
   telegramSendTimeoutMs: DEFAULT_TELEGRAM_SEND_TIMEOUT_MS,
   channelPreviewMode: false,
+  // Link previews disabled by default for backward compatibility and reliability.
+  linkPreviewMarket: false,
+  linkPreviewSquad: false,
 } as const;
 
 /**
@@ -535,6 +542,8 @@ export function loadConfig(): BotConfig {
       0,
     ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
+    linkPreviewMarket: c.bool("LINK_PREVIEW_MARKET", DEFAULTS.linkPreviewMarket),
+    linkPreviewSquad: c.bool("LINK_PREVIEW_SQUAD", DEFAULTS.linkPreviewSquad),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
@@ -659,6 +668,8 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "TELEGRAM_SEND_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
+  { key: "LINK_PREVIEW_MARKET", secret: false, hasBuiltInDefault: true },
+  { key: "LINK_PREVIEW_SQUAD", secret: false, hasBuiltInDefault: true },
   // Injected by a platform, never set by an operator: read only as the
   // HEALTH_PORT fallback, so it is reported for the same reason.
   { key: "PORT", secret: false },

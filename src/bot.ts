@@ -57,8 +57,6 @@ function visibleCommands(config?: BotConfig) {
 }
 
 export function helpMessage(config: BotConfig): string {
-  if (config.operatorTelegramUserId === null) return HELP_BASE.join("\n");
-function helpMessage(config: BotConfig): string {
   return [
     HELP_TITLE,
     "",
@@ -450,12 +448,21 @@ export function registerCommandHandlers(
   }
 }
 
+/** Placeholder for callback query handlers. Additional functionality can be added here. */
+function registerCallbackHandlers(
+  bot: Bot | { on?: (event: string, handler: (ctx: Context) => Promise<void>) => void },
+  deps: BotDeps,
+): void {
+  // Currently no callback handlers implemented; callback queries are not used
+  // in the core notification flow. This function is kept as a hook for future
+  // enhancements like inline keyboard handling for commands.
+}
+
 export function createBot(deps: BotDeps): Bot {
   const bot = new Bot(
     deps.config.botToken,
     deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined,
   );
-  const bot = new Bot(deps.config.botToken, deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined);
   registerCommandHandlers(bot, deps);
   registerCallbackHandlers(bot, deps);
 
@@ -551,9 +558,23 @@ export function createNotifier(bot: Bot, config: BotConfig) {
       : source === "squad"
         ? config.squadChatId ?? config.chatId
         : config.chatId;
+
+    // Select link preview settings based on the contract source.
+    // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
+    const linkPreviewDisabled = source === "market"
+      ? !config.linkPreviewMarket
+      : source === "squad"
+        ? !config.linkPreviewSquad
+        : true;
+
+    const notificationOptions = {
+      parse_mode: "MarkdownV2" as const,
+      link_preview_options: { is_disabled: linkPreviewDisabled },
+    };
+
     try {
       await bot.api.sendMessage(chatId, text, {
-        ...TELEGRAM_OPTIONS,
+        ...notificationOptions,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(extra?.replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
@@ -595,4 +616,6 @@ export async function registerCommands(bot: Bot, config?: BotConfig): Promise<vo
     console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);
   }
 }
+
+
 

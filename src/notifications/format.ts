@@ -550,9 +550,15 @@ export function formatFallbackEvent(
 
 /**
  * Generate a channel preview message for on-demand preview commands.
+ * Shows a sample notification and current link preview settings for the specified contract.
  */
-export function previewMessage(config: StellarConfig, target = "market"): string {
+export function previewMessage(config: StellarConfig & { linkPreviewMarket?: boolean; linkPreviewSquad?: boolean }, target = "market"): string {
   const isSquad = target.trim().toLowerCase() === "squad";
+  const linkPreviewEnabled = isSquad
+    ? config.linkPreviewSquad ?? false
+    : config.linkPreviewMarket ?? false;
+
+  const settingsLine = `Link previews: ${linkPreviewEnabled ? "enabled" : "disabled"}`;
 
   if (isSquad) {
     const sampleEvent: DecodedEvent = {
@@ -576,7 +582,7 @@ export function previewMessage(config: StellarConfig, target = "market"): string
       },
     };
     const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
-    return `${NOTIFICATION_MD.channelPreviewSquad}\n\n${formatted}`;
+    return `${NOTIFICATION_MD.channelPreviewSquad}\n${settingsLine}\n\n${formatted}`;
   }
 
   const sampleEvent: DecodedEvent = {
@@ -598,6 +604,6 @@ export function previewMessage(config: StellarConfig, target = "market"): string
     },
   };
   const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
-  return `${NOTIFICATION_MD.channelPreviewMarket}\n\n${formatted}`;
+  return `${NOTIFICATION_MD.channelPreviewMarket}\n${settingsLine}\n\n${formatted}`;
 }
 
