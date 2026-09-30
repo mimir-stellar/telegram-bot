@@ -1,6 +1,6 @@
 {
   "config": {
-    "chatId": "-1001234567890",
+    "chatIds": [ "-1001234567890"],
     "marketContractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
     "squadContractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
     "rpcUrl": "https://example.invalid/rpc",
@@ -353,19 +353,20 @@
       }
     },
     {
-      "id": "unknown_no_reason",
+      "id": "negative_stake_amount_unknown",
       "kind": "negative",
       "expect": "skip",
       "event": {
         "source": "market",
         "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
-        "ledger": 55,
+        "ledger": 51,
         "txHash": "",
         "at": 0,
-        "eventId": "55-0",
+        "eventId": "51-0",
         "payload": {
           "name": "unknown",
-          "eventName": "fee_policy_changed"
+          "eventName": "claim_challenged",
+          "reason": "claim_challenged.stake: expected non-negative amount, got -20000000"
         }
       }
     },

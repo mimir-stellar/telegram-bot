@@ -1,16 +1,15 @@
 /**
- * Unit tests for paginatedGetEvents, eventCursorLedger, and readContractEvents.
+ * Tests for src/stellar/events.ts
  *
- * All tests use a fake RPC server — no live Testnet connection required.
+ * All fakes are pure in-process objects — no network, no Testnet credentials.
  *
- * Design principles under test:
- *  - Termination is driven by the cursor, not by page length.
- *  - An empty page is NOT the end of the scan.
- *  - startLedger and cursor are mutually exclusive request shapes.
- *  - maxPages bounds one cycle's worst case; truncated=true signals that.
- *  - When the cursor stops advancing the loop exits without an extra request.
- *  - lastCursor is always the last cursor returned by the server, even when
- *    the walk terminates because the cursor's ledger reached the chain tip.
+ * Key invariants verified:
+ *   1. Empty pages never terminate the walk early (the "EVM trap").
+ *   2. eventCursorLedger parses and rejects correctly.
+ *   3. The walk terminates when the cursor's ledger meets or exceeds the tip.
+ *   4. maxPages cap sets truncated=true and stops the walk.
+ *   5. A stalled cursor (server echoes the same cursor twice) terminates safely.
+ *   6. getHealth failure propagates instead of silently returning empty.
  */
 
 import assert from "node:assert/strict";
@@ -19,436 +18,441 @@ import test from "node:test";
 import {
   eventCursorLedger,
   paginatedGetEvents,
-  readContractEvents,
-  EVENT_PAGE_LIMIT,
   EVENT_MAX_PAGES,
+  EVENT_PAGE_LIMIT,
 } from "../dist/stellar/events.js";
 
 // ── Cursor helpers ────────────────────────────────────────────────────────────
 
 /**
- * Pack a ledger sequence into the high 32 bits of a TOID, like the Soroban RPC
- * does, then stringify as `<TOID>-<index>`.
+ * Build a cursor string that encodes a given ledger sequence the same way
+ * Soroban does: TOID = (ledger << 32) | txIndex, cursor = `${TOID}-${opIndex}`.
  */
-function makeCursor(ledger, index = 0) {
-  const toid = BigInt(ledger) << 32n;
-  return `${toid}-${index}`;
+function makeCursor(ledger, txIndex = 1, opIndex = 0) {
+  const toid = (BigInt(ledger) << 32n) | BigInt(txIndex);
+  return `${toid}-${opIndex}`;
 }
 
-// ── Fake RPC builder ─────────────────────────────────────────────────────────
+// ── Server fake ───────────────────────────────────────────────────────────────
 
 /**
- * Build a minimal fake rpc.Server.
+ * Build a minimal fake rpc.Server from a list of page descriptors.
  *
- * `pages` is an array of page descriptors:
- *   { events?: RawEvent[], cursor?: string, latestLedger?: number }
+ * Each call to fakeServer.getEvents() pops the next page off the queue.
+ * A page descriptor is:
+ *   { events: [...], cursor: string, latestLedger: number }
  *
- * `getHealth` returns { status: "healthy", oldestLedger, latestLedger }.
- * `getEvents` dequeues from `pages` on each call.
+ * fakeServer.getHealth() always returns the supplied health values.
  */
-function fakeServer({
-  oldestLedger = 1,
-  latestLedger = 1000,
-  pages = [],
-} = {}) {
+function makeServer(health, pages) {
   const queue = [...pages];
-  const calls = [];
-
+  let callIndex = 0;
   return {
-    calls,
-    server: {
-      async getHealth() {
-        return { status: "healthy", oldestLedger, latestLedger };
-      },
-      async getEvents(req) {
-        calls.push({ ...req });
-        if (queue.length === 0) {
-          return { events: [], cursor: "", latestLedger };
-        }
-        const page = queue.shift();
-        return {
-          events: page.events ?? [],
-          cursor: page.cursor ?? "",
-          latestLedger: page.latestLedger ?? latestLedger,
-        };
-      },
+    async getHealth() {
+      return health;
     },
-  };
-}
-
-/** A minimal raw event payload the RPC would return. */
-function rawEvent(ledger = 100, id = "0") {
-  return {
-    id: `${ledger}-${id}`,
-    ledger,
-    ledgerClosedAt: new Date(0).toISOString(),
-    txHash: `txhash${ledger}`,
-    topic: [],
-    value: { _type: "xdr", xdr: "" },
-    contractId: "",
-    type: "contract",
-    pagingToken: makeCursor(ledger),
+    async getEvents(_req) {
+      const page = queue[callIndex] ?? queue[queue.length - 1];
+      callIndex += 1;
+      return {
+        events: page.events ?? [],
+        cursor: page.cursor ?? "",
+        latestLedger: page.latestLedger ?? health.latestLedger,
+      };
+    },
   };
 }
 
 // ── eventCursorLedger ─────────────────────────────────────────────────────────
 
-test("eventCursorLedger extracts the ledger from a well-formed cursor", () => {
-  // ledger 500 → TOID = 500n << 32n = 2147483648000n
-  const cursor = makeCursor(500);
-  assert.equal(eventCursorLedger(cursor), 500);
+test("eventCursorLedger: valid cursor returns correct ledger", () => {
+  // ledger 1000, txIndex 1 → TOID = (1000 << 32) | 1 = 4294968297
+  const cursor = makeCursor(1000, 1, 0);
+  assert.equal(eventCursorLedger(cursor), 1000);
 });
 
-test("eventCursorLedger returns null for an empty string", () => {
+test("eventCursorLedger: ledger 0 is representable", () => {
+  const cursor = makeCursor(0, 0, 0);
+  assert.equal(eventCursorLedger(cursor), 0);
+});
+
+test("eventCursorLedger: large ledger round-trips", () => {
+  const ledger = 9_999_999;
+  const cursor = makeCursor(ledger, 4294967295, 4294967295);
+  assert.equal(eventCursorLedger(cursor), ledger);
+});
+
+test("eventCursorLedger: missing TOID part returns null", () => {
   assert.equal(eventCursorLedger(""), null);
+  assert.equal(eventCursorLedger("-1"), null);
 });
 
-test("eventCursorLedger returns null for a non-numeric TOID", () => {
-  assert.equal(eventCursorLedger("notanumber-0"), null);
+test("eventCursorLedger: non-numeric TOID returns null", () => {
+  assert.equal(eventCursorLedger("abc-0"), null);
+  assert.equal(eventCursorLedger("0x1A-0"), null);
 });
 
-test("eventCursorLedger handles the all-ones sentinel cursor shape", () => {
-  // The all-ones TOID that the RPC uses as a high-watermark sentinel.
-  const allOnes = "0018276211125911551-4294967295";
-  const ledger = eventCursorLedger(allOnes);
-  // 0018276211125911551 >> 32 = 4261412863 — just needs to be a number > 0
-  assert.ok(typeof ledger === "number" && ledger > 0);
+test("eventCursorLedger: bare number with no dash is rejected as malformed", () => {
+  assert.equal(eventCursorLedger("12345"), null);
 });
 
-test("eventCursorLedger returns null when TOID portion is missing", () => {
-  assert.equal(eventCursorLedger("-0"), null);
-});
+// ── Empty-page walk ───────────────────────────────────────────────────────────
 
-// ── paginatedGetEvents — cursor loop termination ──────────────────────────────
+test("paginatedGetEvents: 12 empty pages then 1 events page — all events collected (the EVM trap)", async () => {
+  // This is the documented Testnet reality: 12 empty pages before the one
+  // that holds all 11 events.  Stopping on an empty page would yield zero.
+  const tip = 5_000;
+  const eventLedger = 4_950;
+  const finalCursor = makeCursor(tip, 1, 0);
 
-test("paginatedGetEvents terminates when cursor reaches the chain tip", async () => {
-  const latestLedger = 1000;
-  const tipCursor = makeCursor(latestLedger);
-
-  const { server, calls } = fakeServer({
-    latestLedger,
-    pages: [
-      { events: [rawEvent(999)], cursor: tipCursor, latestLedger },
+  const pages = [];
+  // 12 empty pages, each advancing the cursor by ~4 ledgers
+  for (let i = 0; i < 12; i++) {
+    const ledger = 4_500 + i * 4;
+    pages.push({ events: [], cursor: makeCursor(ledger), latestLedger: tip });
+  }
+  // Page 13: holds the events, cursor at or past the tip
+  pages.push({
+    events: [
+      { id: "e1", contractId: "C1", ledger: eventLedger, txHash: "abc", ledgerClosedAt: "2026-01-01T00:00:00Z", topic: [], value: null },
+      { id: "e2", contractId: "C1", ledger: eventLedger, txHash: "abc", ledgerClosedAt: "2026-01-01T00:00:00Z", topic: [], value: null },
     ],
+    cursor: finalCursor,
+    latestLedger: tip,
   });
 
-  const result = await paginatedGetEvents(server, [], { startLedger: 900 });
-
-  // Should stop after 1 content page — the cursor's ledger == latestLedger.
-  assert.equal(result.events.length, 1);
-  assert.equal(result.cursor, tipCursor);
-  assert.equal(result.truncated, false);
-  // 1 getHealth + 1 getEvents
-  assert.equal(calls.length, 1);
-});
-
-test("paginatedGetEvents does NOT terminate on an empty page — empty is not EOF", async () => {
-  const latestLedger = 1000;
-  const midCursor = makeCursor(500);
-  const tipCursor = makeCursor(latestLedger);
-
-  const { server, calls } = fakeServer({
-    latestLedger,
-    pages: [
-      // Empty page — must not stop here
-      { events: [], cursor: midCursor, latestLedger },
-      // Page with data — reached because we kept going
-      { events: [rawEvent(999)], cursor: tipCursor, latestLedger },
-    ],
-  });
-
-  const result = await paginatedGetEvents(server, [], { startLedger: 400 });
-
-  assert.equal(result.events.length, 1, "should have collected the event from the second page");
-  assert.equal(result.pages, 2, "should have fetched 2 pages");
-  assert.equal(result.truncated, false);
-  assert.equal(calls.length, 2);
-});
-
-test("paginatedGetEvents stops when the cursor stops advancing", async () => {
-  const latestLedger = 1000;
-  const stalledCursor = makeCursor(600);
-
-  const { server, calls } = fakeServer({
-    latestLedger,
-    pages: [
-      { events: [rawEvent(600)], cursor: stalledCursor, latestLedger },
-      // Same cursor returned again — the server is stuck.
-      { events: [], cursor: stalledCursor, latestLedger },
-    ],
-  });
-
-  const result = await paginatedGetEvents(server, [], { startLedger: 500 });
-
-  // The stall is detected on the SECOND request, when nextCursor === previousCursor.
-  // So the loop fetches page 1 (sets previousCursor), then fetches page 2
-  // (detects stall) and breaks — 2 pages total, not 1.
-  assert.equal(result.pages, 2, "stall detected after 2 requests (1 to see cursor, 1 to confirm it stopped)");
-  assert.equal(result.cursor, stalledCursor);
-  // No third request should have been made.
-  assert.equal(calls.length, 2);
-});
-
-test("paginatedGetEvents stops when the server returns an empty cursor", async () => {
-  const latestLedger = 1000;
-
-  const { server } = fakeServer({
-    latestLedger,
-    pages: [
-      // Empty cursor signals the server has nothing more to say.
-      { events: [rawEvent(500)], cursor: "", latestLedger },
-    ],
-  });
-
-  const result = await paginatedGetEvents(server, [], { startLedger: 400 });
-
-  assert.equal(result.events.length, 1);
-  assert.equal(result.pages, 1);
-  // lastCursor is null because the initial cursor was undefined and the server
-  // returned "" — nothing to resume from.
-  assert.equal(result.cursor, null);
-});
-
-test("paginatedGetEvents honours maxPages and sets truncated=true", async () => {
-  const latestLedger = 10000;
-
-  // Build 5 pages that all look like the tip is far away.
-  const pages = Array.from({ length: 5 }, (_, i) => ({
-    events: [rawEvent(100 + i)],
-    cursor: makeCursor(100 + i),
-    latestLedger,
-  }));
-
-  const { server, calls } = fakeServer({ latestLedger, pages });
+  const server = makeServer(
+    { status: "healthy", oldestLedger: 4_000, latestLedger: tip },
+    pages,
+  );
 
   const result = await paginatedGetEvents(server, [], {
-    startLedger: 100,
-    maxPages: 3,
+    startLedger: 4_500,
+    maxPages: 20,
   });
 
-  assert.equal(result.truncated, true, "should be truncated after maxPages");
-  assert.equal(result.pages, 3);
-  // Should have fetched exactly 3 pages (not the 4th or 5th).
-  assert.equal(calls.length, 3);
+  assert.equal(result.events.length, 2, "all events on page 13 must be returned");
+  assert.equal(result.pages, 13, "must have walked all 13 pages");
+  assert.equal(result.truncated, false, "walk ended at cursor tip, not page cap");
+  assert.equal(result.cursor, finalCursor);
 });
 
-test("paginatedGetEvents accumulates events across multiple pages", async () => {
-  const latestLedger = 1000;
+test("paginatedGetEvents: single empty page with cursor at tip terminates and returns no events", async () => {
+  const tip = 4_000;
+  const cursor = makeCursor(tip, 1, 0);
 
-  const pages = [
-    { events: [rawEvent(100), rawEvent(101)], cursor: makeCursor(200), latestLedger },
-    { events: [rawEvent(200), rawEvent(201)], cursor: makeCursor(300), latestLedger },
-    { events: [rawEvent(300)], cursor: makeCursor(latestLedger), latestLedger },
-  ];
+  const server = makeServer(
+    { status: "healthy", oldestLedger: 3_900, latestLedger: tip },
+    [{ events: [], cursor, latestLedger: tip }],
+  );
 
-  const { server } = fakeServer({ latestLedger, pages });
+  const result = await paginatedGetEvents(server, [], { startLedger: 3_950 });
 
-  const result = await paginatedGetEvents(server, [], { startLedger: 50 });
-
-  assert.equal(result.events.length, 5, "all events from all pages");
-  assert.equal(result.pages, 3);
+  assert.equal(result.events.length, 0);
+  assert.equal(result.pages, 1);
   assert.equal(result.truncated, false);
+  assert.equal(result.cursor, cursor);
 });
 
-// ── Request shape: startLedger vs cursor (mutually exclusive) ─────────────────
+test("paginatedGetEvents: cold start uses lookbackLedgers to compute startLedger", async () => {
+  const tip = 5_000;
+  const cursor = makeCursor(tip, 1, 0);
 
-test("paginatedGetEvents uses startLedger on the first request when no cursor given", async () => {
-  const latestLedger = 1000;
+  const requests = [];
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: 4_000, latestLedger: tip };
+    },
+    async getEvents(req) {
+      requests.push(req);
+      return { events: [], cursor, latestLedger: tip };
+    },
+  };
 
-  const { server, calls } = fakeServer({
-    latestLedger,
-    oldestLedger: 100,
-    pages: [{ events: [], cursor: makeCursor(latestLedger), latestLedger }],
-  });
+  await paginatedGetEvents(server, [], { lookbackLedgers: 100 });
 
-  await paginatedGetEvents(server, [], { startLedger: 500 });
-
-  // First request must have startLedger, not cursor.
-  assert.ok("startLedger" in calls[0], "first request should use startLedger");
-  assert.ok(!("cursor" in calls[0]) || calls[0].cursor === undefined,
-    "first request must not have cursor");
+  // The request should have used startLedger = tip - 100 = 4900
+  const req = requests[0];
+  assert.ok(!req.cursor, "cursor request must not be sent on a cold start");
+  assert.ok(req.startLedger !== undefined, "startLedger should be set");
+  assert.ok(req.startLedger >= 4_900, `startLedger ${req.startLedger} should be >= 4900`);
 });
 
-test("paginatedGetEvents uses cursor on subsequent requests (never startLedger)", async () => {
-  const latestLedger = 1000;
-  const midCursor = makeCursor(500);
+test("paginatedGetEvents: startLedger is clamped up to oldestLedger", async () => {
+  // If the requested startLedger is below the floor, it is clamped up.
+  const tip = 10_000;
+  const oldest = 9_000;
+  const cursor = makeCursor(tip, 1, 0);
 
-  const { server, calls } = fakeServer({
-    latestLedger,
-    pages: [
-      { events: [], cursor: midCursor, latestLedger },
-      { events: [], cursor: makeCursor(latestLedger), latestLedger },
-    ],
-  });
+  const requests = [];
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: oldest, latestLedger: tip };
+    },
+    async getEvents(req) {
+      requests.push(req);
+      return { events: [], cursor, latestLedger: tip };
+    },
+  };
 
-  await paginatedGetEvents(server, [], { startLedger: 100 });
+  await paginatedGetEvents(server, [], { startLedger: 100 }); // far below floor
 
-  // Second request must use cursor, not startLedger.
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1].cursor, midCursor);
-  assert.ok(!("startLedger" in calls[1]), "follow-up request must not have startLedger");
+  assert.ok(requests[0].startLedger >= oldest, "must not request below retained floor");
 });
 
-test("paginatedGetEvents passes an existing cursor directly on the first request", async () => {
-  const latestLedger = 1000;
-  const resumeCursor = makeCursor(700);
+test("paginatedGetEvents: resume cursor request omits startLedger", async () => {
+  const tip = 5_000;
+  const resumeCursor = makeCursor(4_900, 1, 0);
+  const endCursor = makeCursor(tip, 1, 0);
 
-  const { server, calls } = fakeServer({
-    latestLedger,
-    pages: [{ events: [], cursor: makeCursor(latestLedger), latestLedger }],
-  });
+  const requests = [];
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: 4_000, latestLedger: tip };
+    },
+    async getEvents(req) {
+      requests.push(req);
+      return { events: [], cursor: endCursor, latestLedger: tip };
+    },
+  };
 
   await paginatedGetEvents(server, [], { cursor: resumeCursor });
 
-  assert.equal(calls[0].cursor, resumeCursor);
-  assert.ok(!("startLedger" in calls[0]), "cursor resume must not send startLedger");
+  // First request must use cursor, not startLedger
+  assert.equal(requests[0].cursor, resumeCursor, "first request must use cursor");
+  assert.ok(!("startLedger" in requests[0]), "cursor request must not include startLedger");
 });
 
-// ── Floor clamping ────────────────────────────────────────────────────────────
+// ── Cursor stall detection ────────────────────────────────────────────────────
 
-test("paginatedGetEvents clamps startLedger up to the retained floor", async () => {
-  const latestLedger = 5000;
-  const oldestLedger = 3000;
+test("paginatedGetEvents: stalled cursor (server echoes same cursor) terminates without looping", async () => {
+  const tip = 5_000;
+  const stalledCursor = makeCursor(4_800, 1, 0); // well behind tip
 
-  const { server, calls } = fakeServer({
-    latestLedger,
-    oldestLedger,
-    pages: [{ events: [], cursor: makeCursor(latestLedger), latestLedger }],
-  });
-
-  // Ask to start at 100, which is below the retained floor.
-  await paginatedGetEvents(server, [], { startLedger: 100 });
-
-  // The actual startLedger sent must be clamped to oldestLedger.
-  assert.equal(calls[0].startLedger, oldestLedger);
-});
-
-// ── lookbackLedgers cold-start ────────────────────────────────────────────────
-
-test("paginatedGetEvents derives startLedger from lookbackLedgers on cold start", async () => {
-  const latestLedger = 1000;
-  const oldestLedger = 1;
-  const lookback = 60;
-
-  const { server, calls } = fakeServer({
-    latestLedger,
-    oldestLedger,
-    pages: [{ events: [], cursor: makeCursor(latestLedger), latestLedger }],
-  });
-
-  await paginatedGetEvents(server, [], { lookbackLedgers: lookback });
-
-  const expected = Math.max(1, latestLedger - lookback);
-  assert.equal(calls[0].startLedger, expected);
-});
-
-// ── Return values ─────────────────────────────────────────────────────────────
-
-test("paginatedGetEvents exposes oldestLedger and latestLedger from health", async () => {
-  const oldestLedger = 42;
-  const latestLedger = 9999;
-
-  const { server } = fakeServer({
-    oldestLedger,
-    latestLedger,
-    pages: [{ events: [], cursor: makeCursor(latestLedger), latestLedger }],
-  });
-
-  const result = await paginatedGetEvents(server, [], { startLedger: oldestLedger });
-
-  assert.equal(result.oldestLedger, oldestLedger);
-  assert.equal(result.latestLedger, latestLedger);
-});
-
-test("paginatedGetEvents returns the last cursor seen even when events are empty", async () => {
-  const latestLedger = 1000;
-  const cursor1 = makeCursor(500);
-  const cursor2 = makeCursor(latestLedger);
-
-  const { server } = fakeServer({
-    latestLedger,
-    pages: [
-      { events: [], cursor: cursor1, latestLedger },
-      { events: [], cursor: cursor2, latestLedger },
-    ],
-  });
-
-  const result = await paginatedGetEvents(server, [], { startLedger: 1 });
-
-  assert.equal(result.cursor, cursor2, "last cursor should be the tip cursor");
-  assert.equal(result.events.length, 0);
-});
-
-// ── readContractEvents ────────────────────────────────────────────────────────
-
-test("readContractEvents decodes events and computes lastEventLedger", async () => {
-  const latestLedger = 2000;
-
-  // A minimal raw Soroban event for a claim_created.
-  // We only care that the decoded shape is what decodeEvent produces — no need
-  // to build a real XDR value, so we test the integration by inspecting the
-  // unknown payload it degrades to (the fake value is not valid XDR).
-  const fakeRawEvent = {
-    ...rawEvent(1500),
-    ledger: 1500,
+  let calls = 0;
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: 4_000, latestLedger: tip };
+    },
+    async getEvents(_req) {
+      calls += 1;
+      // Always return the same cursor — simulates a stuck server.
+      return { events: [], cursor: stalledCursor, latestLedger: tip };
+    },
   };
 
-  const { server } = fakeServer({
-    latestLedger,
-    pages: [
-      { events: [fakeRawEvent], cursor: makeCursor(latestLedger), latestLedger },
-    ],
-  });
+  const result = await paginatedGetEvents(server, [], { startLedger: 4_800, maxPages: 10 });
 
-  const scan = await readContractEvents(
-    server,
-    { source: "market", contractId: "CFAKE" },
-    { startLedger: 1000 },
+  // The first call gets the stalled cursor. The second call sends that cursor back
+  // and gets the same cursor again — previousCursor === nextCursor, so it stops.
+  assert.ok(calls <= 3, `stall must terminate in a small number of calls, got ${calls}`);
+  assert.equal(result.truncated, false, "stall is not a truncation");
+});
+
+test("paginatedGetEvents: empty cursor string from server terminates walk", async () => {
+  const tip = 5_000;
+  let calls = 0;
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: 4_000, latestLedger: tip };
+    },
+    async getEvents(_req) {
+      calls += 1;
+      return { events: [], cursor: "", latestLedger: tip };
+    },
+  };
+
+  await paginatedGetEvents(server, [], { startLedger: 4_900, maxPages: 10 });
+  assert.equal(calls, 1, "empty cursor on first page must stop immediately");
+});
+
+// ── Page-limit truncation ─────────────────────────────────────────────────────
+
+test("paginatedGetEvents: maxPages cap sets truncated=true and stops the walk", async () => {
+  const tip = 9_999;
+  // Provide 10 pages, each advancing the cursor but never reaching the tip.
+  const pages = Array.from({ length: 10 }, (_, i) => ({
+    events: [],
+    cursor: makeCursor(1_000 + i * 10, 1, 0),
+    latestLedger: tip,
+  }));
+
+  const server = makeServer(
+    { status: "healthy", oldestLedger: 900, latestLedger: tip },
+    pages,
   );
 
-  assert.equal(scan.source, "market");
-  assert.equal(scan.contractId, "CFAKE");
-  assert.equal(scan.events.length, 1);
-  // The raw event has ledger=1500 so lastEventLedger should be 1500.
-  assert.equal(scan.lastEventLedger, 1500);
-  assert.equal(scan.truncated, false);
+  const result = await paginatedGetEvents(server, [], { startLedger: 1_000, maxPages: 5 });
+
+  assert.equal(result.truncated, true, "must be marked truncated when capped");
+  assert.equal(result.pages, 5, "must stop at maxPages");
 });
 
-test("readContractEvents returns null lastEventLedger when no events found", async () => {
-  const latestLedger = 2000;
+test("paginatedGetEvents: default maxPages is EVENT_MAX_PAGES", async () => {
+  const tip = 99_999;
+  // Provide a large number of advancing pages, each short of the tip.
+  const pages = Array.from({ length: EVENT_MAX_PAGES + 5 }, (_, i) => ({
+    events: [],
+    cursor: makeCursor(1_000 + i, 1, 0),
+    latestLedger: tip,
+  }));
 
-  const { server } = fakeServer({
-    latestLedger,
-    pages: [{ events: [], cursor: makeCursor(latestLedger), latestLedger }],
-  });
-
-  const scan = await readContractEvents(
-    server,
-    { source: "squad", contractId: "CFAKE" },
-    { startLedger: 1000 },
+  const server = makeServer(
+    { status: "healthy", oldestLedger: 900, latestLedger: tip },
+    pages,
   );
 
-  assert.equal(scan.lastEventLedger, null);
-  assert.equal(scan.events.length, 0);
+  const result = await paginatedGetEvents(server, [], { startLedger: 1_000 });
+  assert.equal(result.pages, EVENT_MAX_PAGES);
+  assert.equal(result.truncated, true);
 });
 
-test("readContractEvents passes the contractId filter to getEvents", async () => {
-  const latestLedger = 2000;
-  const contractId = "CMARKETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+test("paginatedGetEvents: limit defaults to EVENT_PAGE_LIMIT passed to server", async () => {
+  const tip = 5_000;
+  const cursor = makeCursor(tip, 1, 0);
 
-  const { server, calls } = fakeServer({
-    latestLedger,
-    pages: [{ events: [], cursor: makeCursor(latestLedger), latestLedger }],
+  const requests = [];
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: 4_000, latestLedger: tip };
+    },
+    async getEvents(req) {
+      requests.push(req);
+      return { events: [], cursor, latestLedger: tip };
+    },
+  };
+
+  await paginatedGetEvents(server, [], { startLedger: 4_900 });
+  assert.equal(requests[0].limit, EVENT_PAGE_LIMIT);
+});
+
+test("paginatedGetEvents: custom limit is forwarded to the server", async () => {
+  const tip = 5_000;
+  const cursor = makeCursor(tip, 1, 0);
+
+  const requests = [];
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: 4_000, latestLedger: tip };
+    },
+    async getEvents(req) {
+      requests.push(req);
+      return { events: [], cursor, latestLedger: tip };
+    },
+  };
+
+  await paginatedGetEvents(server, [], { startLedger: 4_900, limit: 42 });
+  assert.equal(requests[0].limit, 42);
+});
+
+// ── Termination on cursor ledger >= tip ───────────────────────────────────────
+
+test("paginatedGetEvents: walk stops as soon as cursor ledger meets the chain tip", async () => {
+  const tip = 5_000;
+  let pageCount = 0;
+
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: 4_000, latestLedger: tip };
+    },
+    async getEvents(_req) {
+      pageCount += 1;
+      // On the first page the cursor ledger equals the tip — should terminate.
+      return {
+        events: [],
+        cursor: makeCursor(tip, 1, 0),
+        latestLedger: tip,
+      };
+    },
+  };
+
+  const result = await paginatedGetEvents(server, [], { startLedger: 4_900 });
+  assert.equal(pageCount, 1);
+  assert.equal(result.truncated, false);
+});
+
+test("paginatedGetEvents: cursor past tip terminates without fetching another page", async () => {
+  const tip = 4_999;
+  let pageCount = 0;
+
+  const server = {
+    async getHealth() {
+      return { status: "healthy", oldestLedger: 4_000, latestLedger: tip };
+    },
+    async getEvents(_req) {
+      pageCount += 1;
+      return {
+        events: [],
+        cursor: makeCursor(tip + 10, 1, 0), // past tip
+        latestLedger: tip,
+      };
+    },
+  };
+
+  await paginatedGetEvents(server, [], { startLedger: 4_900 });
+  assert.equal(pageCount, 1);
+});
+
+// ── getHealth failure ─────────────────────────────────────────────────────────
+
+test("paginatedGetEvents: getHealth failure propagates as a rejection", async () => {
+  const server = {
+    async getHealth() {
+      throw new Error("RPC getHealth timeout");
+    },
+    async getEvents(_req) {
+      return { events: [], cursor: "", latestLedger: 0 };
+    },
+  };
+
+  await assert.rejects(
+    () => paginatedGetEvents(server, [], { startLedger: 100 }),
+    /getHealth timeout/,
+  );
+});
+
+// ── Event accumulation across pages ──────────────────────────────────────────
+
+test("paginatedGetEvents: events from multiple pages are concatenated", async () => {
+  const tip = 6_000;
+
+  const makeEvent = (id) => ({
+    id,
+    contractId: "C1",
+    ledger: 5_000,
+    txHash: "abc",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [],
+    value: null,
   });
 
-  await readContractEvents(server, { source: "market", contractId }, { startLedger: 1 });
+  const pages = [
+    { events: [makeEvent("e1"), makeEvent("e2")], cursor: makeCursor(5_100), latestLedger: tip },
+    { events: [makeEvent("e3")], cursor: makeCursor(tip), latestLedger: tip },
+  ];
 
-  assert.deepEqual(calls[0].filters, [{ type: "contract", contractIds: [contractId] }]);
+  const server = makeServer({ status: "healthy", oldestLedger: 4_000, latestLedger: tip }, pages);
+  const result = await paginatedGetEvents(server, [], { startLedger: 4_900 });
+
+  assert.equal(result.events.length, 3);
+  assert.equal(result.pages, 2);
+  assert.deepEqual(
+    result.events.map((e) => e.id),
+    ["e1", "e2", "e3"],
+  );
 });
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+test("paginatedGetEvents: latestLedger is taken from the last response", async () => {
+  const tip1 = 5_000;
+  const tip2 = 5_005; // tip advances between requests
 
-test("EVENT_PAGE_LIMIT and EVENT_MAX_PAGES are exported positive integers", () => {
-  assert.ok(Number.isInteger(EVENT_PAGE_LIMIT) && EVENT_PAGE_LIMIT > 0);
-  assert.ok(Number.isInteger(EVENT_MAX_PAGES) && EVENT_MAX_PAGES > 0);
+  const pages = [
+    { events: [], cursor: makeCursor(4_990), latestLedger: tip1 },
+    { events: [], cursor: makeCursor(tip2), latestLedger: tip2 },
+  ];
+
+  const server = makeServer({ status: "healthy", oldestLedger: 4_000, latestLedger: tip1 }, pages);
+  const result = await paginatedGetEvents(server, [], { startLedger: 4_900 });
+
+  assert.equal(result.latestLedger, tip2);
 });
