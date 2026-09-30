@@ -27,6 +27,7 @@ import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
+import { log } from "./log.js";
 import { createMetrics } from "./metrics.js";
 import type { MetricsServer } from "./metrics.js";
 import { boundText } from "./status.js";
@@ -40,6 +41,7 @@ function installProcessHandlers(): void {
   // A rejected promise nobody awaited is a bug, but not a reason to stop
   // notifying. Log it and let the poll loop carry on.
   process.on("unhandledRejection", (reason) => {
+    log.error("[error] unhandled rejection:", reason);
     Logger.error("process", `[error] unhandled rejection: ${safeErrorMessage(reason)}`, {
       action: "unhandled_rejection",
     });
@@ -48,6 +50,7 @@ function installProcessHandlers(): void {
   // An uncaught exception means state is unknown; exit so the supervisor
   // restarts us. The persisted cursor is what makes that cheap.
   process.on("uncaughtException", (err) => {
+    log.error("[fatal] uncaught exception, exiting for restart:", err);
     Logger.fatal(
       "process",
       `[fatal] uncaught exception, exiting for restart: ${safeErrorMessage(err)}`,
@@ -104,6 +107,14 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
 
+  log.info(`[boot] Mimir Telegram notifier`);
+  log.info(`[boot] network      ${networkLabel(config)} (${config.rpcUrl})`);
+  log.info(`[boot] market       ${config.marketContractId}`);
+  log.info(`[boot] squad        ${config.squadContractId}`);
+  // Chat id is operational metadata, not a secret — but we do NOT log the bot
+  // token here. The token is already excluded from boot-time diagnostics.
+  log.info(`[boot] chat         ${config.chatId}`);
+  log.info(`[boot] cursor file  ${config.cursorFile}`);
   // Register this process's secrets before anything can fail: every
   // operator-facing error goes through the scrubber, so a call site cannot
   // leak the token or the chat id by forgetting to pass them.
@@ -168,6 +179,11 @@ async function main(): Promise<void> {
   // object to call — no null checks needed there.
   const metrics = createMetrics();
 
+  // One read before announcing readiness: a wrong RPC URL should surface now,
+  // not as a mystery in the poll log an interval later.
+  const health = await server.getHealth();
+  log.info(
+    `[boot] rpc ok, status=${health.status} ledgers ${health.oldestLedger}..${health.latestLedger}`,
   let metricsServer: MetricsServer | null = null;
   if (config.metricsPort !== null) {
     try {
@@ -267,6 +283,11 @@ async function main(): Promise<void> {
   // token itself cannot authenticate, which no amount of waiting fixes.
   void bot
     .start({
+      onStart: (me) => log.info(`[boot] telegram ok, running as @${me.username}`),
+    })
+    .catch((err: unknown) => {
+      log.error("[fatal] telegram long-polling failed — check BOT_TOKEN:", err);
+      process.exit(1);
       onStart: (me) =>
         Logger.info("boot", `[boot] telegram ok, running as @${me.username}`, {
           telegramOk: true,
@@ -295,7 +316,7 @@ async function main(): Promise<void> {
    * cold-ish resume bounded by the last completed cycle.
    */
   const shutdown = (signal: string) => {
-    console.log(`[shutdown] ${signal} received, stopping`);
+    log.info(`[shutdown] ${signal} received, stopping`);
     poller.stop();
     const stopBot = bot.stop().finally(() => process.exit(0));
     const stopMetrics = metricsServer ? metricsServer.close() : Promise.resolve();
@@ -388,6 +409,7 @@ main().catch((err: unknown) => {
     });
     process.exit(1);
   }
+  log.error("[boot] startup failed:", err);
   Logger.error("boot", `[boot] startup failed: ${safeErrorMessage(err)}`, {
     action: "startup_failed",
   });

@@ -13,6 +13,10 @@ import { Bot, type Context, type CommandContext } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import { performance } from "node:perf_hooks";
 
+import { escapeMd } from "./notifications/format.js";
+import { networkLabel, type BotConfig } from "./config.js";
+import type { PollerStatus } from "./poller.js";
+import { log } from "./log.js";
 import {
   escapeMd,
   splitTelegramMessage,
@@ -586,6 +590,7 @@ export function createBot(deps: BotDeps): Bot {
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.
   bot.catch((err) => {
+    log.error(`[bot] handler error on update ${err.ctx.update.update_id}:`, err.error);
     console.error(
       `[bot] handler error on update ${err.ctx.update.update_id}: ` +
         safeErrorMessage(err.error, [deps.config.botToken]),
@@ -730,6 +735,8 @@ export async function registerCommands(bot: Bot, config?: BotConfig): Promise<vo
   try {
     await bot.api.setMyCommands(visibleCommands(config).map(({ command, description }) => ({ command, description })));
   } catch (err) {
+    // Cosmetic. Never worth failing a boot over.
+    log.warn(`[bot] setMyCommands failed: ${err instanceof Error ? err.message : err}`);
     // Cosmetic. Never worth failing a boot over, and never log an unbounded API error.
     console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);
   }

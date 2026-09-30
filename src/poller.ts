@@ -10,6 +10,26 @@
  *
  *  - A failed RPC call fails ONE contract's scan for ONE cycle. Its cursor is
  *    left untouched, so the next cycle picks up exactly where it stopped.
+ *    Transient failures are retried up to MAX_RPC_RETRIES times with
+ *    exponential back-off before being counted as a failure.
+ *  - A Telegram 429 (rate-limit) response is parsed for the Retry-After header
+ *    and the send is retried once after that delay rather than dropped.
+ *  - A failed Telegram send (after any retry) drops ONE message. The cursor
+ *    still advances.  That is deliberate: holding the cursor back on a send
+ *    failure means a broken bot token or a chat the bot was kicked from turns
+ *    into an infinite replay of the same events forever, and recovering floods
+ *    the channel.  Notifications are lossy by design; the chain remains the
+ *    record.
+ *  - After CONSECUTIVE_FAILURE_ALERT_THRESHOLD cycles in a row where every
+ *    target scan fails, the poller posts a single plain-text alert to the
+ *    configured chat so an operator knows the bot is stuck, then stays quiet
+ *    until a cycle partially succeeds again.
+ *  - A cursor file that cannot be read is treated as a cold start; one that
+ *    cannot be written is logged, and the in-memory cursor keeps working until
+ *    the next restart.
+ *  - A persisted cursor whose ledger is outside the RPC's retained window is
+ *    treated as stale: a warning is logged and that target cold-starts rather
+ *    than erroring out.
  *  - Each contract is paced independently. A slow or failing contract does not
  *    block the scanning of other contracts.
  *  - A scan cursor is committed after its returned page has been processed,
@@ -58,6 +78,9 @@ import path from "node:path";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import type { BotConfig } from "./config.js";
+import { log } from "./log.js";
+import { formatEvent } from "./notifications/format.js";
+import { readContractEvents, eventCursorLedger, type WatchTarget } from "./stellar/events.js";
 import { clip, formatEvent } from "./notifications/format.js";
 import { eventCursorLedger, readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
@@ -490,6 +513,27 @@ export function extractRetryAfterMs(err: unknown): number | null {
   if (!err || typeof err !== "object") return null;
   const e = err as any;
 
+/** Maximum RPC retries per scan call with exponential back-off. */
+const MAX_RPC_RETRIES = 3;
+
+/** Base delay (ms) for the first RPC retry; doubles each attempt. */
+const RPC_RETRY_BASE_MS = 2_000;
+
+/**
+ * After this many consecutive all-fail cycles the poller posts one alert.
+ * Can be overridden by CONSECUTIVE_FAILURE_ALERT_THRESHOLD in the environment.
+ */
+function alertThreshold(): number {
+  const raw = process.env["CONSECUTIVE_FAILURE_ALERT_THRESHOLD"];
+  if (raw !== undefined) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && Number.isInteger(n) && n >= 1) return n;
+  }
+  // Default: alert after five consecutive all-fail cycles.
+  return 5;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
   let seconds: number | null = null;
 
   if (typeof e.parameters?.retry_after === "number") {
@@ -1098,6 +1142,64 @@ function telegram429RetryAfter(err: unknown): number | null {
   return TELEGRAM_429_BACKOFF_MS / 1000;
 }
 
+/**
+ * Extract the `retry_after` seconds from a grammy / Telegram API error.
+ *
+ * Telegram returns HTTP 429 with a JSON body like:
+ *   { ok: false, error_code: 429, parameters: { retry_after: 30 } }
+ * grammy surfaces this as an `HttpError` or `GrammyError` with
+ * `error.description` containing the word "retry" and optionally exposes
+ * `error.parameters.retry_after` as a number.
+ */
+export function extractRetryAfter(err: unknown): number | null {
+  if (err == null || typeof err !== "object") return null;
+  const e = err as Record<string, unknown>;
+
+  // grammy's GrammyError exposes error_code and parameters.
+  if (e["error_code"] === 429) {
+    const params = e["parameters"];
+    if (params != null && typeof params === "object") {
+      const ra = (params as Record<string, unknown>)["retry_after"];
+      if (typeof ra === "number" && ra > 0) return ra;
+    }
+    // Fallback: default to 30 s if we know it's 429 but lack the header.
+    return 30;
+  }
+
+  // Some HTTP layers embed the status in `status` or `statusCode`.
+  const status = e["status"] ?? e["statusCode"];
+  if (status === 429) return 30;
+
+  return null;
+}
+
+/**
+ * Call `fn`, retrying up to `maxRetries` times on error with exponential
+ * back-off starting at `baseMs` ms.  Throws the last error if all retries
+ * are exhausted.
+ */
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = MAX_RPC_RETRIES,
+  baseMs: number = RPC_RETRY_BASE_MS,
+): Promise<T> {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn();
+    } catch (err) {
+      attempt += 1;
+      if (attempt > maxRetries) throw err;
+      const delay = baseMs * 2 ** (attempt - 1);
+      log.warn(
+        `[poller] RPC call failed (attempt ${attempt}/${maxRetries}), ` +
+          `retrying in ${delay}ms: ${errMessage(err)}`,
+      );
+      await sleep(delay);
+    }
+  }
+}
+
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
   const metrics = deps.metrics;
@@ -1240,6 +1342,8 @@ export function createPoller(deps: PollerDeps) {
   let stopped = false;
   let paused = false;
   let inFlight = false;
+  /** True once we have sent the consecutive-failure alert for the current run. */
+  let alertSent = false;
   let resumePending = false;
   let instanceLock: InstanceLockHandle | null = null;
   /** Set when load migrates a legacy file so the first save rewrites disk ASAP. */
@@ -1273,6 +1377,14 @@ export function createPoller(deps: PollerDeps) {
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
   /**
+   * Load cursors from disk.  If the cursor file doesn't exist we cold-start.
+   * If a cursor exists but its encoded ledger is outside the RPC's retained
+   * window we discard that cursor and cold-start just that target.
+   *
+   * The `oldestLedger` param comes from the caller so we can perform stale
+   * detection without an extra round trip.
+   */
+  async function loadCursors(oldestLedger: number): Promise<void> {
    * Try to parse and apply a cursor file from `filePath`.
    * Returns true when a valid file was found, false when missing.
    * Throws on a parse or structural error so the caller can decide.
@@ -1282,6 +1394,11 @@ export function createPoller(deps: PollerDeps) {
     try {
       raw = await readFile(filePath, "utf8");
     } catch {
+      log.info(
+        `[poller] no cursor file at ${config.cursorFile}; cold start ` +
+          `${config.startLookbackLedgers} ledgers behind the tip`,
+      );
+      return;
       return false; // file missing — not an error, just absent
     }
 
@@ -1326,7 +1443,23 @@ export function createPoller(deps: PollerDeps) {
         const key = source as ContractSource;
         const target = state.get(key);
         if (!target) continue;
-        target.cursor = saved.cursor ?? null;
+
+        const cursor = saved.cursor ?? null;
+
+        if (cursor !== null) {
+          const cursorLedger = eventCursorLedger(cursor);
+          if (cursorLedger !== null && cursorLedger < oldestLedger) {
+            log.warn(
+              `[poller] ${source} cursor ledger ${cursorLedger} is below the ` +
+                `retained floor ${oldestLedger}; discarding stale cursor, cold-starting`,
+            );
+            // Leave cursor null → cold start for this target.
+            target.lastEventLedger = saved.lastEventLedger ?? null;
+            continue;
+          }
+        }
+
+        target.cursor = cursor;
         target.lastEventLedger = saved.lastEventLedger ?? null;
         // A rewind that was still pending when the process stopped resumes from
         // the same floor instead of falling back to a lookback cold start.
@@ -1336,6 +1469,7 @@ export function createPoller(deps: PollerDeps) {
         // re-notify the last event the inclusive cursor hands back.
         dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
       }
+      log.info(
       // Memory now equals the file; nothing is waiting to be flushed — unless
       // the file was a legacy shape, which start() rewrites before any cycle.
       status.pendingFlush = false;
@@ -1374,6 +1508,8 @@ export function createPoller(deps: PollerDeps) {
         },
       );
     } catch (err) {
+      // A corrupt state file must not wedge the bot; a cold start is recoverable.
+      log.warn(`[poller] cursor file unreadable, starting cold: ${errMessage(err)}`);
       // Quarantine then cold-start: never wedge on a corrupt state file, and
       // keep the bad bytes for operators instead of overwriting them on save.
       const reason = errorMessage(err);
@@ -1436,6 +1572,7 @@ export function createPoller(deps: PollerDeps) {
       pendingRewrite = false;
       return true;
     } catch (err) {
+      log.error(`[poller] could not persist cursor: ${errMessage(err)}`);
       // `pendingFlush` is deliberately left as it was: if state was ahead of
       // the file it stays ahead, so a later cycle — or the shutdown flush —
       // retries. If nothing had changed, write-then-rename left the old file
@@ -1581,6 +1718,9 @@ export function createPoller(deps: PollerDeps) {
 
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
+        log.info(
+          `[poller] skipped ${event.source} event "${event.payload.eventName}" ` +
+            `at ledger ${event.ledger}${event.payload.reason ? ` (${event.payload.reason})` : ""}`,
         metrics?.eventsSkipped.inc();
         // Clip the event name and reason: these come from remote contract data
         // and must not produce unbounded log output.
@@ -1728,6 +1868,8 @@ export function createPoller(deps: PollerDeps) {
       
       if (!routeProcessed) {
         status.eventsSkipped += 1;
+        log.warn(
+          `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
         metrics?.eventsSkipped.inc();
         // Log clearly that the cap was reached, not just that an event was dropped.
         if (sentThisCycle === config.maxNotificationsPerCycle) {
@@ -1762,6 +1904,7 @@ export function createPoller(deps: PollerDeps) {
       }
 
       try {
+        await sendWithRateLimit(text);
         // Use bounded retry for Telegram sends to handle transient failures
         await sendWithRetry((message) => send(message, event.source, extra), text, config.botToken, deps.sendOptions, () => !status.stopping, sleep);
         status.notificationsSent += 1;
@@ -1773,6 +1916,9 @@ export function createPoller(deps: PollerDeps) {
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
         status.notificationsFailed += 1;
+        log.error(
+          `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}: ` +
+            errMessage(err),
         metrics?.notificationsFailed.inc();
         failed += 1;
         audit.recordError(err, "send_failed", {
@@ -1994,6 +2140,41 @@ for (const event of knownEvents) {
     await rewindFromRetainedFloor(target, current);
   }
 
+  /**
+   * Send one message, handling Telegram's 429 rate-limit with a single retry.
+   *
+   * If the error is a 429, we read `retry_after` from the error object and
+   * sleep exactly that long before one retry.  Any other error is re-thrown
+   * immediately so `notify` can count it as a failed send.
+   */
+  async function sendWithRateLimit(text: string): Promise<void> {
+    try {
+      await send(text);
+    } catch (err) {
+      const retryAfter = extractRetryAfter(err);
+      if (retryAfter === null) throw err;
+      log.warn(
+        `[poller] Telegram rate-limited (429); retrying after ${retryAfter}s`,
+      );
+      await sleep(retryAfter * 1_000);
+      await send(text);
+    }
+  }
+
+  /**
+   * Send a plain-text (no MarkdownV2) alert to the configured chat.
+   * This is separate from the main `send` path so a MarkdownV2 formatting
+   * problem in an event doesn't prevent the alert from going out.
+   */
+  async function sendAlert(text: string): Promise<void> {
+    try {
+      await send(text);
+    } catch (err) {
+      log.error(`[poller] could not send consecutive-failure alert: ${errMessage(err)}`);
+    }
+  }
+
+  async function cycle(): Promise<void> {
   async function runCycle(): Promise<void> {
   async function cycle(): Promise<number | void> {
     if (inFlight) return;
@@ -2046,6 +2227,13 @@ for (const event of knownEvents) {
     // not flood the chat.
     await flushDeadLetter();
 
+      try {
+        const scan = await withRetry(() =>
+          readContractEvents(server, target, {
+            cursor: current.cursor ?? undefined,
+            lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
+          }),
+        );
     try {
       // Pace each contract independently: scan them sequentially but do not let
       // a failure in one block the others. This ensures that if the "squad"
@@ -2103,6 +2291,10 @@ for (const event of knownEvents) {
         anyOk = true;
         metrics?.rpcRequests.inc();
 
+        if (scan.events.length > 0) {
+          log.info(
+            `[poller] ${target.source}: ${scan.events.length} event(s) ` +
+              `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
         // Warn if this cursor is already behind the RPC's retention window.
         checkStaleCursors(scan.oldestLedger);
           status.latestLedger = scan.latestLedger;
@@ -2312,6 +2504,7 @@ for (const event of knownEvents) {
         const message = errMessage(err);
         current.lastError = message;
         status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
+        log.error(`[poller] ${target.source} scan failed: ${message}`);
         metrics?.rpcErrors.inc();
         console.error(`[poller] ${target.source} scan failed: ${message}`);
       // ── Circuit breaker state update ─────────────────────────────────────────────
@@ -2331,6 +2524,20 @@ for (const event of knownEvents) {
     if (anyOk) {
       status.lastSuccessAt = Date.now();
       status.consecutiveFailures = 0;
+      alertSent = false;
+    } else {
+      status.consecutiveFailures += 1;
+
+      const threshold = alertThreshold();
+      if (status.consecutiveFailures >= threshold && !alertSent) {
+        alertSent = true;
+        const msg =
+          `⚠️ Mimir notifier: ${status.consecutiveFailures} consecutive poll cycles ` +
+          `failed to reach the Stellar RPC. Last error: ` +
+          (status.lastError?.message ?? "unknown");
+        log.warn(`[poller] sending consecutive-failure alert after ${status.consecutiveFailures} cycles`);
+        await sendAlert(msg);
+      }
       metrics?.consecutiveFailures.set(0);
     } else {
       status.consecutiveFailures += 1;
@@ -2402,6 +2609,7 @@ for (const event of knownEvents) {
       metrics?.consecutiveFailures.set(status.consecutiveFailures);
       emitCircuitBreakerWarning();
       status.lastError = { at: Date.now(), message: errMessage(err) };
+      log.error(`[poller] cycle threw: ${errMessage(err)}`);
       console.error(`[poller] cycle threw: ${errMessage(err)}`);
       status.lastError = { at: now(), message: errorMessage(err) };
       audit.recordError(err, "cycle_failed");
@@ -2420,6 +2628,16 @@ for (const event of knownEvents) {
 
   return {
     async start(): Promise<void> {
+      // Fetch health first so we can validate cursors against the retained floor.
+      let oldestLedger = 0;
+      try {
+        const health = await server.getHealth();
+        oldestLedger = health.oldestLedger;
+      } catch {
+        // If health fails at startup we still load — stale detection just skips.
+      }
+
+      await loadCursors(oldestLedger);
       // Verify persistent volume availability before touching anything else.
       const cursorDir = path.dirname(config.cursorFile);
       try {
@@ -2467,6 +2685,8 @@ for (const event of knownEvents) {
       status.startedAt = nowFn();
       status.startedAt = now();
       status.targets = [...state.values()].map((t) => ({ ...t }));
+      log.info(
+        `[poller] watching market=${config.marketContractId} squad=${config.squadContractId} ` +
       console.log(
         `[poller] watching market=${config.marketContractId} (${config.marketContractVersion}) ` +
           `squad=${config.squadContractId} (${config.squadContractVersion}) ` +
