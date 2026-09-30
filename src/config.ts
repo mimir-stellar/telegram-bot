@@ -137,18 +137,8 @@ export interface BotConfig extends StellarConfig {
   lockFile: string;
   statusFile: string;
   maxNotificationsPerCycle: number;
-  /**
-   * If > 0, the poller warns when the cursor file has not been updated for
-   * this many milliseconds — useful for detecting a bot that is polling but
-   * failing to persist (e.g. ephemeral filesystem). 0 disables the check.
-   */
-  cursorMaxAgeMs: number;
-  /**
-   * If > 0, the poll loop enters a slow-down backoff after this many
-   * consecutive fully-failed cycles (all targets failed). 0 disables the cap.
-   * The bot never exits; backoff is 10× `pollIntervalMs` until one succeeds.
-   */
-  maxConsecutiveFailures: number;
+  /** Path for the standalone scanner's CSV output (see CSV_OUTPUT_FILE). */
+  csvOutputFile: string;
   /** Coarse notification feature flags (see NOTIFY_* env vars). */
   featureFlags: NotificationFeatureFlags;
   /** Append-only JSONL audit trail (see src/audit.ts). Empty disables it. */
@@ -182,12 +172,17 @@ export interface BotConfig extends StellarConfig {
    * cursor state and giving up on it. `0` skips the wait entirely.
    */
   shutdownTimeoutMs: number;
+  /** Wall-clock budget for a single Telegram send before it is abandoned. */
+  telegramSendTimeoutMs: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+
+/** Fallback per-send budget when a config object predates `TELEGRAM_SEND_TIMEOUT_MS`. */
+export const DEFAULT_TELEGRAM_SEND_TIMEOUT_MS = 10_000;
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -214,8 +209,7 @@ const DEFAULTS = {
   lockFile: "./data/poller.lock",
   statusFile: "./data/status.json",
   maxNotificationsPerCycle: 20,
-  cursorMaxAgeMs: 0,
-  maxConsecutiveFailures: 0,
+  csvOutputFile: "./data/scanner_output.csv",
   auditFile: "./data/audit.jsonl",
   dedupWindow: 256,
   healthHost: "127.0.0.1",
@@ -228,6 +222,9 @@ const DEFAULTS = {
   // Long enough for an in-flight read to finish and its cursors to land, short
   // enough that a deploy is never held open by a wedged RPC.
   shutdownTimeoutMs: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  // Bounded so one wedged Telegram send cannot stall the poll loop; long
+  // enough for a normal API round-trip on a slow link.
+  telegramSendTimeoutMs: DEFAULT_TELEGRAM_SEND_TIMEOUT_MS,
   channelPreviewMode: false,
 } as const;
 
@@ -331,6 +328,20 @@ function collector(profile: Record<string, string>) {
       return value;
     },
 
+    optionalUrl(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
+      try {
+        const parsed = new URL(value);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          problems.push(`${name} must be an http(s) URL; got "${value}"`);
+        }
+      } catch {
+        problems.push(`${name} is not a valid URL; got "${value}"`);
+      }
+      return value;
+    },
+
     int(name: string, fallback: number, min: number): number {
       const raw = read(name);
       if (raw === undefined) return fallback;
@@ -356,18 +367,42 @@ function collector(profile: Record<string, string>) {
       return fallback;
     },
 
-    chatId(name: string): string {
+    chatIds(name: string): string[] {
       const value = this.required(name);
-      // Telegram chat ids are integers (channels/supergroups are negative).
-      // A @channelusername also works for public channels, so both are allowed.
-      if (value !== "" && !/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
-        problems.push(
-          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
-        );
+      if (value === "") return [];
+      
+      const ids = value.split(",").map(s => s.trim()).filter(s => s !== "");
+      if (ids.length === 0) {
+        problems.push(`${name} is required but not set`);
+        return [];
       }
-      return value;
+      for (const id of ids) {
+        if (!/^-?\d+$/.test(id) && !/^@[A-Za-z0-9_]{4,}$/.test(id)) {
+          problems.push(
+            `${name} must contain numeric chat ids or @channelusernames; got "${id}"`,
+          );
+        }
+      }
+      return ids;
     },
 
+    /**
+     * Parse an optional TCP port number. Returns `null` when the env var is
+     * absent/empty (server disabled). Validates 1–65535 when present.
+     */
+    optionalPort(name: string): number | null {
+      const raw = read(name);
+      if (raw === undefined) return null;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+        problems.push(`${name} must be an integer port number (1–65535); got "${raw}"`);
+        return null;
+      }
+      if (parsed < 1 || parsed > 65_535) {
+        problems.push(`${name} must be between 1 and 65535; got ${parsed}`);
+        return null;
+      }
+      return parsed;
     optionalChatId(name: string, fallback: string): string {
       const value = read(name) ?? fallback;
       if (value === "") return value;
@@ -489,8 +524,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.maxNotificationsPerCycle,
       1,
     ),
-    cursorMaxAgeMs: c.int("CURSOR_MAX_AGE_MS", DEFAULTS.cursorMaxAgeMs, 0),
-    maxConsecutiveFailures: c.int("MAX_CONSECUTIVE_FAILURES", DEFAULTS.maxConsecutiveFailures, 0),
+    csvOutputFile: path.resolve(process.cwd(), c.get("CSV_OUTPUT_FILE") ?? DEFAULTS.csvOutputFile),
     featureFlags: featureFlagsParsed.flags,
     // Resolved like the cursor file: relative paths anchor to the process cwd.
     auditFile: path.resolve(process.cwd(), read("AUDIT_FILE") ?? DEFAULTS.auditFile),
@@ -512,6 +546,11 @@ export function loadConfig(): BotConfig {
       0,
     ),
     shutdownTimeoutMs: c.int("SHUTDOWN_TIMEOUT_MS", DEFAULTS.shutdownTimeoutMs, 0),
+    telegramSendTimeoutMs: c.int(
+      "TELEGRAM_SEND_TIMEOUT_MS",
+      DEFAULTS.telegramSendTimeoutMs,
+      0,
+    ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
   };
 
@@ -635,6 +674,7 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   },
   { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
+  { key: "TELEGRAM_SEND_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
   // Injected by a platform, never set by an operator: read only as the
   // HEALTH_PORT fallback, so it is reported for the same reason.
