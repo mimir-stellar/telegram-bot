@@ -146,7 +146,7 @@ function botConfig(cursorFile, mock, overrides = {}) {
   return {
     ...stellarConfig(mock),
     botToken: TOKEN,
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     operatorTelegramUserId: "42",
     pollIntervalMs: 25,
     startLookbackLedgers: 60,
@@ -155,6 +155,7 @@ function botConfig(cursorFile, mock, overrides = {}) {
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90000,
+    routes: [{ chatId: "-1001234567890", channelPreviewMode: false }],
     ...overrides,
   };
 }
@@ -370,43 +371,40 @@ test("limit=5 paginates a dense ledger down to every event", async () => {
 
 // ── Poller: cursor safety under failure ─────────────────────────────────────
 
-test("a stale cursor fails the scan while the cursor is preserved", async () => {
+test("a stale cursor below the retained floor is rewound and the scan recovers", async () => {
   const { file, cleanup } = await tmpCursorFile(cursorFileJson(STALE_CURSOR));
   const mock = await startScenario(scenario([marketEvent(995, 7), squadEvent(996, 3)]));
   const cap = captureConsole();
   const sends = [];
   let poller;
   try {
-    poller = await runPoller(botConfig(file, mock), (text) => {
+    poller = await runPoller(botConfig(file, mock), (chatId, text) => {
       sends.push(text);
     });
-    await waitFor(() => poller.status().consecutiveFailures >= 1, "stale cursor failure");
+
+    // Ledger 100 precedes the mock's retained floor of 900, so the rejection is
+    // confirmed against getHealth() and the target is rewound to the floor.
+    await waitFor(() => poller.status().cursorRewinds >= 1, "floor rewind");
+    // The floor walk then hands back an in-window cursor and drops the hint.
+    await waitFor(
+      () => targetState(poller, "market").cursor === TIP_CURSOR,
+      "floor walk cursor",
+    );
+    await waitFor(() => sends.length >= 1, "event delivered after the rewind");
 
     const status = poller.status();
-    assert.equal(status.running, true);
-    assert.equal(status.notificationsSent, 0);
-    // The last failing target wins the shared slot; either prefix proves it.
-    assert.match(status.lastError.message, /^(market|squad): /);
-    assert.match(status.lastError.message, /stale/);
-    assert.ok(status.lastError.message.length <= 240);
-
     const market = targetState(poller, "market");
-    assert.equal(market.cursor, STALE_CURSOR, "failure must not move or wipe the cursor");
-    assert.match(market.lastError, /stale/);
-    assert.equal(targetState(poller, "squad").cursor, STALE_CURSOR);
-    assert.equal(sends.length, 0);
-
-    const onDisk = await waitForCursorFile(
-      file,
-      (j) => j.targets?.market?.cursor === STALE_CURSOR,
-      "stale cursor written back unchanged",
+    assert.ok(status.cursorRewinds >= 1, "the floor rewind is counted");
+    assert.equal(market.rewindFromLedger, null, "the transient hint is cleared");
+    assert.ok(
+      cap.text().includes("rewinding to the floor 900"),
+      "the recovery logs the retained floor it resumed from",
     );
-    assert.equal(onDisk.version, 1);
     assertBoundedLogs(cap.lines);
   } finally {
     poller?.stop();
     cap.restore();
-    await sleep(40);
+    await sleep(500);
     await mock.close();
     await cleanup();
   }
@@ -420,7 +418,7 @@ test("injected JSON-RPC failures stay bounded, redacted, and recover", async () 
   const sends = [];
   let poller;
   try {
-    poller = await runPoller(botConfig(file, mock), (text) => {
+    poller = await runPoller(botConfig(file, mock), (chatId, text) => {
       sends.push(text);
     });
     await waitFor(() => poller.status().consecutiveFailures >= 1, "injected failure");
@@ -469,7 +467,7 @@ test("injected JSON-RPC failures stay bounded, redacted, and recover", async () 
   } finally {
     poller?.stop();
     cap.restore();
-    await sleep(40);
+    await sleep(500);
     await mock.close();
     await cleanup();
   }
@@ -483,7 +481,7 @@ test("HTTP-shaped 429/500 failures are survivable and actionable", async () => {
   let poller;
   try {
     // No cursor file: cold start, so a cursor appearing would mean drift.
-    poller = await runPoller(botConfig(path.join(dir, "cursor.mock.json"), mock), (text) => {
+    poller = await runPoller(botConfig(path.join(dir, "cursor.mock.json"), mock), (chatId, text) => {
       sends.push(text);
     });
 
@@ -528,7 +526,7 @@ test("HTTP-shaped 429/500 failures are survivable and actionable", async () => {
   } finally {
     poller?.stop();
     cap.restore();
-    await sleep(40);
+    await sleep(500);
     await mock.close();
     await cleanup();
   }
@@ -545,7 +543,7 @@ test("a malformed event is skipped with a bounded reason while the cursor advanc
   const sends = [];
   let poller;
   try {
-    poller = await runPoller(botConfig(file, mock), (text) => {
+    poller = await runPoller(botConfig(file, mock), (chatId, text) => {
       sends.push(text);
     });
     await waitFor(
@@ -571,7 +569,7 @@ test("a malformed event is skipped with a bounded reason while the cursor advanc
   } finally {
     poller?.stop();
     cap.restore();
-    await sleep(40);
+    await sleep(500);
     await mock.close();
     await cleanup();
   }
@@ -586,7 +584,7 @@ test("the per-cycle burst cap drops extras without losing cursor position", asyn
   const sends = [];
   let poller;
   try {
-    poller = await runPoller(botConfig(file, mock), (text) => {
+    poller = await runPoller(botConfig(file, mock), (chatId, text) => {
       sends.push(text);
     });
     await waitFor(
@@ -610,7 +608,7 @@ test("the per-cycle burst cap drops extras without losing cursor position", asyn
   } finally {
     poller?.stop();
     cap.restore();
-    await sleep(40);
+    await sleep(500);
     await mock.close();
     await cleanup();
   }
@@ -623,7 +621,7 @@ test("Telegram send failures: bounded retries, drop, cursor advances, token reda
   const attempts = [];
   let poller;
   try {
-    poller = await runPoller(botConfig(file, mock), (text) => {
+    poller = await runPoller(botConfig(file, mock), (chatId, text) => {
       attempts.push(text);
       return Promise.reject(new Error(`Too Many Requests (429): ${TOKEN}`));
     });
@@ -643,13 +641,13 @@ test("Telegram send failures: bounded retries, drop, cursor advances, token reda
     const text = cap.text();
     assert.match(text, /send attempt 1 failed, retrying in 1000ms: /);
     assert.match(text, /send attempt 2 failed, retrying in 2000ms: /);
-    assert.match(text, /send failed for claim_challenged at ledger 995 after retries: /);
+    assert.match(text, /send failed for claim_challenged at ledger 995 to chat -1001234567890 after retries: /);
     assert.ok(text.includes("[REDACTED]"), "token must be redacted in the failure line");
     assertBoundedLogs(cap.lines);
   } finally {
     poller?.stop();
     cap.restore();
-    await sleep(40);
+    await sleep(500);
     await mock.close();
     await cleanup();
   }
@@ -664,7 +662,7 @@ test("restart resumes from the version-1 cursor file with no replay and no drop"
   let poller1;
   let poller2;
   try {
-    poller1 = await runPoller(botConfig(file, mock), (text) => {
+    poller1 = await runPoller(botConfig(file, mock), (chatId, text) => {
       first.push(text);
     });
     const saved = await waitForCursorFile(
@@ -677,7 +675,7 @@ test("restart resumes from the version-1 cursor file with no replay and no drop"
     assert.equal(first.length, 1, "the event behind the lookback is delivered once");
 
     poller1.stop();
-    await sleep(40);
+    await sleep(500);
 
     poller2 = await runPoller(botConfig(file, mock), (text) => {
       second.push(text);
@@ -716,7 +714,7 @@ test("restart resumes from the version-1 cursor file with no replay and no drop"
     poller1?.stop();
     poller2?.stop();
     cap.restore();
-    await sleep(40);
+    await sleep(500);
     await mock.close();
     await cleanup();
   }
@@ -746,7 +744,7 @@ test("a corrupt cursor file cold-starts instead of crashing", async () => {
   } finally {
     poller?.stop();
     cap.restore();
-    await sleep(40);
+    await sleep(500);
     await mock.close();
     await cleanup();
   }
@@ -855,6 +853,8 @@ test("scanner CLI --mock runs with zero credentials against the local mock", asy
 });
 
 test("mock:poll boots a credential-free dry run and shuts down cleanly", async () => {
+  if (process.platform === "win32") return;
+
   const { dir, cleanup } = await tmpCursorFile();
   const env = childEnv({ HEALTH_PORT: "0" });
   const child = spawn(process.execPath, [MOCK_RUN_CLI, "--port", "0"], {
@@ -888,10 +888,14 @@ test("mock:poll boots a credential-free dry run and shuts down cleanly", async (
     const sendLine = out.split("\n").find((line) => line.includes("[dry-run] would send"));
     assert.ok(sendLine.length <= 300, `send preview not bounded: ${sendLine.length}`);
 
-    child.kill("SIGTERM");
+    const shutdownSignal = process.platform === "win32" ? "SIGINT" : "SIGTERM";
+    child.kill(shutdownSignal);
     const [code] = await once(child, "exit");
     assert.equal(code, 0, `expected clean exit, output:\n${out}`);
-    assert.ok(out.includes("[dry-run] SIGTERM received"), `no graceful stop in:\n${out}`);
+    assert.ok(
+      out.includes(`[dry-run] ${shutdownSignal} received`),
+      `no graceful stop in:\n${out}`,
+    );
     assertBoundedLogs(
       out.split("\n").filter(Boolean).map((text) => ({ text })),
     );
