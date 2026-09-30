@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createNotifier } from "../dist/bot.js";
-import { escapeMd, formatEvent } from "../dist/notifications/format.js";
+import { escapeMd, formatEvent, splitTelegramMessage, TELEGRAM_MAX_MESSAGE_LENGTH } from "../dist/notifications/format.js";
 import { formatUsdc } from "../dist/stellar/decode.js";
 
 const reserved = "_*[]()~`>#+-=|{}.\\!";
@@ -41,7 +41,7 @@ test("formatUsdc always renders all seven Stellar USDC decimals", () => {
 
 test("formatted money notifications keep explicit decimals and escape the decimal point", () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -64,14 +64,13 @@ test("formatted money notifications keep explicit decimals and escape the decima
     },
   };
 
-  const formatted = formatEvent(config, event);
-  assert.ok(formatted, "event should be formatted");
-  assert.match(formatted.text, /Stake: \*2\\\.0000000 USDC\*/);
+  const message = formatEvent(config, event);
+  assert.match(message, /Stake: \*2\\.0000000 USDC\*/);
 });
 
 test("unknown or malformed decoded events stay non-notifying", () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -113,7 +112,7 @@ test("escapeMd matches the character-wise rule for deterministic fuzz inputs", (
 
 test("formatted untrusted event text reaches Telegram as exact MarkdownV2", async () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -138,7 +137,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
   const formatted = formatEvent(config, event);
   const expectedMessage =
     `🆕 *New claim* \\#7\nCategory: ${expectedEscape(reserved)}\n` +
-    "Creator: `GABCD`\n_ledger 42_";
+    "Creator: `GABCD`\n_ledger 42_ \\· _v1_";
   const sent = [];
   const fakeBot = {
     api: {
@@ -149,13 +148,11 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
     },
   };
 
-  assert.ok(formatted, "event should be formatted");
-  assert.equal(formatted.text, expectedMessage);
-  assert.equal(formatted.previewsEnabled, false, "no tx hash so no previews");
-  await createNotifier(fakeBot, config)(formatted.text, formatted.previewsEnabled);
+  assert.equal(message, expectedMessage);
+  await createNotifier(fakeBot)(config.chatId, message);
   assert.deepEqual(sent, [
     [
-      config.chatId,
+      config.chatIds[0],
       expectedMessage,
       {
         parse_mode: "MarkdownV2",
@@ -165,17 +162,181 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
   ]);
 });
 
+test("oversized event fields are clipped safely before MarkdownV2 escaping", () => {
+  const config = {
+    chatIds: ["-1001234567890"],
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
+  };
+  const category = `${"a".repeat(199)}🛰️`;
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 42,
+    txHash: "x".repeat(129),
+    at: 0,
+    eventId: "42-0",
+    payload: { name: "claim_created", claimId: 7, creator: "GABCD", category },
+  };
+
+  const message = formatEvent(config, event);
+  const expectedMessage =
+    `🆕 *New claim* \\#7\nCategory: ${"a".repeat(199)}…\n` +
+    "Creator: `GABCD`\n_ledger 42_";
+
+  assert.equal(message, expectedMessage);
+  assert.equal(message.length < 4096, true);
+});
+
+test("oversized squad questions are clipped without splitting emoji", () => {
+  const config = {
+    chatIds: ["-1001234567890"],
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
+  };
+  const event = {
+    source: "squad",
+    contractId: "squad",
+    ledger: 42,
+    txHash: "",
+    at: 0,
+    eventId: "42-0",
+    payload: {
+      name: "market_created",
+      marketId: 7,
+      captain: "GABCD",
+      deadline: 1_800_000_000,
+      feeBps: 25,
+      question: `${"q".repeat(199)}🛰️`,
+    },
+  };
+
+  const message = formatEvent(config, event);
+  assert.match(message, new RegExp(`\\n${"q".repeat(199)}…\\n`));
+  assert.equal(message.includes("🛰️"), false);
+});
+
 test("createNotifier preserves Telegram send failures for the poller", async () => {
   const error = new Error("Telegram API unavailable");
   const fakeBot = { api: { sendMessage: async () => Promise.reject(error) } };
-  const notify = createNotifier(fakeBot, { chatId: "-1001234567890" });
+  const notify = createNotifier(fakeBot, { chatIds: ["-1001234567890"] });
   await assert.rejects(notify("message"), error);
+});
+
+test("createNotifier routes named contract sources and preserves the legacy fallback", async () => {
+  const sent = [];
+  const fakeBot = {
+    api: {
+      sendMessage: async (...args) => {
+        sent.push(args);
+        return {};
+      },
+    },
+  };
+  const notify = createNotifier(fakeBot, {
+    chatId: "-1001234567890",
+    marketChatId: "-1001111111111",
+    squadChatId: "@mimir_squad",
+  });
+
+  await notify("market event", "market");
+  await notify("squad event", "squad");
+  await notify("legacy event");
+
+  assert.deepEqual(sent.map(([chatId, text]) => [chatId, text]), [
+    ["-1001111111111", "market event"],
+    ["@mimir_squad", "squad event"],
+    ["-1001234567890", "legacy event"],
+  ]);
 });
 
 test("escapeMd handles a long adversarial string without dropping characters", () => {
   const input = reserved.repeat(10_000);
   const escaped = escapeMd(input);
   assert.equal(escaped, expectedEscape(input));
+});
+
+test("createNotifier links to threaded replies when replyToMessageId is provided", async () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const sent = [];
+  const fakeBot = {
+    api: {
+      sendMessage: async (...args) => {
+        sent.push(args);
+        return {};
+      },
+    },
+  };
+
+  const notify = createNotifier(fakeBot, config);
+  // Merged signature: the notifier keeps main's (text, source?, extra?)
+  // shape, so the thread target rides on SendExtra rather than a bare
+  // second argument.
+  await notify("threaded message", undefined, { replyToMessageId: 12345 });
+
+  assert.deepEqual(sent, [
+    [
+      config.chatId,
+      "threaded message",
+      {
+        parse_mode: "MarkdownV2",
+        link_preview_options: { is_disabled: true },
+        reply_parameters: {
+          chat_id: config.chatId,
+          message_id: 12345,
+        },
+      },
+    ],
+  ]);
+});
+
+test("createNotifier sends without reply_parameters when replyToMessageId is undefined", async () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const sent = [];
+  const fakeBot = {
+    api: {
+      sendMessage: async (...args) => {
+        sent.push(args);
+        return {};
+      },
+    },
+  };
+
+  const notify = createNotifier(fakeBot, config);
+  await notify("standalone message");
+
+  assert.deepEqual(sent, [
+    [
+      config.chatId,
+      "standalone message",
+      {
+        parse_mode: "MarkdownV2",
+        link_preview_options: { is_disabled: true },
+      },
+    ],
+  ]);
 });
 
 test("txExplorerUrl is centralized and network-aware", async () => {
@@ -217,114 +378,112 @@ test("txExplorerUrl is centralized and network-aware", async () => {
   assert.equal(txExplorerUrl(testnet, "  "), "");
 });
 
-test("formatEvent enables link previews when transaction hash is present", () => {
+test("formatEvent prefixes message with [PREVIEW MODE] when channelPreviewMode is enabled", async () => {
+  const { formatEvent } = await import("../dist/notifications/format.js");
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
-    explorerBaseUrl: "https://stellar.expert/explorer",
   };
+  const longQuestion = "Will ".repeat(100); // 500 chars
+  const event = {
+    source: "squad",
+    contractId: "squad",
+    ledger: 51,
+    txHash: "",
+    at: 0,
+    eventId: "51-0",
+    payload: {
+      name: "market_created",
+      marketId: 1,
+      captain: "GABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDE",
+      deadline: 1_800_000_000,
+      feeBps: 100,
+      question: longQuestion,
+    },
+  };
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  assert.ok(
+    !message.includes("Will ".repeat(50)),
+    "Question was not truncated in the notification output",
+  );
+});
 
-  // Event WITH transaction hash
-  const eventWithTx = {
+test("clip: summary field is bounded in claim_resolved notification", () => {
+    explorerBaseUrl: "https://stellar.expert/explorer",
+    channelPreviewMode: true,
+  };
+  const event = {
     source: "market",
     contractId: "market",
     ledger: 100,
-    txHash: "abc123def456",
+    txHash: "hash123",
     at: 0,
     eventId: "100-0",
     payload: {
-      name: "claim_resolved",
-      claimId: 42,
-      winnerSide: 1,
-      summary: "test",
-      confidence: 90,
-      evidenceHash: "hash",
-    },
-  };
-
-  const formattedWithTx = formatEvent(config, eventWithTx);
-  assert.ok(formattedWithTx, "should format event with txHash");
-  assert.equal(formattedWithTx.previewsEnabled, true, "previews enabled when txHash present");
-  assert.match(formattedWithTx.text, /\[tx\]/);
-
-  // Event WITHOUT transaction hash
-  const eventWithoutTx = {
-    source: "market",
-    contractId: "market",
-    ledger: 101,
-    txHash: "",
-    at: 0,
-    eventId: "101-0",
-    payload: {
       name: "claim_created",
-      claimId: 43,
+      claimId: 5,
       creator: "GABCD",
-      category: "politics",
+      category: "sports",
     },
   };
 
-  const formattedWithoutTx = formatEvent(config, eventWithoutTx);
-  assert.ok(formattedWithoutTx, "should format event without txHash");
-  assert.equal(formattedWithoutTx.previewsEnabled, false, "previews disabled when no txHash");
-  assert.equal(/\[tx\]/.test(formattedWithoutTx.text), false, "should not have [tx] link");
+  await createNotifier(fakeBot, config)(text);
+  assert.ok(sent.length >= 2);
+  for (const [chatId, body, opts] of sent) {
+    assert.equal(chatId, config.chatId);
+    assert.ok(body.length <= TELEGRAM_MAX_MESSAGE_LENGTH);
+    assert.deepEqual(opts, {
+      parse_mode: "MarkdownV2",
+      link_preview_options: { is_disabled: true },
+    });
+  }
+  assert.equal(sent.map((s) => s[1]).join("\n"), text);
 });
 
-test("formatEvent disables previews for events with empty txHash", () => {
+test("formatFallbackEvent formats actionable degraded event notification with redacted reason", async () => {
+  const { formatFallbackEvent } = await import("../dist/notifications/format.js");
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
-    explorerBaseUrl: "https://stellar.expert/explorer",
   };
-
-  // Event with whitespace-only txHash
-  const eventWhitespace = {
+  const longSummary = "evidence ".repeat(100); // 900 chars
+  const event = {
     source: "market",
     contractId: "market",
-    ledger: 102,
-    txHash: "   ",
+    ledger: 52,
+    txHash: "",
     at: 0,
-    eventId: "102-0",
+    eventId: "52-0",
     payload: {
-      name: "claim_cancelled",
-      claimId: 44,
+      name: "claim_resolved",
+      claimId: 3,
+      winnerSide: 2,
+      summary: longSummary,
+      confidence: 95,
+      evidenceHash: "abc123",
     },
   };
-
-  const formatted = formatEvent(config, eventWhitespace);
-  assert.ok(formatted, "should format event");
-  assert.equal(formatted.previewsEnabled, false, "previews disabled for whitespace txHash");
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  // The raw summary should not appear verbatim past 200 chars in the output
+  assert.ok(
+    !message.includes("evidence ".repeat(30)),
+    "Summary was not truncated in the notification output",
+  );
 });
-
-test("createNotifier respects previewsEnabled flag", async () => {
-  const sent = [];
-  const fakeBot = {
-    api: {
-      sendMessage: async (...args) => {
-        sent.push(args);
-        return {};
-      },
-    },
+    explorerBaseUrl: "https://stellar.expert/explorer",
   };
-  const config = { chatId: "-1001234567890" };
-  const notify = createNotifier(fakeBot, config);
-
-  // Send with previews enabled
-  await notify("message with link", true);
-  assert.deepEqual(sent[sent.length - 1][2].link_preview_options.is_disabled, false);
-
-  // Send with previews disabled (default)
-  await notify("message without link");
-  assert.deepEqual(sent[sent.length - 1][2].link_preview_options.is_disabled, true);
-
-  // Send explicitly disabled
-  await notify("another message", false);
-  assert.deepEqual(sent[sent.length - 1][2].link_preview_options.is_disabled, true);
+  const big = "z".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 10);
+  const notify = createNotifier(fakeBot, { chatId: "-1001" });
+  await assert.rejects(notify(big), error);
+  assert.equal(calls, 1);
 });
