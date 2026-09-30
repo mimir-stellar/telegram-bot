@@ -1,211 +1,281 @@
 /**
- * Soroban RPC client construction.
+ * Soroban RPC client construction and Stellar explorer URL helpers.
  *
  * `getEvents` is the only endpoint this bot needs, and it is unauthenticated on
  * the public Testnet RPC — there is no key to configure here.
+ *
+ * Explorer links are centralized here so notifications, logs, and CLI helpers
+ * share one construction path (network segment + optional base override).
+ *
+ * Ledger-window validation lives here too: the client is the one place that
+ * knows the RPC contract, so the bounds an `getEvents` request must respect
+ * (retained floor, chain tip) are checked before a request is spent on them.
  */
 
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
 
-export function createRpcServer(config: StellarConfig): rpc.Server {
-  return new rpc.Server(config.rpcUrl, {
+/** Soroban contract strkey: `C` + 55 base32 characters. */
+const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
+
+/**
+ * Validate that a contract ID is a well-formed Soroban strkey.
+ * Returns true if valid; throws an error with a descriptive message if not.
+ * Kept as a runtime check so the poller can catch misconfigurations early
+ * before a scan attempt and log actionable diagnostics.
+ */
+export function validateContractId(contractId: string, fieldName: string = "contract ID"): boolean {
+  const trimmed = contractId.trim();
+  if (trimmed === "") {
+    throw new Error(`${fieldName} is empty`);
+  }
+  if (!CONTRACT_ID_PATTERN.test(trimmed)) {
+    throw new Error(
+      `${fieldName} is not a valid Soroban contract ID (expected C… strkey, 56 chars); got "${trimmed}"`,
+    );
+  }
+  return true;
+}
+
+export class RpcPassphraseError extends Error {
+  constructor(expected: string, actual: string) {
+    super(
+      `RPC network passphrase mismatch: expected "${expected}" but RPC reported "${actual}". ` +
+      `Check STELLAR_RPC_URL and STELLAR_NETWORK_PASSPHRASE configuration.`,
+    );
+    this.name = "RpcPassphraseError";
+  }
+}
+
+/**
+ * Create an RPC server and verify its network passphrase matches the configured value.
+ * This fail-fast check at boot prevents silent misconfigurations where the bot reads
+ * events from the wrong network.
+ *
+ * Throws RpcPassphraseError if the passphrase does not match.
+ */
+export async function createRpcServer(config: StellarConfig): Promise<rpc.Server> {
+  const server = new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
+    timeout: 15000,
   });
+
+  // Verify the RPC's passphrase matches the configured one. This is a fail-fast
+  // check that prevents configuration errors from silently producing wrong results.
+  const network = await server.getNetwork();
+  if (network.passphrase !== config.networkPassphrase) {
+    throw new RpcPassphraseError(config.networkPassphrase, network.passphrase);
+  }
+
+  return server;
+}
+
+/** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */
+export const DEFAULT_EXPLORER_BASE_URL = "https://stellar.expert/explorer";
+
+/**
+ * Resolve the explorer network path segment from the configured network name.
+ * `futurenet` and `custom` fall back to `testnet` so links remain usable in
+ * local and non-standard deployments. Falls back to passphrase inference when
+ * the `network` field is absent (e.g. in tests that predate multi-network support).
+ */
+export function explorerNetworkSegment(config: StellarConfig): "public" | "testnet" {
+  const net = config.network ?? inferFromPassphrase(config.networkPassphrase);
+  return net === "mainnet" ? "public" : "testnet";
+}
+
+function inferFromPassphrase(passphrase: string): string {
+  if (passphrase === "Public Global Stellar Network ; September 2015") return "mainnet";
+  return "testnet";
+}
+
+function explorerBase(config: StellarConfig): string {
+  const raw = (config.explorerBaseUrl || DEFAULT_EXPLORER_BASE_URL).replace(/\/+$/, "");
+  return raw;
+}
+
+function explorerPart(value: string): string {
+  return encodeURIComponent(value.trim());
 }
 
 /** Explorer link for a transaction hash, used in notification footers. */
 export function txExplorerUrl(config: StellarConfig, txHash: string): string {
+  const hash = txHash.trim();
+  if (!hash || !/^[a-fA-F0-9]{64}$/.test(hash)) return "";
+  const network = explorerNetworkSegment(config);
+  return `${explorerBase(config)}/${network}/tx/${explorerPart(hash)}`;
+}
+
+/** Explorer link for a classic / contract account. */
+export function accountExplorerUrl(config: StellarConfig, address: string): string {
+  const id = address.trim();
+  if (!id || !/^[GC][A-Z2-7]{55}$/.test(id)) return "";
+  const network = explorerNetworkSegment(config);
+  return `${explorerBase(config)}/${network}/account/${explorerPart(id)}`;
+}
+
+/** Explorer link for a Soroban contract id, used by /contracts. */
+export function contractExplorerUrl(config: StellarConfig, contractId: string): string {
+  const id = contractId.trim();
+  if (!id || !/^C[A-Z2-7]{55}$/.test(id)) return "";
+  const network = explorerNetworkSegment(config);
+  return `${explorerBase(config)}/${network}/contract/${explorerPart(id)}`;
+}
+
+// ── Ledger-window bounds ─────────────────────────────────────────────────────
+//
+// `getEvents` only serves a rolling window of history. `getHealth()` reports it:
+//
+//   oldestLedger  the retained floor — anything earlier is an ERROR, not a gap
+//   latestLedger  the chain tip     — anything later is an ERROR, not a gap
+//
+// The real RPC rejects both, and so does `src/stellar/mock-rpc.ts`. Refusing
+// them here instead means the failure is a bounded, deterministic, secret-free
+// error that names the bound — never an opaque remote payload copied into a log
+// — and that no request is spent on a range the window already proves invalid.
+
+/** The retained event window reported by `getHealth()`. */
+export interface LedgerWindow {
+  /** Oldest ledger the RPC still retains. Requests below it are errors. */
+  oldestLedger: number;
+  /** Current chain tip. Requests above it are errors. */
+  latestLedger: number;
+}
+
+/** Why a ledger window, start ledger, or resume cursor cannot be scanned. */
+export type LedgerWindowProblem =
+  | "malformed-window"
+  | "start-invalid"
+  | "start-after-tip"
+  | "cursor-after-tip";
+
+/**
+ * Raised for a ledger-window bound that is invalid before any request is sent.
+ *
+ * The message is numeric and bounded by construction, so it can be surfaced in
+ * `/status`, in logs, and by the scanner CLI without copying a remote payload.
+ */
+export class LedgerWindowError extends Error {
+  readonly problem: LedgerWindowProblem;
+
+  constructor(problem: LedgerWindowProblem, message: string) {
+    super(message);
+    this.name = "LedgerWindowError";
+    this.problem = problem;
+  }
+}
+
+/** A ledger sequence we are willing to put into a request. */
+function isLedgerSequence(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Render an untrusted health value without echoing an unbounded payload. */
+function boundedLedgerValue(value: unknown): string {
+  const text = String(value).replace(/\s+/g, " ").trim() || "missing";
+  return text.length <= 32 ? text : `${text.slice(0, 31)}…`;
+}
+
+/**
+ * Validate the window reported by `getHealth()`.
+ *
+ * Throws a bounded {@link LedgerWindowError} when the numbers are missing,
+ * negative, non-integer, or inverted, rather than letting a nonsense range
+ * reach the RPC.
+ */
+export function validateLedgerWindow(health: {
+  oldestLedger?: unknown;
+  latestLedger?: unknown;
+}): LedgerWindow {
+  const oldestLedger = health?.oldestLedger;
+  const latestLedger = health?.latestLedger;
+
+  if (!isLedgerSequence(oldestLedger) || !isLedgerSequence(latestLedger)) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `getHealth reported a malformed ledger window ` +
+        `(oldest=${boundedLedgerValue(oldestLedger)}, latest=${boundedLedgerValue(latestLedger)})`,
+    );
+  }
+  if (oldestLedger > latestLedger) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `getHealth reported an inverted ledger window ` +
+        `(oldest ${oldestLedger} > latest ${latestLedger})`,
+    );
+  }
+
+  return { oldestLedger, latestLedger };
+}
+
+/**
+ * Put a requested start ledger inside the retained window.
+ *
+ * Below the floor is clamped *up*: the floor is dynamic and the events there are
+ * gone, so a cold start asks for the oldest thing that still exists. Above the
+ * tip is an error — silently substituting a different range would make
+ * `npm run scan -- --from <future>` claim to have read ledger `<future>`.
+ */
+export function clampStartLedger(
+  requested: number,
+  window: LedgerWindow,
+): { startLedger: number; clamped: boolean } {
+  if (!isLedgerSequence(requested) || requested < 1) {
+    throw new LedgerWindowError(
+      "start-invalid",
+      `startLedger must be a positive integer; got ${boundedLedgerValue(requested)}`,
+    );
+  }
+  if (requested > window.latestLedger) {
+    throw new LedgerWindowError(
+      "start-after-tip",
+      `startLedger ${requested} is ahead of the chain tip ${window.latestLedger}`,
+    );
+  }
+  if (requested < window.oldestLedger) {
+    return { startLedger: window.oldestLedger, clamped: true };
+  }
+  return { startLedger: requested, clamped: false };
+}
+
+/**
+ * Generates a synthetic Soroban event fixture for testing purposes.
+ *
+ * This function creates a valid-looking Soroban event structure without
+ * requiring actual RPC calls or signing keys. It is used to ensure the
+ * read-only Mimir notifier remains reliable during long-running Stellar
+ * and Telegram failures.
+ *
+ * @param config - The Stellar configuration object.
+ * @param txHash - A mock transaction hash for the fixture.
+ * @returns A synthetic Soroban event object.
+ */
+export function generateSyntheticEventFixture(
+  config: StellarConfig,
+  txHash: string = "mock-tx-hash-1234567890abcdef"
+): rpc.GetEventsResponse {
   const network =
     config.networkPassphrase === "Public Global Stellar Network ; September 2015"
       ? "public"
       : "testnet";
-  return `https://stellar.expert/explorer/${network}/tx/${txHash}`;
-}
-
-/**
- * Environment loading and validation.
- *
- * Fails fast and LOUDLY: a notifier that boots with a missing chat id or a
- * typo'd contract id looks healthy while silently notifying nobody, which is
- * worse than not starting. Every problem found is collected and reported in one
- * error rather than one-at-a-time across restarts.
- *
- * Split into two loaders on purpose:
- *   - {@link loadStellarConfig} needs no Telegram credentials, so the chain
- *     reader (`src/stellar/events.ts`) can be run standalone against Testnet.
- *   - {@link loadConfig} is the full bot config.
- */
-
-import path from "node:path";
-
-import "dotenv/config";
-
-export interface StellarConfig {
-  marketContractId: string;
-  squadContractId: string;
-  rpcUrl: string;
-  horizonUrl: string;
-  networkPassphrase: string;
-}
-
-export interface BotConfig extends StellarConfig {
-  botToken: string;
-  chatId: string;
-  pollIntervalMs: number;
-  startLookbackLedgers: number;
-  cursorFile: string;
-  maxNotificationsPerCycle: number;
-}
-
-export class ConfigError extends Error {
-  readonly problems: string[];
-
-  constructor(problems: string[]) {
-    super(
-      `Invalid configuration (${problems.length} problem${problems.length === 1 ? "" : "s"}):\n` +
-        problems.map((p) => `  - ${p}`).join("\n") +
-        `\n\nCopy .env.example to .env and fill in the missing values.`,
-    );
-    this.name = "ConfigError";
-    this.problems = problems;
-  }
-}
-
-const DEFAULTS = {
-  rpcUrl: "https://soroban-testnet.stellar.org",
-  horizonUrl: "https://horizon-testnet.stellar.org",
-  networkPassphrase: "Test SDF Network ; September 2015",
-  pollIntervalMs: 30_000,
-  minPollIntervalMs: 5_000,
-  startLookbackLedgers: 60,
-  cursorFile: "./data/cursor.json",
-  maxNotificationsPerCycle: 20,
-} as const;
-
-/** Strkey for a contract: `C` + 55 base32 characters. */
-const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
-
-function read(name: string): string | undefined {
-  const raw = process.env[name];
-  if (raw === undefined) return undefined;
-  const trimmed = raw.trim();
-  return trimmed === "" ? undefined : trimmed;
-}
-
-function collector() {
-  const problems: string[] = [];
 
   return {
-    problems,
-
-    required(name: string): string {
-      const value = read(name);
-      if (value === undefined) {
-        problems.push(`${name} is required but not set`);
-        return "";
-      }
-      return value;
-    },
-
-    contractId(name: string): string {
-      const value = this.required(name);
-      if (value !== "" && !CONTRACT_ID_RE.test(value)) {
-        problems.push(
-          `${name} is not a Soroban contract id (expected C… strkey, 56 chars); got "${value}"`,
-        );
-      }
-      return value;
-    },
-
-    url(name: string, fallback: string): string {
-      const value = read(name) ?? fallback;
-      try {
-        const parsed = new URL(value);
-        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          problems.push(`${name} must be an http(s) URL; got "${value}"`);
-        }
-      } catch {
-        problems.push(`${name} is not a valid URL; got "${value}"`);
-      }
-      return value;
-    },
-
-    int(name: string, fallback: number, min: number): number {
-      const raw = read(name);
-      if (raw === undefined) return fallback;
-      const parsed = Number(raw);
-      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
-        problems.push(`${name} must be an integer; got "${raw}"`);
-        return fallback;
-      }
-      if (parsed < min) {
-        problems.push(`${name} must be >= ${min}; got ${parsed}`);
-        return fallback;
-      }
-      return parsed;
-    },
-
-    chatId(name: string): string {
-      const value = this.required(name);
-      // Telegram chat ids are integers (channels/supergroups are negative).
-      // A @channelusername also works for public channels, so both are allowed.
-      if (value !== "" && !/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
-        problems.push(
-          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
-        );
-      }
-      return value;
-    },
+    events: [
+      {
+        type: "contract",
+        contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        id: "1234567890",
+        ledger: 12345678,
+        ledgerClosedAt: new Date().toISOString(),
+        inSuccessfulContractEvent: true,
+        contractEventType: "log",
+        topic: ["bG9nIGV2ZW50"], // Base64 encoded "log event"
+        data: "SGVsbG8gV29ybGQ=", // Base64 encoded "Hello World"
+        txHash: txHash,
+      },
+    ],
+    latestLedger: 12345678,
   };
-}
-
-function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
-  return {
-    marketContractId: c.contractId("MARKET_CONTRACT_ID"),
-    squadContractId: c.contractId("SQUAD_CONTRACT_ID"),
-    rpcUrl: c.url("STELLAR_RPC_URL", DEFAULTS.rpcUrl),
-    horizonUrl: c.url("STELLAR_HORIZON_URL", DEFAULTS.horizonUrl),
-    networkPassphrase: read("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
-  };
-}
-
-/** Chain-only config. No Telegram credentials required. */
-export function loadStellarConfig(): StellarConfig {
-  const c = collector();
-  const config = stellarFrom(c);
-  if (c.problems.length > 0) throw new ConfigError(c.problems);
-  return config;
-}
-
-/** Full bot config: chain + Telegram + poller tuning. */
-export function loadConfig(): BotConfig {
-  const c = collector();
-  const stellar = stellarFrom(c);
-
-  const config: BotConfig = {
-    ...stellar,
-    botToken: c.required("BOT_TOKEN"),
-    chatId: c.chatId("TELEGRAM_CHAT_ID"),
-    pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
-    startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
-    cursorFile: path.resolve(process.cwd(), read("CURSOR_FILE") ?? DEFAULTS.cursorFile),
-    maxNotificationsPerCycle: c.int(
-      "MAX_NOTIFICATIONS_PER_CYCLE",
-      DEFAULTS.maxNotificationsPerCycle,
-      1,
-    ),
-  };
-
-  if (c.problems.length > 0) throw new ConfigError(c.problems);
-  return config;
-}
-
-/** `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */
-export function networkLabel(config: StellarConfig): string {
-  if (config.networkPassphrase === "Test SDF Network ; September 2015") return "testnet";
-  if (config.networkPassphrase === "Public Global Stellar Network ; September 2015") return "public";
-  return "custom";
 }
