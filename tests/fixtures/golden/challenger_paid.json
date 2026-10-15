@@ -1,0 +1,48 @@
+{
+  "eventName": "challenger_paid",
+  "source": "market",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Challenger paid with net, gross, and fee",
+      "event": {
+        "source": "market",
+        "ledger": 1050,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4509715660800-0",
+        "payload": {
+          "name": "challenger_paid",
+          "claimId": 42,
+          "challenger": "GCLJODG4L36N3Y4435S2F36Z5V57J3446T5Z7K5P7C6S5G5B7C6HFA5",
+          "stake": "20000000",
+          "gross": "38000000",
+          "fee": "1900000",
+          "net": "36100000"
+        }
+      },
+      "expectedMarkdown": "🏆 *Challenger paid* on claim \\#42\n`GCLJO…HFA5` staked 2\\.0000000 USDC → net *3\\.6100000 USDC*\nGross 3\\.8000000 USDC · fee 0\\.1900000 USDC\n_ledger 1050_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Challenger paid on claim #42\nGCLJO…HFA5 staked 2.0000000 USDC → net 3.6100000 USDC\nGross 3.8000000 USDC · fee 0.1900000 USDC\nledger 1050\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "zero_fee",
+      "description": "Challenger paid with zero fee",
+      "event": {
+        "source": "market",
+        "ledger": 1051,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4514010628096-0",
+        "payload": {
+          "name": "challenger_paid",
+          "claimId": 43,
+          "challenger": "GCLJODG4L36N3Y4435S2F36Z5V57J3446T5Z7K5P7C6S5G5B7C6HFA5",
+          "stake": "10000000",
+          "gross": "20000000",
+          "fee": "0",
+          "net": "20000000"
+        }
+      },
+      "expectedMarkdown": "🏆 *Challenger paid* on claim \\#43\n`GCLJO…HFA5` staked 1\\.0000000 USDC → net *2\\.0000000 USDC*\nGross 2\\.0000000 USDC · fee 0\\.0000000 USDC\n_ledger 1051_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Challenger paid on claim #43\nGCLJO…HFA5 staked 1.0000000 USDC → net 2.0000000 USDC\nGross 2.0000000 USDC · fee 0.0000000 USDC\nledger 1051\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

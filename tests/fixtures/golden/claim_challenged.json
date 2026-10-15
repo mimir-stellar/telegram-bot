@@ -1,0 +1,60 @@
+{
+  "eventName": "claim_challenged",
+  "source": "market",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Standard claim challenged with typical stake",
+      "event": {
+        "source": "market",
+        "ledger": 1010,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4337916968960-0",
+        "payload": {
+          "name": "claim_challenged",
+          "claimId": 42,
+          "stake": "25000000",
+          "challenger": "GCLJODG4L36N3Y4435S2F36Z5V57J3446T5Z7K5P7C6S5G5B7C6HFA5"
+        }
+      },
+      "expectedMarkdown": "⚔️ *Claim \\#42 challenged*\nStake: *2\\.5000000 USDC*\nChallenger: `GCLJO…HFA5`\n_ledger 1010_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #42 challenged\nStake: 2.5000000 USDC\nChallenger: GCLJO…HFA5\nledger 1010\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "zero_stake",
+      "description": "Zero stake challenge",
+      "event": {
+        "source": "market",
+        "ledger": 1011,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4342211936256-0",
+        "payload": {
+          "name": "claim_challenged",
+          "claimId": 43,
+          "stake": "0",
+          "challenger": "GCLJODG4L36N3Y4435S2F36Z5V57J3446T5Z7K5P7C6S5G5B7C6HFA5"
+        }
+      },
+      "expectedMarkdown": "⚔️ *Claim \\#43 challenged*\nStake: *0\\.0000000 USDC*\nChallenger: `GCLJO…HFA5`\n_ledger 1011_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #43 challenged\nStake: 0.0000000 USDC\nChallenger: GCLJO…HFA5\nledger 1011\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "max_stake",
+      "description": "High maximum USDC stake",
+      "event": {
+        "source": "market",
+        "ledger": 1012,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4346506903552-0",
+        "payload": {
+          "name": "claim_challenged",
+          "claimId": 44,
+          "stake": "100000000000000",
+          "challenger": "GCLJODG4L36N3Y4435S2F36Z5V57J3446T5Z7K5P7C6S5G5B7C6HFA5"
+        }
+      },
+      "expectedMarkdown": "⚔️ *Claim \\#44 challenged*\nStake: *10000000\\.0000000 USDC*\nChallenger: `GCLJO…HFA5`\n_ledger 1012_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #44 challenged\nStake: 10000000.0000000 USDC\nChallenger: GCLJO…HFA5\nledger 1012\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

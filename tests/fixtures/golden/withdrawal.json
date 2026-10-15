@@ -1,0 +1,40 @@
+{
+  "eventName": "withdrawal",
+  "source": "market",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Typical market withdrawal",
+      "event": {
+        "source": "market",
+        "ledger": 1070,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4595615006720-0",
+        "payload": {
+          "name": "withdrawal",
+          "amount": "50000000",
+          "to": "GCATS35LUSYNDL4OHZJ5Z6R4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55U"
+        }
+      },
+      "expectedMarkdown": "📤 *Withdrawal* — 5\\.0000000 USDC to `GCATS…I55U`\n_ledger 1070_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Withdrawal — 5.0000000 USDC to GCATS…I55U\nledger 1070\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "max_amount",
+      "description": "Large market withdrawal",
+      "event": {
+        "source": "market",
+        "ledger": 1071,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4599909974016-0",
+        "payload": {
+          "name": "withdrawal",
+          "amount": "999999999000000",
+          "to": "GCATS35LUSYNDL4OHZJ5Z6R4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55U"
+        }
+      },
+      "expectedMarkdown": "📤 *Withdrawal* — 99999999\\.9000000 USDC to `GCATS…I55U`\n_ledger 1071_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Withdrawal — 99999999.9000000 USDC to GCATS…I55U\nledger 1071\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

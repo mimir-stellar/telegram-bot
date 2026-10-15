@@ -1,0 +1,66 @@
+{
+  "eventName": "market_created",
+  "source": "squad",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Squad market created with deadline",
+      "event": {
+        "source": "squad",
+        "ledger": 2000,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "8589934592000-0",
+        "payload": {
+          "name": "market_created",
+          "marketId": 101,
+          "question": "Will Stellar protocol 22 activate in 2026?",
+          "captain": "GB72Z4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55UGCLJODG4L36N3Y4435S",
+          "feeBps": 250,
+          "deadline": 1800000000
+        }
+      },
+      "expectedMarkdown": "🆕 *New squad market* \\#101\nWill Stellar protocol 22 activate in 2026?\nCaptain: `GB72Z…435S` · fee 250 bps · deadline 2027\\-01\\-15T08:00:00\\.000Z\n_ledger 2000_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "New squad market #101\nWill Stellar protocol 22 activate in 2026?\nCaptain: GB72Z…435S · fee 250 bps · deadline 2027-01-15T08:00:00.000Z\nledger 2000\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "hostile_question",
+      "description": "Question with MarkdownV2 reserved characters",
+      "event": {
+        "source": "squad",
+        "ledger": 2001,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "8594229559296-0",
+        "payload": {
+          "name": "market_created",
+          "marketId": 102,
+          "question": "BTC > $100k? [Yes/No] *Important* (2026+)! ~Test~",
+          "captain": "GB72Z4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55UGCLJODG4L36N3Y4435S",
+          "feeBps": 100,
+          "deadline": 1800000000
+        }
+      },
+      "expectedMarkdown": "🆕 *New squad market* \\#102\nBTC \\> $100k? \\[Yes/No\\] \\*Important\\* \\(2026\\+\\)\\! \\~Test\\~\nCaptain: `GB72Z…435S` · fee 100 bps · deadline 2027\\-01\\-15T08:00:00\\.000Z\n_ledger 2001_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "New squad market #102\nBTC > $100k? [Yes/No] *Important* (2026+)! ~Test~\nCaptain: GB72Z…435S · fee 100 bps · deadline 2027-01-15T08:00:00.000Z\nledger 2001\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "oversized_question",
+      "description": "Question exceeding 200 characters",
+      "event": {
+        "source": "squad",
+        "ledger": 2002,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "8598524526592-0",
+        "payload": {
+          "name": "market_created",
+          "marketId": 103,
+          "question": "Question: QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ",
+          "captain": "GB72Z4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55UGCLJODG4L36N3Y4435S",
+          "feeBps": 500,
+          "deadline": 1800000000
+        }
+      },
+      "expectedMarkdown": "🆕 *New squad market* \\#103\nQuestion: QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ…\nCaptain: `GB72Z…435S` · fee 500 bps · deadline 2027\\-01\\-15T08:00:00\\.000Z\n_ledger 2002_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "New squad market #103\nQuestion: QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ…\nCaptain: GB72Z…435S · fee 500 bps · deadline 2027-01-15T08:00:00.000Z\nledger 2002\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

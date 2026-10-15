@@ -1,0 +1,96 @@
+{
+  "eventName": "claim_created",
+  "source": "market",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Typical claim created in crypto category",
+      "event": {
+        "source": "market",
+        "ledger": 1000,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4294967296000-0",
+        "payload": {
+          "name": "claim_created",
+          "claimId": 42,
+          "category": "crypto",
+          "creator": "GCATS35LUSYNDL4OHZJ5Z6R4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55U"
+        }
+      },
+      "expectedMarkdown": "🆕 *New claim* \\#42\nCategory: crypto\nCreator: `GCATS…I55U`\n_ledger 1000_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "New claim #42\nCategory: crypto\nCreator: GCATS…I55U\nledger 1000\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "empty_category",
+      "description": "Empty category string",
+      "event": {
+        "source": "market",
+        "ledger": 1001,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4299262263296-0",
+        "payload": {
+          "name": "claim_created",
+          "claimId": 1,
+          "category": "",
+          "creator": "GCATS35LUSYNDL4OHZJ5Z6R4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55U"
+        }
+      },
+      "expectedMarkdown": "🆕 *New claim* \\#1\nCategory: \nCreator: `GCATS…I55U`\n_ledger 1001_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "New claim #1\nCategory: \nCreator: GCATS…I55U\nledger 1001\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "hostile_characters",
+      "description": "Category with MarkdownV2 special chars",
+      "event": {
+        "source": "market",
+        "ledger": 1002,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4303557230592-0",
+        "payload": {
+          "name": "claim_created",
+          "claimId": 999,
+          "category": "DeFi_v2*beta*[test]~`>#+-=|{}.!",
+          "creator": "GCATS35LUSYNDL4OHZJ5Z6R4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55U"
+        }
+      },
+      "expectedMarkdown": "🆕 *New claim* \\#999\nCategory: DeFi\\_v2\\*beta\\*\\[test\\]\\~\\`\\>\\#\\+\\-\\=\\|\\{\\}\\.\\!\nCreator: `GCATS…I55U`\n_ledger 1002_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "New claim #999\nCategory: DeFi_v2*beta*[test]~`>#+-=|{}.!\nCreator: GCATS…I55U\nledger 1002\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "oversized_category",
+      "description": "Category exceeding 200 chars to test clipping",
+      "event": {
+        "source": "market",
+        "ledger": 1003,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4307852197888-0",
+        "payload": {
+          "name": "claim_created",
+          "claimId": 1000,
+          "category": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "creator": "GCATS35LUSYNDL4OHZJ5Z6R4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55U"
+        }
+      },
+      "expectedMarkdown": "🆕 *New claim* \\#1000\nCategory: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA…\nCreator: `GCATS…I55U`\n_ledger 1003_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "New claim #1000\nCategory: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA…\nCreator: GCATS…I55U\nledger 1003\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "no_tx_hash",
+      "description": "Missing transaction hash (no explorer URL)",
+      "event": {
+        "source": "market",
+        "ledger": 1004,
+        "txHash": "",
+        "eventId": "4312147165184-0",
+        "payload": {
+          "name": "claim_created",
+          "claimId": 5,
+          "category": "sports",
+          "creator": "GCATS35LUSYNDL4OHZJ5Z6R4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55U"
+        }
+      },
+      "expectedMarkdown": "🆕 *New claim* \\#5\nCategory: sports\nCreator: `GCATS…I55U`\n_ledger 1004_",
+      "expectedPlain": "New claim #5\nCategory: sports\nCreator: GCATS…I55U\nledger 1004"
+    }
+  ]
+}

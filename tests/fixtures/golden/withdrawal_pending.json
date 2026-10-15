@@ -1,0 +1,23 @@
+{
+  "eventName": "withdrawal_pending",
+  "source": "market",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Pending withdrawal notification",
+      "event": {
+        "source": "market",
+        "ledger": 1080,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4638564679680-0",
+        "payload": {
+          "name": "withdrawal_pending",
+          "amount": "25000000",
+          "to": "GCATS35LUSYNDL4OHZJ5Z6R4LBNJ77L5G6Z5P2Y5GCP76C4T5P5I55U"
+        }
+      },
+      "expectedMarkdown": "⏳ *Withdrawal parked* — 2\\.5000000 USDC claimable by `GCATS…I55U`\n_ledger 1080_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Withdrawal parked — 2.5000000 USDC claimable by GCATS…I55U\nledger 1080\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

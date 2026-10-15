@@ -1,0 +1,44 @@
+{
+  "eventName": "deposited",
+  "source": "squad",
+  "cases": [
+    {
+      "caseId": "typical_side_a",
+      "description": "Deposit on side A",
+      "event": {
+        "source": "squad",
+        "ledger": 2010,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "8632884264960-0",
+        "payload": {
+          "name": "deposited",
+          "marketId": 101,
+          "amount": "50000000",
+          "side": "A",
+          "participant": "GAPARTICIPANT7L5G6Z5P2Y5GCP76C4T5P5I55UGCLJODG4L36N3Y443"
+        }
+      },
+      "expectedMarkdown": "➕ *Squad \\#101* — 5\\.0000000 USDC on *side A*\nParticipant: `GAPAR…Y443`\n_ledger 2010_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Squad #101 — 5.0000000 USDC on side A\nParticipant: GAPAR…Y443\nledger 2010\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "typical_side_b",
+      "description": "Deposit on side B",
+      "event": {
+        "source": "squad",
+        "ledger": 2011,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "8637179232256-0",
+        "payload": {
+          "name": "deposited",
+          "marketId": 101,
+          "amount": "75000000",
+          "side": "B",
+          "participant": "GAPARTICIPANT7L5G6Z5P2Y5GCP76C4T5P5I55UGCLJODG4L36N3Y443"
+        }
+      },
+      "expectedMarkdown": "➕ *Squad \\#101* — 7\\.5000000 USDC on *side B*\nParticipant: `GAPAR…Y443`\n_ledger 2011_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Squad #101 — 7.5000000 USDC on side B\nParticipant: GAPAR…Y443\nledger 2011\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

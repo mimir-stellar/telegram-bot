@@ -1,0 +1,40 @@
+{
+  "eventName": "fee_claimed",
+  "source": "market",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Market fee claimed by recipient",
+      "event": {
+        "source": "market",
+        "ledger": 1060,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4552665333760-0",
+        "payload": {
+          "name": "fee_claimed",
+          "amount": "15000000",
+          "recipient": "GDFEEADDR77L5G6Z5P2Y5GCP76C4T5P5I55UGCLJODG4L36N3Y4435S"
+        }
+      },
+      "expectedMarkdown": "🧾 *Fees claimed* — 1\\.5000000 USDC to `GDFEE…435S`\n_ledger 1060_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Fees claimed — 1.5000000 USDC to GDFEE…435S\nledger 1060\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "fractional_usdc",
+      "description": "Small fractional USDC fee claimed",
+      "event": {
+        "source": "market",
+        "ledger": 1061,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4556960301056-0",
+        "payload": {
+          "name": "fee_claimed",
+          "amount": "12345",
+          "recipient": "GDFEEADDR77L5G6Z5P2Y5GCP76C4T5P5I55UGCLJODG4L36N3Y4435S"
+        }
+      },
+      "expectedMarkdown": "🧾 *Fees claimed* — 0\\.0012345 USDC to `GDFEE…435S`\n_ledger 1061_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Fees claimed — 0.0012345 USDC to GDFEE…435S\nledger 1061\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

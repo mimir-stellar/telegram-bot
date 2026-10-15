@@ -1,0 +1,44 @@
+{
+  "eventName": "market_settled",
+  "source": "market",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Market settled with typical numbers",
+      "event": {
+        "source": "market",
+        "ledger": 1040,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4466765987840-0",
+        "payload": {
+          "name": "market_settled",
+          "claimId": 42,
+          "totalPaid": "100000000",
+          "totalFees": "5000000",
+          "owedToChallengers": "95000000"
+        }
+      },
+      "expectedMarkdown": "💰 *Claim \\#42 settled*\nPaid out: *10\\.0000000 USDC* · fees 0\\.5000000 USDC\nOwed to challengers: 9\\.5000000 USDC\n_ledger 1040_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #42 settled\nPaid out: 10.0000000 USDC · fees 0.5000000 USDC\nOwed to challengers: 9.5000000 USDC\nledger 1040\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "zero_amounts",
+      "description": "Market settled with all zero amounts",
+      "event": {
+        "source": "market",
+        "ledger": 1041,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4471060955136-0",
+        "payload": {
+          "name": "market_settled",
+          "claimId": 43,
+          "totalPaid": "0",
+          "totalFees": "0",
+          "owedToChallengers": "0"
+        }
+      },
+      "expectedMarkdown": "💰 *Claim \\#43 settled*\nPaid out: *0\\.0000000 USDC* · fees 0\\.0000000 USDC\nOwed to challengers: 0\\.0000000 USDC\n_ledger 1041_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #43 settled\nPaid out: 0.0000000 USDC · fees 0.0000000 USDC\nOwed to challengers: 0.0000000 USDC\nledger 1041\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

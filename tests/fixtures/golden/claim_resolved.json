@@ -1,0 +1,82 @@
+{
+  "eventName": "claim_resolved",
+  "source": "market",
+  "cases": [
+    {
+      "caseId": "typical_creator_win",
+      "description": "Creator wins with high confidence and summary",
+      "event": {
+        "source": "market",
+        "ledger": 1020,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4380866641920-0",
+        "payload": {
+          "name": "claim_resolved",
+          "claimId": 42,
+          "winnerSide": "creator",
+          "confidence": 95,
+          "summary": "Oracle verified truth"
+        }
+      },
+      "expectedMarkdown": "⚖️ *Claim \\#42 resolved* — winner: *side creator*\nConfidence: 95%\n_Oracle verified truth_\n_ledger 1020_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #42 resolved — winner: side creator\nConfidence: 95%\nOracle verified truth\nledger 1020\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "challenger_win_no_summary",
+      "description": "Challenger wins with null summary",
+      "event": {
+        "source": "market",
+        "ledger": 1021,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4385161609216-0",
+        "payload": {
+          "name": "claim_resolved",
+          "claimId": 43,
+          "winnerSide": "challenger",
+          "confidence": 80,
+          "summary": null
+        }
+      },
+      "expectedMarkdown": "⚖️ *Claim \\#43 resolved* — winner: *side challenger*\nConfidence: 80%\n_ledger 1021_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #43 resolved — winner: side challenger\nConfidence: 80%\nledger 1021\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "hostile_summary",
+      "description": "Summary with Markdown reserved chars",
+      "event": {
+        "source": "market",
+        "ledger": 1022,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4389456576512-0",
+        "payload": {
+          "name": "claim_resolved",
+          "claimId": 44,
+          "winnerSide": 1,
+          "confidence": 100,
+          "summary": "*Resolution* confirmed (100%) -> [OK]!"
+        }
+      },
+      "expectedMarkdown": "⚖️ *Claim \\#44 resolved* — winner: *creator*\nConfidence: 100%\n_\\*Resolution\\* confirmed \\(100%\\) \\-\\> \\[OK\\]\\!_\n_ledger 1022_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #44 resolved — winner: creator\nConfidence: 100%\n*Resolution* confirmed (100%) -> [OK]!\nledger 1022\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "oversized_summary",
+      "description": "Summary exceeding max length for clipping",
+      "event": {
+        "source": "market",
+        "ledger": 1023,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4393751543808-0",
+        "payload": {
+          "name": "claim_resolved",
+          "claimId": 45,
+          "winnerSide": 2,
+          "confidence": 90,
+          "summary": "Result: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+        }
+      },
+      "expectedMarkdown": "⚖️ *Claim \\#45 resolved* — winner: *challengers*\nConfidence: 90%\n_Result: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX…_\n_ledger 1023_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #45 resolved — winner: challengers\nConfidence: 90%\nResult: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX…\nledger 1023\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

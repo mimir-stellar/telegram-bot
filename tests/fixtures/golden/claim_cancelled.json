@@ -1,0 +1,38 @@
+{
+  "eventName": "claim_cancelled",
+  "source": "market",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Claim cancelled normally",
+      "event": {
+        "source": "market",
+        "ledger": 1030,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4423816314880-0",
+        "payload": {
+          "name": "claim_cancelled",
+          "claimId": 42
+        }
+      },
+      "expectedMarkdown": "🚫 *Claim \\#42 cancelled* — stakes returned\n_ledger 1030_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #42 cancelled — stakes returned\nledger 1030\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "max_id",
+      "description": "Large claimId value",
+      "event": {
+        "source": "market",
+        "ledger": 1031,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "4428111282176-0",
+        "payload": {
+          "name": "claim_cancelled",
+          "claimId": 999999999
+        }
+      },
+      "expectedMarkdown": "🚫 *Claim \\#999999999 cancelled* — stakes returned\n_ledger 1031_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Claim #999999999 cancelled — stakes returned\nledger 1031\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "eventName": "fees_claimed",
+  "source": "squad",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Squad fee claimed by recipient",
+      "event": {
+        "source": "squad",
+        "ledger": 2050,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "8804682956800-0",
+        "payload": {
+          "name": "fees_claimed",
+          "amount": "12500000",
+          "recipient": "GDFEEADDR77L5G6Z5P2Y5GCP76C4T5P5I55UGCLJODG4L36N3Y4435S"
+        }
+      },
+      "expectedMarkdown": "🧾 *Squad fees claimed* — 1\\.2500000 USDC to `GDFEE…435S`\n_ledger 2050_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Squad fees claimed — 1.2500000 USDC to GDFEE…435S\nledger 2050\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "eventName": "claimed",
+  "source": "squad",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Participant claims payout from resolved squad market",
+      "event": {
+        "source": "squad",
+        "ledger": 2040,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "8761733283840-0",
+        "payload": {
+          "name": "claimed",
+          "marketId": 101,
+          "participant": "GAPARTICIPANT7L5G6Z5P2Y5GCP76C4T5P5I55UGCLJODG4L36N3Y443",
+          "gross": "85000000",
+          "fee": "2125000",
+          "net": "82875000"
+        }
+      },
+      "expectedMarkdown": "💸 *Squad payout* on \\#101\n`GAPAR…Y443` → net *8\\.2875000 USDC* \\(gross 8\\.5000000 USDC, fee 0\\.2125000 USDC\\)\n_ledger 2040_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Squad payout on #101\nGAPAR…Y443 → net 8.2875000 USDC (gross 8.5000000 USDC, fee 0.2125000 USDC)\nledger 2040\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

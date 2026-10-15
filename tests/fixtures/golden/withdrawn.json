@@ -1,0 +1,25 @@
+{
+  "eventName": "withdrawn",
+  "source": "squad",
+  "cases": [
+    {
+      "caseId": "typical",
+      "description": "Withdrawal from squad market side A",
+      "event": {
+        "source": "squad",
+        "ledger": 2020,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "8675833937920-0",
+        "payload": {
+          "name": "withdrawn",
+          "marketId": 101,
+          "participant": "GAPARTICIPANT7L5G6Z5P2Y5GCP76C4T5P5I55UGCLJODG4L36N3Y443",
+          "amount": "30000000",
+          "side": "A"
+        }
+      },
+      "expectedMarkdown": "➖ *Squad \\#101* — `GAPAR…Y443` pulled 3\\.0000000 USDC from side A\n_ledger 2020_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Squad #101 — GAPAR…Y443 pulled 3.0000000 USDC from side A\nledger 2020\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}

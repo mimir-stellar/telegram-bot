@@ -1,0 +1,44 @@
+{
+  "eventName": "resolved",
+  "source": "squad",
+  "cases": [
+    {
+      "caseId": "typical_side_a_win",
+      "description": "Squad market resolved for side A",
+      "event": {
+        "source": "squad",
+        "ledger": 2030,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "8718783610880-0",
+        "payload": {
+          "name": "resolved",
+          "marketId": 101,
+          "result": "A",
+          "poolA": "500000000",
+          "poolB": "300000000"
+        }
+      },
+      "expectedMarkdown": "🏁 *Squad \\#101 resolved* — *side A*\nPools: A 50\\.0000000 USDC · B 30\\.0000000 USDC\n_ledger 2030_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Squad #101 resolved — side A\nPools: A 50.0000000 USDC · B 30.0000000 USDC\nledger 2030\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    },
+    {
+      "caseId": "typical_side_b_win",
+      "description": "Squad market resolved for side B",
+      "event": {
+        "source": "squad",
+        "ledger": 2031,
+        "txHash": "2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e",
+        "eventId": "8723078578176-0",
+        "payload": {
+          "name": "resolved",
+          "marketId": 102,
+          "result": "B",
+          "poolA": "200000000",
+          "poolB": "600000000"
+        }
+      },
+      "expectedMarkdown": "🏁 *Squad \\#102 resolved* — *side B*\nPools: A 20\\.0000000 USDC · B 60\\.0000000 USDC\n_ledger 2031_ · [tx](https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e)",
+      "expectedPlain": "Squad #102 resolved — side B\nPools: A 20.0000000 USDC · B 60.0000000 USDC\nledger 2031\ntx: https://stellar.expert/explorer/testnet/tx/2b386012af5ccc719db70a47b2f8cc486099de023055375f1b212f45ff53018e"
+    }
+  ]
+}
