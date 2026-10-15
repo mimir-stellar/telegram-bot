@@ -998,6 +998,13 @@ export function createNotifier(
     Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad">>,
 ) {
   return async (text: string, source?: ContractSource, extra?: SendExtra): Promise<void> => {
+    if (typeof text !== "string" || text.trim() === "") {
+      console.warn(
+        `[notifier] skipped empty message${eventRefLabel(extra?.eventRef)}`,
+      );
+      return;
+    }
+
     const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
     const chatId = source === "market"
       ? config.marketChatId || defaultChat
@@ -1048,8 +1055,14 @@ export function createNotifier(
       return;
     } catch (err) {
       const fallback = extra?.plainText;
-      if (typeof fallback !== "string" || fallback === "" || !isMarkdownParseError(err)) {
+      if (!isMarkdownParseError(err)) {
         throw err;
+      }
+      if (typeof fallback !== "string" || fallback.trim() === "") {
+        console.warn(
+          `[notifier] skipped empty plain text fallback${eventRefLabel(extra?.eventRef)}`,
+        );
+        return;
       }
       // Only bounded metadata is logged: the fallback outcome, the safe error
       // category, and the caller-supplied event reference — never message
