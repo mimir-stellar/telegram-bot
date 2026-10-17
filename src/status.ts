@@ -73,6 +73,10 @@ export function redactChatId(chatId: string | undefined): string {
 export interface StatusTargetSnapshot {
   source: string;
   contractId: string;
+  /** Duration of this target's most recent attempted cycle. */
+  lastCycleMs: number;
+  /** Longest attempted cycle for this target since process start. */
+  maxCycleMs: number;
   cursor: string | null;
   lastEventLedger: number | null;
   /**
@@ -166,6 +170,8 @@ export function buildStatusSnapshot(
     targets: status.targets.map((target) => ({
       source: target.source,
       contractId: target.contractId,
+      lastCycleMs: target.lastCycleMs ?? 0,
+      maxCycleMs: target.maxCycleMs ?? 0,
       cursor: target.cursor === null ? null : boundText(target.cursor, MAX_CURSOR_CHARS),
       lastEventLedger: target.lastEventLedger,
       rewindFromLedger:

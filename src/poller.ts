@@ -105,6 +105,10 @@ export interface TargetState {
   source: ContractSource;
   contractId: string;
   version: string;
+  /** Duration of this target's most recent attempted fetch-decode-send cycle. */
+  lastCycleMs: number;
+  /** Longest attempted cycle for this target since process start. */
+  maxCycleMs: number;
   cursor: string | null;
   /** Highest ledger an event was seen in, from this run or the cursor file. */
   lastEventLedger: number | null;
@@ -1207,6 +1211,8 @@ export function createPoller(deps: PollerDeps) {
         source: t.source,
         contractId: t.contractId,
         version: normalizeContractVersion(t.version),
+        lastCycleMs: 0,
+        maxCycleMs: 0,
         cursor: null,
         lastEventLedger: null,
         rewindFromLedger: null,
@@ -2056,6 +2062,7 @@ export function createPoller(deps: PollerDeps) {
           continue;
         }
 
+        const targetStartedAt = now();
         try {
           // Before asking for events, place the resume position against the last
           // floor a successful scan reported: below it, the events are already
@@ -2282,6 +2289,11 @@ export function createPoller(deps: PollerDeps) {
             explicitBackoff = retryAfterMs;
             break; // Stop scanning other targets, they will likely hit the same limit
           }
+        } finally {
+          const measured = now() - targetStartedAt;
+          const elapsed = Number.isFinite(measured) && measured > 0 ? measured : 0;
+          current.lastCycleMs = elapsed;
+          current.maxCycleMs = Math.max(current.maxCycleMs, elapsed);
         }
       }
 
