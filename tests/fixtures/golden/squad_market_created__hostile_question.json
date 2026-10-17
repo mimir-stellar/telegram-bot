@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "squad",
+    "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5037,
+    "txHash": "",
+    "at": 1724005037,
+    "eventId": "5037-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "market_created",
+      "marketId": 2,
+      "captain": "GCAPTAINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "deadline": 1730000000,
+      "feeBps": 0,
+      "question": "Will *price* reach $100 (see [chart](url))? — `yes` or _no_."
+    }
+  },
+  "md": "🆕 *New squad market* \\#2\nWill \\*price\\* reach $100 \\(see \\[chart\\]\\(url\\)\\)? — \\`yes\\` or \\_no\\_\\.\nCaptain: `GCAPT…AAAA` · fee 0 bps · deadline 2024\\-10\\-27T03:33:20\\.000Z\n_ledger 5037_",
+  "plain": "New squad market #2\nWill *price* reach $100 (see [chart](url))? — `yes` or _no_.\nCaptain: GCAPT…AAAA · fee 0 bps · deadline 2024-10-27T03:33:20.000Z\nledger 5037"
+}

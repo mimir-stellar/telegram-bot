@@ -1,0 +1,22 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5028,
+    "txHash": "",
+    "at": 1724005028,
+    "eventId": "5028-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "fee_claimed",
+      "recipient": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "amount": "0"
+    }
+  },
+  "md": "🧾 *Fees claimed* — 0\\.0000000 USDC to `GABCD…TUVW`\n_ledger 5028_",
+  "plain": "Fees claimed — 0.0000000 USDC to GABCD…TUVW\nledger 5028"
+}
