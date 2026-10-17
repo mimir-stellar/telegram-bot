@@ -24,7 +24,7 @@ function baseConfig(cursorFile) {
     networkPassphrase: "Test SDF Network ; September 2015",
     explorerBaseUrl: "https://example.invalid/explorer",
     botToken: "123456789:TEST-ONLY-TOKEN-NEVER-USE",
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     operatorTelegramUserId: "42",
     pollIntervalMs: 5_000,
     startLookbackLedgers: 60,
@@ -156,7 +156,7 @@ test("RPC failures are bounded and redact the configured bot token in status", a
   const cursorFile = path.join(directory, "cursor.json");
   await writeFile(cursorFile, CURSOR_FILE, "utf8");
   const originalUpdatedAt = JSON.parse(await readFile(cursorFile, "utf8")).updatedAt;
-  const secret = "123456789:TEST-ONLY-TOKEN-NEVER-USE";
+  const secret = "123456789:" + "TEST-ONLY-TOKEN-NEVER-USE";
   const longPayload = "remote-payload".repeat(100);
   const poller = createPoller({
     config: baseConfig(cursorFile),
@@ -185,6 +185,30 @@ test("RPC failures are bounded and redact the configured bot token in status", a
     console.error = originalError;
     poller.stop();
     await waitForCursorRewrite(cursorFile, originalUpdatedAt);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("poller reports an unwritable persistent volume and keeps running", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-volume-failure-"));
+  const cursorFile = path.join(directory, "not-exist/cursor.json");
+  // Prevent directory creation by creating a file where the directory should be
+  await writeFile(path.join(directory, "not-exist"), "blocked", "utf8");
+
+  const poller = createPoller({
+    config: baseConfig(cursorFile),
+    server: stuckServer(),
+    send: async () => undefined,
+  });
+
+  try {
+    await poller.start();
+    const status = poller.status();
+    assert.equal(status.running, true);
+    assert.equal(status.persistentVolumeAvailable, false);
+    assert.ok(typeof status.persistentVolumeError === "string" && status.persistentVolumeError.length > 0);
+  } finally {
+    poller.stop();
     await rm(directory, { recursive: true, force: true });
   }
 });

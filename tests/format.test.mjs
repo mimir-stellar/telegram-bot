@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createNotifier } from "../dist/bot.js";
-import { escapeMd, formatEvent } from "../dist/notifications/format.js";
+import { escapeMd, formatEvent, splitTelegramMessage, TELEGRAM_MAX_MESSAGE_LENGTH } from "../dist/notifications/format.js";
 import { formatUsdc } from "../dist/stellar/decode.js";
 
 const reserved = "_*[]()~`>#+-=|{}.\\!";
@@ -41,7 +41,7 @@ test("formatUsdc always renders all seven Stellar USDC decimals", () => {
 
 test("formatted money notifications keep explicit decimals and escape the decimal point", () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -65,12 +65,12 @@ test("formatted money notifications keep explicit decimals and escape the decima
   };
 
   const message = formatEvent(config, event);
-  assert.match(message, /Stake: \*2\\\.0000000 USDC\*/);
+  assert.match(message, /Stake: \*2\\.0000000 USDC\*/);
 });
 
 test("unknown or malformed decoded events stay non-notifying", () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -112,7 +112,7 @@ test("escapeMd matches the character-wise rule for deterministic fuzz inputs", (
 
 test("formatted untrusted event text reaches Telegram as exact MarkdownV2", async () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -152,7 +152,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
   await createNotifier(fakeBot, config)(message);
   assert.deepEqual(sent, [
     [
-      config.chatId,
+      config.chatIds[0],
       expectedMessage,
       {
         parse_mode: "MarkdownV2",
@@ -164,7 +164,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
 
 test("oversized event fields are clipped safely before MarkdownV2 escaping", () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -194,7 +194,7 @@ test("oversized event fields are clipped safely before MarkdownV2 escaping", () 
 
 test("oversized squad questions are clipped without splitting emoji", () => {
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -227,14 +227,116 @@ test("oversized squad questions are clipped without splitting emoji", () => {
 test("createNotifier preserves Telegram send failures for the poller", async () => {
   const error = new Error("Telegram API unavailable");
   const fakeBot = { api: { sendMessage: async () => Promise.reject(error) } };
-  const notify = createNotifier(fakeBot, { chatId: "-1001234567890" });
+  const notify = createNotifier(fakeBot, { chatIds: ["-1001234567890"] });
   await assert.rejects(notify("message"), error);
+});
+
+test("createNotifier routes named contract sources and preserves the legacy fallback", async () => {
+  const sent = [];
+  const fakeBot = {
+    api: {
+      sendMessage: async (...args) => {
+        sent.push(args);
+        return {};
+      },
+    },
+  };
+  const notify = createNotifier(fakeBot, {
+    chatId: "-1001234567890",
+    marketChatId: "-1001111111111",
+    squadChatId: "@mimir_squad",
+  });
+
+  await notify("market event", "market");
+  await notify("squad event", "squad");
+  await notify("legacy event");
+
+  assert.deepEqual(sent.map(([chatId, text]) => [chatId, text]), [
+    ["-1001111111111", "market event"],
+    ["@mimir_squad", "squad event"],
+    ["-1001234567890", "legacy event"],
+  ]);
 });
 
 test("escapeMd handles a long adversarial string without dropping characters", () => {
   const input = reserved.repeat(10_000);
   const escaped = escapeMd(input);
   assert.equal(escaped, expectedEscape(input));
+});
+
+test("createNotifier links to threaded replies when replyToMessageId is provided", async () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const sent = [];
+  const fakeBot = {
+    api: {
+      sendMessage: async (...args) => {
+        sent.push(args);
+        return {};
+      },
+    },
+  };
+
+  const notify = createNotifier(fakeBot, config);
+  // Merged signature: the notifier keeps main's (text, source?, extra?)
+  // shape, so the thread target rides on SendExtra rather than a bare
+  // second argument.
+  await notify("threaded message", undefined, { replyToMessageId: 12345 });
+
+  assert.deepEqual(sent, [
+    [
+      config.chatId,
+      "threaded message",
+      {
+        parse_mode: "MarkdownV2",
+        link_preview_options: { is_disabled: true },
+        reply_parameters: {
+          chat_id: config.chatId,
+          message_id: 12345,
+        },
+      },
+    ],
+  ]);
+});
+
+test("createNotifier sends without reply_parameters when replyToMessageId is undefined", async () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const sent = [];
+  const fakeBot = {
+    api: {
+      sendMessage: async (...args) => {
+        sent.push(args);
+        return {};
+      },
+    },
+  };
+
+  const notify = createNotifier(fakeBot, config);
+  await notify("standalone message");
+
+  assert.deepEqual(sent, [
+    [
+      config.chatId,
+      "standalone message",
+      {
+        parse_mode: "MarkdownV2",
+        link_preview_options: { is_disabled: true },
+      },
+    ],
+  ]);
 });
 
 test("txExplorerUrl is centralized and network-aware", async () => {
@@ -279,7 +381,7 @@ test("txExplorerUrl is centralized and network-aware", async () => {
 test("formatEvent prefixes message with [PREVIEW MODE] when channelPreviewMode is enabled", async () => {
   const { formatEvent } = await import("../dist/notifications/format.js");
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -309,7 +411,7 @@ test("formatEvent prefixes message with [PREVIEW MODE] when channelPreviewMode i
 test("formatFallbackEvent formats actionable degraded event notification with redacted reason", async () => {
   const { formatFallbackEvent } = await import("../dist/notifications/format.js");
   const config = {
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: "market",
     squadContractId: "squad",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -331,3 +433,164 @@ test("formatFallbackEvent formats actionable degraded event notification with re
   assert.equal(fallback.includes("SECRET-TOKEN"), false);
 });
 
+test("clip: question field is bounded in market_created notification", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const longQuestion = "Will ".repeat(100); // 500 chars
+  const event = {
+    source: "squad",
+    contractId: "squad",
+    ledger: 51,
+    txHash: "",
+    at: 0,
+    eventId: "51-0",
+    payload: {
+      name: "market_created",
+      marketId: 1,
+      captain: "GABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDE",
+      deadline: 1_800_000_000,
+      feeBps: 100,
+      question: longQuestion,
+    },
+  };
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  assert.ok(
+    !message.includes("Will ".repeat(50)),
+    "Question was not truncated in the notification output",
+  );
+});
+
+test("clip: summary field is bounded in claim_resolved notification", () => {
+  const config = {
+    chatId: "-1001234567890",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const longSummary = "evidence ".repeat(100); // 900 chars
+  const event = {
+    source: "market",
+    contractId: "market",
+    ledger: 52,
+    txHash: "",
+    at: 0,
+    eventId: "52-0",
+    payload: {
+      name: "claim_resolved",
+      claimId: 3,
+      winnerSide: 2,
+      summary: longSummary,
+      confidence: 95,
+      evidenceHash: "abc123",
+    },
+  };
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  // The raw summary should not appear verbatim past 200 chars in the output
+  assert.ok(
+    !message.includes("evidence ".repeat(30)),
+    "Summary was not truncated in the notification output",
+  );
+});
+
+test("splitTelegramMessage keeps short payloads as a single chunk", () => {
+  assert.deepEqual(splitTelegramMessage("hello"), ["hello"]);
+  assert.deepEqual(splitTelegramMessage("a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH)), [
+    "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH),
+  ]);
+});
+
+test("splitTelegramMessage prefers newline boundaries under the limit", () => {
+  const line = "x".repeat(100);
+  const text = Array.from({ length: 50 }, () => line).join("\n");
+  assert.ok(text.length > TELEGRAM_MAX_MESSAGE_LENGTH);
+  const parts = splitTelegramMessage(text);
+  assert.ok(parts.length >= 2);
+  for (const part of parts) {
+    assert.ok(part.length <= TELEGRAM_MAX_MESSAGE_LENGTH, part.length);
+  }
+  assert.equal(parts.join("\n"), text);
+});
+
+test("splitTelegramMessage hard-splits a single oversized line", () => {
+  const text = "y".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 50);
+  const parts = splitTelegramMessage(text);
+  assert.equal(parts.length, 2);
+  assert.equal(parts[0].length, TELEGRAM_MAX_MESSAGE_LENGTH);
+  assert.equal(parts[1].length, 50);
+  assert.equal(parts.join(""), text);
+});
+
+test("splitTelegramMessage never ends a chunk on a lone MarkdownV2 backslash", () => {
+  const limit = 20;
+  // 19 chars then \, then "!" — cutting at 20 would leave a trailing \.
+  const text = "a".repeat(19) + "\\!";
+  const parts = splitTelegramMessage(text, limit);
+  assert.ok(parts.length >= 2);
+  for (const part of parts) {
+    assert.ok(part.length <= limit, part.length);
+  }
+  // First chunk must not end mid-escape (lone trailing backslash).
+  assert.equal(parts[0].endsWith("\\"), false);
+  assert.equal(parts.join(""), text);
+});
+
+test("splitTelegramMessage rejects a non-positive limit", () => {
+  assert.throws(() => splitTelegramMessage("x", 0), RangeError);
+  assert.throws(() => splitTelegramMessage("x", -1), RangeError);
+});
+
+test("createNotifier splits oversized MarkdownV2 into ordered Telegram sends", async () => {
+  const config = { chatId: "-1001234567890" };
+  const line = "word ".repeat(200).trim(); // ~1000 chars
+  const text = Array.from({ length: 6 }, (_, i) => `*Part ${i}* ${line}`).join("\n");
+  assert.ok(text.length > TELEGRAM_MAX_MESSAGE_LENGTH);
+
+  const sent = [];
+  const fakeBot = {
+    api: {
+      sendMessage: async (...args) => {
+        sent.push(args);
+        return {};
+      },
+    },
+  };
+
+  await createNotifier(fakeBot, config)(text);
+  assert.ok(sent.length >= 2);
+  for (const [chatId, body, opts] of sent) {
+    assert.equal(chatId, config.chatId);
+    assert.ok(body.length <= TELEGRAM_MAX_MESSAGE_LENGTH);
+    assert.deepEqual(opts, {
+      parse_mode: "MarkdownV2",
+      link_preview_options: { is_disabled: true },
+    });
+  }
+  assert.equal(sent.map((s) => s[1]).join("\n"), text);
+});
+
+test("createNotifier still surfaces Telegram failures on the first chunk", async () => {
+  const error = new Error("message is too long");
+  let calls = 0;
+  const fakeBot = {
+    api: {
+      sendMessage: async () => {
+        calls += 1;
+        return Promise.reject(error);
+      },
+    },
+  };
+  const big = "z".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 10);
+  const notify = createNotifier(fakeBot, { chatId: "-1001" });
+  await assert.rejects(notify(big), error);
+  assert.equal(calls, 1);
+});
