@@ -166,6 +166,9 @@ test("resumes", () =>
 
 ## Failure drills against the local mock
 
+See [Mock RPC scenarios](mock-rpc.md) for the exact scenario fields, value
+encodings, failure budgets, and CLI precedence.
+
 The table above is enforced against fakes in unit tests **and** against a real
 HTTP server: `src/stellar/mock-rpc.ts` implements the Soroban JSON-RPC surface
 (cursor pagination, empty pages, retained floor, mutual exclusion) plus
