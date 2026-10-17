@@ -1,0 +1,26 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5023,
+    "txHash": "",
+    "at": 1724005023,
+    "eventId": "5023-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "challenger_paid",
+      "claimId": 50,
+      "challenger": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "stake": "20000000",
+      "gross": "38000000",
+      "fee": "2000000",
+      "net": "36000000"
+    }
+  },
+  "md": "🏆 *Challenger paid* on claim \\#50\n`GABCD…TUVW` staked 2\\.0000000 USDC → net *3\\.6000000 USDC*\nGross 3\\.8000000 USDC · fee 0\\.2000000 USDC\n_ledger 5023_",
+  "plain": "Challenger paid on claim #50\nGABCD…TUVW staked 2.0000000 USDC → net 3.6000000 USDC\nGross 3.8000000 USDC · fee 0.2000000 USDC\nledger 5023"
+}

@@ -1,0 +1,23 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5006,
+    "txHash": "",
+    "at": 1724005006,
+    "eventId": "5006-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_challenged",
+      "claimId": 11,
+      "challenger": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "stake": "9999999999999"
+    }
+  },
+  "md": "⚔️ *Claim \\#11 challenged*\nStake: *999999\\.9999999 USDC*\nChallenger: `GABCD…TUVW`\n_ledger 5006_",
+  "plain": "Claim #11 challenged\nStake: 999999.9999999 USDC\nChallenger: GABCD…TUVW\nledger 5006"
+}

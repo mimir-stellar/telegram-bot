@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "squad",
+    "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5036,
+    "txHash": "",
+    "at": 1724005036,
+    "eventId": "5036-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "market_created",
+      "marketId": 1,
+      "captain": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "deadline": 1730000000,
+      "feeBps": 100,
+      "question": "Will BTC hit 100k by end of year?"
+    }
+  },
+  "md": "🆕 *New squad market* \\#1\nWill BTC hit 100k by end of year?\nCaptain: `GABCD…TUVW` · fee 100 bps · deadline 2024\\-10\\-27T03:33:20\\.000Z\n_ledger 5036_",
+  "plain": "New squad market #1\nWill BTC hit 100k by end of year?\nCaptain: GABCD…TUVW · fee 100 bps · deadline 2024-10-27T03:33:20.000Z\nledger 5036"
+}

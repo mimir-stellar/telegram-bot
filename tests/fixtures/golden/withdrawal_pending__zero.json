@@ -1,0 +1,22 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5034,
+    "txHash": "",
+    "at": 1724005034,
+    "eventId": "5034-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "withdrawal_pending",
+      "to": "GCAPTAINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "amount": "0"
+    }
+  },
+  "md": "⏳ *Withdrawal parked* — 0\\.0000000 USDC claimable by `GCAPT…AAAA`\n_ledger 5034_",
+  "plain": "Withdrawal parked — 0.0000000 USDC claimable by GCAPT…AAAA\nledger 5034"
+}
