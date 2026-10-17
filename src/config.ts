@@ -67,6 +67,8 @@ export interface BotConfig extends StellarConfig {
   healthStaleMs: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
+  /** Optional bearer token for health endpoint authentication. Null disables auth. */
+  healthAuthToken: string | null;
 }
 
 export class ConfigError extends Error {
@@ -270,6 +272,16 @@ function collector(profile: Record<string, string>) {
       }
       return value;
     },
+
+    /**
+     * Parses an optional secret value. Returns null when unset.
+     * Used for authentication tokens that should be redacted in logs.
+     */
+    optionalSecret(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
+      return value;
+    },
   };
 }
 
@@ -319,10 +331,32 @@ export function loadConfig(): BotConfig {
     healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
+    healthAuthToken: c.optionalSecret("HEALTH_AUTH_TOKEN"),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
+
+  // Warn if health endpoint is exposed beyond loopback without authentication.
+  if (config.healthPort !== 0 && !isLoopback(config.healthHost) && config.healthAuthToken === null) {
+    console.warn(
+      `[config] HEALTH_HOST=${config.healthHost} is non-loopback but HEALTH_AUTH_TOKEN is not set. ` +
+        `Health and metrics will be accessible without authentication. ` +
+        `Set HEALTH_AUTH_TOKEN to protect these endpoints.`,
+    );
+  }
+
   return config;
+}
+
+/** Check if a host is a loopback address (127.0.0.1, [::1], localhost). */
+function isLoopback(host: string): boolean {
+  const normalized = host.toLowerCase();
+  return (
+    normalized === "127.0.0.1" ||
+    normalized === "::1" ||
+    normalized === "localhost" ||
+    normalized.startsWith("127.")
+  );
 }
 
 /** `mock` / `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */

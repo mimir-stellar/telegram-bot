@@ -21,6 +21,7 @@ function baseConfig(overrides = {}) {
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
+    healthAuthToken: null,
     ...overrides,
   };
 }
