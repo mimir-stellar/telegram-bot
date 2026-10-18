@@ -45,6 +45,34 @@ npm test              # build, then run every tests/*.test.mjs with node's built
 npm run test:mock
 ```
 
+### Fast unit-test loop (`test:fast`)
+
+`test:fast` runs the full test suite directly against `src/` using
+[tsx](https://tsx.is/) as a TypeScript transpiler — no `tsc` build step, no
+`dist/` output. A tiny loader shim (`scripts/tsx-dist-loader.mjs`) intercepts
+`../dist/*.js` import specifiers in the test files and rewrites them to their
+`src/*.ts` counterparts; `tsx` then transpiles each module in-memory.
+
+```bash
+# Run the whole suite
+npm run test:fast
+
+# Run only the formatter and decoder tests (common inner-loop targets)
+node --import tsx/esm --import ./scripts/tsx-dist-loader.mjs \
+  --test --test-timeout=120000 \
+  tests/format.test.mjs tests/decode.test.mjs
+```
+
+**When to use each script:**
+
+| Script | Builds `dist/`? | Type-checks? | When to run |
+|---|---|---|---|
+| `npm run test:fast` | No | No (transpile only) | Inner-loop iterations on formatter/decoder logic |
+| `npm test` | Yes | Yes (via tsc) | Before opening a PR; mirrors CI exactly |
+
+> **Note:** `test:fast` skips type-checking. Always run `npm test` (or
+> `npm run typecheck`) as a final check before submitting a PR.
+
 ### Local mock profile (no Testnet or Telegram)
 
 Rehearse failure drills against a loopback Soroban mock instead of live services:
@@ -95,5 +123,6 @@ table.
 
 - `src/` — the TypeScript source (config, RPC client, decoder, poller, bot, audit).
 - `tests/` — Node built-in test runner suites compiled against `dist/`.
+- `scripts/tsx-dist-loader.mjs` — ESM loader that maps `dist/*.js` → `src/*.ts` for `test:fast`.
 - `docs/contributor-fixtures.md` — credential-free fixture guide and failure modes.
 - `.env.example` — the documented runtime settings (not required for testing).
