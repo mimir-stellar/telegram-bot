@@ -105,6 +105,11 @@ export interface ScanOptions {
    * scan — the `scan` CLI, a test — fetches its own tip.
    */
   ledgerTip?: LedgerTip | undefined;
+  /**
+   * Optional hook to filter which events have full values decoded.
+   * If `shouldDecode(name)` returns false, value decoding is skipped.
+   */
+  shouldDecode?: (name: string) => boolean;
 }
 
 export interface RawScan {
@@ -369,7 +374,7 @@ export async function readContractEvents(
   const decoded: DecodedEvent[] = [];
   for (const event of rawEvents) {
     if (!event || typeof event !== "object") continue;
-    decoded.push(decodeEvent(target.source, event, target.version));
+    decoded.push(decodeEvent(target.source, event, target.version, { shouldDecode: opts.shouldDecode }));
   }
 
   // Deterministic order from chain metadata (ledger → transaction index →

@@ -2091,6 +2091,7 @@ export function createPoller(deps: PollerDeps) {
                 !rewinding && current.cursor === null ? config.startLookbackLedgers : undefined,
               seenEventIds: dedupWindow.toJSON(),
               dedupWindow: config.dedupWindow,
+              shouldDecode: (name) => isNotificationAllowed(config.featureFlags, target.source, name),
             }),
             SCAN_TIMEOUT_MS,
             "RPC scan",
