@@ -37,6 +37,16 @@ npm run build         # compile src/ -> dist/
 npm test              # build, then run every tests/*.test.mjs with node's built-in runner
 ```
 
+### Pre-commit hook (optional)
+
+Catch tokens locally before committing:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This opt-in hook runs `scripts/pre-commit.mjs` on staged files prior to each commit.
+
 - `npm test` builds `src/` into `dist/` and then runs all suites
   (`tests/*.test.mjs`). It needs no network credentials.
 - To run only the local-mock suites (`tests/mock-*.test.mjs`):
