@@ -10,6 +10,7 @@
  * kill switches, not a name allowlist.
  */
 
+import fs from "node:fs";
 import type { ContractSource } from "../stellar/decode.js";
 
 export interface NotificationFeatureFlags {
@@ -108,6 +109,71 @@ export function parseNotificationFeatureFlags(env: {
   };
 }
 
+// In-memory layer holding runtime overrides on top of env flags
+let activeOverrides: Partial<NotificationFeatureFlags> = {};
+let persistenceFilePath: string | null = null;
+
+export function setPersistencePath(filePath: string | null): void {
+  persistenceFilePath = filePath;
+  if (persistenceFilePath) {
+    try {
+      if (fs.existsSync(persistenceFilePath)) {
+        const content = fs.readFileSync(persistenceFilePath, "utf8");
+        const parsed = JSON.parse(content);
+        if (parsed && typeof parsed === "object") {
+          activeOverrides = {};
+          if (typeof parsed.enabled === "boolean") activeOverrides.enabled = parsed.enabled;
+          if (typeof parsed.market === "boolean") activeOverrides.market = parsed.market;
+          if (typeof parsed.squad === "boolean") activeOverrides.squad = parsed.squad;
+        }
+      }
+    } catch {
+      // Ignored for resilience
+    }
+  }
+}
+
+export function getFlagOverrides(): Partial<NotificationFeatureFlags> {
+  return { ...activeOverrides };
+}
+
+export function setFlagOverride(
+  flag: keyof NotificationFeatureFlags,
+  value: boolean,
+): void {
+  activeOverrides[flag] = value;
+  if (persistenceFilePath) {
+    try {
+      fs.writeFileSync(persistenceFilePath, JSON.stringify(activeOverrides, null, 2), "utf8");
+    } catch {
+      // Ignored for resilience
+    }
+  }
+}
+
+export function clearFlagOverrides(): void {
+  activeOverrides = {};
+  if (persistenceFilePath) {
+    try {
+      if (fs.existsSync(persistenceFilePath)) {
+        fs.unlinkSync(persistenceFilePath);
+      }
+    } catch {
+      // Ignored for resilience
+    }
+  }
+}
+
+export function getEffectiveFeatureFlags(
+  flagsOrUndefined: NotificationFeatureFlags | undefined,
+): NotificationFeatureFlags {
+  const base = flagsOrUndefined ?? DEFAULT_FEATURE_FLAGS;
+  return {
+    ...base,
+    ...activeOverrides,
+  };
+}
+
 /**
  * Whether a decoded event from `source` may be posted under the active flags.
  * Event name is accepted for future fine-grained gates; today the decision is
@@ -118,8 +184,8 @@ export function isNotificationAllowed(
   source: ContractSource,
   _eventName?: string,
 ): boolean {
-  // Configs built before NOTIFY_* existed keep the always-on behaviour.
-  const flags = flagsOrUndefined ?? DEFAULT_FEATURE_FLAGS;
+  // Consult effective flags with active overrides applied
+  const flags = getEffectiveFeatureFlags(flagsOrUndefined);
   if (!flags.enabled) return false;
   if (source === "market") return flags.market;
   if (source === "squad") return flags.squad;
@@ -130,8 +196,9 @@ export function isNotificationAllowed(
 export function formatFeatureFlags(
   flagsOrUndefined: NotificationFeatureFlags | undefined,
 ): string {
-  const flags = flagsOrUndefined ?? DEFAULT_FEATURE_FLAGS;
+  const flags = getEffectiveFeatureFlags(flagsOrUndefined);
   return (
     `enabled=${flags.enabled} market=${flags.market} squad=${flags.squad}`
   );
 }
+

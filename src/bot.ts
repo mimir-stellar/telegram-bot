@@ -19,7 +19,18 @@ import {
   safeErrorMessage,
   type ExplorerKeyboard,
 } from "./notifications/format.js";
-import { formatFeatureFlags } from "./notifications/featureFlags.js";
+import {
+  formatFeatureFlags,
+  getFlagOverrides,
+  getEffectiveFeatureFlags,
+  setFlagOverride,
+} from "./notifications/featureFlags.js";
+import {
+  canAccessSettings,
+  settingsKeyboard,
+  settingsMessage,
+} from "./commands/settings.js";
+export { settingsKeyboard, settingsMessage, canAccessSettings } from "./commands/settings.js";
 export { previewMessage } from "./notifications/format.js";
 import { formatProvenanceSummary, networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
@@ -85,12 +96,20 @@ export const TELEGRAM_OPTIONS = {
 // Callback data is untrusted user input: it is validated before any action
 // runs, and operator actions are authorized exactly like /pause and /resume.
 
-export type CallbackActionType = "status" | "contracts" | "help" | "pause" | "resume";
+export type StandardCallbackActionType = "status" | "contracts" | "help" | "pause" | "resume";
+export type CallbackActionType = StandardCallbackActionType | "set";
 
-export interface ValidCallbackAction {
-  type: CallbackActionType;
-  raw: string;
-}
+export type ValidCallbackAction =
+  | {
+      type: StandardCallbackActionType;
+      raw: string;
+    }
+  | {
+      type: "set";
+      flag: "enabled" | "market" | "squad";
+      value: 0 | 1;
+      raw: string;
+    };
 
 export type CallbackValidationResult =
   | { ok: true; action: ValidCallbackAction }
@@ -109,9 +128,10 @@ export const CALLBACK_FALLBACK_FEEDBACK = "Invalid or unrecognized action";
 export const CALLBACK_UNAUTHORIZED_FEEDBACK = "Unauthorized: operator only";
 
 
-function isKnownAction(val: string): val is CallbackActionType {
+function isKnownAction(val: string): val is StandardCallbackActionType {
   return ["status", "contracts", "help", "pause", "resume"].includes(val);
 }
+
 
 /**
  * Validate untrusted callback-query data before any action is executed.
@@ -177,9 +197,33 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
     }
   }
 
-  // 2. Colon-delimited: e.g. "status:refresh", "mimir:contracts", etc.
+  // 2. Colon-delimited: e.g. "status:refresh", "mimir:contracts", "set:market:1", etc.
   if (trimmed.includes(":")) {
     const parts = trimmed.split(":");
+    if (parts[0] === "set") {
+      const flag = parts[1];
+      const valStr = parts[2];
+      if (
+        (flag === "enabled" || flag === "market" || flag === "squad") &&
+        (valStr === "0" || valStr === "1") &&
+        parts.length === 3
+      ) {
+        return {
+          ok: true,
+          action: {
+            type: "set",
+            flag,
+            value: valStr === "1" ? 1 : 0,
+            raw,
+          },
+        };
+      }
+      return {
+        ok: false,
+        reason: "invalid-set-format",
+        fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+      };
+    }
     if (parts[0] === "mimir" && parts[1] && isKnownAction(parts[1])) {
       return {
         ok: true,
@@ -462,6 +506,13 @@ export function healthMessage(
   // only from key names, source names, and counts (see config.ts), so it has no
   // MarkdownV2 reserved character to escape and stays copy-pasteable.
   lines.push("", `Config: \`${formatProvenanceSummary(report.config)}\``);
+  const overrides = getFlagOverrides();
+  if (Object.keys(overrides).length > 0) {
+    const summary = Object.entries(overrides)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(" ");
+    lines.push(`Feature flag overrides: \`${summary}\``);
+  }
   if (report.config.warnings.length > 0) {
     lines.push(`Config notes: ${escapeMd(report.config.warnings.join("; "))}`);
   }
@@ -794,7 +845,7 @@ export async function handleCallbackQuery(
   const { action } = validation;
 
   // Enforce operator role authorization
-  if (action.type === "pause" || action.type === "resume") {
+  if (action.type === "pause" || action.type === "resume" || action.type === "set") {
     if (!isOperator(ctx, config)) {
       console.warn(
         `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
@@ -873,6 +924,27 @@ export async function handleCallbackQuery(
         });
         break;
       }
+
+      case "set": {
+        const flagName = action.flag;
+        const newValue = action.value === 1;
+        setFlagOverride(flagName, newValue);
+        const currentFlags = getEffectiveFeatureFlags(config.featureFlags);
+        const text = settingsMessage(config);
+        const kb = settingsKeyboard(currentFlags);
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text, kb);
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, {
+            ...TELEGRAM_OPTIONS,
+            reply_markup: kb,
+          });
+        }
+        await safeAnswerCallback(ctx, config, {
+          text: `${flagName} set to ${newValue ? "ON" : "OFF"}`,
+        });
+        break;
+      }
     }
   } catch (err) {
     console.error(
@@ -919,6 +991,20 @@ export function createBot(deps: BotDeps): Bot {
     // cosmetic wart.
     await ctx.reply(renderLogExport(config, status(), logs), {
       link_preview_options: { is_disabled: true },
+    });
+  });
+
+  bot.command("settings", async (ctx) => {
+    if (!canAccessSettings(ctx, config)) {
+      console.warn(
+        `[bot] ignored unauthorized or non-private /settings on update ${ctx.update.update_id}`,
+      );
+      return;
+    }
+    const currentFlags = getEffectiveFeatureFlags(config.featureFlags);
+    await ctx.reply(settingsMessage(config), {
+      ...TELEGRAM_OPTIONS,
+      reply_markup: settingsKeyboard(currentFlags),
     });
   });
 

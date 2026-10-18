@@ -14,6 +14,7 @@ import type { AddressInfo } from "node:net";
 import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
 import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
+import { getEffectiveFeatureFlags, getFlagOverrides } from "./notifications/featureFlags.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
 
@@ -149,6 +150,8 @@ export interface HealthReport {
    * of them leaving the process.
    */
   config: ConfigProvenance;
+  featureFlags?: { enabled: boolean; market: boolean; squad: boolean };
+  featureFlagOverrides?: Partial<{ enabled: boolean; market: boolean; squad: boolean }>;
 }
 
 const CURSOR_PREVIEW_LEN = 24;
@@ -318,6 +321,8 @@ export function buildHealthReport(
       persistentVolumeError: poller.persistentVolumeError ?? null,
     },
     config: provenance,
+    featureFlags: getEffectiveFeatureFlags(config.featureFlags),
+    featureFlagOverrides: getFlagOverrides(),
   };
 }
 
