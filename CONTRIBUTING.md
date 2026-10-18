@@ -7,7 +7,8 @@ signs nothing.
 
 ## Prerequisites
 
-- **Node.js >= 20** (the `engines.node` field in `package.json`).
+- **Node.js >= 20** (the `engines.node` field in `package.json`); production runs on
+  Node 22, pinned in `.nvmrc`.
 - A local checkout of this repository.
 - **No credentials required to develop or test.** The automated suite never calls the
   live Testnet RPC or the Telegram API; fixture and mock profiles are credential-free.
@@ -17,6 +18,7 @@ signs nothing.
 ## Setup
 
 ```bash
+nvm use   # optional: selects Node 22 from .nvmrc
 npm ci
 ```
 
