@@ -47,15 +47,15 @@ export { helpDetailMessage, COMMAND_DETAILS, type CommandDetail } from "./comman
 
 /** Shared metadata for handlers, help, and Telegram's command menu. */
 export const COMMANDS = [
-  { command: "start", description: COMMAND_DESCRIPTIONS.start, operatorOnly: false },
-  { command: "help", description: COMMAND_DESCRIPTIONS.help, operatorOnly: false },
-  { command: "status", description: COMMAND_DESCRIPTIONS.status, operatorOnly: false },
-  { command: "audit", description: COMMAND_DESCRIPTIONS.audit, operatorOnly: true },
-  { command: "contracts", description: COMMAND_DESCRIPTIONS.contracts, operatorOnly: false },
-  { command: "health", description: COMMAND_DESCRIPTIONS.health, operatorOnly: false },
-  { command: "preview", description: COMMAND_DESCRIPTIONS.preview, operatorOnly: false },
-  { command: "pause", description: COMMAND_DESCRIPTIONS.pause, operatorOnly: true },
-  { command: "resume", description: COMMAND_DESCRIPTIONS.resume, operatorOnly: true },
+  { command: "start", description: COMMAND_DESCRIPTIONS.start, operatorOnly: false, allowlistGated: false },
+  { command: "help", description: COMMAND_DESCRIPTIONS.help, operatorOnly: false, allowlistGated: false },
+  { command: "status", description: COMMAND_DESCRIPTIONS.status, operatorOnly: false, allowlistGated: true },
+  { command: "audit", description: COMMAND_DESCRIPTIONS.audit, operatorOnly: true, allowlistGated: false },
+  { command: "contracts", description: COMMAND_DESCRIPTIONS.contracts, operatorOnly: false, allowlistGated: true },
+  { command: "health", description: COMMAND_DESCRIPTIONS.health, operatorOnly: false, allowlistGated: true },
+  { command: "preview", description: COMMAND_DESCRIPTIONS.preview, operatorOnly: false, allowlistGated: true },
+  { command: "pause", description: COMMAND_DESCRIPTIONS.pause, operatorOnly: true, allowlistGated: false },
+  { command: "resume", description: COMMAND_DESCRIPTIONS.resume, operatorOnly: true, allowlistGated: false },
 ] as const;
 
 function visibleCommands(config?: BotConfig) {
