@@ -7,7 +7,7 @@
  * state. All chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
-import { Bot, type Context } from "grammy";
+import { Bot, InlineKeyboard, type Context } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 
 import { escapeMd, previewMessage, safeErrorMessage } from "./notifications/format.js";
@@ -16,6 +16,44 @@ import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
 import { buildHealthReport } from "./health.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
+
+/**
+ * How long a pause-confirmation message stays valid.
+ * Callbacks arriving after this window are rejected as stale.
+ */
+export const PAUSE_CONFIRM_TTL_MS = 60_000;
+
+/**
+ * The two callback_data strings used by the pause confirmation flow.
+ * Both are well under Telegram's 64-byte limit.
+ */
+export const CALLBACK_PAUSE_CONFIRM = "pause-confirm" as const;
+export const CALLBACK_PAUSE_CANCEL = "pause-cancel" as const;
+
+type ValidCallbackAction = typeof CALLBACK_PAUSE_CONFIRM | typeof CALLBACK_PAUSE_CANCEL;
+
+const VALID_CALLBACK_DATA = new Set<string>([
+  CALLBACK_PAUSE_CONFIRM,
+  CALLBACK_PAUSE_CANCEL,
+]);
+
+/**
+ * Returns the validated action string or `null` if data is unknown/missing.
+ * Keeps the handler from acting on arbitrary payloads from third parties.
+ */
+export function validateCallbackData(data: string | undefined): ValidCallbackAction | null {
+  if (data !== undefined && VALID_CALLBACK_DATA.has(data)) {
+    return data as ValidCallbackAction;
+  }
+  return null;
+}
+
+/** Inline keyboard attached to the pause confirmation message. */
+export function operatorKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("✅ Confirm pause", CALLBACK_PAUSE_CONFIRM)
+    .text("❌ Cancel", CALLBACK_PAUSE_CANCEL);
+}
 
 const HELP_BASE = [
   "*Mimir notifier*",
@@ -194,6 +232,56 @@ export function resumeMessage(result: PollerResumeResult): string {
   }
 }
 
+/**
+ * Shared handler for pause inline-keyboard callbacks.
+ *
+ * Exported for unit testing without needing a live grammy `Bot` instance.
+ * Callers must pass a grammy-compatible `ctx` that exposes:
+ *   - `ctx.from`
+ *   - `ctx.callbackQuery.data`
+ *   - `ctx.callbackQuery.message.date` (Unix seconds, set by Telegram)
+ *   - `ctx.answerCallbackQuery(text?, opts?)`
+ *   - `ctx.editMessageText(text, opts)`
+ */
+export async function handleCallbackQuery(
+  ctx: Context,
+  deps: Pick<BotDeps, "config" | "pause">,
+  nowMs: number = Date.now(),
+): Promise<void> {
+  const { config, pause } = deps;
+
+  const action = validateCallbackData(ctx.callbackQuery?.data);
+  if (action === null) return; // unknown payload — silently ignore
+
+  // Only the operator may act on these buttons.
+  if (!isOperator(ctx, config)) {
+    await ctx.answerCallbackQuery({ text: "Only the operator can do that.", show_alert: true });
+    return;
+  }
+
+  // Reject stale confirmations so an old message cannot pause the bot later.
+  const messageDate = ctx.callbackQuery?.message?.date ?? 0;
+  const ageMs = nowMs - messageDate * 1000;
+  if (ageMs > PAUSE_CONFIRM_TTL_MS) {
+    await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
+    await ctx.editMessageText("⏱ *Pause confirmation expired\\.* Run /pause again\\.", TELEGRAM_OPTIONS);
+    return;
+  }
+
+  if (action === CALLBACK_PAUSE_CONFIRM) {
+    const result = pause();
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
+    return;
+  }
+
+  if (action === CALLBACK_PAUSE_CANCEL) {
+    await ctx.answerCallbackQuery({ text: "Cancelled." });
+    await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
+    return;
+  }
+}
+
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
@@ -274,7 +362,10 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
       console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
       return;
     }
-    await ctx.reply(pauseMessage(pause()), TELEGRAM_OPTIONS);
+    await ctx.reply(
+      "⏸ *Pause polling?*\nThis will stop new scans from starting\\. The current scan may finish\\.",
+      { ...TELEGRAM_OPTIONS, reply_markup: operatorKeyboard() },
+    );
   });
 
   bot.command("resume", async (ctx) => {
@@ -284,6 +375,12 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
     }
     await ctx.reply(resumeMessage(resume()), TELEGRAM_OPTIONS);
   });
+
+  // Inline-keyboard callbacks for the pause confirmation flow.
+  bot.callbackQuery(
+    [CALLBACK_PAUSE_CONFIRM, CALLBACK_PAUSE_CANCEL],
+    async (ctx) => handleCallbackQuery(ctx, { config, pause }),
+  );
 }
 
 export function createBot(deps: BotDeps): Bot {
