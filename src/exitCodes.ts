@@ -19,6 +19,10 @@
  * │      │ the Telegram API. Restarting will not help; the token must be    │
  * │      │ replaced before restart.                                         │
  * ├──────┼──────────────────────────────────────────────────────────────────┤
+ * │  4   │ CLI usage error: bad arguments, malformed base64, or invalid     │
+ * │      │ XDR passed to the offline decode CLI. Restarting will not help;  │
+ * │      │ fix the invocation or input.                                     │
+ * ├──────┼──────────────────────────────────────────────────────────────────┤
  * │  3   │ Persistent Stellar RPC failure: the consecutive-failure counter  │
  * │      │ reached CONSECUTIVE_FAILURE_EXIT_THRESHOLD. The process exits    │
  * │      │ deliberately so the supervisor can restart it with a clean       │
@@ -37,3 +41,4 @@ export const EXIT_OK = 0;
 export const EXIT_ERROR = 1;
 export const EXIT_BAD_TOKEN = 2;
 export const EXIT_RPC_PERSISTENT = 3;
+export const EXIT_USAGE = 4;

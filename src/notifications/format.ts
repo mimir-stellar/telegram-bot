@@ -24,11 +24,14 @@ import {
   winnerSideLabel,
   type DecodedEvent,
 } from "../stellar/decode.js";
+import { appUrlFor } from "./app-links.js";
 import { groupDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
+import { settlementLines } from "./settlement.js";
 import type { StellarConfig } from "../config.js";
 import {
   EXPLORER_BUTTON_TEXT,
+  MIMIR_APP_BUTTON_TEXT,
   NOTIFICATION_MD,
   NOTIFICATION_PLAIN,
 } from "../i18n.js";
@@ -249,21 +252,37 @@ export interface ExplorerKeyboard {
 }
 
 /**
+ * Config the keyboard builder reads: the chain fields `eventExplorerUrl`
+ * needs, plus the optional Mimir web-app origin (`MIMIR_APP_URL`) that adds a
+ * second button. Optional here so a chain-only config keeps building the
+ * explorer-only keyboard it has always built.
+ */
+export type KeyboardConfig = StellarConfig & { mimirAppUrl?: string | null };
+
+/**
  * Telegram inline keyboard for an event notification.
  *
- * Returns undefined when the event carries no usable transaction hash, so the
- * caller sends the existing text-only message unchanged. The button reuses the
- * same canonical explorer URL as the `· [tx](…)` footer link — the footer stays
- * as the text fallback, the button is progressive enhancement in the same
- * Telegram request (no second message, no extra rate-limit cost).
+ * Returns undefined when the event carries no usable transaction hash and no
+ * Mimir app page, so the caller sends the existing text-only message
+ * unchanged. The explorer button reuses the same canonical explorer URL as the
+ * `· [tx](…)` footer link — the footer stays as the text fallback, the button
+ * is progressive enhancement in the same Telegram request (no second message,
+ * no extra rate-limit cost). When `config.mimirAppUrl` is set and the event
+ * maps to an app page, the "Open in Mimir" button joins the same row.
  */
 export function explorerKeyboard(
-  config: StellarConfig,
+  config: KeyboardConfig,
   event: DecodedEvent,
 ): ExplorerKeyboard | undefined {
-  const url = eventExplorerUrl(config, event);
-  if (!url) return undefined;
-  return { inline_keyboard: [[{ text: EXPLORER_BUTTON_TEXT, url }]] };
+  const buttons: ExplorerButton[] = [];
+  const explorerUrl = eventExplorerUrl(config, event);
+  if (explorerUrl) buttons.push({ text: EXPLORER_BUTTON_TEXT, url: explorerUrl });
+
+  const appUrl = appUrlFor(event, config.mimirAppUrl);
+  if (appUrl) buttons.push({ text: MIMIR_APP_BUTTON_TEXT, url: appUrl });
+
+  if (buttons.length === 0) return undefined;
+  return { inline_keyboard: [buttons] };
 }
 
 /** Format the latest observed event, including events with no notification template. */
@@ -381,13 +400,16 @@ function headline(event: DecodedEvent): string | null {
     case "claim_cancelled":
       return NOTIFICATION_MD.claimCancelled(String(p.claimId));
 
-    case "market_settled":
+    case "market_settled": {
+      const lines = settlementLines(p).map(escapeMd);
       return NOTIFICATION_MD.marketSettled(
         String(p.claimId),
         usdc(p.totalPaid),
         usdc(p.totalFees),
         usdc(p.owedToChallengers),
+        lines,
       );
+    }
 
     case "challenger_paid":
       return NOTIFICATION_MD.challengerPaid(
@@ -561,13 +583,16 @@ function plainHeadline(event: DecodedEvent): string | null {
     case "claim_cancelled":
       return NOTIFICATION_PLAIN.claimCancelled(p.claimId);
 
-    case "market_settled":
+    case "market_settled": {
+      const lines = settlementLines(p);
       return NOTIFICATION_PLAIN.marketSettled(
         p.claimId,
         plainUsdc(p.totalPaid),
         plainUsdc(p.totalFees),
         plainUsdc(p.owedToChallengers),
+        lines,
       );
+    }
 
     case "challenger_paid":
       return NOTIFICATION_PLAIN.challengerPaid(

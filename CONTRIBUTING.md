@@ -7,7 +7,8 @@ signs nothing.
 
 ## Prerequisites
 
-- **Node.js >= 20** (the `engines.node` field in `package.json`).
+- **Node.js >= 20** (the `engines.node` field in `package.json`); production runs on
+  Node 22, pinned in `.nvmrc`.
 - A local checkout of this repository.
 - **No credentials required to develop or test.** The automated suite never calls the
   live Testnet RPC or the Telegram API; fixture and mock profiles are credential-free.
@@ -17,6 +18,7 @@ signs nothing.
 ## Setup
 
 ```bash
+nvm use   # optional: selects Node 22 from .nvmrc
 npm ci
 ```
 
@@ -37,6 +39,16 @@ npm run build         # compile src/ -> dist/
 npm test              # build, then run every tests/*.test.mjs with node's built-in runner
 ```
 
+### Pre-commit hook (optional)
+
+Catch tokens locally before committing:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This opt-in hook runs `scripts/pre-commit.mjs` on staged files prior to each commit.
+
 - `npm test` builds `src/` into `dist/` and then runs all suites
   (`tests/*.test.mjs`). It needs no network credentials.
 - To run only the local-mock suites (`tests/mock-*.test.mjs`):
@@ -46,6 +58,9 @@ npm run test:mock
 ```
 
 ### Local mock profile (no Testnet or Telegram)
+
+For a five-minute quickstart walking through the mock RPC, scanner, and rendered
+notifications without tokens, see [docs/quickstart-mock.md](docs/quickstart-mock.md).
 
 Rehearse failure drills against a loopback Soroban mock instead of live services:
 
@@ -95,5 +110,6 @@ table.
 
 - `src/` — the TypeScript source (config, RPC client, decoder, poller, bot, audit).
 - `tests/` — Node built-in test runner suites compiled against `dist/`.
+- `docs/quickstart-mock.md` — five-minute quickstart using the local mock RPC.
 - `docs/contributor-fixtures.md` — credential-free fixture guide and failure modes.
 - `.env.example` — the documented runtime settings (not required for testing).
