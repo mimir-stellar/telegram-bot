@@ -26,6 +26,7 @@ import {
 } from "../stellar/decode.js";
 import { groupDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
+import { sanitizeUserText } from "./sanitize.js";
 import type { StellarConfig } from "../config.js";
 import {
   EXPLORER_BUTTON_TEXT,
@@ -359,7 +360,7 @@ function headline(event: DecodedEvent): string | null {
     case "claim_created":
       return NOTIFICATION_MD.claimCreated(
         String(p.claimId),
-        escapeMd(clip(p.category)),
+        escapeMd(clip(sanitizeUserText(p.category))),
         who(p.creator),
       );
 
@@ -375,7 +376,7 @@ function headline(event: DecodedEvent): string | null {
         String(p.claimId),
         escapeMd(winnerSideLabel(p.winnerSide)),
         escapeMd(confidenceIndicator(p.confidence)),
-        p.summary ? escapeMd(clip(p.summary)) : null,
+        p.summary ? escapeMd(clip(sanitizeUserText(p.summary))) : null,
       );
 
     case "claim_cancelled":
@@ -412,7 +413,7 @@ function headline(event: DecodedEvent): string | null {
     case "market_created":
       return NOTIFICATION_MD.marketCreated(
         String(p.marketId),
-        escapeMd(clip(p.question)),
+        escapeMd(clip(sanitizeUserText(p.question))),
         who(p.captain),
         escapeMd(String(p.feeBps)),
         escapeMd(new Date(p.deadline * 1000).toISOString()),
@@ -541,7 +542,11 @@ function plainHeadline(event: DecodedEvent): string | null {
   switch (p.name) {
     // ── mimir-market ────────────────────────────────────────────────────────
     case "claim_created":
-      return NOTIFICATION_PLAIN.claimCreated(p.claimId, clip(p.category), plainWho(p.creator));
+      return NOTIFICATION_PLAIN.claimCreated(
+        p.claimId,
+        clip(sanitizeUserText(p.category)),
+        plainWho(p.creator),
+      );
 
     case "claim_challenged":
       return NOTIFICATION_PLAIN.claimChallenged(
@@ -555,7 +560,7 @@ function plainHeadline(event: DecodedEvent): string | null {
         p.claimId,
         winnerSideLabel(p.winnerSide),
         confidenceIndicator(p.confidence),
-        p.summary ? clip(p.summary) : null,
+        p.summary ? clip(sanitizeUserText(p.summary)) : null,
       );
 
     case "claim_cancelled":
@@ -592,7 +597,7 @@ function plainHeadline(event: DecodedEvent): string | null {
     case "market_created":
       return NOTIFICATION_PLAIN.marketCreated(
         p.marketId,
-        clip(p.question),
+        clip(sanitizeUserText(p.question)),
         plainWho(p.captain),
         String(p.feeBps),
         new Date(p.deadline * 1000).toISOString(),
