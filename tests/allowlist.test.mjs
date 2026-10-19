@@ -64,6 +64,9 @@ function makeConfig(allowedChatIds = []) {
 function makeStatus() {
   return {
     running: true,
+    startedAt: Date.now(),
+    lastSuccessAt: null,
+    chainClockAt: null,
     cycles: 0,
     latestLedger: 1000,
     oldestLedger: 900,
@@ -351,3 +354,32 @@ test("config: single numeric id (positive) is valid", async () => {
 
   assert.deepEqual(config.allowedChatIds, ["123456789"]);
 });
+
+// /health, /contracts and /preview expose deployment details just like /status,
+// so they share its ALLOWED_CHAT_IDS gate.
+for (const command of ["health", "contracts", "preview"]) {
+  test(`/${command} is silently ignored for a chat not in the allowlist`, async () => {
+    const config = makeConfig(["-1001234567890"]);
+    const bot = createBot({ config, status: makeStatus, botInfo: FAKE_BOT_INFO });
+
+    const replies = await dispatchCommand(bot, command, -9999999999);
+    assert.equal(replies.length, 0, `/${command} must not reply to a blocked chat`);
+  });
+
+  test(`/${command} replies to a chat in the allowlist`, async () => {
+    const allowedId = -1001234567890;
+    const config = makeConfig([String(allowedId)]);
+    const bot = createBot({ config, status: makeStatus, botInfo: FAKE_BOT_INFO });
+
+    const replies = await dispatchCommand(bot, command, allowedId);
+    assert.equal(replies.length, 1, `/${command} should reply to an allowed chat`);
+  });
+
+  test(`/${command} replies to any chat when the allowlist is empty`, async () => {
+    const config = makeConfig([]);
+    const bot = createBot({ config, status: makeStatus, botInfo: FAKE_BOT_INFO });
+
+    const replies = await dispatchCommand(bot, command, -9876543210);
+    assert.equal(replies.length, 1, `/${command} should reply when the allowlist is open`);
+  });
+}

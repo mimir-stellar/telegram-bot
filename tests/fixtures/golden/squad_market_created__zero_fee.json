@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "squad",
+    "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5038,
+    "txHash": "",
+    "at": 1724005038,
+    "eventId": "5038-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "market_created",
+      "marketId": 3,
+      "captain": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "deadline": 1000000000,
+      "feeBps": 0,
+      "question": "Zero fee market"
+    }
+  },
+  "md": "🆕 *New squad market* \\#3\nZero fee market\nCaptain: `GABCD…TUVW` · fee 0 bps · deadline 2001\\-09\\-09T01:46:40\\.000Z\n_ledger 5038_",
+  "plain": "New squad market #3\nZero fee market\nCaptain: GABCD…TUVW · fee 0 bps · deadline 2001-09-09T01:46:40.000Z\nledger 5038"
+}

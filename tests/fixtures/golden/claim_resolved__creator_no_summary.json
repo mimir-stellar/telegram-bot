@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5010,
+    "txHash": "",
+    "at": 1724005010,
+    "eventId": "5010-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_resolved",
+      "claimId": 21,
+      "winnerSide": 1,
+      "summary": "",
+      "confidence": 100,
+      "evidenceHash": "cafecafe"
+    }
+  },
+  "md": "⚖️ *Claim \\#21 resolved* — winner: *creator*\nConfidence: ██████████ 100%\n_ledger 5010_",
+  "plain": "Claim #21 resolved — winner: creator\nConfidence: ██████████ 100%\nledger 5010"
+}

@@ -1,0 +1,23 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5007,
+    "txHash": "",
+    "at": 1724005007,
+    "eventId": "5007-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_challenged",
+      "claimId": 12,
+      "challenger": "GCAPTAINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "stake": "1"
+    }
+  },
+  "md": "⚔️ *Claim \\#12 challenged*\nStake: *0\\.0000001 USDC*\nChallenger: `GCAPT…AAAA`\n_ledger 5007_",
+  "plain": "Claim #12 challenged\nStake: 0.0000001 USDC\nChallenger: GCAPT…AAAA\nledger 5007"
+}

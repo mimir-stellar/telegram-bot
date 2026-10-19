@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5013,
+    "txHash": "",
+    "at": 1724005013,
+    "eventId": "5013-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_resolved",
+      "claimId": 24,
+      "winnerSide": 4,
+      "summary": "",
+      "confidence": 0,
+      "evidenceHash": ""
+    }
+  },
+  "md": "⚖️ *Claim \\#24 resolved* — winner: *unresolvable*\nConfidence: ░░░░░░░░░░ 0%\n_ledger 5013_",
+  "plain": "Claim #24 resolved — winner: unresolvable\nConfidence: ░░░░░░░░░░ 0%\nledger 5013"
+}
