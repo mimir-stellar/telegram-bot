@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5009,
+    "txHash": "",
+    "at": 1724005009,
+    "eventId": "5009-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_resolved",
+      "claimId": 20,
+      "winnerSide": 2,
+      "summary": "Onchain data confirms the claim — challengers win.",
+      "confidence": 95,
+      "evidenceHash": "deadbeef01234567"
+    }
+  },
+  "md": "⚖️ *Claim \\#20 resolved* — winner: *challengers*\nConfidence: ██████████ 95%\n_Onchain data confirms the claim — challengers win\\._\n_ledger 5009_",
+  "plain": "Claim #20 resolved — winner: challengers\nConfidence: ██████████ 95%\nOnchain data confirms the claim — challengers win.\nledger 5009"
+}

@@ -9,13 +9,41 @@ import { createPoller } from "../dist/poller.js";
 
 const VALID_ACCOUNT = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 const CURSOR_1999 = `${1999n << 32n}-1`;
+const MARKET_ID = "CAP3GIE7KQDU4NOEF2UPNP7YRH2ARA6KBXXFV73RNBVEGMRCIKT4BBNF";
+const SQUAD_ID = "CADTGYRIPLZRIZBQVYT7ZD6K5LG5CSLLEX53WIG5NXJLTUSEYN7ATYAQ";
+
+// Every poller a test starts is stopped even when an assertion fails first;
+// a leaked poller keeps rescheduling itself and the runner never exits.
+const livePollers = new Set();
+const realCreatePoller = createPoller;
+function trackedPoller(deps) {
+  const poller = realCreatePoller(deps);
+  livePollers.add(poller);
+  return poller;
+}
+/** Poll `predicate` until it holds or `timeoutMs` elapses (no fixed sleeps). */
+async function waitFor(predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+const marketCursor = (poller) =>
+  poller.status().targets.find((t) => t.source === "market")?.cursor;
+
+test.afterEach(async () => {
+  const pollers = [...livePollers];
+  livePollers.clear();
+  await Promise.all(pollers.map((p) => p.stop()));
+});
 
 function mockConfig(cursorFile) {
   return {
     botToken: "test-token",
     chatId: "-1001234567890",
-    marketContractId: "CCONTRACTMARKET",
-    squadContractId: "CCONTRACTSQUAD",
+    marketContractId: MARKET_ID,
+    squadContractId: SQUAD_ID,
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
@@ -26,6 +54,7 @@ function mockConfig(cursorFile) {
     maxNotificationsPerCycle: 10,
     sendSpacingMs: 0,
     initialBackoffMs: 1,
+    sendTimeoutMs: 50,
   };
 }
 
@@ -60,7 +89,7 @@ test("poller initializes and handles cold start when cursor file is missing", as
   const sent = [];
   const send = async (msg) => { sent.push(msg); };
 
-  const poller = createPoller({ config, server, send });
+  const poller = trackedPoller({ config, server, send });
   await poller.start();
   const status = poller.status();
 
@@ -84,7 +113,7 @@ test("poller persists cursor upon successful cycle and reloads upon restart", as
   });
 
   const send = async () => {};
-  const poller = createPoller({ config, server, send });
+  const poller = trackedPoller({ config, server, send });
   await poller.start();
 
   await new Promise((resolve) => setTimeout(resolve, 100));
@@ -95,7 +124,7 @@ test("poller persists cursor upon successful cycle and reloads upon restart", as
   assert.equal(saved.version, 1);
   assert.equal(saved.targets.market.cursor, CURSOR_1999);
 
-  const poller2 = createPoller({ config, server, send });
+  const poller2 = trackedPoller({ config, server, send });
   await poller2.start();
   const status2 = poller2.status();
   const marketTarget = status2.targets.find((t) => t.source === "market");
@@ -121,7 +150,7 @@ test("poller continues and does not lose cursor state during transient RPC failu
     },
   };
 
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = trackedPoller({ config, server, send: async () => {} });
   await poller.start();
   await new Promise((r) => setTimeout(r, 80));
 
@@ -156,7 +185,7 @@ test("poller logs and handles Telegram send retries/failures without stalling cu
       return {
         events: [
           {
-            contractId: req.filters?.[0]?.contractIds?.[0] ?? "CCONTRACTMARKET",
+            contractId: req.filters?.[0]?.contractIds?.[0] ?? MARKET_ID,
             ledger: 100,
             txHash: "0x1234",
             ledgerClosedAt: "2026-01-01T00:00:00Z",
@@ -175,7 +204,7 @@ test("poller logs and handles Telegram send retries/failures without stalling cu
     throw new Error("Telegram 429 Too Many Requests");
   };
 
-  const poller = createPoller({ config, server, send, sendOptions: { sendSpacingMs: 0, initialBackoffMs: 10 } });
+  const poller = trackedPoller({ config, server, send, sendOptions: { sendSpacingMs: 0, initialBackoffMs: 10 } });
   await poller.start();
   await new Promise((r) => setTimeout(r, 200));
 
@@ -185,6 +214,280 @@ test("poller logs and handles Telegram send retries/failures without stalling cu
   assert.equal(marketTarget.cursor, CURSOR_1999);
 
   poller.stop();
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+});
+
+test("poller times out a hung Telegram send and continues without stalling cursor", async () => {
+  const dir = await mkdtemp(path.join(tmp.tmpdir(), "poller-test-"));
+  const cursorFile = path.join(dir, "cursor.json");
+  const config = { ...mockConfig(cursorFile), sendTimeoutMs: 40 };
+
+  const topics = [
+    xdr.ScVal.scvSymbol("claim_created"),
+    nativeToScVal(1),
+    nativeToScVal(VALID_ACCOUNT),
+  ];
+  const value = nativeToScVal({ category: "crypto" });
+
+  const server = mockServer({
+    getEvents: async (req) => {
+      if (req.cursor) {
+        return { events: [], latestLedger: 2000, cursor: req.cursor };
+      }
+      return {
+        events: [
+          {
+            contractId: req.filters?.[0]?.contractIds?.[0] ?? MARKET_ID,
+            ledger: 100,
+            txHash: "0x1234",
+            ledgerClosedAt: "2026-01-01T00:00:00Z",
+            id: "100-1",
+            topic: topics,
+            value,
+          },
+        ],
+        latestLedger: 2000,
+        cursor: CURSOR_1999,
+      };
+    },
+  });
+
+  let sendStarted = false;
+  const send = async () => {
+    sendStarted = true;
+    await new Promise(() => {});
+  };
+
+  const poller = trackedPoller({ config, server, send, sendOptions: { initialBackoffMs: 1 } });
+  await poller.start();
+  await waitFor(() => marketCursor(poller) === CURSOR_1999);
+
+  assert.equal(sendStarted, true, "send should have been attempted");
+  const status = poller.status();
+  assert.ok(status.notificationsFailed >= 1, "timed out send should count as a failure");
+  const marketTarget = status.targets.find((t) => t.source === "market");
+  assert.equal(marketTarget.cursor, CURSOR_1999, "cursor should advance despite send timeout");
+
+  poller.stop();
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+});
+
+test("poller send timeout is bounded and does not leak pending timers across cycles", async () => {
+  const dir = await mkdtemp(path.join(tmp.tmpdir(), "poller-test-"));
+  const cursorFile = path.join(dir, "cursor.json");
+  const config = { ...mockConfig(cursorFile), pollIntervalMs: 30, sendTimeoutMs: 20 };
+
+  const topics = [
+    xdr.ScVal.scvSymbol("claim_created"),
+    nativeToScVal(1),
+    nativeToScVal(VALID_ACCOUNT),
+  ];
+  const value = nativeToScVal({ category: "crypto" });
+
+  let cycle = 0;
+  const server = mockServer({
+    getEvents: async (req) => {
+      if (req.cursor) {
+        return { events: [], latestLedger: 2000, cursor: req.cursor };
+      }
+      cycle++;
+      return {
+        events: [
+          {
+            contractId: req.filters?.[0]?.contractIds?.[0] ?? MARKET_ID,
+            ledger: 100,
+            txHash: `0x${cycle}`,
+            ledgerClosedAt: "2026-01-01T00:00:00Z",
+            id: `100-${cycle}`,
+            topic: topics,
+            value,
+          },
+        ],
+        latestLedger: 2000,
+        cursor: CURSOR_1999,
+      };
+    },
+  });
+
+  const send = async () => {
+    await new Promise(() => {});
+  };
+
+  const poller = trackedPoller({ config, server, send, sendOptions: { initialBackoffMs: 1 } });
+  await poller.start();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const status = poller.status();
+  assert.ok(status.notificationsFailed >= 1);
+  assert.equal(status.running, true, "poller should remain running after send timeouts");
+
+  poller.stop();
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+});
+
+test("poller respects sendTimeoutMs override via sendOptions", async () => {
+  const dir = await mkdtemp(path.join(tmp.tmpdir(), "poller-test-"));
+  const cursorFile = path.join(dir, "cursor.json");
+  const config = { ...mockConfig(cursorFile), sendTimeoutMs: 5000 };
+
+  const topics = [
+    xdr.ScVal.scvSymbol("claim_created"),
+    nativeToScVal(1),
+    nativeToScVal(VALID_ACCOUNT),
+  ];
+  const value = nativeToScVal({ category: "crypto" });
+
+  const server = mockServer({
+    getEvents: async (req) => {
+      if (req.cursor) {
+        return { events: [], latestLedger: 2000, cursor: req.cursor };
+      }
+      return {
+        events: [
+          {
+            contractId: req.filters?.[0]?.contractIds?.[0] ?? MARKET_ID,
+            ledger: 100,
+            txHash: "0x1234",
+            ledgerClosedAt: "2026-01-01T00:00:00Z",
+            id: "100-1",
+            topic: topics,
+            value,
+          },
+        ],
+        latestLedger: 2000,
+        cursor: CURSOR_1999,
+      };
+    },
+  });
+
+  const send = async () => {
+    await new Promise(() => {});
+  };
+
+  const poller = trackedPoller({
+    config,
+    server,
+    send,
+    sendOptions: { sendTimeoutMs: 30, sendSpacingMs: 0, initialBackoffMs: 1 },
+  });
+  await poller.start();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const status = poller.status();
+  assert.ok(status.notificationsFailed >= 1, "override timeout should fire");
+
+  poller.stop();
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+});
+
+test("poller send timeout does not fire when send resolves before deadline", async () => {
+  const dir = await mkdtemp(path.join(tmp.tmpdir(), "poller-test-"));
+  const cursorFile = path.join(dir, "cursor.json");
+  const config = { ...mockConfig(cursorFile), sendTimeoutMs: 500 };
+
+  const topics = [
+    xdr.ScVal.scvSymbol("claim_created"),
+    nativeToScVal(1),
+    nativeToScVal(VALID_ACCOUNT),
+  ];
+  const value = nativeToScVal({ category: "crypto" });
+
+  const server = mockServer({
+    getEvents: async (req) => {
+      if (req.cursor) {
+        return { events: [], latestLedger: 2000, cursor: req.cursor };
+      }
+      return {
+        events: [
+          {
+            contractId: req.filters?.[0]?.contractIds?.[0] ?? MARKET_ID,
+            ledger: 100,
+            txHash: "0x1234",
+            ledgerClosedAt: "2026-01-01T00:00:00Z",
+            id: "100-1",
+            topic: topics,
+            value,
+          },
+        ],
+        latestLedger: 2000,
+        cursor: CURSOR_1999,
+      };
+    },
+  });
+
+  const sent = [];
+  const send = async (msg) => {
+    sent.push(msg);
+  };
+
+  const poller = trackedPoller({ config, server, send, sendOptions: { initialBackoffMs: 1 } });
+  await poller.start();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const status = poller.status();
+  assert.ok(sent.length >= 1, "send should have completed");
+  assert.equal(status.notificationsFailed, 0, "no failures expected for fast send");
+
+  poller.stop();
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+});
+
+test("poller send timeout preserves cursor across restart", async () => {
+  const dir = await mkdtemp(path.join(tmp.tmpdir(), "poller-test-"));
+  const cursorFile = path.join(dir, "cursor.json");
+  const config = { ...mockConfig(cursorFile), sendTimeoutMs: 30 };
+
+  const topics = [
+    xdr.ScVal.scvSymbol("claim_created"),
+    nativeToScVal(1),
+    nativeToScVal(VALID_ACCOUNT),
+  ];
+  const value = nativeToScVal({ category: "crypto" });
+
+  const server = mockServer({
+    getEvents: async (req) => {
+      if (req.cursor) {
+        return { events: [], latestLedger: 2000, cursor: req.cursor };
+      }
+      return {
+        events: [
+          {
+            contractId: req.filters?.[0]?.contractIds?.[0] ?? MARKET_ID,
+            ledger: 100,
+            txHash: "0x1234",
+            ledgerClosedAt: "2026-01-01T00:00:00Z",
+            id: "100-1",
+            topic: topics,
+            value,
+          },
+        ],
+        latestLedger: 2000,
+        cursor: CURSOR_1999,
+      };
+    },
+  });
+
+  const send = async () => {
+    await new Promise(() => {});
+  };
+
+  const poller = trackedPoller({ config, server, send, sendOptions: { initialBackoffMs: 1 } });
+  await poller.start();
+  await waitFor(() => marketCursor(poller) === CURSOR_1999);
+  await poller.shutdown({ timeoutMs: 1000 });
+
+  const savedRaw = await readFile(cursorFile, "utf8");
+  const saved = JSON.parse(savedRaw);
+  assert.equal(saved.version, 1);
+  assert.equal(saved.targets.market.cursor, CURSOR_1999);
+
+  const poller2 = trackedPoller({ config, server, send: async () => {} });
+  await poller2.start();
+  const status2 = poller2.status();
+  const marketTarget = status2.targets.find((t) => t.source === "market");
+  assert.equal(marketTarget.cursor, CURSOR_1999);
+  poller2.stop();
+
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -202,7 +505,7 @@ test("poller circuit breaker opens after consecutive RPC failures", async () => 
     },
   };
 
-  const poller = createPoller({
+  const poller = trackedPoller({
     config,
     server,
     send: async () => {},
@@ -236,7 +539,7 @@ test("poller circuit breaker skips RPC calls when open", async () => {
     },
   };
 
-  const poller = createPoller({
+  const poller = trackedPoller({
     config,
     server,
     send: async () => {},
@@ -280,7 +583,7 @@ test("poller circuit breaker closes after cooldown and successful RPC", async ()
     },
   };
 
-  const poller = createPoller({
+  const poller = trackedPoller({
     config,
     server,
     send: async () => {},
@@ -324,7 +627,7 @@ test("poller circuit breaker resets on successful RPC before threshold", async (
     },
   };
 
-  const poller = createPoller({
+  const poller = trackedPoller({
     config,
     server,
     send: async () => {},

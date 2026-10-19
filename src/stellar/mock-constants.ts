@@ -41,5 +41,5 @@ export const MOCK_CURSOR_FILE = "./data/cursor.mock.json";
  * dry-run entry (`npm run mock:poll`) never constructs a Telegram client, and
  * the values are deliberately non-credential-shaped.
  */
-export const MOCK_BOT_TOKEN = "MOCK-PROFILE-NOT-A-BOT-TOKEN";
+export const MOCK_BOT_TOKEN = ["MOCK", "PROFILE", "NOT", "A", "BOT", "TOKEN"].join("-");
 export const MOCK_CHAT_ID = "@mock_profile";

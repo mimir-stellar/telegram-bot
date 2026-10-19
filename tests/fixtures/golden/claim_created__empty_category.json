@@ -1,0 +1,23 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5001,
+    "txHash": "",
+    "at": 1724005001,
+    "eventId": "5001-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_created",
+      "claimId": 2,
+      "creator": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "category": ""
+    }
+  },
+  "md": "🆕 *New claim* \\#2\nCategory: \nCreator: `GABCD…TUVW`\n_ledger 5001_",
+  "plain": "New claim #2\nCategory: \nCreator: GABCD…TUVW\nledger 5001"
+}

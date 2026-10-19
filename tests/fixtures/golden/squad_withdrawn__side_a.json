@@ -1,0 +1,24 @@
+{
+  "event": {
+    "source": "squad",
+    "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5045,
+    "txHash": "",
+    "at": 1724005045,
+    "eventId": "5045-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "withdrawn",
+      "marketId": 1,
+      "side": 1,
+      "participant": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "amount": "5000000"
+    }
+  },
+  "md": "➖ *Squad \\#1* — `GABCD…TUVW` pulled 0\\.5000000 USDC from Side A\n_ledger 5045_",
+  "plain": "Squad #1 — GABCD…TUVW pulled 0.5000000 USDC from Side A\nledger 5045"
+}

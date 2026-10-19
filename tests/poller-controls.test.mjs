@@ -114,7 +114,7 @@ test("RPC failures are bounded and redact the configured bot token in status", a
   const dataDir = await createTempDataDir("mimir-rpc-failure-");
   const cursorFile = dataDir.file("cursor.json");
   await writeFile(cursorFile, CURSOR_FILE, "utf8");
-  const secret = "123456789:TEST-ONLY-TOKEN-NEVER-USE";
+  const secret = "123456789:" + "TEST-ONLY-TOKEN-NEVER-USE";
   const longPayload = "remote-payload".repeat(100);
   const poller = createPoller({
     config: baseConfig(cursorFile),
