@@ -540,6 +540,8 @@ export interface BotDeps {
   botInfo?: UserFromGetMe;
   /** Bounded redacted log ring backing /export. Absent = command disabled. */
   logs?: LogCapture | undefined;
+  /** Bounded recent events store for answering inline queries. */
+  recentEvents?: RecentEventsStore | undefined;
 }
 
 /**
@@ -894,6 +896,20 @@ export function registerCallbackHandlers(
     },
   );
 }
+ 
+/** Register inline query handler on a grammy-compatible bot. */
+export function registerInlineQueryHandler(
+  bot: Bot | { on: (event: string, handler: (ctx: Context) => Promise<void>) => void },
+  deps: BotDeps,
+): void {
+  const store = deps.recentEvents ?? new RecentEventsStore();
+  (bot as { on: (event: string, handler: (ctx: Context) => Promise<void>) => void }).on(
+    "inline_query",
+    async (ctx: Context) => {
+      await handleInlineQuery(ctx, store, deps.config);
+    },
+  );
+}
 
 export function createBot(deps: BotDeps): Bot {
   const bot = new Bot(
@@ -902,6 +918,8 @@ export function createBot(deps: BotDeps): Bot {
   );
   registerCommandHandlers(bot, deps);
   registerCallbackHandlers(bot, deps);
+  const recentEventsStore = deps.recentEvents ?? new RecentEventsStore();
+  bot.on("inline_query", async (ctx) => { await handleInlineQuery(ctx, recentEventsStore, deps.config); });
   const { config, status, logs } = deps;
 
   bot.command("export", async (ctx) => {

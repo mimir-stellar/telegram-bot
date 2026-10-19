@@ -149,6 +149,22 @@ is operator-only. Repeated `/pause` or `/resume` commands
 are idempotent. Control state is process-local: a restart resumes polling and
 loads the existing version-1 cursor file.
 
+## Inline Queries
+
+Users can type `@bot <claimId>` or `@bot <text>` in any Telegram chat to share recent claims and market summaries.
+
+- `@bot 42` returns recent events matching claim or market `#42`.
+- `@bot sports` searches across recent event payloads (category, question, etc.).
+- `@bot` (empty or whitespace) returns the latest delivered events.
+
+### Enabling Inline Mode in BotFather
+
+To enable inline queries for the bot:
+1. Open [@BotFather](https://t.me/BotFather) in Telegram.
+2. Send `/setinline`.
+3. Select your bot.
+4. Set the placeholder text (for example: `Search claims or markets...`).
+
 ## Machine-readable status snapshot
 
 `/status` is for a human in the chat. For a supervisor, a dashboard, or a shell

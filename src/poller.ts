@@ -61,6 +61,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 import type { Metrics } from "./metrics.js";
 import type { SendExtra } from "./bot.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
+import type { RecentEventsStore } from "./commands/inline.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
 import { EventDedupWindow } from "./dedup.js";
 import {
@@ -427,6 +428,8 @@ export interface PollerDeps {
    * default; disable for in-memory-only auditing (ephemeral tooling, tests).
    */
   persistAudit?: boolean | undefined;
+  /** Bounded store for recently delivered events used by inline queries. */
+  recentEvents?: RecentEventsStore | undefined;
   sendOptions?: SendOptions;
   /** Per-target RPC backoff configuration */
   targetBackoffOptions?: TargetBackoffOptions;
@@ -1778,6 +1781,7 @@ export function createPoller(deps: PollerDeps) {
         status.notificationsSent += 1;
         metrics?.notificationsSent.inc();
         sentThisCycle += 1;
+        deps.recentEvents?.add(event);
       } catch (err) {
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a

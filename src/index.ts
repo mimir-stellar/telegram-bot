@@ -24,7 +24,7 @@ import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
 import { attachConsole, createLogCapture, Logger, secretsFor } from "./logger.js";
-import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
+import { createBot, createNotifier, registerCommands, RecentEventsStore, type SendExtra } from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
@@ -251,12 +251,14 @@ async function main(): Promise<void> {
       detail: `network=${networkLabel(config)} poll=${config.pollIntervalMs}ms`,
     }),
   );
+  const recentEvents = new RecentEventsStore();
   const poller = createPoller({
     config,
     server,
     send: (text, source, extra) => notify(text, source, extra),
     audit,
     metrics,
+    recentEvents,
   });
   const bot = createBot({
     config,
@@ -265,6 +267,7 @@ async function main(): Promise<void> {
     pause: () => poller.pause(),
     resume: () => poller.resume(),
     logs: logCapture,
+    recentEvents,
   });
   notify = createNotifier(bot, config);
 
