@@ -271,6 +271,12 @@ export interface BotConfig extends StellarConfig {
   logBufferLines: number;
   /** Optional public URL to run the bot in webhook mode instead of long-polling. */
   telegramWebhookUrl: string | null;
+  /**
+   * Optional Mimir web-app origin (MIMIR_APP_URL) behind the "Open in Mimir"
+   * notification button; null leaves the keyboard explorer-only. Validated as
+   * an https URL at load time.
+   */
+  mimirAppUrl: string | null;
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
@@ -458,6 +464,28 @@ function collector(profile: Record<string, string>) {
         }
       } catch {
         problems.push(`${name} is not a valid URL; got "${value}"`);
+      }
+      return value;
+    },
+
+    /**
+     * Parse an optional https-only URL. Returns `null` when unset, and also
+     * when the value is unusable — a Telegram button must never carry an
+     * off-site or plain-http origin, so the problem is reported and the link
+     * stays disabled instead of being downgraded.
+     */
+    optionalHttpsUrl(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
+      try {
+        const parsed = new URL(value);
+        if (parsed.protocol !== "https:") {
+          problems.push(`${name} must be an https URL; got "${value}"`);
+          return null;
+        }
+      } catch {
+        problems.push(`${name} is not a valid URL; got "${value}"`);
+        return null;
       }
       return value;
     },
@@ -767,6 +795,7 @@ export function loadConfig(): BotConfig {
     logSampleWindowMs: c.int("LOG_SAMPLE_WINDOW_MS", DEFAULTS.logSampleWindowMs, 1_000),
     logBufferLines: c.int("LOG_BUFFER_LINES", DEFAULTS.logBufferLines, 0),
     telegramWebhookUrl: c.optionalUrl("TELEGRAM_WEBHOOK_URL"),
+    mimirAppUrl: c.optionalHttpsUrl("MIMIR_APP_URL"),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
@@ -907,6 +936,7 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_MARKET", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_SQUAD", secret: false, hasBuiltInDefault: true },
+  { key: "MIMIR_APP_URL", secret: false },
   // Injected by a platform, never set by an operator: read only as the
   // HEALTH_PORT fallback, so it is reported for the same reason.
   { key: "PORT", secret: false },

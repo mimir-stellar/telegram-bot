@@ -293,3 +293,9 @@ export const NOTIFICATION_PLAIN = {
 
 /** Text shown on the Telegram inline keyboard button for explorer links. */
 export const EXPLORER_BUTTON_TEXT = "View on Explorer";
+
+/**
+ * Text shown on the Telegram inline keyboard button that opens the Mimir web
+ * app (see `MIMIR_APP_URL`). Absent from a keyboard when no URL is configured.
+ */
+export const MIMIR_APP_BUTTON_TEXT = "Open in Mimir";
