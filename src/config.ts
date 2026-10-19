@@ -395,6 +395,68 @@ function read(name: string): string | undefined {
   return trimmed === "" ? undefined : trimmed;
 }
 
+/**
+ * Telegram bot token shape: `<digits>:<35+ url-safe chars>`.
+ *
+ * The id part is numeric and the secret part is base64url-ish (`A-Za-z0-9_-`).
+ * Real tokens are ~46 chars total, but the secret length has grown over time,
+ * so only a lower bound is enforced.
+ */
+const BOT_TOKEN_RE = /^\d+:[A-Za-z0-9_-]{35,}$/;
+
+/** Characters that suggest a value was pasted with surrounding quotes. */
+const QUOTE_CHARS = new Set(['"', "'", "`", "\u2018", "\u2019", "\u201C", "\u201D"]);
+
+/**
+ * Explains why `BOT_TOKEN` is not a valid token, without echoing any part of
+ * it. Returns `null` when the value is well-formed.
+ *
+ * The message names the *kind* of problem (quotes, whitespace, missing colon,
+ * wrong shape) so an operator can fix it in one pass, but never includes a
+ * character of the token itself.
+ */
+function describeBotTokenProblem(raw: string): string | null {
+  if (BOT_TOKEN_RE.test(raw)) return null;
+
+  const trimmed = raw.trim();
+  const hasSurroundingWhitespace = trimmed !== raw;
+  const hasSurroundingQuotes =
+    raw.length >= 2 &&
+    QUOTE_CHARS.has(raw[0]!) &&
+    QUOTE_CHARS.has(raw[raw.length - 1]!);
+  const hasInnerWhitespace = /\s/.test(trimmed);
+
+  const hints: string[] = [];
+  if (hasSurroundingQuotes) {
+    hints.push("it is wrapped in quotes — paste the token without them");
+  }
+  if (hasSurroundingWhitespace) {
+    hints.push("it has leading or trailing whitespace — trim it");
+  }
+  if (hasInnerWhitespace) {
+    hints.push("it contains whitespace inside the value");
+  }
+
+  const colonIndex = trimmed.indexOf(":");
+  if (colonIndex === -1) {
+    hints.push("it is missing the ':' separator between the id and the secret");
+  } else if (colonIndex === 0 || colonIndex === trimmed.length - 1) {
+    hints.push("the ':' separator must sit between the id and the secret");
+  } else if (!/^\d+$/.test(trimmed.slice(0, colonIndex))) {
+    hints.push("the part before ':' must be the numeric bot id");
+  } else if (!/^[A-Za-z0-9_-]{35,}$/.test(trimmed.slice(colonIndex + 1))) {
+    hints.push(
+      "the part after ':' must be at least 35 url-safe characters (A-Z, a-z, 0-9, '_', '-')",
+    );
+  }
+
+  if (hints.length === 0) {
+    hints.push("it does not match the expected <digits>:<35+ url-safe chars> shape");
+  }
+
+  return `BOT_TOKEN is not a valid Telegram bot token: ${hints.join("; ")}`;
+}
+
 function collector(profile: Record<string, string>) {
   const problems: string[] = [];
   /** Environment first, then the active profile's defaults. */
@@ -411,6 +473,19 @@ function collector(profile: Record<string, string>) {
         problems.push(`${name} is required but not set`);
         return "";
       }
+      return value;
+    },
+
+    /**
+     * Validates `BOT_TOKEN` shape at load time so a quoted or padded paste
+     * fails fast with a clear message instead of surfacing as a `getMe`
+     * failure at startup. The message never includes any part of the token.
+     */
+    botToken(name: string): string {
+      const value = this.required(name);
+      if (value === "") return value;
+      const problem = describeBotTokenProblem(value);
+      if (problem !== null) problems.push(problem);
       return value;
     },
 
@@ -697,7 +772,7 @@ export function loadConfig(): BotConfig {
   const config: BotConfig = {
     ...stellar,
     version: APP_VERSION,
-    botToken: c.required("BOT_TOKEN"),
+    botToken: c.botToken("BOT_TOKEN"),
     chatId: chatIds[0] ?? "",
     chatIds,
     marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),

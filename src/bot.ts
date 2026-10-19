@@ -45,6 +45,87 @@ import {
 import { helpDetailMessage } from "./commands/help-detail.js";
 export { helpDetailMessage, COMMAND_DETAILS, type CommandDetail } from "./commands/help-detail.js";
 
+/**
+ * Telegram bot tokens have the shape `<digits>:<35+ url-safe chars>`.
+ * Values pasted from dashboards frequently arrive wrapped in quotes or with
+ * trailing whitespace/newlines, which only surface as a `getMe` failure at
+ * startup. Validate the shape up front and name the problem without ever
+ * echoing the token (or any part of it) into a message or log.
+ */
+export type BotTokenShapeProblem =
+  | "empty"
+  | "surrounding-quotes"
+  | "whitespace"
+  | "missing-colon"
+  | "bad-prefix"
+  | "bad-suffix"
+  | "wrong-shape";
+
+export interface BotTokenShapeResult {
+  ok: boolean;
+  problem?: BotTokenShapeProblem;
+  message?: string;
+}
+
+const BOT_TOKEN_SHAPE = /^\d+:[A-Za-z0-9_-]{35,}$/;
+
+/**
+ * Validate a `BOT_TOKEN` value without ever including the token (or any
+ * substring of it) in the returned message. The messages are intentionally
+ * generic so they are safe to log and to surface in a startup error.
+ */
+export function validateBotTokenShape(raw: unknown): BotTokenShapeResult {
+  if (typeof raw !== "string" || raw.length === 0) {
+    return {
+      ok: false,
+      problem: "empty",
+      message: "BOT_TOKEN is empty; expected <digits>:<35+ url-safe chars>.",
+    };
+  }
+
+  // Surrounding quotes are the most common paste artefact.
+  if (
+    (raw.startsWith('"') && raw.endsWith('"')) ||
+    (raw.startsWith("'") && raw.endsWith("'"))
+  ) {
+    return {
+      ok: false,
+      problem: "surrounding-quotes",
+      message:
+        "BOT_TOKEN is wrapped in quotes; remove the surrounding quotes and retry.",
+    };
+  }
+
+  // Any whitespace anywhere (leading, trailing, or embedded) is rejected.
+  if (/\s/.test(raw)) {
+    return {
+      ok: false,
+      problem: "whitespace",
+      message:
+        "BOT_TOKEN contains whitespace (leading, trailing, or embedded); trim it and retry.",
+    };
+  }
+
+  if (!raw.includes(":")) {
+    return {
+      ok: false,
+      problem: "missing-colon",
+      message: "BOT_TOKEN is missing the ':' separator; expected <digits>:<35+ url-safe chars>.",
+    };
+  }
+
+  if (!BOT_TOKEN_SHAPE.test(raw)) {
+    return {
+      ok: false,
+      problem: "wrong-shape",
+      message:
+        "BOT_TOKEN has the wrong shape; expected <digits>:<35+ url-safe chars>.",
+    };
+  }
+
+  return { ok: true };
+}
+
 /** Shared metadata for handlers, help, and Telegram's command menu. */
 export const COMMANDS = [
   { command: "start", description: COMMAND_DESCRIPTIONS.start, operatorOnly: false },
@@ -896,6 +977,13 @@ export function registerCallbackHandlers(
 }
 
 export function createBot(deps: BotDeps): Bot {
+  const tokenCheck = validateBotTokenShape(deps.config.botToken);
+  if (!tokenCheck.ok) {
+    // Never include the token (or any part of it) in the thrown error.
+    throw new Error(
+      `Invalid BOT_TOKEN (${tokenCheck.problem}): ${tokenCheck.message}`,
+    );
+  }
   const bot = new Bot(
     deps.config.botToken,
     deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined,
