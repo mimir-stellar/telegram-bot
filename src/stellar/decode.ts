@@ -25,6 +25,7 @@
  * decoding and are only converted for display, at the formatting edge.
  */
 
+import { recordDecodeOutcome } from "./decode-stats.js";
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
 import type { StellarConfig } from "../config.js";
 import { eventKey } from "../dedup.js";
@@ -1072,6 +1073,7 @@ export function decodeEvent(
   const meta: EventMeta = { ...safeMeta(source, event), version: normVersion };
 
   if (!event || !Array.isArray(event.topic)) {
+    recordDecodeOutcome(source, "", "malformed");
     return {
       ...meta,
       payload: { name: "unknown", eventName: "", reason: "missing or invalid topic array" },
@@ -1079,6 +1081,7 @@ export function decodeEvent(
   }
 
   if (event.topic.length === 0) {
+    recordDecodeOutcome(source, "", "malformed");
     return {
       ...meta,
       payload: { name: "unknown", eventName: "", reason: "empty topic array" },
@@ -1110,6 +1113,7 @@ export function decodeEvent(
     }
     if (eventName === "") {
       // Without a name no decoder can be chosen; say why instead of "no decoder".
+      recordDecodeOutcome(source, eventName, "malformed");
       return {
         ...meta,
         payload: { name: "unknown", eventName, reason: "topic[0] is not an event name string" },
@@ -1126,6 +1130,7 @@ export function decodeEvent(
       try {
         decodedValue = native(event.value);
       } catch (err) {
+        recordDecodeOutcome(source, eventName, "malformed");
         return {
           ...meta,
           payload: {
@@ -1149,9 +1154,14 @@ export function decodeEvent(
 
     const payload = decoder(eventName, topics, fields);
 
-    if (payload) return { ...meta, payload } as DecodedEvent;
+    if (payload) {
+      recordDecodeOutcome(source, eventName, isAdminPayload(payload) ? "admin" : "decoded");
+      return { ...meta, payload } as DecodedEvent;
+    }
+    recordDecodeOutcome(source, eventName, "unknown");
     return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
   } catch (err) {
+    recordDecodeOutcome(source, eventName, "malformed");
     return {
       ...meta,
       payload: {
