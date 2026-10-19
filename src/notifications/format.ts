@@ -26,6 +26,7 @@ import {
 } from "../stellar/decode.js";
 import { groupDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
+import { settlementLines } from "./settlement.js";
 import type { StellarConfig } from "../config.js";
 import {
   EXPLORER_BUTTON_TEXT,
@@ -381,13 +382,16 @@ function headline(event: DecodedEvent): string | null {
     case "claim_cancelled":
       return NOTIFICATION_MD.claimCancelled(String(p.claimId));
 
-    case "market_settled":
+    case "market_settled": {
+      const lines = settlementLines(p).map(escapeMd);
       return NOTIFICATION_MD.marketSettled(
         String(p.claimId),
         usdc(p.totalPaid),
         usdc(p.totalFees),
         usdc(p.owedToChallengers),
+        lines,
       );
+    }
 
     case "challenger_paid":
       return NOTIFICATION_MD.challengerPaid(
@@ -561,13 +565,16 @@ function plainHeadline(event: DecodedEvent): string | null {
     case "claim_cancelled":
       return NOTIFICATION_PLAIN.claimCancelled(p.claimId);
 
-    case "market_settled":
+    case "market_settled": {
+      const lines = settlementLines(p);
       return NOTIFICATION_PLAIN.marketSettled(
         p.claimId,
         plainUsdc(p.totalPaid),
         plainUsdc(p.totalFees),
         plainUsdc(p.owedToChallengers),
+        lines,
       );
+    }
 
     case "challenger_paid":
       return NOTIFICATION_PLAIN.challengerPaid(

@@ -104,8 +104,19 @@ export const NOTIFICATION_MD = {
     totalPaid: string,
     totalFees: string,
     owedToChallengers: string,
-  ): string =>
-    `💰 *Claim \\#${claimId} settled*\nPaid out: *${totalPaid}* · fees ${totalFees}\nOwed to challengers: ${owedToChallengers}`,
+    ...rest: (readonly string[] | string | undefined)[]
+  ): string => {
+    const lines = rest[0];
+    const linesPart = Array.isArray(lines)
+      ? `\n${lines.join("\n")}`
+      : typeof lines === "string" && lines.length > 0
+        ? `\n${lines}`
+        : "";
+    if (linesPart) {
+      return `💰 *Claim \\#${claimId} settled*\nPaid out: *${totalPaid}* · fees ${totalFees}${linesPart}`;
+    }
+    return `💰 *Claim \\#${claimId} settled*\nPaid out: *${totalPaid}* · fees ${totalFees}\nOwed to challengers: ${owedToChallengers}`;
+  },
 
   challengerPaid: (
     claimId: string,
@@ -211,8 +222,19 @@ export const NOTIFICATION_PLAIN = {
     totalPaid: string,
     totalFees: string,
     owedToChallengers: string,
-  ): string =>
-    `Claim #${claimId} settled\nPaid out: ${totalPaid} · fees ${totalFees}\nOwed to challengers: ${owedToChallengers}`,
+    ...rest: (readonly string[] | string | undefined)[]
+  ): string => {
+    const lines = rest[0];
+    const linesPart = Array.isArray(lines)
+      ? `\n${lines.join("\n")}`
+      : typeof lines === "string" && lines.length > 0
+        ? `\n${lines}`
+        : "";
+    if (linesPart) {
+      return `Claim #${claimId} settled\nPaid out: ${totalPaid} · fees ${totalFees}${linesPart}`;
+    }
+    return `Claim #${claimId} settled\nPaid out: ${totalPaid} · fees ${totalFees}\nOwed to challengers: ${owedToChallengers}`;
+  },
 
   challengerPaid: (
     claimId: string | number,
