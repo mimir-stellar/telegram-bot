@@ -92,7 +92,7 @@ export const NOTIFICATION_MD = {
   ): string =>
     (
       `⚖️ *Claim \\#${claimId} resolved* — winner: *${winnerSide}*\n` +
-      `Confidence: ${confidence}%\n` +
+      `Confidence: ${confidence}\n` +
       (summary ? `_${summary}_` : "")
     ).trimEnd(),
 
@@ -104,8 +104,19 @@ export const NOTIFICATION_MD = {
     totalPaid: string,
     totalFees: string,
     owedToChallengers: string,
-  ): string =>
-    `💰 *Claim \\#${claimId} settled*\nPaid out: *${totalPaid}* · fees ${totalFees}\nOwed to challengers: ${owedToChallengers}`,
+    ...rest: (readonly string[] | string | undefined)[]
+  ): string => {
+    const lines = rest[0];
+    const linesPart = Array.isArray(lines)
+      ? `\n${lines.join("\n")}`
+      : typeof lines === "string" && lines.length > 0
+        ? `\n${lines}`
+        : "";
+    if (linesPart) {
+      return `💰 *Claim \\#${claimId} settled*\nPaid out: *${totalPaid}* · fees ${totalFees}${linesPart}`;
+    }
+    return `💰 *Claim \\#${claimId} settled*\nPaid out: *${totalPaid}* · fees ${totalFees}\nOwed to challengers: ${owedToChallengers}`;
+  },
 
   challengerPaid: (
     claimId: string,
@@ -200,7 +211,7 @@ export const NOTIFICATION_PLAIN = {
     confidence: string,
     summary: string | null,
   ): string =>
-    `Claim #${claimId} resolved — winner: ${winnerSide}\nConfidence: ${confidence}%` +
+    `Claim #${claimId} resolved — winner: ${winnerSide}\nConfidence: ${confidence}` +
     (summary ? `\n${summary}` : ""),
 
   claimCancelled: (claimId: string | number): string =>
@@ -211,8 +222,19 @@ export const NOTIFICATION_PLAIN = {
     totalPaid: string,
     totalFees: string,
     owedToChallengers: string,
-  ): string =>
-    `Claim #${claimId} settled\nPaid out: ${totalPaid} · fees ${totalFees}\nOwed to challengers: ${owedToChallengers}`,
+    ...rest: (readonly string[] | string | undefined)[]
+  ): string => {
+    const lines = rest[0];
+    const linesPart = Array.isArray(lines)
+      ? `\n${lines.join("\n")}`
+      : typeof lines === "string" && lines.length > 0
+        ? `\n${lines}`
+        : "";
+    if (linesPart) {
+      return `Claim #${claimId} settled\nPaid out: ${totalPaid} · fees ${totalFees}${linesPart}`;
+    }
+    return `Claim #${claimId} settled\nPaid out: ${totalPaid} · fees ${totalFees}\nOwed to challengers: ${owedToChallengers}`;
+  },
 
   challengerPaid: (
     claimId: string | number,
@@ -293,3 +315,9 @@ export const NOTIFICATION_PLAIN = {
 
 /** Text shown on the Telegram inline keyboard button for explorer links. */
 export const EXPLORER_BUTTON_TEXT = "View on Explorer";
+
+/**
+ * Text shown on the Telegram inline keyboard button that opens the Mimir web
+ * app (see `MIMIR_APP_URL`). Absent from a keyboard when no URL is configured.
+ */
+export const MIMIR_APP_BUTTON_TEXT = "Open in Mimir";

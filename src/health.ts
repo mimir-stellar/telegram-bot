@@ -116,6 +116,10 @@ export interface HealthReport {
       version: string;
       /** Public contract id (on-chain). */
       contractId: string;
+      /** Duration of this target's most recent attempted cycle. */
+      lastCycleMs: number;
+      /** Longest attempted cycle for this target since process start. */
+      maxCycleMs: number;
       lastEventLedger: number | null;
       /** Opaque resume cursor; not a secret. Truncated for readability. */
       cursorPreview: string | null;
@@ -297,6 +301,8 @@ export function buildHealthReport(
         source: t.source,
         version: t.version ?? "v1",
         contractId: t.contractId,
+        lastCycleMs: t.lastCycleMs ?? 0,
+        maxCycleMs: t.maxCycleMs ?? 0,
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),
         gapLedgers: typeof t.gapLedgers === "number" ? t.gapLedgers : 0,
