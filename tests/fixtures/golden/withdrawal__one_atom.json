@@ -1,0 +1,22 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5031,
+    "txHash": "",
+    "at": 1724005031,
+    "eventId": "5031-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "withdrawal",
+      "to": "GCAPTAINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "amount": "1"
+    }
+  },
+  "md": "📤 *Withdrawal* — 0\\.0000001 USDC to `GCAPT…AAAA`\n_ledger 5031_",
+  "plain": "Withdrawal — 0.0000001 USDC to GCAPT…AAAA\nledger 5031"
+}

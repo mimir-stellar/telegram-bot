@@ -1,0 +1,22 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5030,
+    "txHash": "",
+    "at": 1724005030,
+    "eventId": "5030-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "withdrawal",
+      "to": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "amount": "50000000"
+    }
+  },
+  "md": "📤 *Withdrawal* — 5\\.0000000 USDC to `GABCD…TUVW`\n_ledger 5030_",
+  "plain": "Withdrawal — 5.0000000 USDC to GABCD…TUVW\nledger 5030"
+}
