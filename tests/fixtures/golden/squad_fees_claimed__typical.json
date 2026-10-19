@@ -1,0 +1,22 @@
+{
+  "event": {
+    "source": "squad",
+    "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5056,
+    "txHash": "",
+    "at": 1724005056,
+    "eventId": "5056-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "fees_claimed",
+      "recipient": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "amount": "3000000"
+    }
+  },
+  "md": "🧾 *Squad fees claimed* — 0\\.3000000 USDC to `GABCD…TUVW`\n_ledger 5056_",
+  "plain": "Squad fees claimed — 0.3000000 USDC to GABCD…TUVW\nledger 5056"
+}

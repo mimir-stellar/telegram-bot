@@ -1,0 +1,24 @@
+{
+  "event": {
+    "source": "squad",
+    "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5051,
+    "txHash": "",
+    "at": 1724005051,
+    "eventId": "5051-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "resolved",
+      "marketId": 4,
+      "result": 1,
+      "poolA": "500000000",
+      "poolB": "500000000"
+    }
+  },
+  "md": "🏁 *Squad \\#4 resolved* — *Side A*\nPools: A 50\\.0000000 USDC · B 50\\.0000000 USDC\n_ledger 5051_",
+  "plain": "Squad #4 resolved — Side A\nPools: A 50.0000000 USDC · B 50.0000000 USDC\nledger 5051"
+}

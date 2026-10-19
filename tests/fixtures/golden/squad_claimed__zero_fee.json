@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "squad",
+    "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5054,
+    "txHash": "",
+    "at": 1724005054,
+    "eventId": "5054-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claimed",
+      "marketId": 2,
+      "participant": "GCAPTAINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "gross": "30000000",
+      "fee": "0",
+      "net": "30000000"
+    }
+  },
+  "md": "💸 *Squad payout* on \\#2\n`GCAPT…AAAA` → net *3\\.0000000 USDC* \\(gross 3\\.0000000 USDC, fee 0\\.0000000 USDC\\)\n_ledger 5054_",
+  "plain": "Squad payout on #2\nGCAPT…AAAA → net 3.0000000 USDC (gross 3.0000000 USDC, fee 0.0000000 USDC)\nledger 5054"
+}

@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "squad",
+    "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5039,
+    "txHash": "",
+    "at": 1724005039,
+    "eventId": "5039-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "market_created",
+      "marketId": 4,
+      "captain": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "deadline": 1730000000,
+      "feeBps": 10000,
+      "question": "Max fee market"
+    }
+  },
+  "md": "🆕 *New squad market* \\#4\nMax fee market\nCaptain: `GABCD…TUVW` · fee 10000 bps · deadline 2024\\-10\\-27T03:33:20\\.000Z\n_ledger 5039_",
+  "plain": "New squad market #4\nMax fee market\nCaptain: GABCD…TUVW · fee 10000 bps · deadline 2024-10-27T03:33:20.000Z\nledger 5039"
+}

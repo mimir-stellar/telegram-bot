@@ -1,0 +1,22 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5059,
+    "txHash": "",
+    "at": 1724005059,
+    "eventId": "5059-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "unknown",
+      "eventName": "oracle_changed",
+      "reason": "admin event"
+    }
+  },
+  "md": null,
+  "plain": null
+}

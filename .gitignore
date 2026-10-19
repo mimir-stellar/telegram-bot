@@ -17,6 +17,9 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 .idea/
+.vscode/*
+!.vscode/launch.json
+!.vscode/extensions.json
 *.tsbuildinfo
 branch_structure.json
 temp_auto_push.bat
