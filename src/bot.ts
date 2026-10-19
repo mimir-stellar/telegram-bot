@@ -43,12 +43,14 @@ import {
   RESUME_MESSAGES,
 } from "./i18n.js";
 import { helpDetailMessage } from "./commands/help-detail.js";
+import { aboutMessage } from "./commands/about.js";
 export { helpDetailMessage, COMMAND_DETAILS, type CommandDetail } from "./commands/help-detail.js";
 
 /** Shared metadata for handlers, help, and Telegram's command menu. */
 export const COMMANDS = [
   { command: "start", description: COMMAND_DESCRIPTIONS.start, operatorOnly: false },
   { command: "help", description: COMMAND_DESCRIPTIONS.help, operatorOnly: false },
+  { command: "about", description: COMMAND_DESCRIPTIONS.about, operatorOnly: false },
   { command: "status", description: COMMAND_DESCRIPTIONS.status, operatorOnly: false },
   { command: "audit", description: COMMAND_DESCRIPTIONS.audit, operatorOnly: true },
   { command: "contracts", description: COMMAND_DESCRIPTIONS.contracts, operatorOnly: false },
@@ -529,6 +531,8 @@ export interface BotDeps {
   status: () => PollerStatus;
   pause: () => PollerPauseResult;
   resume: () => PollerResumeResult;
+  /** Bot version string, typically read from package.json. */
+  version?: string | undefined;
   /** Live in-memory audit window; renders immediately even before a flush. */
   audit?: AuditLog | undefined;
   /** Where the audit JSONL file lives, for the file-backed report. */
@@ -589,6 +593,7 @@ export function registerCommandHandlers(
   deps: BotDeps,
 ): void {
   const { config, status } = deps;
+  const version = deps.version ?? "unknown";
   const pause = deps.pause ?? (() => "stopped");
   const resume = deps.resume ?? (() => "stopped");
 
@@ -622,6 +627,10 @@ export function registerCommandHandlers(
       } else {
         await replyMarkdown(ctx, helpMessage(config));
       }
+    },
+
+    about: async (ctx) => {
+      await replyMarkdown(ctx, aboutMessage(config, version));
     },
 
     status: async (ctx) => {
