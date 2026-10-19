@@ -28,7 +28,9 @@
     "seed:cursor": "tsx src/dev/seedCursor.ts",
     "cursor": "node dist/cursor-cli.js",
     "replay": "tsx src/replay-cli.ts",
-    "replay:mock": "tsx src/replay-cli.ts --mock"
+    "replay:mock": "tsx src/replay-cli.ts --mock",
+    "decode": "tsx src/decode-cli.ts",
+    "doctor": "tsx src/doctor-cli.ts"
   },
   "c8": {
     "all": true,

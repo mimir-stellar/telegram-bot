@@ -24,9 +24,14 @@ import {
   winnerSideLabel,
   type DecodedEvent,
 } from "../stellar/decode.js";
+import { appUrlFor } from "./app-links.js";
+import { groupDigestEvents } from "./digest-grouping.js";
+import { confidenceIndicator } from "./confidence.js";
+import { settlementLines } from "./settlement.js";
 import type { StellarConfig } from "../config.js";
 import {
   EXPLORER_BUTTON_TEXT,
+  MIMIR_APP_BUTTON_TEXT,
   NOTIFICATION_MD,
   NOTIFICATION_PLAIN,
 } from "../i18n.js";
@@ -47,9 +52,10 @@ export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 /**
  * Split a MarkdownV2 (or plain) payload so each chunk fits Telegram's size limit.
  *
- * Prefers breaking on newlines. Never ends a chunk on a lone trailing backslash,
- * which would corrupt a MarkdownV2 escape sequence across chunk boundaries.
- * Hard-splits only when a single line exceeds the limit.
+ * Prefers breaking on newlines, omitting the separator newline from the chunks.
+ * Never splits a UTF-16 surrogate pair or ends a chunk on a lone backslash.
+ * Hard-splits only when a single line exceeds the limit. Throws if the limit
+ * cannot fit a complete code point or MarkdownV2 escape.
  */
 export function splitTelegramMessage(
   text: string,
@@ -63,32 +69,26 @@ export function splitTelegramMessage(
   const parts: string[] = [];
   let remaining = text;
 
+  function safeCut(cut: number): number {
+    const before = remaining.charCodeAt(cut - 1);
+    const after = remaining.charCodeAt(cut);
+    if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) {
+      cut -= 1;
+    }
+    // Retreating before an emoji can expose an escape prefix as well.
+    let start = cut;
+    while (start > 0 && remaining[start - 1] === "\\") start -= 1;
+    return cut - ((cut - start) % 2);
+  }
+
   while (remaining.length > limit) {
     let cut = remaining.lastIndexOf("\n", limit);
-    if (cut <= 0) cut = limit;
-
-    // If the chunk would end on an odd-length trailing backslash run, the next
-    // character belongs to that escape — pull the cut back before the run.
-    while (cut > 0) {
-      let i = cut - 1;
-      let slashes = 0;
-      while (i >= 0 && remaining[i] === "\\") {
-        slashes += 1;
-        i -= 1;
-      }
-      if (slashes % 2 === 1) {
-        cut = cut - 1;
-        continue;
-      }
-      break;
-    }
-
+    if (cut <= 0) cut = Math.floor(limit);
+    cut = safeCut(cut);
+    // An unsafe newline near the start may still allow a safe hard split.
+    if (cut <= 0) cut = safeCut(Math.floor(limit));
     if (cut <= 0) {
-      cut = limit;
-      if (remaining[cut - 1] === "\\" && cut < remaining.length) {
-        cut = limit - 1;
-        if (cut <= 0) cut = limit;
-      }
+      throw new RangeError(`splitTelegramMessage limit ${limit} cannot fit a code point or escape`);
     }
 
     parts.push(remaining.slice(0, cut));
@@ -252,21 +252,37 @@ export interface ExplorerKeyboard {
 }
 
 /**
+ * Config the keyboard builder reads: the chain fields `eventExplorerUrl`
+ * needs, plus the optional Mimir web-app origin (`MIMIR_APP_URL`) that adds a
+ * second button. Optional here so a chain-only config keeps building the
+ * explorer-only keyboard it has always built.
+ */
+export type KeyboardConfig = StellarConfig & { mimirAppUrl?: string | null };
+
+/**
  * Telegram inline keyboard for an event notification.
  *
- * Returns undefined when the event carries no usable transaction hash, so the
- * caller sends the existing text-only message unchanged. The button reuses the
- * same canonical explorer URL as the `· [tx](…)` footer link — the footer stays
- * as the text fallback, the button is progressive enhancement in the same
- * Telegram request (no second message, no extra rate-limit cost).
+ * Returns undefined when the event carries no usable transaction hash and no
+ * Mimir app page, so the caller sends the existing text-only message
+ * unchanged. The explorer button reuses the same canonical explorer URL as the
+ * `· [tx](…)` footer link — the footer stays as the text fallback, the button
+ * is progressive enhancement in the same Telegram request (no second message,
+ * no extra rate-limit cost). When `config.mimirAppUrl` is set and the event
+ * maps to an app page, the "Open in Mimir" button joins the same row.
  */
 export function explorerKeyboard(
-  config: StellarConfig,
+  config: KeyboardConfig,
   event: DecodedEvent,
 ): ExplorerKeyboard | undefined {
-  const url = eventExplorerUrl(config, event);
-  if (!url) return undefined;
-  return { inline_keyboard: [[{ text: EXPLORER_BUTTON_TEXT, url }]] };
+  const buttons: ExplorerButton[] = [];
+  const explorerUrl = eventExplorerUrl(config, event);
+  if (explorerUrl) buttons.push({ text: EXPLORER_BUTTON_TEXT, url: explorerUrl });
+
+  const appUrl = appUrlFor(event, config.mimirAppUrl);
+  if (appUrl) buttons.push({ text: MIMIR_APP_BUTTON_TEXT, url: appUrl });
+
+  if (buttons.length === 0) return undefined;
+  return { inline_keyboard: [buttons] };
 }
 
 /** Format the latest observed event, including events with no notification template. */
@@ -281,16 +297,68 @@ export function formatLastEvent(config: StellarConfig, event: DecodedEvent): str
   );
 }
 
+/** Options for {@link formatDigest}. */
+export interface FormatDigestOptions {
+  /**
+   * When `true`, events are grouped by claim / squad market before rendering.
+   * Multi-event groups get an escaped Group_Key header and indented sub-lines;
+   * singletons are rendered exactly like the flat layout.
+   *
+   * Defaults to `false` — the existing flat layout is unchanged when this
+   * option is omitted or set to `false`.
+   */
+  grouped?: boolean;
+}
+
+/**
+ * One digest line in the flat layout.  Extracted so both the flat path and the
+ * grouped renderer share identical line formatting.
+ */
+function flatLine(event: DecodedEvent): string {
+  const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
+  return `· mimir\\-${escapeMd(event.source)} \`${escapeMd(clip(name, 80))}\` at ledger ${event.ledger}`;
+}
+
+/**
+ * Render a grouped digest.  Called only when `options.grouped` is `true`.
+ */
+function renderGroupedDigest(events: readonly DecodedEvent[]): string {
+  const groups = groupDigestEvents(events);
+  const header = `*Mimir Digest* — ${events.length} events in this cycle`;
+  const body: string[] = [];
+
+  for (const group of groups) {
+    if (group.events.length === 1) {
+      // Singleton group: no header, no indentation — identical to flat layout.
+      const [sole] = group.events;
+      if (sole) body.push(flatLine(sole));
+    } else {
+      // Multi-event group: MarkdownV2-escaped Group_Key as header, then
+      // each event on an indented line.
+      body.push(escapeMd(group.key));
+      for (const e of group.events) {
+        body.push(`  ${flatLine(e)}`);
+      }
+    }
+  }
+
+  return [header, "", ...body].join("\n");
+}
+
 /**
  * One MarkdownV2 message summarising a burst of events: a header with the count
  * and one bounded line per event. Returns null when there is nothing to send.
+ *
+ * Pass `{ grouped: true }` to group consecutive events by claim / squad market.
+ * The default (`{}` or no second argument) produces the unchanged flat layout.
  */
-export function formatDigest(events: readonly DecodedEvent[]): string | null {
+export function formatDigest(
+  events: readonly DecodedEvent[],
+  options: FormatDigestOptions = {},
+): string | null {
   if (events.length === 0) return null;
-  const lines = events.map((event) => {
-    const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
-    return `· mimir\\-${escapeMd(event.source)} \`${escapeMd(clip(name, 80))}\` at ledger ${event.ledger}`;
-  });
+  if (options.grouped) return renderGroupedDigest(events);
+  const lines = events.map(flatLine);
   return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
 }
 
@@ -325,20 +393,23 @@ function headline(event: DecodedEvent): string | null {
       return NOTIFICATION_MD.claimResolved(
         String(p.claimId),
         escapeMd(winnerSideLabel(p.winnerSide)),
-        escapeMd(String(p.confidence)),
+        escapeMd(confidenceIndicator(p.confidence)),
         p.summary ? escapeMd(clip(p.summary)) : null,
       );
 
     case "claim_cancelled":
       return NOTIFICATION_MD.claimCancelled(String(p.claimId));
 
-    case "market_settled":
+    case "market_settled": {
+      const lines = settlementLines(p).map(escapeMd);
       return NOTIFICATION_MD.marketSettled(
         String(p.claimId),
         usdc(p.totalPaid),
         usdc(p.totalFees),
         usdc(p.owedToChallengers),
+        lines,
       );
+    }
 
     case "challenger_paid":
       return NOTIFICATION_MD.challengerPaid(
@@ -505,20 +576,23 @@ function plainHeadline(event: DecodedEvent): string | null {
       return NOTIFICATION_PLAIN.claimResolved(
         p.claimId,
         winnerSideLabel(p.winnerSide),
-        String(p.confidence),
+        confidenceIndicator(p.confidence),
         p.summary ? clip(p.summary) : null,
       );
 
     case "claim_cancelled":
       return NOTIFICATION_PLAIN.claimCancelled(p.claimId);
 
-    case "market_settled":
+    case "market_settled": {
+      const lines = settlementLines(p);
       return NOTIFICATION_PLAIN.marketSettled(
         p.claimId,
         plainUsdc(p.totalPaid),
         plainUsdc(p.totalFees),
         plainUsdc(p.owedToChallengers),
+        lines,
       );
+    }
 
     case "challenger_paid":
       return NOTIFICATION_PLAIN.challengerPaid(

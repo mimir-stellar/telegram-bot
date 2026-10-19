@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "squad",
+    "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5043,
+    "txHash": "",
+    "at": 1724005043,
+    "eventId": "5043-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "deposited",
+      "marketId": 2,
+      "side": 1,
+      "participant": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "amount": "9999999999999",
+      "shares": "9999999999999"
+    }
+  },
+  "md": "➕ *Squad \\#2* — 999999\\.9999999 USDC on *Side A*\nParticipant: `GABCD…TUVW`\n_ledger 5043_",
+  "plain": "Squad #2 — 999999.9999999 USDC on Side A\nParticipant: GABCD…TUVW\nledger 5043"
+}

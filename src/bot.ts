@@ -42,11 +42,109 @@ import {
   PAUSE_MESSAGES,
   RESUME_MESSAGES,
 } from "./i18n.js";
+import { helpDetailMessage } from "./commands/help-detail.js";
+import { aboutMessage } from "./commands/about.js";
+export { helpDetailMessage, COMMAND_DETAILS, type CommandDetail } from "./commands/help-detail.js";
+import {
+  handleBroadcastCallback,
+  registerBroadcastHandlers,
+  type BroadcastStore,
+} from "./commands/broadcast.js";
+export {
+  handleBroadcastCallback,
+  registerBroadcastHandlers,
+  handleBroadcastCommand,
+  getConfiguredBroadcastChats,
+  BroadcastStore,
+  sendBroadcast,
+} from "./commands/broadcast.js";
+
+/**
+ * Telegram bot tokens have the shape `<digits>:<35+ url-safe chars>`.
+ * Values pasted from dashboards frequently arrive wrapped in quotes or with
+ * trailing whitespace/newlines, which only surface as a `getMe` failure at
+ * startup. Validate the shape up front and name the problem without ever
+ * echoing the token (or any part of it) into a message or log.
+ */
+export type BotTokenShapeProblem =
+  | "empty"
+  | "surrounding-quotes"
+  | "whitespace"
+  | "missing-colon"
+  | "bad-prefix"
+  | "bad-suffix"
+  | "wrong-shape";
+
+export interface BotTokenShapeResult {
+  ok: boolean;
+  problem?: BotTokenShapeProblem;
+  message?: string;
+}
+
+const BOT_TOKEN_SHAPE = /^\d+:[A-Za-z0-9_-]{35,}$/;
+
+/**
+ * Validate a `BOT_TOKEN` value without ever including the token (or any
+ * substring of it) in the returned message. The messages are intentionally
+ * generic so they are safe to log and to surface in a startup error.
+ */
+export function validateBotTokenShape(raw: unknown): BotTokenShapeResult {
+  if (typeof raw !== "string" || raw.length === 0) {
+    return {
+      ok: false,
+      problem: "empty",
+      message: "BOT_TOKEN is empty; expected <digits>:<35+ url-safe chars>.",
+    };
+  }
+
+  // Surrounding quotes are the most common paste artefact.
+  if (
+    (raw.startsWith('"') && raw.endsWith('"')) ||
+    (raw.startsWith("'") && raw.endsWith("'"))
+  ) {
+    return {
+      ok: false,
+      problem: "surrounding-quotes",
+      message:
+        "BOT_TOKEN is wrapped in quotes; remove the surrounding quotes and retry.",
+    };
+  }
+
+  // Any whitespace anywhere (leading, trailing, or embedded) is rejected.
+  if (/\s/.test(raw)) {
+    return {
+      ok: false,
+      problem: "whitespace",
+      message:
+        "BOT_TOKEN contains whitespace (leading, trailing, or embedded); trim it and retry.",
+    };
+  }
+
+  if (!raw.includes(":")) {
+    return {
+      ok: false,
+      problem: "missing-colon",
+      message: "BOT_TOKEN is missing the ':' separator; expected <digits>:<35+ url-safe chars>.",
+    };
+  }
+
+  if (!BOT_TOKEN_SHAPE.test(raw)) {
+    return {
+      ok: false,
+      problem: "wrong-shape",
+      message:
+        "BOT_TOKEN has the wrong shape; expected <digits>:<35+ url-safe chars>.",
+    };
+  }
+
+  return { ok: true };
+}
 
 /** Shared metadata for handlers, help, and Telegram's command menu. */
-const COMMANDS = [
+export const COMMANDS = [
   { command: "start", description: COMMAND_DESCRIPTIONS.start, operatorOnly: false },
   { command: "help", description: COMMAND_DESCRIPTIONS.help, operatorOnly: false },
+  { command: "about", description: COMMAND_DESCRIPTIONS.about, operatorOnly: false },
   { command: "status", description: COMMAND_DESCRIPTIONS.status, operatorOnly: false },
   { command: "audit", description: COMMAND_DESCRIPTIONS.audit, operatorOnly: true },
   { command: "contracts", description: COMMAND_DESCRIPTIONS.contracts, operatorOnly: false },
@@ -62,7 +160,7 @@ function visibleCommands(config?: BotConfig) {
   );
 }
 
-export function helpMessage(config: BotConfig): string {
+export function helpMessage(config?: BotConfig): string {
   return [
     HELP_TITLE,
     "",
@@ -83,7 +181,7 @@ export const TELEGRAM_OPTIONS = {
 // Callback data is untrusted user input: it is validated before any action
 // runs, and operator actions are authorized exactly like /pause and /resume.
 
-export type CallbackActionType = "status" | "contracts" | "help" | "pause" | "resume";
+export type CallbackActionType = "status" | "contracts" | "help" | "pause" | "resume" | "broadcast";
 
 export interface ValidCallbackAction {
   type: CallbackActionType;
@@ -108,7 +206,7 @@ export const CALLBACK_UNAUTHORIZED_FEEDBACK = "Unauthorized: operator only";
 
 
 function isKnownAction(val: string): val is CallbackActionType {
-  return ["status", "contracts", "help", "pause", "resume"].includes(val);
+  return ["status", "contracts", "help", "pause", "resume", "broadcast"].includes(val);
 }
 
 /**
@@ -527,6 +625,8 @@ export interface BotDeps {
   status: () => PollerStatus;
   pause: () => PollerPauseResult;
   resume: () => PollerResumeResult;
+  /** Bot version string, typically read from package.json. */
+  version?: string | undefined;
   /** Live in-memory audit window; renders immediately even before a flush. */
   audit?: AuditLog | undefined;
   /** Where the audit JSONL file lives, for the file-backed report. */
@@ -538,6 +638,8 @@ export interface BotDeps {
   botInfo?: UserFromGetMe;
   /** Bounded redacted log ring backing /export. Absent = command disabled. */
   logs?: LogCapture | undefined;
+  /** In-memory broadcast confirmation store. */
+  broadcastStore?: BroadcastStore | undefined;
 }
 
 /**
@@ -587,6 +689,7 @@ export function registerCommandHandlers(
   deps: BotDeps,
 ): void {
   const { config, status } = deps;
+  const version = deps.version ?? "unknown";
   const pause = deps.pause ?? (() => "stopped");
   const resume = deps.resume ?? (() => "stopped");
 
@@ -608,7 +711,22 @@ export function registerCommandHandlers(
     },
 
     help: async (ctx) => {
-      await replyMarkdown(ctx, helpMessage(config));
+      const text = ctx.message?.text ?? "";
+      const spaceIndex = text.indexOf(" ");
+      const arg = (
+        typeof ctx.match === "string" && ctx.match.trim().length > 0
+          ? ctx.match.trim()
+          : (spaceIndex !== -1 ? text.slice(spaceIndex + 1).trim() : "")
+      );
+      if (arg) {
+        await replyMarkdown(ctx, helpDetailMessage(arg, config));
+      } else {
+        await replyMarkdown(ctx, helpMessage(config));
+      }
+    },
+
+    about: async (ctx) => {
+      await replyMarkdown(ctx, aboutMessage(config, version));
     },
 
     status: async (ctx) => {
@@ -781,7 +899,7 @@ export async function handleCallbackQuery(
   const { action } = validation;
 
   // Enforce operator role authorization
-  if (action.type === "pause" || action.type === "resume") {
+  if (action.type === "pause" || action.type === "resume" || action.type === "broadcast") {
     if (!isOperator(ctx, config)) {
       console.warn(
         `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
@@ -797,6 +915,11 @@ export async function handleCallbackQuery(
   // Execute validated action
   try {
     switch (action.type) {
+      case "broadcast": {
+        await handleBroadcastCallback(ctx, deps, action.raw);
+        break;
+      }
+
       case "status": {
         const text = statusMessage(config, status());
         if (ctx.callbackQuery?.message) {
@@ -883,12 +1006,20 @@ export function registerCallbackHandlers(
 }
 
 export function createBot(deps: BotDeps): Bot {
+  const tokenCheck = validateBotTokenShape(deps.config.botToken);
+  if (!tokenCheck.ok) {
+    // Never include the token (or any part of it) in the thrown error.
+    throw new Error(
+      `Invalid BOT_TOKEN (${tokenCheck.problem}): ${tokenCheck.message}`,
+    );
+  }
   const bot = new Bot(
     deps.config.botToken,
     deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined,
   );
   registerCommandHandlers(bot, deps);
   registerCallbackHandlers(bot, deps);
+  registerBroadcastHandlers(bot, deps);
   const { config, status, logs } = deps;
 
   bot.command("export", async (ctx) => {
@@ -928,7 +1059,7 @@ export interface SendExtra {
    * Plain-text rendering of the same notification, sent without a `parse_mode`
    * when Telegram rejects the MarkdownV2 version for entity/parse reasons.
    * Optional: without it the notifier behaves exactly as before (parse errors
-   * propagate, no second send).
+   * propagate, no second send). Empty or whitespace-only values count as absent.
    */
   plainText?: string | undefined;
   /**
@@ -980,24 +1111,51 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
 }
 
 /**
+ * Sends suppressed by the empty-message guard, counted so callers (and the
+ * empty-text tests) can prove a blank render never reached the Telegram API.
+ */
+export const notifierSkips = { emptyText: 0 };
+
+/**
  * The poller's send path: route each contract's messages to its named chat,
  * with the event's explorer button when `extra.reply_markup` is set.
  *
  * MarkdownV2 first; exactly one plain-text retry when Telegram rejects the
- * entities *and* the caller supplied `extra.plainText`. The retry carries no
- * `parse_mode`, so it cannot fail the same way. Every other failure —
+ * entities *and* the caller supplied a non-blank `extra.plainText`. The retry
+ * carries no `parse_mode`, so it cannot fail the same way. Every other failure —
  * network, rate limit, auth, unknown chats, or a failed plain-text retry —
  * propagates unchanged, preserving the poller's existing error/cursor
  * accounting. An oversized payload is split into chunks and an
  * unspecified one into a single call, so the MarkdownV2-to-plain-text
  * retry happens at most once per chunk, never in a loop.
+ *
+ * A rendering that is empty, whitespace-only, or not a string at all is
+ * skipped before any API call: Telegram rejects blank message text with a
+ * 400, and a formatters' `null` must never turn into a doomed send. The skip
+ * is counted in {@link notifierSkips} and logged with bounded metadata.
  */
 export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
     Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad">>,
 ) {
-  return async (text: string, source?: ContractSource, extra?: SendExtra): Promise<void> => {
+  return async (
+    text: string | null,
+    source?: ContractSource,
+    extra?: SendExtra,
+  ): Promise<void> => {
+    if (typeof text !== "string" || text.trim() === "") {
+      notifierSkips.emptyText += 1;
+      // Only bounded metadata: which chat path and how short the render was —
+      // never the payload itself.
+      console.warn(
+        `[notifier] skipped empty message${eventRefLabel(extra?.eventRef)} ` +
+          `(source=${typeof source === "string" && source ? source.slice(0, 32) : "default"}, ` +
+          `chars=${typeof text === "string" ? text.length : -1})`,
+      );
+      return;
+    }
+
     const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
     const chatId = source === "market"
       ? config.marketChatId || defaultChat
@@ -1047,8 +1205,10 @@ export function createNotifier(
       });
       return;
     } catch (err) {
+      // A blank fallback is no fallback: sending whitespace-only text would
+      // just draw the same 400, so the original parse error propagates.
       const fallback = extra?.plainText;
-      if (typeof fallback !== "string" || fallback === "" || !isMarkdownParseError(err)) {
+      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
         throw err;
       }
       // Only bounded metadata is logged: the fallback outcome, the safe error
