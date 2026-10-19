@@ -1,4 +1,4 @@
-/**
+/*
  * Notification feature flags.
  *
  * Coarse boolean gates for Telegram posts so operators can quiet the bot
@@ -56,7 +56,7 @@ export function parseBoolFlag(
   if (trimmed === "") return { value: fallback, problems };
 
   const normalized = trimmed.toLowerCase();
-  if (TRUTHY.has(normalized)) return { value: true, problems };
+  if (TRUTHU.has(normalized)) return { value: true, problems };
   if (FALSY.has(normalized)) return { value: false, problems };
 
   problems.push(
