@@ -51,6 +51,7 @@ import {
   parseNotificationFeatureFlags,
   type NotificationFeatureFlags,
 } from "./notifications/featureFlags.js";
+import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -206,6 +207,8 @@ export interface BotConfig extends StellarConfig {
   metricsPort: number | null;
   /** Optional allowlist of claim categories to notify about. Empty means allow all. */
   notificationCategories: readonly string[];
+  /** Event names sent without a notification sound (SILENT_EVENTS). */
+  silentEvents: readonly string[];
   /** Path for the standalone scanner's CSV output (see CSV_OUTPUT_FILE). */
   csvOutputFile: string;
   /** Coarse notification feature flags (see NOTIFY_* env vars). */
@@ -770,6 +773,19 @@ function notificationCategoriesFrom(): readonly string[] {
   return parseNotificationCategories(envValues.join(","));
 }
 
+function silentEventsFrom(c: ReturnType<typeof collector>): readonly string[] {
+  const raw = c.get("SILENT_EVENTS");
+  if (raw === undefined || raw.trim() === "") return DEFAULT_SILENT_EVENTS;
+
+  const entries = [...new Set(raw.split(",").map((value) => value.trim()).filter(Boolean))];
+  for (const entry of entries) {
+    if (!(KNOWN_EVENT_NAMES as readonly string[]).includes(entry)) {
+      c.problems.push(`SILENT_EVENTS contains unknown event name "${entry}"`);
+    }
+  }
+  return entries;
+}
+
 function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
   // An explicit STELLAR_NETWORK wins; otherwise an explicit passphrase names
   // the network (beating a profile's default), so a passphrase-only deployment
@@ -861,6 +877,7 @@ export function loadConfig(): BotConfig {
     interSendDelayMs: c.int("INTER_SEND_DELAY_MS", DEFAULTS.interSendDelayMs, 0),
     metricsPort: c.optionalPort("METRICS_PORT"),
     notificationCategories: notificationCategoriesFrom(),
+    silentEvents: silentEventsFrom(c),
     csvOutputFile: path.resolve(process.cwd(), c.get("CSV_OUTPUT_FILE") ?? DEFAULTS.csvOutputFile),
     featureFlags: featureFlagsParsed.flags,
     // Resolved like the cursor file: relative paths anchor to the process cwd.
