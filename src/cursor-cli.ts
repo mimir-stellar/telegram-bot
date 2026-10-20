@@ -59,7 +59,7 @@ async function writeAtomic(filePath: string, contents: string, replace: boolean)
       }
     }
   } finally {
-    await unlinj(temporaryPath).catch(() => undefined);
+    await unlink(temporaryPath).catch(() => undefined);
   }
 }
 

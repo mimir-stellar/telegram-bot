@@ -61,6 +61,7 @@ export const AUDIT_CLI_HINT =
 export const COMMAND_DESCRIPTIONS = {
   start: "What this bot does",
   help: "Show help",
+  about: "About this bot",
   status: "Last-seen ledger and watched contracts",
   audit: "Operator only: audit report (redacted, bounded)",
   contracts: "Contract ids and explorer links",

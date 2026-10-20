@@ -74,6 +74,26 @@ isolated cursor file (`data/cursor.mock.json`), so a drill cannot touch the live
 position. See `docs/contributor-fixtures.md` for the fixture catalog and failure-mode
 table.
 
+### Interactive developer REPL
+
+To explore Soroban event decoding and Telegram notification formatting interactively without network access or `.env` credentials, launch the preloaded REPL:
+
+```bash
+node dist/dev/repl.js
+# or with tsx directly from source:
+npx tsx src/dev/repl.ts
+```
+
+The REPL context is preloaded with:
+- **Decoders**: `decode`, `decodeEvent`, `formatUsdc`, `shortAddress`.
+- **Formatters**: `format`, `formatEvent`, `formatPlainTextEvent`, `escapeMd`, `eventExplorerUrl`.
+- **Fixtures & constants**: `mockConstants` (mock contract IDs, RPC port, passphrase), `sampleConfig` / `config` (offline mock configuration), `fixtures` / `events` (synthetic event builders from `tests/fixtures/events.mjs`), and `scenario` (`defaultMockScenario()`).
+- **Interactive helpers**:
+  - `render(name, overrides?)` — Renders Telegram notification text for an event from the in-process mock scenario (e.g. `render("claim_created")`, `render("market_created")`) or fixtures, applying optional field overrides (e.g. `render("claim_created", { claimId: 42, category: "sports" })`).
+  - `scan(n?)` — Scans, decodes, and logs the first `n` events from the in-process mock scenario (defaults to all events).
+  - `help()` — Prints available variables and helper signatures.
+
+
 ## Adding tests
 
 - Put a new suite in its own `tests/*.test.mjs` file.
@@ -109,6 +129,7 @@ table.
 ## Where things live
 
 - `src/` — the TypeScript source (config, RPC client, decoder, poller, bot, audit).
+- `src/dev/repl.ts` — interactive developer REPL with preloaded decoders, formatters, and mock helpers.
 - `tests/` — Node built-in test runner suites compiled against `dist/`.
 - `docs/quickstart-mock.md` — five-minute quickstart using the local mock RPC.
 - `docs/contributor-fixtures.md` — credential-free fixture guide and failure modes.

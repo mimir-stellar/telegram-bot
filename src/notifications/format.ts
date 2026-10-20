@@ -286,8 +286,12 @@ export function explorerKeyboard(
 }
 
 /** Format the latest observed event, including events with no notification template. */
-export function formatLastEvent(config: StellarConfig, event: DecodedEvent): string {
-  const notification = formatEvent(config, event);
+export function formatLastEvent(
+  config: StellarConfig & { nowMs?: number },
+  event: DecodedEvent,
+  nowMs?: number,
+): string {
+  const notification = formatEvent(config, event, nowMs);
   if (notification !== null) return notification;
 
   const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
@@ -370,7 +374,7 @@ export function formatDigest(
  * in contract state, not the event, so it is not invented here. The squad
  * contract's `market_created` does carry `question`, and that is shown.
  */
-function headline(event: DecodedEvent): string | null {
+function headline(event: DecodedEvent, nowMs?: number): string | null {
   const p = event.payload;
 
   switch (p.name) {
@@ -437,7 +441,7 @@ function headline(event: DecodedEvent): string | null {
         escapeMd(clip(p.question)),
         who(p.captain),
         escapeMd(String(p.feeBps)),
-        escapeMd(new Date(p.deadline * 1000).toISOString()),
+        escapeMd(formatDeadline(p.deadline, nowMs)),
       );
 
     case "deposited":
@@ -514,12 +518,15 @@ export function formatEvent(
   config: StellarConfig & {
     channelPreviewMode?: boolean;
     notificationCategories?: readonly string[];
+    nowMs?: number;
   },
   event: DecodedEvent,
+  nowMs?: number,
 ): string | null {
   if (!eventAllowedByCategory(config, event)) return null;
+  const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    const head = headline(event);
+    const head = headline(event, currentMs);
     if (head === null) return null;
     const body = `${head}\n${footer(config, event)}`;
     if (config.channelPreviewMode) {
@@ -557,7 +564,7 @@ function plainFooter(config: StellarConfig, event: DecodedEvent): string {
  * field-for-field (same identities, amounts, bounded clips) but emits no
  * MarkdownV2 syntax at all, so Telegram cannot reject it for entity parsing.
  */
-function plainHeadline(event: DecodedEvent): string | null {
+function plainHeadline(event: DecodedEvent, nowMs?: number): string | null {
   const p = event.payload;
 
   switch (p.name) {
@@ -620,7 +627,7 @@ function plainHeadline(event: DecodedEvent): string | null {
         clip(p.question),
         plainWho(p.captain),
         String(p.feeBps),
-        new Date(p.deadline * 1000).toISOString(),
+        formatDeadline(p.deadline, nowMs),
       );
 
     case "deposited":
@@ -695,11 +702,13 @@ function clipPlainText(text: string, max = MAX_PLAIN_TEXT_LENGTH): string {
  * a minimal bounded line rather than crashing the notifier.
  */
 export function formatPlainTextEvent(
-  config: StellarConfig,
+  config: StellarConfig & { nowMs?: number },
   event: DecodedEvent,
+  nowMs?: number,
 ): string | null {
+  const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    const head = plainHeadline(event);
+    const head = plainHeadline(event, currentMs);
     if (head === null) return null;
     const body = `${head}\n${plainFooter(config, event)}`.trim();
     if (!body) return minimalPlainTextEvent(event);

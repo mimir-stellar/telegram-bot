@@ -51,6 +51,7 @@ import {
   parseNotificationFeatureFlags,
   type NotificationFeatureFlags,
 } from "./notifications/featureFlags.js";
+import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -206,6 +207,8 @@ export interface BotConfig extends StellarConfig {
   metricsPort: number | null;
   /** Optional allowlist of claim categories to notify about. Empty means allow all. */
   notificationCategories: readonly string[];
+  /** Event names sent without a notification sound (SILENT_EVENTS). */
+  silentEvents: readonly string[];
   /** Path for the standalone scanner's CSV output (see CSV_OUTPUT_FILE). */
   csvOutputFile: string;
   /** Coarse notification feature flags (see NOTIFY_* env vars). */
@@ -279,6 +282,8 @@ export interface BotConfig extends StellarConfig {
   logBufferLines: number;
   /** Optional public URL to run the bot in webhook mode instead of long-polling. */
   telegramWebhookUrl: string | null;
+  /** Dev-only override for grammy's `client.apiRoot`; loopback hosts only. */
+  telegramApiRoot: string | null;
   /**
    * Optional Mimir web-app origin (MIMIR_APP_URL) behind the "Open in Mimir"
    * notification button; null leaves the keyboard explorer-only. Validated as
@@ -554,6 +559,34 @@ function collector(profile: Record<string, string>) {
     },
 
     /**
+     * Optional dev-only Telegram Bot API root. Must be a loopback http URL so a
+     * misconfigured deployment can never silently route traffic to a fake.
+     */
+    loopbackApiRoot(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
+      let parsed: URL;
+      try {
+        parsed = new URL(value);
+      } catch {
+        problems.push(`${name} is not a valid URL; got "${value}"`);
+        return null;
+      }
+      if (parsed.protocol !== "http:") {
+        problems.push(`${name} must use http:// (loopback only); got "${value}"`);
+        return null;
+      }
+      const host = parsed.hostname;
+      if (host !== "127.0.0.1" && host !== "localhost") {
+        problems.push(
+          `${name} must point at 127.0.0.1 or localhost (dev only); got "${value}"`,
+        );
+        return null;
+      }
+      return value;
+    },
+
+    /**
      * Parse an optional https-only URL. Returns `null` when unset, and also
      * when the value is unusable — a Telegram button must never carry an
      * off-site or plain-http origin, so the problem is reported and the link
@@ -740,6 +773,19 @@ function notificationCategoriesFrom(): readonly string[] {
   return parseNotificationCategories(envValues.join(","));
 }
 
+function silentEventsFrom(c: ReturnType<typeof collector>): readonly string[] {
+  const raw = c.get("SILENT_EVENTS");
+  if (raw === undefined || raw.trim() === "") return DEFAULT_SILENT_EVENTS;
+
+  const entries = [...new Set(raw.split(",").map((value) => value.trim()).filter(Boolean))];
+  for (const entry of entries) {
+    if (!(KNOWN_EVENT_NAMES as readonly string[]).includes(entry)) {
+      c.problems.push(`SILENT_EVENTS contains unknown event name "${entry}"`);
+    }
+  }
+  return entries;
+}
+
 function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
   // An explicit STELLAR_NETWORK wins; otherwise an explicit passphrase names
   // the network (beating a profile's default), so a passphrase-only deployment
@@ -831,6 +877,7 @@ export function loadConfig(): BotConfig {
     interSendDelayMs: c.int("INTER_SEND_DELAY_MS", DEFAULTS.interSendDelayMs, 0),
     metricsPort: c.optionalPort("METRICS_PORT"),
     notificationCategories: notificationCategoriesFrom(),
+    silentEvents: silentEventsFrom(c),
     csvOutputFile: path.resolve(process.cwd(), c.get("CSV_OUTPUT_FILE") ?? DEFAULTS.csvOutputFile),
     featureFlags: featureFlagsParsed.flags,
     // Resolved like the cursor file: relative paths anchor to the process cwd.
@@ -885,6 +932,7 @@ export function loadConfig(): BotConfig {
     logSampleWindowMs: c.int("LOG_SAMPLE_WINDOW_MS", DEFAULTS.logSampleWindowMs, 1_000),
     logBufferLines: c.int("LOG_BUFFER_LINES", DEFAULTS.logBufferLines, 0),
     telegramWebhookUrl: c.optionalUrl("TELEGRAM_WEBHOOK_URL"),
+    telegramApiRoot: c.loopbackApiRoot("TELEGRAM_API_ROOT"),
     mimirAppUrl: c.optionalHttpsUrl("MIMIR_APP_URL"),
   };
 
@@ -1027,6 +1075,7 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_MARKET", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_SQUAD", secret: false, hasBuiltInDefault: true },
+  { key: "TELEGRAM_API_ROOT", secret: false },
   { key: "MIMIR_APP_URL", secret: false },
   // Injected by a platform, never set by an operator: read only as the
   // HEALTH_PORT fallback, so it is reported for the same reason.
