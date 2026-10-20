@@ -128,6 +128,9 @@ Do not manually advance the cursor to skip an RPC failure.
 
 ## Telegram failures
 
+For a quick mapping of raw Telegram error messages to fixes, see the
+[Telegram Troubleshooting FAQ](telegram-troubleshooting.md).
+
 ### Symptoms
 
 * Event scanning continues but sends fail.

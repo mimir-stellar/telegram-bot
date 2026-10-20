@@ -19,7 +19,7 @@ export class ScheduleParseError extends Error {
   }
 }
 
-const WEEKDAYS: ReadonlyRecord<string, number> = {
+const WEEKDAYS: Record<string, number> = {
   sun: 0,
   mon: 1,
   tue: 2,
@@ -66,15 +66,15 @@ export function parseSchedule(spec: string): Schedule {
   }
   const trimmed = spec.trim();
   const daily = /^daily@(.+)$/i.exec(trimmed);
-  if (daily) {
+  if (daily && daily[1]) {
     return { kind: "daily", minuteOfDay: parseTimeOfDay(daily[1].trim()) };
   }
-  const weekly = /^weekly@([A-Za-z]{3})\s+(.+)$/.exec(trimmed);
+  const weekly = /^weekly@([A-Za-z]{3})\s+(.+)$/.exec(trimmed);
   if (weekly) {
     return {
       kind: "weekly",
-      dayOfWeek: parseWeekday(weekly[1]),
-      minuteOfDay: parseTimeOfDay(weekly[2].trim()),
+      dayOfWeek: parseWeekday(weekly[1]!),
+      minuteOfDay: parseTimeOfDay(weekly[2]!.trim()),
     };
   }
   throw new ScheduleParseError(
@@ -93,7 +93,7 @@ function utcWeekday(ms: number): number {
 }
 
 export function nextRun(schedule: Schedule, nowMs: number): number {
-  if (!Number.finite(nowMs)) {
+  if (!Number.isFinite(nowMs)) {
     throw new ScheduleParseError("nowMs must be a finite number");
   }
   const dayStart = startOfUtcDay(nowMs);
@@ -125,9 +125,9 @@ export class FileLastRunStore implements LastRunStore {
       const trimmed = raw.trim();
       if (trimmed === "") return null;
       const parsed = Number(trimmed);
-      return Number.finite(parsed) ? parsed : null;
+      return Number.isFinite(parsed) ? parsed : null;
     } catch (err: unknown) {
-      if ((err as NodeJSError)?.code === "ENOENT") return null;
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return null;
       throw err;
     }
   }

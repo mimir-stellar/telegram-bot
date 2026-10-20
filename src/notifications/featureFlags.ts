@@ -56,7 +56,7 @@ export function parseBoolFlag(
   if (trimmed === "") return { value: fallback, problems };
 
   const normalized = trimmed.toLowerCase();
-  if (TRUTHU.has(normalized)) return { value: true, problems };
+  if (TRUTHY.has(normalized)) return { value: true, problems };
   if (FALSY.has(normalized)) return { value: false, problems };
 
   problems.push(

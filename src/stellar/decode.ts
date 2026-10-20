@@ -26,7 +26,7 @@
  */
 
 import { recordDecodeOutcome } from "./decode-stats.js";
-import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
+import { scValToNative, type rpc, xdr } from "@stellar/stellar-sdk";
 import type { StellarConfig } from "../config.js";
 import { eventKey } from "../dedup.js";
 import { txExplorerUrl } from "./client.js";

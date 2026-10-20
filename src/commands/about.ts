@@ -1,5 +1,5 @@
-import { escapeMd } from "../utils/markdown.js";
-import type { BotConfig } from "../config.js";
+import { escapeMd } from "../notifications/format.js";
+import { networkLabel, type BotConfig } from "../config.js";
 
 const REPOSITORY_URL = "https://github.com/example/stellar-bot";
 

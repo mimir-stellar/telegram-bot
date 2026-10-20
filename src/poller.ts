@@ -2007,12 +2007,11 @@ export function createPoller(deps: PollerDeps) {
           // below is unchanged: either path counts as sent, neither as skipped.
           const plainText = formatPlainTextEvent(config, event);
           const eventRef = { eventId: event.eventId, ledger: event.ledger, source: event.source };
-          if (reply_markup || plainText !== null) {
-            extra = {
-              ...(reply_markup ? { reply_markup } : {}),
-              ...(plainText !== null ? { plainText, eventRef } : {}),
-            };
-          }
+          extra = {
+            eventName: event.payload.name,
+            ...(reply_markup ? { reply_markup } : {}),
+            ...(plainText !== null ? { plainText, eventRef } : {}),
+          };
         }
       } catch (err) {
         recordSkippedIncrement();
