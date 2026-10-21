@@ -12,7 +12,7 @@ const MOCK_ORACLE_ADDR = "GBZXN7PIRZGNMHGA72XZQCLCJH5I6D25GI5AO5AGNDJTCX7754YNOU
 const MOCK_PREV_OWNER = "GD6W5V5G5S6DGB3M46X4B6F7B2U67WJ5C3S2E3M46X4B6F7B2U67WJ5C";
 const MOCK_NEW_OWNER = "GA2W5V5G5S6DGB3M46X4B6F7B2U67WJ5C3S2E3M46X4B6F7B2U67WJ5A";
 const MOCK_CONTRACT = "CA2W5V5G5S6DGB3M46X4B6F7B2U67WJ5C3S2E3M46X4B6F7B2U67WJ5A";
-const MOCK_AGENT = "GAA2W5V5G5S6DGB3M46X4B6F7B2U67WJ5C3S2E3M46X4B6F7B2U67WJ5A";
+const MOCK_AGENT = MOCK_ORACLE_ADDR;
 const MOCK_TX = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 test("shortens addresses with shortAddress and sanitizes fields", () => {
@@ -134,8 +134,8 @@ test("formatAdminRecord: covers agent_attributed", () => {
   const formatted = formatAdminRecord(record);
   assert.match(formatted, /\[admin\] agent_attributed/);
   assert.match(formatted, /ledger 123460/);
-  assert.match(formatted, /admin=GAA2W…WJ5A/);
-  assert.match(formatted, /agent=GAA2W…WJ5A/);
+  assert.ok(formatted.includes(`admin=${shortAddress(MOCK_AGENT)}`));
+  assert.ok(formatted.includes(`agent=${shortAddress(MOCK_AGENT)}`));
   assert.doesNotMatch(formatted, /undefined/);
 });
 
