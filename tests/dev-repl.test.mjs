@@ -88,7 +88,7 @@ test("dev-repl: render helper applies field overrides correctly", async () => {
 
   assert.equal(exitCode, 0);
   assert.ok(stdout.includes("#42"));
-  assert.ok(stdout.includes("Category: sports"));
+  assert.ok(stdout.includes("Category: ⚽ sports"));
 });
 
 test("dev-repl: render helper formats fixture events not present in default scenario", async () => {
