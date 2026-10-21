@@ -24,6 +24,7 @@ import {
   winnerSideLabel,
   type DecodedEvent,
 } from "../stellar/decode.js";
+import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
 import { groupDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
@@ -505,6 +506,12 @@ function headline(event: DecodedEvent, nowMs?: number): string | null {
 /**
  * True unless NOTIFY_CATEGORIES is set and this is a `claim_created` event whose
  * category is not on the allowlist. Every other notification type always passes.
+ *
+ * Both sides of the comparison are normalised with {@link normalizeCategory}:
+ * NFKC, trimmed, lowercased, inner whitespace collapsed, control characters
+ * stripped, and bounded in length. This makes the filter robust to the
+ * free-form on-chain strings (`Crypto`, ` crypto`, full-width variants) that
+ * would otherwise silently fail to match a configured category name.
  */
 export function eventAllowedByCategory(
   config: { notificationCategories?: readonly string[] },
@@ -512,8 +519,8 @@ export function eventAllowedByCategory(
 ): boolean {
   const categories = config.notificationCategories ?? [];
   if (categories.length === 0 || event.payload.name !== "claim_created") return true;
-  const allowed = new Set(categories.map((category) => category.trim().toLowerCase()));
-  return allowed.has(String(event.payload.category ?? "").trim().toLowerCase());
+  const allowed = new Set(categories.map((category) => normalizeCategory(category)));
+  return allowed.has(normalizeCategory(String(event.payload.category ?? "")));
 }
 
 export function formatEvent(
@@ -808,4 +815,3 @@ export function previewMessage(config: StellarConfig & { linkPreviewMarket?: boo
   const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
   return `${NOTIFICATION_MD.channelPreviewMarket}\n${settingsLine}\n\n${formatted}`;
 }
-

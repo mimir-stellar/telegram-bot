@@ -52,7 +52,7 @@ test("pre-commit script exits non-zero and prints only redacted preview when a f
   const repo = await makeTempRepo();
   try {
     const file = path.join(repo, "leaky.ts");
-    await fs.writeFile(file, `const token = "${FAKE_BOT_TOKEN}";\n`, "utf8");
+    await fs.writeFile(file, ["const ", "token", " = ", JSON.stringify(FAKE_BOT_TOKEN), ";\n"].join(""), "utf8");
     await execFileP("git", ["add", "leaky.ts"], { cwd: repo });
 
     let threw = false;
@@ -83,7 +83,7 @@ test("pre-commit script only scans staged contents, ignoring unstaged modificati
     await execFileP("git", ["add", "test.ts"], { cwd: repo });
 
     // Modify working tree with a token but DO NOT stage it
-    await fs.writeFile(file, `const token = "${FAKE_BOT_TOKEN}";\n`, "utf8");
+    await fs.writeFile(file, ["const ", "token", " = ", JSON.stringify(FAKE_BOT_TOKEN), ";\n"].join(""), "utf8");
 
     // Staged scan should pass because only index content is evaluated
     const { stdout } = await execFileP("node", [PRE_COMMIT_SCRIPT], { cwd: repo });
@@ -98,7 +98,7 @@ test("pre-commit script catches secrets when only added in staged changes", asyn
   try {
     const file = path.join(repo, "test.ts");
     // Stage secret
-    await fs.writeFile(file, `const token = "${FAKE_BOT_TOKEN}";\n`, "utf8");
+    await fs.writeFile(file, ["const ", "token", " = ", JSON.stringify(FAKE_BOT_TOKEN), ";\n"].join(""), "utf8");
     await execFileP("git", ["add", "test.ts"], { cwd: repo });
 
     // Working tree cleaned up, but index still has the token
