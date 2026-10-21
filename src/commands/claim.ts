@@ -114,7 +114,8 @@ export function claimTimelineMessage(
 
   const matching = (events ?? []).filter(
     (e) =>
-      e &&
+      e !== null &&
+      typeof e === "object" &&
       e.payload &&
       typeof e.payload === "object" &&
       "claimId" in e.payload &&

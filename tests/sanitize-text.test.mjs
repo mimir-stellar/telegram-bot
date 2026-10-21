@@ -130,7 +130,7 @@ test("formatEvent: sanitizes bidi spoofing in claim_created category and market_
   const mdMessage = formatEvent(CONFIG, claimEvent);
   assert.ok(mdMessage !== null);
   assert.equal(mdMessage.includes("\u202E"), false);
-  assert.ok(mdMessage.includes("crypto 000.001 edis"));
+  assert.ok(mdMessage.includes("crypto 000\\.001 edis"));
 
   const plainMessage = formatPlainTextEvent(CONFIG, claimEvent);
   assert.ok(plainMessage !== null);
@@ -159,7 +159,7 @@ test("formatEvent: sanitizes bidi spoofing in claim_created category and market_
   const mdSquad = formatEvent(CONFIG, squadEvent);
   assert.ok(mdSquad !== null);
   assert.equal(mdSquad.includes("\u202E"), false);
-  assert.ok(mdSquad.includes("Will Stellar hit 100M? RLO-attack"));
+  assert.ok(mdSquad.includes("Will Stellar hit 100M? RLO\\-attack"));
 
   const plainSquad = formatPlainTextEvent(CONFIG, squadEvent);
   assert.ok(plainSquad !== null);
@@ -189,7 +189,7 @@ test("formatEvent: sanitizes bidi spoofing in claim_resolved summary", () => {
   const mdResolved = formatEvent(CONFIG, resolvedEvent);
   assert.ok(mdResolved !== null);
   assert.equal(mdResolved.includes("\u202E"), false);
-  assert.ok(mdResolved.includes("Resolved in favor of YES (actually NO)"));
+  assert.ok(mdResolved.includes("Resolved in favor of YES \\(actually NO\\)"));
 
   const plainResolved = formatPlainTextEvent(CONFIG, resolvedEvent);
   assert.ok(plainResolved !== null);
