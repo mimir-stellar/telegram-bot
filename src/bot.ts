@@ -7,7 +7,7 @@
  * state. All chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
-import { Bot, InlineKeyboard, type Context } from "grammy";
+import { Bot, InlineKeyboard, type CommandContext, type Context } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import { performance } from "node:perf_hooks";
 
@@ -45,6 +45,8 @@ import {
 } from "./i18n.js";
 import { helpDetailMessage } from "./commands/help-detail.js";
 import { aboutMessage } from "./commands/about.js";
+import { createEventsHandler } from "./commands/events.js";
+import { recentEvents } from "./notifications/recent.js";
 export { helpDetailMessage, COMMAND_DETAILS, type CommandDetail } from "./commands/help-detail.js";
 import {
   handleBroadcastCallback,
@@ -60,43 +62,7 @@ export {
   sendBroadcast,
 } from "./commands/broadcast.js";
 
-/**
- * How long a pause-confirmation message stays valid.
- * Callbacks arriving after this window are rejected as stale.
- */
-export const PAUSE_CONFIRM_TTL_MS = 60_000;
 
-/**
- * The two callback_data strings used by the pause confirmation flow.
- * Both are well under Telegram's 64-byte limit.
- */
-export const CALLBACK_PAUSE_CONFIRM = "pause-confirm" as const;
-export const CALLBACK_PAUSE_CANCEL = "pause-cancel" as const;
-
-type ValidCallbackAction = typeof CALLBACK_PAUSE_CONFIRM | typeof CALLBACK_PAUSE_CANCEL;
-
-const VALID_CALLBACK_DATA = new Set<string>([
-  CALLBACK_PAUSE_CONFIRM,
-  CALLBACK_PAUSE_CANCEL,
-]);
-
-/**
- * Returns the validated action string or `null` if data is unknown/missing.
- * Keeps the handler from acting on arbitrary payloads from third parties.
- */
-export function validateCallbackData(data: string | undefined): ValidCallbackAction | null {
-  if (data !== undefined && VALID_CALLBACK_DATA.has(data)) {
-    return data as ValidCallbackAction;
-  }
-  return null;
-}
-
-/** Inline keyboard attached to the pause confirmation message. */
-export function operatorKeyboard(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("✅ Confirm pause", CALLBACK_PAUSE_CONFIRM)
-    .text("❌ Cancel", CALLBACK_PAUSE_CANCEL);
-}
 
 const HELP_BASE = [
   "*Mimir notifier*",
@@ -110,8 +76,8 @@ const HELP_BASE = [
   "/help — this message",
 ];
 
-function helpMessage(config: BotConfig): string {
-  if (config.operatorTelegramUserId === null) return HELP_BASE.join("\n");
+export function helpMessage(config?: BotConfig): string {
+  if (config?.operatorTelegramUserId === null) return HELP_BASE.join("\n");
   return [
     HELP_TITLE,
     "",
@@ -571,56 +537,6 @@ export function resumeMessage(result: PollerResumeResult): string {
   }
 }
 
-/**
- * Shared handler for pause inline-keyboard callbacks.
- *
- * Exported for unit testing without needing a live grammy `Bot` instance.
- * Callers must pass a grammy-compatible `ctx` that exposes:
- *   - `ctx.from`
- *   - `ctx.callbackQuery.data`
- *   - `ctx.callbackQuery.message.date` (Unix seconds, set by Telegram)
- *   - `ctx.answerCallbackQuery(text?, opts?)`
- *   - `ctx.editMessageText(text, opts)`
- */
-export async function handleCallbackQuery(
-  ctx: Context,
-  deps: Pick<BotDeps, "config" | "pause">,
-  nowMs: number = Date.now(),
-): Promise<void> {
-  const { config, pause } = deps;
-
-  const action = validateCallbackData(ctx.callbackQuery?.data);
-  if (action === null) return; // unknown payload — silently ignore
-
-  // Only the operator may act on these buttons.
-  if (!isOperator(ctx, config)) {
-    await ctx.answerCallbackQuery({ text: "Only the operator can do that.", show_alert: true });
-    return;
-  }
-
-  // Reject stale confirmations so an old message cannot pause the bot later.
-  const messageDate = ctx.callbackQuery?.message?.date ?? 0;
-  const ageMs = nowMs - messageDate * 1000;
-  if (ageMs > PAUSE_CONFIRM_TTL_MS) {
-    await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
-    await ctx.editMessageText("⏱ *Pause confirmation expired\\.* Run /pause again\\.", TELEGRAM_OPTIONS);
-    return;
-  }
-
-  if (action === CALLBACK_PAUSE_CONFIRM) {
-    const result = pause();
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
-    return;
-  }
-
-  if (action === CALLBACK_PAUSE_CANCEL) {
-    await ctx.answerCallbackQuery({ text: "Cancelled." });
-    await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
-    return;
-  }
-}
-
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
@@ -682,6 +598,28 @@ async function replyMarkdown(
   for (const part of splitTelegramMessage(text)) {
     await ctx.reply(part, options);
   }
+}
+
+/** The commands the bot advertises in Telegram's command menu. */
+export const COMMANDS = [
+  { command: "start", description: COMMAND_DESCRIPTIONS.start, operatorOnly: false },
+  { command: "help", description: COMMAND_DESCRIPTIONS.help, operatorOnly: false },
+  { command: "about", description: COMMAND_DESCRIPTIONS.about, operatorOnly: false },
+  { command: "status", description: COMMAND_DESCRIPTIONS.status, operatorOnly: false },
+  { command: "audit", description: COMMAND_DESCRIPTIONS.audit, operatorOnly: true },
+  { command: "contracts", description: COMMAND_DESCRIPTIONS.contracts, operatorOnly: false },
+  { command: "health", description: COMMAND_DESCRIPTIONS.health, operatorOnly: false },
+  { command: "preview", description: COMMAND_DESCRIPTIONS.preview, operatorOnly: false },
+  { command: "pause", description: COMMAND_DESCRIPTIONS.pause, operatorOnly: true },
+  { command: "resume", description: COMMAND_DESCRIPTIONS.resume, operatorOnly: true },
+  { command: "events", description: "Recent delivered notifications", operatorOnly: false },
+] as const;
+
+/** Commands visible to a chat, gating operator-only commands behind the operator id. */
+function visibleCommands(config?: BotConfig) {
+  return COMMANDS.filter((command) =>
+    !command.operatorOnly || config === undefined || config.operatorTelegramUserId !== null,
+  );
 }
 
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
@@ -813,6 +751,11 @@ export function registerCommandHandlers(
       }
       await ctx.reply(resumeMessage(resume()), TELEGRAM_OPTIONS);
     },
+
+    events: async (ctx) => {
+      if (!chatAllowed(ctx, "events")) return;
+      await createEventsHandler(recentEvents, config)(ctx);
+    },
   };
 
   for (const { command } of COMMANDS) {
@@ -911,11 +854,7 @@ export async function handleCallbackQuery(
       });
       return;
     }
-    await ctx.reply(
-      "⏸ *Pause polling?*\nThis will stop new scans from starting\\. The current scan may finish\\.",
-      { ...TELEGRAM_OPTIONS, reply_markup: operatorKeyboard() },
-    );
-  });
+  }
 
   // Execute validated action
   try {
@@ -989,14 +928,22 @@ export async function handleCallbackQuery(
         break;
       }
     }
-    await ctx.reply(resumeMessage(resume()), TELEGRAM_OPTIONS);
-  });
+  } catch (err) {
+    console.warn(
+      `[bot] callback ${action.type} failed: ${safeErrorMessage(err, [config.botToken])}`,
+    );
+    await safeAnswerCallback(ctx, config, { text: "Action failed", show_alert: true });
+  }
+}
 
-  // Inline-keyboard callbacks for the pause confirmation flow.
-  bot.callbackQuery(
-    [CALLBACK_PAUSE_CONFIRM, CALLBACK_PAUSE_CANCEL],
-    async (ctx) => handleCallbackQuery(ctx, { config, pause }),
-  );
+/**
+ * Registers the inline-callback query handler so every callback_query update
+ * is validated and dispatched through {@link handleCallbackQuery}.
+ */
+export function registerCallbackHandlers(bot: Bot, deps: BotDeps): void {
+  bot.on("callback_query", async (ctx: Context) => {
+    await handleCallbackQuery(ctx, deps);
+  });
 }
 
 export function createBot(deps: BotDeps): Bot {
@@ -1004,13 +951,6 @@ export function createBot(deps: BotDeps): Bot {
     deps.config.telegramApiRoot !== undefined && deps.config.telegramApiRoot !== null
       ? { client: { apiRoot: deps.config.telegramApiRoot } }
       : undefined;
-  const tokenCheck = validateBotTokenShape(deps.config.botToken);
-  if (!tokenCheck.ok) {
-    // Never include the token (or any part of it) in the thrown error.
-    throw new Error(
-      `Invalid BOT_TOKEN (${tokenCheck.problem}): ${tokenCheck.message}`,
-    );
-  }
   const bot = new Bot(
     deps.config.botToken,
     deps.botInfo !== undefined

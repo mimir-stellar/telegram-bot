@@ -88,6 +88,7 @@ import {
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
+import { recentEvents } from "./notifications/recent.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
@@ -2133,6 +2134,15 @@ export function createPoller(deps: PollerDeps) {
         recordSentIncrement();
         metrics?.notificationsSent.inc();
         sentThisCycle += 1;
+        // Feed the bounded ring buffer so /events can scroll recent deliveries.
+        // Best-effort: a recording failure must not fail a successful send.
+        try {
+          recentEvents.record(event);
+        } catch (err) {
+          console.error(
+            `[poller] failed to record delivered event ${event.eventId}: ${safeErrorMessage(err)}`,
+          );
+        }
         if (sendJournal) {
           try {
             await sendJournal.recordDone(event.eventId);
