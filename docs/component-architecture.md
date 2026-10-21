@@ -67,6 +67,8 @@ Configuration is loaded from environment variables with support for profiles (`M
 
 The poller is the central orchestrator that runs a recurring loop to scan contracts and send notifications. It maintains in-memory state for each watched contract and persists cursors to disk.
 
+For a detailed step-by-step walkthrough and sequence diagram of a single poll cycle, see [Poll Cycle Execution](poll-cycle.md).
+
 **Key responsibilities:**
 - **Polling loop**: Schedules cycles at `POLL_INTERVAL_MS` intervals
 - **Contract scanning**: Calls `readContractEvents()` for each target contract
