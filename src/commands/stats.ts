@@ -1,4 +1,4 @@
-import { escapeMd } from "../telegram.js";
+import { escapeMd } from "../notifications/format.js";
 
 export interface StatsSnapshot {
   notificationsSent?: number;

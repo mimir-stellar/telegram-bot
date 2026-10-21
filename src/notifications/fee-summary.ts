@@ -1,11 +1,11 @@
 import type { MarketPayload, SquadFeesClaimedPayload } from "../stellar/decode.js";
-import { formatUsdc } from "../stellar/format.js";
-import { escapeMd, shortAddress } from "../telegram/format.js";
+import { formatUsdc, shortAddress } from "../stellar/decode.js";
+import { escapeMd } from "./format.js";
 
 export interface FeeEvent {
   contractId?: string;
   recipient?: string;
-  amount: bigint | string | number;
+  amount: bigint;
   kind: "market" | "squad";
 }
 
@@ -66,7 +66,7 @@ function normalizeEvent(event: FeeEventInput): FeeEvent {
     kind: event.kind,
     contractId: event.contractId,
     recipient: event.recipient,
-    amount: toBigInt(event.amount),
+    amount: toBigInt(event.amount as bigint | string | number),
   };
 }
 
@@ -78,7 +78,7 @@ export function summarizeFees(events: FeeEventInput[]): FeeSummary {
 
   for (const raw of events) {
     const event = normalizeEvent(raw);
-    const amount = event.amount;
+    const amount = toBigInt(event.amount);
     total += amount;
     count += 1;
 

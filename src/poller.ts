@@ -178,6 +178,21 @@ export interface RestartGap {
   missedLedgers: number;
 }
 
+/**
+ * Format an unrecoverable restart gap alert for the operator as plain text.
+ */
+export function formatRestartGapAlert(gap: {
+  source: ContractSource;
+  cursorLedger: number;
+  oldestLedger: number;
+}): string {
+  return (
+    `[Restart Gap Alert] Unrecoverable restart gap detected for ${gap.source}.\n` +
+    `Missed ledger range: ${gap.cursorLedger} to ${gap.oldestLedger}.\n` +
+    `Suggested replay command: npm run replay -- --from ${gap.oldestLedger} --contract ${gap.source} --send`
+  );
+}
+
 export type PollerPauseResult = "paused" | "already-paused" | "stopped";
 export type PollerResumeResult = "resumed" | "already-running" | "stopped";
 
@@ -445,6 +460,11 @@ export interface PollerDeps {
    * set. May reject.
    */
   send: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>;
+  /**
+   * Optional direct notification hook for the operator (e.g. restart gaps).
+   * Plain-text message sent to the operator's private chat.
+   */
+  notifyOperator?: ((text: string) => Promise<void>) | undefined;
   /**
    * Operator audit trail. A fresh one is created when omitted, so the poller
    * keeps working in callers that do not care about auditing (tests, tooling).
@@ -1254,6 +1274,7 @@ export function buildDigests(
 }
 
 export function createPoller(deps: PollerDeps) {
+  const notifiedGaps = new Set<string>();
   const { config, server, send } = deps;
   const metrics = deps.metrics;
   const audit: AuditLog = deps.audit ?? createAuditLog();
@@ -2007,12 +2028,11 @@ export function createPoller(deps: PollerDeps) {
           // below is unchanged: either path counts as sent, neither as skipped.
           const plainText = formatPlainTextEvent(config, event);
           const eventRef = { eventId: event.eventId, ledger: event.ledger, source: event.source };
-          if (reply_markup || plainText !== null) {
-            extra = {
-              ...(reply_markup ? { reply_markup } : {}),
-              ...(plainText !== null ? { plainText, eventRef } : {}),
-            };
-          }
+          extra = {
+            eventName: event.payload.name,
+            ...(reply_markup ? { reply_markup } : {}),
+            ...(plainText !== null ? { plainText, eventRef } : {}),
+          };
         }
       } catch (err) {
         recordSkippedIncrement();
@@ -2304,6 +2324,20 @@ export function createPoller(deps: PollerDeps) {
       oldestLedger: window.oldestLedger,
       missedLedgers: missed,
     };
+    const gapKey = `${target.source}:${cursorLedger ?? window.oldestLedger}:${window.oldestLedger}`;
+    if (!notifiedGaps.has(gapKey)) {
+      notifiedGaps.add(gapKey);
+      if (deps.notifyOperator && config.operatorTelegramUserId) {
+        const alertText = formatRestartGapAlert({
+          source: target.source,
+          cursorLedger: cursorLedger ?? window.oldestLedger,
+          oldestLedger: window.oldestLedger,
+        });
+        void deps.notifyOperator(alertText).catch((err) => {
+          console.error(`[poller] failed to notify operator of restart gap: ${safeErrorMessage(err)}`);
+        });
+      }
+    }
     markDirty();
     console.warn(
       `[poller] ${target.source}: restart gap — cursor at ledger ${cursorLedger} is ` +

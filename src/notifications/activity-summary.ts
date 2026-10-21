@@ -1,5 +1,5 @@
-import { escapeMd } from "./markdown.js";
-import { formatUsdc } from "./format.js";
+import { escapeMd } from "./format.js";
+import { formatUsdc } from "../stellar/decode.js";
 
 export interface ActivityEvent {
   type: string;

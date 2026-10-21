@@ -128,6 +128,9 @@ Do not manually advance the cursor to skip an RPC failure.
 
 ## Telegram failures
 
+For a quick mapping of raw Telegram error messages to fixes, see the
+[Telegram Troubleshooting FAQ](telegram-troubleshooting.md).
+
 ### Symptoms
 
 * Event scanning continues but sends fail.
@@ -235,6 +238,6 @@ being replaced.
 npm run cursor -- backup --out data/cursor-backup.json
 ```
 
-Restore only after stopping the notifier. See [Cursor CLI reference](cursor-cli.md)
+Restore only after stopping the notifier. See [Cursor CLI reference](../README.md#cursor-backup-and-restore)
 for the full subcommand and flag reference, including how to inspect a cursor
 file and what `--force` overrides.

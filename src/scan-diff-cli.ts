@@ -216,8 +216,8 @@ export function main(argv: string[] = process.argv.slice(2)): number {
   let beforeReport: ScanReport;
   let afterReport: ScanReport;
   try {
-    beforeReport = parseReport(readFileSync(beforePath, "utf8"), beforePath);
-    afterReport = parseReport(readFileSync(afterPath, "utf8"), afterPath);
+    beforeReport = parseReport(readFileSync(beforePath!, "utf8"), beforePath!);
+    afterReport = parseReport(readFileSync(afterPath!, "utf8"), afterPath!);
   } catch (err) {
     process.stderr.write(`${(err as Error).message}\n`);
     return 2;

@@ -58,6 +58,7 @@ export function parsePaginationCallback(
   if (parts.length !== 4) return null;
   const [prefix, version, kind, pageStr] = parts;
   if (prefix !== "pg" || version !== CALLBACK_VERSION) return null;
+  if (!pageStr || !kind) return null;
   const page = Number(pageStr);
   if (!Number.isInteger(page) || page < 0) return null;
   return { kind, page };

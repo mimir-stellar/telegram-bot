@@ -61,11 +61,13 @@ export const AUDIT_CLI_HINT =
 export const COMMAND_DESCRIPTIONS = {
   start: "What this bot does",
   help: "Show help",
+  about: "About this bot",
   status: "Last-seen ledger and watched contracts",
   audit: "Operator only: audit report (redacted, bounded)",
   contracts: "Contract ids and explorer links",
   health: "Health assessment and operational readiness",
   preview: "Preview channel notification formatting",
+  ping: "Measure Telegram round-trip latency",
   pause: "Operator only: pause new scans",
   resume: "Operator only: resume polling now",
 } as const;
@@ -144,8 +146,12 @@ export const NOTIFICATION_MD = {
     captain: string,
     feeBps: string,
     deadline: string,
+    category?: string | null,
   ): string =>
-    `🆕 *New squad market* \\#${marketId}\n${question}\nCaptain: ${captain} · fee ${feeBps} bps · deadline ${deadline}`,
+    (
+      `🆕 *New squad market* \\#${marketId}\n${question}\nCaptain: ${captain} · fee ${feeBps} bps · deadline ${deadline}` +
+      (category ? `\nCategory: ${category}` : "")
+    ),
 
   deposited: (marketId: string, amount: string, side: string, participant: string): string =>
     `➕ *Squad \\#${marketId}* — ${amount} on *${side}*\nParticipant: ${participant}`,
@@ -262,8 +268,12 @@ export const NOTIFICATION_PLAIN = {
     captain: string,
     feeBps: string,
     deadline: string,
+    category?: string | null,
   ): string =>
-    `New squad market #${marketId}\n${question}\nCaptain: ${captain} · fee ${feeBps} bps · deadline ${deadline}`,
+    (
+      `New squad market #${marketId}\n${question}\nCaptain: ${captain} · fee ${feeBps} bps · deadline ${deadline}` +
+      (category ? `\nCategory: ${category}` : "")
+    ),
 
   deposited: (
     marketId: string | number,
