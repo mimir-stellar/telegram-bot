@@ -6,11 +6,13 @@
 |---|---|---|---|
 | `/start` | What this bot does | No | No |
 | `/help` | Show help | No | No |
+| `/about` | About this bot | No | No |
 | `/status` | Last-seen ledger and watched contracts | No | Yes |
 | `/audit` | Operator only: audit report (redacted, bounded) | Yes | No |
 | `/contracts` | Contract ids and explorer links | No | Yes |
 | `/health` | Health assessment and operational readiness | No | Yes |
 | `/preview` | Preview channel notification formatting | No | Yes |
+| `/ping` | Measure Telegram round-trip latency | No | No |
 | `/pause` | Operator only: pause new scans | Yes | No |
 | `/resume` | Operator only: resume polling now | Yes | No |
 
