@@ -14,8 +14,8 @@ import test from "node:test";
 
 import {
   handleCallbackQuery,
-  validateCallbackData,
-  operatorKeyboard,
+  validatePauseCallbackData,
+  pauseConfirmationKeyboard,
   CALLBACK_PAUSE_CONFIRM,
   CALLBACK_PAUSE_CANCEL,
   PAUSE_CONFIRM_TTL_MS,

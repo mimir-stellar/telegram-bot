@@ -18,6 +18,7 @@
     "lockfile:reproduce": "node scripts/check-lockfile.mjs --reproduce",
     "test": "npm run build && node --test --test-timeout=120000 tests/*.test.mjs",
     "test:mock": "npm run build && node --test --test-timeout=120000 tests/mock-*.test.mjs",
+    "test:fast": "node --import ./scripts/tsx-dist-loader.mjs --test --test-timeout=120000 tests/*.test.mjs",
     "scan": "tsx src/stellar/events.ts",
     "scan:secrets": "node scripts/scan-secrets.mjs",
     "scan:mock": "tsx src/stellar/events.ts --mock",

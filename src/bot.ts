@@ -7,7 +7,7 @@
  * state. All chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
-import { Bot, InlineKeyboard, type Context } from "grammy";
+import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import { performance } from "node:perf_hooks";
 
@@ -44,11 +44,41 @@ import {
 import { helpDetailMessage } from "./commands/help-detail.js";
 import { aboutMessage } from "./commands/about.js";
 export { helpDetailMessage, COMMAND_DETAILS, type CommandDetail } from "./commands/help-detail.js";
+import { handlePingCommand } from "./commands/ping.js";
+export {
+  handlePingCommand,
+  pingCommand,
+  pongMessage,
+  formatPong,
+  type PingDeps,
+  type Clock,
+} from "./commands/ping.js";
 import {
   handleBroadcastCallback,
   registerBroadcastHandlers,
   type BroadcastStore,
 } from "./commands/broadcast.js";
+
+/** Shared metadata for handlers, help, and Telegram's command menu. */
+export const COMMANDS = [
+  { command: "start", description: COMMAND_DESCRIPTIONS.start, operatorOnly: false },
+  { command: "help", description: COMMAND_DESCRIPTIONS.help, operatorOnly: false },
+  { command: "about", description: COMMAND_DESCRIPTIONS.about, operatorOnly: false },
+  { command: "status", description: COMMAND_DESCRIPTIONS.status, operatorOnly: false },
+  { command: "audit", description: COMMAND_DESCRIPTIONS.audit, operatorOnly: true },
+  { command: "contracts", description: COMMAND_DESCRIPTIONS.contracts, operatorOnly: false },
+  { command: "health", description: COMMAND_DESCRIPTIONS.health, operatorOnly: false },
+  { command: "preview", description: COMMAND_DESCRIPTIONS.preview, operatorOnly: false },
+  { command: "ping", description: COMMAND_DESCRIPTIONS.ping, operatorOnly: false },
+  { command: "pause", description: COMMAND_DESCRIPTIONS.pause, operatorOnly: true },
+  { command: "resume", description: COMMAND_DESCRIPTIONS.resume, operatorOnly: true },
+] as const;
+
+function visibleCommands(config?: BotConfig) {
+  return COMMANDS.filter((command) =>
+    !command.operatorOnly || config === undefined || config.operatorTelegramUserId !== null,
+  );
+}
 export {
   handleBroadcastCallback,
   registerBroadcastHandlers,
@@ -93,6 +123,12 @@ function visibleCommands(config?: BotConfig): typeof COMMANDS {
 export const PAUSE_CONFIRM_TTL_MS = 60_000;
 export const CALLBACK_PAUSE_CONFIRM = "pause-confirm" as const;
 export const CALLBACK_PAUSE_CANCEL = "pause-cancel" as const;
+
+type PauseCallbackAction = typeof CALLBACK_PAUSE_CONFIRM | typeof CALLBACK_PAUSE_CANCEL;
+
+export function validatePauseCallbackData(data: unknown): PauseCallbackAction | null {
+  return data === CALLBACK_PAUSE_CONFIRM || data === CALLBACK_PAUSE_CANCEL ? data : null;
+}
 
 const HELP_BASE = [
   "*Mimir notifier*",
@@ -280,7 +316,6 @@ export function operatorKeyboard(): InlineKeyboard {
     .row()
     .text("📊 Status", "status");
 }
-
 
 function ago(timestamp: number | null, nowMs: number = Date.now()): string {
   if (timestamp === null) return "never";
@@ -578,14 +613,14 @@ export function resumeMessage(result: PollerResumeResult): string {
  *   - `ctx.answerCallbackQuery(text?, opts?)`
  *   - `ctx.editMessageText(text, opts)`
  */
-export async function handleCallbackQuery(
+async function handlePauseCallback(
   ctx: Context,
   deps: Pick<BotDeps, "config" | "pause">,
   nowMs: number = Date.now(),
 ): Promise<void> {
   const { config, pause } = deps;
 
-  const action = validateCallbackData(ctx.callbackQuery?.data);
+  const action = validatePauseCallbackData(ctx.callbackQuery?.data);
   if (action === null) return; // unknown payload — silently ignore
 
   // Only the operator may act on these buttons.
@@ -649,7 +684,7 @@ export interface BotDeps {
  *   id (stored as a number in grammy's ctx.chat.id) and its string form are
  *   compared so that negative group ids such as -1001234567890 match correctly.
  */
-function isChatAllowed(allowedChatIds: readonly string[] | undefined, chatId: number): boolean {
+export function isChatAllowed(allowedChatIds: readonly string[] | undefined, chatId: number): boolean {
   // Hand-built configs (tests, embedders) may omit the list: treat it as open.
   if (!allowedChatIds || allowedChatIds.length === 0) return true;
   const asString = String(chatId);
@@ -682,7 +717,7 @@ async function replyMarkdown(
 
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
 export function registerCommandHandlers(
-  bot: Bot | { command: (name: string, handler: (ctx: CommandContext<Context>) => Promise<void>) => void },
+  bot: Bot | { command: (name: string, handler: (ctx: CommandContext<Context>) => Promise<void>) => void; callbackQuery?: (filter: string | string[], handler: (ctx: Context) => Promise<void>) => void },
   deps: BotDeps,
 ): void {
   const { config, status } = deps;
@@ -794,12 +829,19 @@ export function registerCommandHandlers(
       await ctx.reply(previewMessage(config, arg || "market"), TELEGRAM_OPTIONS);
     },
 
+    ping: async (ctx) => {
+      await handlePingCommand(ctx, { config });
+    },
+
     pause: async (ctx) => {
       if (!isOperator(ctx, config)) {
         console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
         return;
       }
-      await ctx.reply(pauseMessage(pause()), TELEGRAM_OPTIONS);
+      await ctx.reply("⏸ *Pause polling?*\\nThis will stop new scans from starting\\. The current scan may finish\\.", {
+        ...TELEGRAM_OPTIONS,
+        reply_markup: pauseConfirmationKeyboard(),
+      });
     },
 
     resume: async (ctx) => {
@@ -813,6 +855,12 @@ export function registerCommandHandlers(
 
   for (const { command } of COMMANDS) {
     bot.command(command, handlers[command]);
+  }
+  if (!("on" in bot) && typeof bot.callbackQuery === "function") {
+    bot.callbackQuery(
+      [CALLBACK_PAUSE_CONFIRM, CALLBACK_PAUSE_CANCEL],
+      async (ctx) => handlePauseCallback(ctx, { config, pause }),
+    );
   }
 }
 
@@ -873,7 +921,13 @@ export async function updateOrReplyMessage(
 export async function handleCallbackQuery(
   ctx: Context,
   deps: BotDeps,
+  nowMs?: number,
 ): Promise<void> {
+  if (nowMs !== undefined || ctx.callbackQuery?.data === CALLBACK_PAUSE_CONFIRM || ctx.callbackQuery?.data === CALLBACK_PAUSE_CANCEL) {
+    await handlePauseCallback(ctx, { config: deps.config, pause: deps.pause }, nowMs);
+    return;
+  }
+
   const { config, status } = deps;
   const pause = deps.pause ?? (() => "stopped");
   const resume = deps.resume ?? (() => "stopped");
@@ -907,11 +961,7 @@ export async function handleCallbackQuery(
       });
       return;
     }
-    await ctx.reply(
-      "⏸ *Pause polling?*\nThis will stop new scans from starting\\. The current scan may finish\\.",
-      { ...TELEGRAM_OPTIONS, reply_markup: operatorKeyboard() },
-    );
-  });
+  }
 
   // Execute validated action
   try {
@@ -1014,13 +1064,6 @@ export function createBot(deps: BotDeps): Bot {
     deps.config.telegramApiRoot !== undefined && deps.config.telegramApiRoot !== null
       ? { client: { apiRoot: deps.config.telegramApiRoot } }
       : undefined;
-  const tokenCheck = validateBotTokenShape(deps.config.botToken);
-  if (!tokenCheck.ok) {
-    // Never include the token (or any part of it) in the thrown error.
-    throw new Error(
-      `Invalid BOT_TOKEN (${tokenCheck.problem}): ${tokenCheck.message}`,
-    );
-  }
   const bot = new Bot(
     deps.config.botToken,
     deps.botInfo !== undefined
