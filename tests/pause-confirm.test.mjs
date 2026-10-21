@@ -14,8 +14,8 @@ import test from "node:test";
 
 import {
   handleCallbackQuery,
-  validateCallbackData,
-  operatorKeyboard,
+  validatePauseCallbackData,
+  pauseConfirmationKeyboard,
   CALLBACK_PAUSE_CONFIRM,
   CALLBACK_PAUSE_CANCEL,
   PAUSE_CONFIRM_TTL_MS,
@@ -84,24 +84,24 @@ function nowSeconds() {
 
 // ── validateCallbackData ──────────────────────────────────────────────────────
 
-test("validateCallbackData accepts pause-confirm", () => {
-  assert.equal(validateCallbackData(CALLBACK_PAUSE_CONFIRM), CALLBACK_PAUSE_CONFIRM);
+test("validatePauseCallbackData accepts pause-confirm", () => {
+  assert.equal(validatePauseCallbackData(CALLBACK_PAUSE_CONFIRM), CALLBACK_PAUSE_CONFIRM);
 });
 
-test("validateCallbackData accepts pause-cancel", () => {
-  assert.equal(validateCallbackData(CALLBACK_PAUSE_CANCEL), CALLBACK_PAUSE_CANCEL);
+test("validatePauseCallbackData accepts pause-cancel", () => {
+  assert.equal(validatePauseCallbackData(CALLBACK_PAUSE_CANCEL), CALLBACK_PAUSE_CANCEL);
 });
 
-test("validateCallbackData rejects unknown data", () => {
-  assert.equal(validateCallbackData("bad-action"), null);
+test("validatePauseCallbackData rejects unknown data", () => {
+  assert.equal(validatePauseCallbackData("bad-action"), null);
 });
 
-test("validateCallbackData rejects undefined", () => {
-  assert.equal(validateCallbackData(undefined), null);
+test("validatePauseCallbackData rejects undefined", () => {
+  assert.equal(validatePauseCallbackData(undefined), null);
 });
 
-test("validateCallbackData rejects empty string", () => {
-  assert.equal(validateCallbackData(""), null);
+test("validatePauseCallbackData rejects empty string", () => {
+  assert.equal(validatePauseCallbackData(""), null);
 });
 
 // ── operatorKeyboard ──────────────────────────────────────────────────────────
@@ -117,8 +117,8 @@ test("operatorKeyboard button callback_data strings are within Telegram's 64-byt
   );
 });
 
-test("operatorKeyboard returns an object with inline_keyboard rows", () => {
-  const kb = operatorKeyboard();
+test("pauseConfirmationKeyboard returns an object with inline_keyboard rows", () => {
+  const kb = pauseConfirmationKeyboard();
   // grammy InlineKeyboard serialises to { inline_keyboard: Button[][] }
   const serialised = kb.inline_keyboard;
   assert.ok(Array.isArray(serialised), "inline_keyboard is an array");

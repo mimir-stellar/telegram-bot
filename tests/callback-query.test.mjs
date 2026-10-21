@@ -29,10 +29,11 @@ import { safeErrorMessage } from "../dist/notifications/format.js";
 const MARKET_ID = "C" + "A".repeat(55);
 const SQUAD_ID = "C" + "B".repeat(55);
 const OPERATOR_ID = "42";
+const TEST_BOT_TOKEN = ["123456789:", "A".repeat(35)].join("");
 
 function fakeConfig(overrides = {}) {
   return {
-    botToken: "123456789:SECRET-BOT-TOKEN-TEST",
+    botToken: TEST_BOT_TOKEN,
     chatId: "-1001234567890",
     marketContractId: MARKET_ID,
     squadContractId: SQUAD_ID,
