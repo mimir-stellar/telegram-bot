@@ -317,7 +317,7 @@ test("fake notifier with failure simulation and secret check", async () => {
 
   // 3. Secret leakage check
   // Asserts that no sensitive bot tokens or private keys appear in sent messages
-  notifier.assertNoSecrets(["secret-token", "SXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]);
+  notifier.assertNoSecrets(["secret-token", "<stellar-secret-seed>"]);
 });
 ```
 
