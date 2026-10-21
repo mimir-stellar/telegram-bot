@@ -83,12 +83,29 @@ export async function runSmoke(options = {}) {
 
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "mimir-smoke-"));
   const cursorFile = path.join(tempDir, "cursor.json");
+  const countersFile = path.join(tempDir, "counters.json");
   const lockFile = path.join(tempDir, "poller.lock");
   const statusFile = path.join(tempDir, "status.json");
+  const envKeys = [
+    "MIMIR_PROFILE",
+    "BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "CURSOR_FILE",
+    "COUNTERS_FILE",
+    "INSTANCE_LOCK_FILE",
+    "STATUS_FILE",
+  ];
+  const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
 
   // Select mock profile and temporary isolated files
   process.env.MIMIR_PROFILE = "mock";
+  // loadConfig validates Telegram token shape even though the fake notifier
+  // never contacts Telegram. Construct this only at runtime; do not commit a
+  // token-shaped literal to the repository.
+  process.env.BOT_TOKEN = ["123456789", "M".repeat(35)].join(":");
+  process.env.TELEGRAM_CHAT_ID = "-1001234567890";
   process.env.CURSOR_FILE = cursorFile;
+  process.env.COUNTERS_FILE = countersFile;
   process.env.INSTANCE_LOCK_FILE = lockFile;
   process.env.STATUS_FILE = statusFile;
 
@@ -106,6 +123,7 @@ export async function runSmoke(options = {}) {
       ...baseConfig,
       rpcUrl: mock.url,
       cursorFile,
+      countersFile,
       lockFile,
       statusFile,
       pollIntervalMs: intervalMs,
@@ -223,6 +241,10 @@ export async function runSmoke(options = {}) {
       }
     }
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 }
 
