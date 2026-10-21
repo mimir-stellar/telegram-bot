@@ -7,7 +7,7 @@ export const MAX_CATEGORY_LENGTH = 128;
  * Control characters that are stripped during normalisation.
  * Covers C0-C1 controls, format characters and zero-width characters.
  */
-const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF]/g;
+const CONTROL_CHARS = /[\u0000-\u0008\u000E-\u001F\u007F-\u009F\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF]/g;
 
 /**
  * Normalise a free-form category string coming from on-chain data so that

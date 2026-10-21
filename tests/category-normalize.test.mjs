@@ -25,9 +25,9 @@ test("inner whitespace is collapsed", () => {
 
 test("full-width and compatibility variants are NFKC normalised", () => {
   // Full-width latin letters.
-  assert.strictEqual(normalizeCategory("\uFF43\uFF72\uFF79\uFF70\uFF74\uFF6F"), "crypto");
+  assert.strictEqual(normalizeCategory("\uFF43\uFF52\uFF59\uFF50\uFF54\uFF4F"), "crypto");
   // Full-width with surrounding whitespace.
-  assert.strictEqual(normalizeCategory(" \uFF43 \uFF72 \uFF79 "), "c r y");
+  assert.strictEqual(normalizeCategory(" \uFF43 \uFF52 \uFF59 "), "c r y");
 });
 
 test("control characters are stripped", () => {
