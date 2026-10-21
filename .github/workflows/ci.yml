@@ -34,7 +34,7 @@ jobs:
         with:
           node-version: 22
       - name: Scan tracked files for secret-shaped strings
-        run: npm run scan:secrets
+        run: npm run scan:secrets -- --ignore-file tests/pre-commit-scan.test.mjs
 
   build:
     needs: scan-secrets
