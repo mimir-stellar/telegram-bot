@@ -1,0 +1,23 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5004,
+    "txHash": "",
+    "at": 1724005004,
+    "eventId": "5004-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_created",
+      "claimId": 5,
+      "creator": "GCAPTAINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "category": "🚀 crypto & DeFi — 星 한국어"
+    }
+  },
+  "md": "🆕 *New claim* \\#5\nCategory: 🚀 crypto & DeFi — 星 한국어\nCreator: `GCAPT…AAAA`\n_ledger 5004_",
+  "plain": "New claim #5\nCategory: 🚀 crypto & DeFi — 星 한국어\nCreator: GCAPT…AAAA\nledger 5004"
+}

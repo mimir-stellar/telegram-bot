@@ -1,0 +1,23 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5000,
+    "txHash": "",
+    "at": 1724005000,
+    "eventId": "5000-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_created",
+      "claimId": 1,
+      "creator": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+      "category": "crypto"
+    }
+  },
+  "md": "🆕 *New claim* \\#1\nCategory: crypto\nCreator: `GABCD…TUVW`\n_ledger 5000_",
+  "plain": "New claim #1\nCategory: crypto\nCreator: GABCD…TUVW\nledger 5000"
+}

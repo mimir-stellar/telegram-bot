@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5022,
+    "txHash": "",
+    "at": 1724005022,
+    "eventId": "5022-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "market_settled",
+      "claimId": 43,
+      "totalPaid": "9999999999999",
+      "totalFees": "999999999999",
+      "owedToChallengers": "9000000000000",
+      "dust": "7"
+    }
+  },
+  "md": "💰 *Claim \\#43 settled*\nPaid out: *999999\\.9999999 USDC* · fees 99999\\.9999999 USDC\nOwed to challengers: 900000\\.0000000 USDC \\(90\\.00%\\)\nTotal fees: 99999\\.9999999 USDC \\(10\\.00%\\)\nDust: 0\\.0000007 USDC \\(0\\.00%\\)\n_ledger 5022_",
+  "plain": "Claim #43 settled\nPaid out: 999999.9999999 USDC · fees 99999.9999999 USDC\nOwed to challengers: 900000.0000000 USDC (90.00%)\nTotal fees: 99999.9999999 USDC (10.00%)\nDust: 0.0000007 USDC (0.00%)\nledger 5022"
+}

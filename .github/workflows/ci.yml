@@ -29,8 +29,8 @@ jobs:
     # tests/secrets.test.mjs, run in the build job below).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Scan tracked files for secret-shaped strings
@@ -72,3 +72,7 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: End-to-end smoke test
+        if: matrix.node-version == 22
+        run: node scripts/e2e-smoke.mjs
