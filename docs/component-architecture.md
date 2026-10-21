@@ -456,3 +456,13 @@ See [contributor-fixtures.md](contributor-fixtures.md) for detailed guidance.
 ### Incident Response
 
 See [incident-runbook.md](incident-runbook.md) for operational guidance.
+
+## Architecture Decision Records
+
+Key design choices and their trade-offs are documented in [`docs/adr/`](adr/) (using [`docs/adr/template.md`](adr/template.md) for new records):
+
+- [ADR 0001: Cursor Commit Policy and Lossy Notification Delivery](adr/0001-cursor-commit-policy.md)
+- [ADR 0002: MarkdownV2 Formatting with Plain-Text Fallback](adr/0002-markdownv2-with-plain-text-fallback.md)
+- [ADR 0003: Retaining Admin and Unrecognized Events Without Notifying](adr/0003-admin-events-retained-as-unknown.md)
+- [ADR 0004: Telegram Long-Polling by Default with Optional Webhook Mode](adr/0004-long-polling-with-optional-webhook.md)
+

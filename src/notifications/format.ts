@@ -24,11 +24,15 @@ import {
   winnerSideLabel,
   type DecodedEvent,
 } from "../stellar/decode.js";
+import { appUrlFor } from "./app-links.js";
 import { groupDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
+import { settlementLines } from "./settlement.js";
+import { formatDeadline } from "./time.js";
 import type { StellarConfig } from "../config.js";
 import {
   EXPLORER_BUTTON_TEXT,
+  MIMIR_APP_BUTTON_TEXT,
   NOTIFICATION_MD,
   NOTIFICATION_PLAIN,
 } from "../i18n.js";
@@ -249,26 +253,46 @@ export interface ExplorerKeyboard {
 }
 
 /**
+ * Config the keyboard builder reads: the chain fields `eventExplorerUrl`
+ * needs, plus the optional Mimir web-app origin (`MIMIR_APP_URL`) that adds a
+ * second button. Optional here so a chain-only config keeps building the
+ * explorer-only keyboard it has always built.
+ */
+export type KeyboardConfig = StellarConfig & { mimirAppUrl?: string | null };
+
+/**
  * Telegram inline keyboard for an event notification.
  *
- * Returns undefined when the event carries no usable transaction hash, so the
- * caller sends the existing text-only message unchanged. The button reuses the
- * same canonical explorer URL as the `· [tx](…)` footer link — the footer stays
- * as the text fallback, the button is progressive enhancement in the same
- * Telegram request (no second message, no extra rate-limit cost).
+ * Returns undefined when the event carries no usable transaction hash and no
+ * Mimir app page, so the caller sends the existing text-only message
+ * unchanged. The explorer button reuses the same canonical explorer URL as the
+ * `· [tx](…)` footer link — the footer stays as the text fallback, the button
+ * is progressive enhancement in the same Telegram request (no second message,
+ * no extra rate-limit cost). When `config.mimirAppUrl` is set and the event
+ * maps to an app page, the "Open in Mimir" button joins the same row.
  */
 export function explorerKeyboard(
-  config: StellarConfig,
+  config: KeyboardConfig,
   event: DecodedEvent,
 ): ExplorerKeyboard | undefined {
-  const url = eventExplorerUrl(config, event);
-  if (!url) return undefined;
-  return { inline_keyboard: [[{ text: EXPLORER_BUTTON_TEXT, url }]] };
+  const buttons: ExplorerButton[] = [];
+  const explorerUrl = eventExplorerUrl(config, event);
+  if (explorerUrl) buttons.push({ text: EXPLORER_BUTTON_TEXT, url: explorerUrl });
+
+  const appUrl = appUrlFor(event, config.mimirAppUrl);
+  if (appUrl) buttons.push({ text: MIMIR_APP_BUTTON_TEXT, url: appUrl });
+
+  if (buttons.length === 0) return undefined;
+  return { inline_keyboard: [buttons] };
 }
 
 /** Format the latest observed event, including events with no notification template. */
-export function formatLastEvent(config: StellarConfig, event: DecodedEvent): string {
-  const notification = formatEvent(config, event);
+export function formatLastEvent(
+  config: StellarConfig & { nowMs?: number },
+  event: DecodedEvent,
+  nowMs?: number,
+): string {
+  const notification = formatEvent(config, event, nowMs);
   if (notification !== null) return notification;
 
   const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
@@ -351,7 +375,7 @@ export function formatDigest(
  * in contract state, not the event, so it is not invented here. The squad
  * contract's `market_created` does carry `question`, and that is shown.
  */
-function headline(event: DecodedEvent): string | null {
+function headline(event: DecodedEvent, nowMs?: number): string | null {
   const p = event.payload;
 
   switch (p.name) {
@@ -381,13 +405,16 @@ function headline(event: DecodedEvent): string | null {
     case "claim_cancelled":
       return NOTIFICATION_MD.claimCancelled(String(p.claimId));
 
-    case "market_settled":
+    case "market_settled": {
+      const lines = settlementLines(p).map(escapeMd);
       return NOTIFICATION_MD.marketSettled(
         String(p.claimId),
         usdc(p.totalPaid),
         usdc(p.totalFees),
         usdc(p.owedToChallengers),
+        lines,
       );
+    }
 
     case "challenger_paid":
       return NOTIFICATION_MD.challengerPaid(
@@ -415,7 +442,8 @@ function headline(event: DecodedEvent): string | null {
         escapeMd(clip(p.question)),
         who(p.captain),
         escapeMd(String(p.feeBps)),
-        escapeMd(new Date(p.deadline * 1000).toISOString()),
+        escapeMd(formatDeadline(p.deadline, nowMs)),
+        p.category ? escapeMd(clip(p.category)) : null,
       );
 
     case "deposited":
@@ -492,12 +520,15 @@ export function formatEvent(
   config: StellarConfig & {
     channelPreviewMode?: boolean;
     notificationCategories?: readonly string[];
+    nowMs?: number;
   },
   event: DecodedEvent,
+  nowMs?: number,
 ): string | null {
   if (!eventAllowedByCategory(config, event)) return null;
+  const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    const head = headline(event);
+    const head = headline(event, currentMs);
     if (head === null) return null;
     const body = `${head}\n${footer(config, event)}`;
     if (config.channelPreviewMode) {
@@ -535,7 +566,7 @@ function plainFooter(config: StellarConfig, event: DecodedEvent): string {
  * field-for-field (same identities, amounts, bounded clips) but emits no
  * MarkdownV2 syntax at all, so Telegram cannot reject it for entity parsing.
  */
-function plainHeadline(event: DecodedEvent): string | null {
+function plainHeadline(event: DecodedEvent, nowMs?: number): string | null {
   const p = event.payload;
 
   switch (p.name) {
@@ -561,13 +592,16 @@ function plainHeadline(event: DecodedEvent): string | null {
     case "claim_cancelled":
       return NOTIFICATION_PLAIN.claimCancelled(p.claimId);
 
-    case "market_settled":
+    case "market_settled": {
+      const lines = settlementLines(p);
       return NOTIFICATION_PLAIN.marketSettled(
         p.claimId,
         plainUsdc(p.totalPaid),
         plainUsdc(p.totalFees),
         plainUsdc(p.owedToChallengers),
+        lines,
       );
+    }
 
     case "challenger_paid":
       return NOTIFICATION_PLAIN.challengerPaid(
@@ -595,7 +629,8 @@ function plainHeadline(event: DecodedEvent): string | null {
         clip(p.question),
         plainWho(p.captain),
         String(p.feeBps),
-        new Date(p.deadline * 1000).toISOString(),
+        formatDeadline(p.deadline, nowMs),
+        p.category ? clip(p.category) : null,
       );
 
     case "deposited":
@@ -670,11 +705,13 @@ function clipPlainText(text: string, max = MAX_PLAIN_TEXT_LENGTH): string {
  * a minimal bounded line rather than crashing the notifier.
  */
 export function formatPlainTextEvent(
-  config: StellarConfig,
+  config: StellarConfig & { nowMs?: number },
   event: DecodedEvent,
+  nowMs?: number,
 ): string | null {
+  const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    const head = plainHeadline(event);
+    const head = plainHeadline(event, currentMs);
     if (head === null) return null;
     const body = `${head}\n${plainFooter(config, event)}`.trim();
     if (!body) return minimalPlainTextEvent(event);
