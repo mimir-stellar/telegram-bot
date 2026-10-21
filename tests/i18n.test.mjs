@@ -577,7 +577,7 @@ test("formatPlainTextEvent for claim_created uses NOTIFICATION_PLAIN.claimCreate
   const result = formatPlainTextEvent(config, event);
   assert.ok(result !== null);
   assert.match(result, /New claim #99/);
-  assert.match(result, /Category: sports/);
+  assert.match(result, /Category: ⚽ sports/);
   assert.equal(result.includes("*"), false); // no Markdown
 });
 
@@ -638,7 +638,7 @@ test("claim_created MarkdownV2 snapshot matches i18n template exactly", () => {
   const event = marketEvent({ name: "claim_created", claimId: 7, category: "crypto", creator: "GABCD" });
   const result = formatEvent(config, event);
   const expected =
-    "🆕 *New claim* \\#7\nCategory: crypto\nCreator: `GABCD`\n_ledger 42_";
+    "🆕 *New claim* \\#7\nCategory: 🪙 crypto\nCreator: `GABCD`\n_ledger 42_";
   assert.equal(result, expected);
 });
 

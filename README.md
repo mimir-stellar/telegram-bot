@@ -1014,6 +1014,10 @@ deadline.
 The process exposes a **loopback HTTP** probe for supervisors and deploy
 checks (default `http://127.0.0.1:8787`):
 
+Webhook deployments reuse this listener. See the
+[Telegram webhook mode runbook](docs/webhook-mode.md) for the exact route,
+proxy requirements, secret lifecycle, verification, and rollback steps.
+
 | Path | Meaning |
 | --- | --- |
 | `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
