@@ -6,6 +6,7 @@
  * two decimal places.
  */
 
+import { SETTLEMENT_LABELS, type SettlementLabels } from "../i18n.js";
 import { formatUsdc } from "../stellar/decode.js";
 
 export interface SettlementPayload {
@@ -53,8 +54,13 @@ export function formatPercentage(amount: bigint, gross: bigint): string {
 
 /**
  * Calculate the gross total and per-bucket proportions for a settled market.
+ * `labels` defaults to English so callers without a locale keep working; the
+ * notification formatter passes the configured locale's labels.
  */
-export function settlementBreakdown(payload: SettlementPayload): SettlementItem[] {
+export function settlementBreakdown(
+  payload: SettlementPayload,
+  labels: SettlementLabels = SETTLEMENT_LABELS,
+): SettlementItem[] {
   const owed = toBigInt(payload.owedToChallengers);
   const fees = toBigInt(payload.totalFees);
   const dust = toBigInt(payload.dust);
@@ -64,19 +70,19 @@ export function settlementBreakdown(payload: SettlementPayload): SettlementItem[
 
   return [
     {
-      label: "Owed to challengers",
+      label: labels.owedToChallengers,
       amount: owed,
       formattedAmount: `${formatUsdc(owed)} USDC`,
       percent: formatPercentage(owed, gross),
     },
     {
-      label: "Total fees",
+      label: labels.totalFees,
       amount: fees,
       formattedAmount: `${formatUsdc(fees)} USDC`,
       percent: formatPercentage(fees, gross),
     },
     {
-      label: "Dust",
+      label: labels.dust,
       amount: dust,
       formattedAmount: `${formatUsdc(dust)} USDC`,
       percent: formatPercentage(dust, gross),
@@ -94,8 +100,11 @@ export function settlementBreakdown(payload: SettlementPayload): SettlementItem[
  *   "Dust: 0.0000000 USDC (0.00%)"
  * ]
  */
-export function settlementLines(payload: SettlementPayload): string[] {
-  return settlementBreakdown(payload).map(
+export function settlementLines(
+  payload: SettlementPayload,
+  labels?: SettlementLabels,
+): string[] {
+  return settlementBreakdown(payload, labels).map(
     (item) => `${item.label}: ${item.formattedAmount} (${item.percent})`,
   );
 }

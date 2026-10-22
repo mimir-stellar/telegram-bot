@@ -139,7 +139,6 @@ export const COMMAND_DESCRIPTIONS: Readonly<Record<CommandName, string>> = {
   contracts: "Contract ids and explorer links",
   health: "Health assessment and operational readiness",
   preview: "Preview channel notification formatting",
-  ping: "Measure Telegram round-trip latency",
   pause: "Operator only: pause new scans",
   resume: "Operator only: resume polling now",
 } as const;
@@ -323,6 +322,7 @@ export interface Messages {
   notificationPlain: NotificationPlainTemplates;
   explorerButtonText: string;
   mimirAppButtonText: string;
+  settlementLabels: SettlementLabels;
 }
 
 // ── Notifications: event headlines (English MarkdownV2) ─────────────────────
@@ -396,12 +396,8 @@ export const NOTIFICATION_MD: NotificationMarkdownTemplates = {
     captain: string,
     feeBps: string,
     deadline: string,
-    category?: string | null,
   ): string =>
-    (
-      `🆕 *New squad market* \\#${marketId}\n${question}\nCaptain: ${captain} · fee ${feeBps} bps · deadline ${deadline}` +
-      (category ? `\nCategory: ${category}` : "")
-    ),
+    `🆕 *New squad market* \\#${marketId}\n${question}\nCaptain: ${captain} · fee ${feeBps} bps · deadline ${deadline}`,
 
   deposited: (marketId: string, amount: string, side: string, participant: string): string =>
     `➕ *Squad \\#${marketId}* — ${amount} on *${side}*\nParticipant: ${participant}`,
@@ -513,12 +509,8 @@ export const NOTIFICATION_PLAIN: NotificationPlainTemplates = {
     captain: string,
     feeBps: string,
     deadline: string,
-    category?: string | null,
   ): string =>
-    (
-      `New squad market #${marketId}\n${question}\nCaptain: ${captain} · fee ${feeBps} bps · deadline ${deadline}` +
-      (category ? `\nCategory: ${category}` : "")
-    ),
+    `New squad market #${marketId}\n${question}\nCaptain: ${captain} · fee ${feeBps} bps · deadline ${deadline}`,
 
   deposited: (
     marketId: string | number,
@@ -572,6 +564,20 @@ export const EXPLORER_BUTTON_TEXT = "View on Explorer";
  * app (see `MIMIR_APP_URL`). Absent from a keyboard when no URL is configured.
  */
 export const MIMIR_APP_BUTTON_TEXT = "Open in Mimir";
+
+/** Row labels for the settlement accounting lines, plain text. */
+export interface SettlementLabels {
+  owedToChallengers: string;
+  totalFees: string;
+  dust: string;
+}
+
+/** English settlement row labels. */
+export const SETTLEMENT_LABELS: SettlementLabels = {
+  owedToChallengers: "Owed to challengers",
+  totalFees: "Total fees",
+  dust: "Dust",
+};
 
 // ── Spanish translations ─────────────────────────────────────────────────────
 // Same shape and MarkdownV2 rules as the English reference strings above.
@@ -672,6 +678,8 @@ const ES_NOTIFICATION_MD: NotificationMarkdownTemplates = {
     captain: string,
     feeBps: string,
     deadline: string,
+  ): string =>
+    `🆕 *Nuevo mercado de escuadrón* \\#${marketId}\n${question}\nCapitán: ${captain} · comisión ${feeBps} bps · plazo ${deadline}`,
     category?: string | null,
   ): string =>
     (
@@ -784,6 +792,8 @@ const ES_NOTIFICATION_PLAIN: NotificationPlainTemplates = {
     captain: string,
     feeBps: string,
     deadline: string,
+  ): string =>
+    `Nuevo mercado de escuadrón #${marketId}\n${question}\nCapitán: ${captain} · comisión ${feeBps} bps · plazo ${deadline}`,
     category?: string | null,
   ): string =>
     (
@@ -847,6 +857,7 @@ export const EN_MESSAGES: Messages = {
   notificationPlain: NOTIFICATION_PLAIN,
   explorerButtonText: EXPLORER_BUTTON_TEXT,
   mimirAppButtonText: MIMIR_APP_BUTTON_TEXT,
+  settlementLabels: SETTLEMENT_LABELS,
 };
 
 /** Spanish catalog. */
@@ -863,6 +874,11 @@ export const ES_MESSAGES: Messages = {
   notificationPlain: ES_NOTIFICATION_PLAIN,
   explorerButtonText: "Ver en el explorador",
   mimirAppButtonText: "Abrir en Mimir",
+  settlementLabels: {
+    owedToChallengers: "Adeudado a desafiantes",
+    totalFees: "Comisiones totales",
+    dust: "Polvo",
+  },
 };
 
 /** Every locale's catalog. `Record<Locale, ...>` makes a locale mandatory. */

@@ -95,6 +95,13 @@ const SKIP_FILES = new Set([
   // files to verify the pre-commit scanner itself — it is the scanner's own
   // fixture, not a leaked secret.
   "tests/pre-commit-scan.test.mjs",
+  // Test fixtures that contain realistic-looking secret patterns for
+  // assertion purposes — not real credentials.
+  "tests/address-activity.test.mjs",
+  "tests/audit-check-cli.test.mjs",
+  "tests/cycle-summary.test.mjs",
+  "tests/health-auth.test.mjs",
+  "tests/safe-error-message.test.mjs",
 ]);
 
 /** Read as text, line by line, so findings carry line numbers. */

@@ -163,6 +163,8 @@ export interface BotTokenShapeResult {
   ok: boolean;
   problem?: BotTokenShapeProblem;
   message?: string;
+}
+
 // ── Command registry ─────────────────────────────────────────────────────────
 
 /** grammy does not export a CommandContext type; alias Context for compatibility. */
@@ -715,6 +717,10 @@ export function registerCommandHandlers(
   bot: Bot | { command: (name: string, handler: (ctx: CommandContext<Context>) => Promise<void>) => void; callbackQuery?: (filter: string | string[], handler: (ctx: Context) => Promise<void>) => void },
   deps: BotDeps,
 ): void {
+  const registrar = bot as {
+    command: (name: string, handler: (ctx: CommandContext<Context>) => Promise<void>) => unknown;
+    callbackQuery?: (filter: string | string[], handler: (ctx: Context) => Promise<void>) => unknown;
+  };
   const { config, status } = deps;
   const version = deps.version ?? "unknown";
   const pause = deps.pause ?? (() => "stopped");
