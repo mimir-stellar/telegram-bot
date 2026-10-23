@@ -178,19 +178,19 @@ test("decoded events with extended metadata still notify", () => {
 // ── Negative ─────────────────────────────────────────────────────────────────
 
 test("malformed XDR and malformed entries never crash the scanner", async () => {
+  // Entries that are not event objects at all (null, numbers, strings) or have
+  // no valid ledger are rejected up front by the getEvents shape guard (#609);
+  // see the next test. Everything that passes the guard must decode, possibly
+  // to `unknown`, without crashing.
   const server = fakeServer({
     health: { oldestLedger: 90, latestLedger: 100 },
     pages: [
       page({
         events: [
-          null,
-          42,
-          "not-an-event",
           rawEvent({ id: cursorFor(100, 0), topic: "not-an-array", value: "!!!not-xdr!!!" }),
           rawEvent({ id: cursorFor(100, 1), topic: [null], value: null }),
           rawEvent({
             id: cursorFor(100, 2),
-            ledger: "abc",
             transactionIndex: -5,
             operationIndex: 1.5,
           }),
@@ -203,7 +203,6 @@ test("malformed XDR and malformed entries never crash the scanner", async () => 
   });
 
   const scan = await readContractEvents(server, TARGET, { cursor: cursorFor(99) });
-  // Non-objects skipped; everything else decodes (possibly to `unknown`).
   assert.equal(scan.events.length, 4);
   assert.ok(scan.events.some((e) => e.payload.name === "claim_cancelled"));
   for (const event of scan.events) {
@@ -213,6 +212,19 @@ test("malformed XDR and malformed entries never crash the scanner", async () => 
   }
   // Cursor still advances on a successful-but-messy scan.
   assert.equal(scan.cursor, cursorFor(100));
+});
+
+test("non-object event entries reject the scan instead of being decoded", async () => {
+  for (const bad of [null, 42, "not-an-event", rawEvent({ id: cursorFor(100, 0), ledger: "abc" })]) {
+    const server = fakeServer({
+      health: { oldestLedger: 90, latestLedger: 100 },
+      pages: [page({ events: [bad], cursor: cursorFor(100), latestLedger: 100 })],
+    });
+    await assert.rejects(
+      readContractEvents(server, TARGET, { cursor: cursorFor(99) }),
+      { name: "RpcResponseShapeError" },
+    );
+  }
 });
 
 test("malformed ordering metadata degrades to safe defaults, never NaN", () => {
@@ -247,18 +259,23 @@ test("decodeEvent never throws, even on null input", () => {
   assert.equal(decoded.eventId, "");
 });
 
-test("unexpected RPC shapes are treated as empty pages, not crashes", async () => {
-  const server = fakeServer({
-    health: { oldestLedger: 90, latestLedger: 100 },
-    pages: [
-      page({ events: null, cursor: cursorFor(100), latestLedger: 100 }),
-      page({ events: "oops", cursor: cursorFor(100), latestLedger: 100 }),
-      page({ events: undefined, cursor: 42, latestLedger: 100 }),
-    ],
-  });
-  const scan = await readContractEvents(server, TARGET, { cursor: cursorFor(99) });
-  assert.deepEqual(scan.events, []);
-  assert.equal(scan.lastEventLedger, null);
+test("unexpected RPC shapes reject the scan so the poller keeps its cursor", async () => {
+  // #609: a getEvents page whose shape is wrong is an RPC failure, not an
+  // empty page, so the cursor is never advanced past events we did not see.
+  for (const bad of [
+    page({ events: null, cursor: cursorFor(100), latestLedger: 100 }),
+    page({ events: "oops", cursor: cursorFor(100), latestLedger: 100 }),
+    page({ events: undefined, cursor: 42, latestLedger: 100 }),
+  ]) {
+    const server = fakeServer({
+      health: { oldestLedger: 90, latestLedger: 100 },
+      pages: [bad],
+    });
+    await assert.rejects(
+      readContractEvents(server, TARGET, { cursor: cursorFor(99) }),
+      { name: "RpcResponseShapeError" },
+    );
+  }
 });
 
 test("RPC failure rejects the scan so the poller keeps its cursor", async () => {

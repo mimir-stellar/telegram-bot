@@ -367,7 +367,7 @@ test("config provenance never includes setting values", () => {
   withEnv(
     {
       MIMIR_PROFILE: "mock",
-      BOT_TOKEN: "123456789:" + "REAL-SECRET-TOKEN",
+      BOT_TOKEN: "123456789:" + "REAL-SECRET-TOKEN-PADDED-TO-35-CHARS",
       TELEGRAM_CHAT_ID: "-1001234567890",
     },
     () => {
@@ -466,10 +466,13 @@ test("clean checkout: mock RPC, poller, and health server start without credenti
       const pollerConfig = {
         ...config,
         cursorFile,
+        countersFile: path.join(dir, "counters.json"),
         lockFile: path.join(dir, "poller.lock"),
         statusFile: path.join(dir, "status.json"),
         auditFile: path.join(dir, "audit.jsonl"),
         deadLetterFile: path.join(dir, "dead-letter.json"),
+        sendJournalFile: path.join(dir, "send-journal.jsonl"),
+        csvOutputFile: path.join(dir, "scanner_output.csv"),
         healthPort: 18799, // unique across suites: test files run in parallel
         rpcUrl: mock.url,
       };

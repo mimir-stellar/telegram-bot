@@ -234,6 +234,10 @@ export const LOG_LEVEL_ENV = "LOG_LEVEL";
 export const LOG_FORMAT_ENV = "LOG_FORMAT";
 export const DEFAULT_LOG_LEVEL: LogLevel = "info";
 export const DEFAULT_LOG_FORMAT: LogFormat = "text";
+/** Every accepted LOG_LEVEL value, lowest severity first. */
+export const LOG_LEVELS: readonly LogLevel[] = Object.freeze(["debug", "info", "warn", "error", "fatal"]);
+/** Every accepted LOG_FORMAT value. */
+export const LOG_FORMATS: readonly LogFormat[] = Object.freeze(["text", "json"]);
 /** Longest string any single field may carry into a JSON record. */
 export const MAX_LOG_FIELD_CHARS = 1_000;
 

@@ -5,7 +5,7 @@ import {
   planBackfill,
   describePlan,
   BackfillPlanError,
-} from "../src/stellar/backfill-plan.ts";
+} from "../dist/stellar/backfill-plan.js";
 
 function coveredCount(chunks) {
   return chunks.reduce((sum, chunk) => sum + chunk.count, 0);

@@ -139,7 +139,6 @@ export const COMMAND_DESCRIPTIONS: Readonly<Record<CommandName, string>> = {
   contracts: "Contract ids and explorer links",
   health: "Health assessment and operational readiness",
   preview: "Preview channel notification formatting",
-  ping: "Measure Telegram round-trip latency",
   pause: "Operator only: pause new scans",
   resume: "Operator only: resume polling now",
 } as const;
@@ -193,6 +192,10 @@ export interface NotificationMarkdownTemplates {
   deposited(marketId: string, amount: string, side: string, participant: string): string;
   withdrawn(marketId: string, participant: string, amount: string, side: string): string;
   resolved(marketId: string, result: string, poolA: string, poolB: string): string;
+  /** Gross payout per 1 USDC staked on the winning side (squad `resolved`). */
+  resolvedPayout(ratio: string): string;
+  /** Squad `resolved` whose winning side has no stake, so no ratio exists. */
+  resolvedNoWinningStake(side: string): string;
   claimed(
     marketId: string,
     participant: string,
@@ -281,6 +284,8 @@ export interface NotificationPlainTemplates {
     poolA: string,
     poolB: string,
   ): string;
+  resolvedPayout(ratio: string): string;
+  resolvedNoWinningStake(side: string): string;
   claimed(
     marketId: string | number,
     participant: string,
@@ -411,6 +416,12 @@ export const NOTIFICATION_MD: NotificationMarkdownTemplates = {
 
   resolved: (marketId: string, result: string, poolA: string, poolB: string): string =>
     `🏁 *Squad \\#${marketId} resolved* — *${result}*\nPools: A ${poolA} · B ${poolB}`,
+
+  resolvedPayout: (ratio: string): string =>
+    `Payout: ${ratio} per 1 USDC staked \\(gross\\)`,
+
+  resolvedNoWinningStake: (side: string): string =>
+    `Payout: none — no stake on ${side}`,
 
   claimed: (
     marketId: string,
@@ -543,6 +554,10 @@ export const NOTIFICATION_PLAIN: NotificationPlainTemplates = {
     poolB: string,
   ): string =>
     `Squad #${marketId} resolved — ${result}\nPools: A ${poolA} · B ${poolB}`,
+
+  resolvedPayout: (ratio: string): string => `Payout: ${ratio} per 1 USDC staked (gross)`,
+
+  resolvedNoWinningStake: (side: string): string => `Payout: none — no stake on ${side}`,
 
   claimed: (
     marketId: string | number,
@@ -688,6 +703,12 @@ const ES_NOTIFICATION_MD: NotificationMarkdownTemplates = {
   resolved: (marketId: string, result: string, poolA: string, poolB: string): string =>
     `🏁 *Escuadrón \\#${marketId} resuelto* — *${result}*\nPozos: A ${poolA} · B ${poolB}`,
 
+  resolvedPayout: (ratio: string): string =>
+    `Pago: ${ratio} por cada 1 USDC apostado \\(bruto\\)`,
+
+  resolvedNoWinningStake: (side: string): string =>
+    `Pago: ninguno — nadie apostó en ${side}`,
+
   claimed: (
     marketId: string,
     participant: string,
@@ -814,6 +835,10 @@ const ES_NOTIFICATION_PLAIN: NotificationPlainTemplates = {
     poolB: string,
   ): string =>
     `Escuadrón #${marketId} resuelto — ${result}\nPozos: A ${poolA} · B ${poolB}`,
+
+  resolvedPayout: (ratio: string): string => `Pago: ${ratio} por cada 1 USDC apostado (bruto)`,
+
+  resolvedNoWinningStake: (side: string): string => `Pago: ninguno — nadie apostó en ${side}`,
 
   claimed: (
     marketId: string | number,

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert";
-import { mkdtemp } from "node:fs/promises";
-import { rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseSchedule,
@@ -9,7 +9,15 @@ import {
   createScheduler,
   FileLastRunStore,
   ScheduleParseError,
-} from "../src/notifications/schedule.js";
+} from "../dist/notifications/schedule.js";
+
+async function waitUntil(condition, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("fake clock: scheduler did not re-arm");
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
 
 function fakeClock(startMs) {
   let now = startMs;
@@ -36,9 +44,10 @@ function fakeClock(startMs) {
         timers.delete(id);
         now = t.at;
         t.cb();
-        // Yield to allow async continuations to run.
-        await Promise.resolve();
-        await Promise.resolve();
+        // The scheduler's tick does real file I/O (FileLastRunStore), which a
+        // couple of microtask yields cannot cover. Wait until it re-arms its
+        // next timer, which it does only once the tick has finished.
+        await waitUntil(() => timers.size > 0);
       }
       now = target;
     },
@@ -85,7 +94,7 @@ test("nextRun returns today when boundary is in the future", () => {
 });
 
 test("scheduler fires at the scheduled time", async () => {
-  const dir = await mkdtemp("test-schedule-");
+  const dir = await mkdtemp(join(tmpdir(), "test-schedule-"));
   try {
     const store = new FileLastRunStore(join(dir, "last-run"));
     const clock = fakeClock(Date.UTC(2024, 0, 1, 8, 0, 0));
@@ -99,8 +108,10 @@ test("scheduler fires at the scheduled time", async () => {
       },
     });
     await scheduler.start();
+    // No recorded run yet: nothing is missed, so nothing fires before 09:00.
+    assert.strictEqual(runs.length, 0);
     await clock.advanceTo(Date.UTC(2024, 0, 1, 9, 0, 0));
-    assert.strictEqual(runs.length, 1);
+    assert.deepStrictEqual(runs, [Date.UTC(2024, 0, 1, 9, 0, 0)]);
     await scheduler.stop();
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -108,7 +119,7 @@ test("scheduler fires at the scheduled time", async () => {
 });
 
 test("scheduler fires missed run once on restart", async () => {
-  const dir = await mkdtemp("test-schedule-restart-");
+  const dir = await mkdtemp(join(tmpdir(), "test-schedule-restart-"));
   try {
     const store = new FileLastRunStore(join(dir, "last-run"));
     // Simulate a run that happened two days ago.

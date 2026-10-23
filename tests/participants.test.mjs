@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
-import { participantSummary } from "../src/stellar/participants.ts";
+import { participantSummary } from "../dist/stellar/participants.js";
 
 test("participantSummary returns zeros for empty input", () => {
   assert.deepEqual(participantSummary([]), {

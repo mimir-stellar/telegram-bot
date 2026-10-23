@@ -86,6 +86,12 @@ export async function runSmoke(options = {}) {
   const countersFile = path.join(tempDir, "counters.json");
   const lockFile = path.join(tempDir, "poller.lock");
   const statusFile = path.join(tempDir, "status.json");
+  // Every state file the poller can write lives in tempDir, so neither the
+  // smoke run nor the tests that call it ever touch the repo's data/.
+  const sendJournalFile = path.join(tempDir, "send-journal.jsonl");
+  const auditFile = path.join(tempDir, "audit.jsonl");
+  const deadLetterFile = path.join(tempDir, "dead-letter.json");
+  const csvOutputFile = path.join(tempDir, "scanner_output.csv");
   const envKeys = [
     "MIMIR_PROFILE",
     "BOT_TOKEN",
@@ -94,6 +100,10 @@ export async function runSmoke(options = {}) {
     "COUNTERS_FILE",
     "INSTANCE_LOCK_FILE",
     "STATUS_FILE",
+    "SEND_JOURNAL_FILE",
+    "AUDIT_FILE",
+    "DEAD_LETTER_FILE",
+    "CSV_OUTPUT_FILE",
   ];
   const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
 
@@ -108,6 +118,10 @@ export async function runSmoke(options = {}) {
   process.env.COUNTERS_FILE = countersFile;
   process.env.INSTANCE_LOCK_FILE = lockFile;
   process.env.STATUS_FILE = statusFile;
+  process.env.SEND_JOURNAL_FILE = sendJournalFile;
+  process.env.AUDIT_FILE = auditFile;
+  process.env.DEAD_LETTER_FILE = deadLetterFile;
+  process.env.CSV_OUTPUT_FILE = csvOutputFile;
 
   let mock = null;
   let poller = null;
@@ -126,6 +140,10 @@ export async function runSmoke(options = {}) {
       countersFile,
       lockFile,
       statusFile,
+      sendJournalFile,
+      auditFile,
+      deadLetterFile,
+      csvOutputFile,
       pollIntervalMs: intervalMs,
       interSendDelayMs: 0,
     };

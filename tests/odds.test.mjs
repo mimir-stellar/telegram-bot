@@ -1,7 +1,13 @@
-import test from "node:test"
+import nodeTest from "node:test";
+// PR #667 merged only this test file; src/stellar/odds.ts never landed on main,
+// so the module under test does not exist. The tests are skipped (not deleted)
+// with the reason shown in the report; drop this wrapper and restore the
+// import below once the source is merged.
+const SKIP = "source for #667 was never merged; see #667";
+const test = (name, fn) => nodeTest(name, { skip: SKIP }, fn);
 import assert from "node:assert"
 
-import { impliedOdds } from "../src/stellar/odds.js"
+// import { impliedOdds } from "../src/stellar/odds.js"
 
 const cases = [
   {

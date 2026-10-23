@@ -51,7 +51,7 @@ function makeConfig(overrides = {}) {
     allowedChatIds: [],
     pollIntervalMs: 30_000,
     startLookbackLedgers: 60,
-    cursorFile: "./data/cursor.json",
+    cursorFile: "/tmp/unused-cursor.json", // never read or written by these tests
     maxNotificationsPerCycle: 20,
     marketContractId: "C" + "A".repeat(55),
     squadContractId: "C" + "B".repeat(55),

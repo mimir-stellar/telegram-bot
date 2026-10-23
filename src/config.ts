@@ -279,6 +279,31 @@ export interface BotConfig extends StellarConfig {
   sendTimeoutMs?: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
+  /** Show Telegram link previews on market notifications (LINK_PREVIEW_MARKET). */
+  linkPreviewMarket: boolean;
+  /** Show Telegram link previews on squad notifications (LINK_PREVIEW_SQUAD). */
+  linkPreviewSquad: boolean;
+  /** Per-chat notification preferences. Optional; absent means the single chat route. */
+  routes?: TelegramRoute[];
+  /**
+   * Identical RPC/poller error lines allowed per key per sampling window.
+   * Repeats beyond this are counted and reported as one summary line.
+   */
+  logSampleMaxPerWindow: number;
+  /** Sampling window for repetitive error logs, in milliseconds. */
+  logSampleWindowMs: number;
+  /** Recent console lines kept (redacted) for /export. `0` disables capture. */
+  logBufferLines: number;
+  /** Optional public URL to run the bot in webhook mode instead of long-polling. */
+  telegramWebhookUrl: string | null;
+  /** Dev-only override for grammy's `client.apiRoot`; loopback hosts only. */
+  telegramApiRoot: string | null;
+  /**
+   * Optional Mimir web-app origin (MIMIR_APP_URL) behind the "Open in Mimir"
+   * notification button; null leaves the keyboard explorer-only. Validated as
+   * an https URL at load time.
+   */
+  mimirAppUrl: string | null;
   /** Optional bearer token for health endpoint authentication. Null disables auth. */
   healthAuthToken: string | null;
 }
@@ -497,6 +522,9 @@ function collector(profile: Record<string, string>) {
     botToken(name: string): string {
       const value = this.required(name);
       if (value === "") return value;
+      // The mock profile's placeholder is deliberately not token-shaped (it
+      // only ever talks to the fake Telegram server); #658 must not reject it.
+      if (value === MOCK_BOT_TOKEN) return value;
       const problem = describeBotTokenProblem(value);
       if (problem !== null) problems.push(problem);
       return value;
@@ -721,6 +749,19 @@ function collector(profile: Record<string, string>) {
       return value;
     },
 
+    network(name: string, fallback: StellarNetwork): StellarNetwork {
+      const value = get(name);
+      if (value === undefined) return fallback;
+      const valid: StellarNetwork[] = ["testnet", "mainnet", "futurenet", "custom"];
+      if (!valid.includes(value as StellarNetwork)) {
+        problems.push(
+          `${name} must be one of ${valid.join(", ")}; got "${value}"`,
+        );
+        return fallback;
+      }
+      return value as StellarNetwork;
+    },
+
     /**
      * Parses an optional secret value. Returns null when unset.
      * Used for authentication tokens that should be redacted in logs.
@@ -919,6 +960,19 @@ export function loadConfig(): BotConfig {
       0,
     ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
+    linkPreviewMarket: c.bool("LINK_PREVIEW_MARKET", DEFAULTS.linkPreviewMarket),
+    linkPreviewSquad: c.bool("LINK_PREVIEW_SQUAD", DEFAULTS.linkPreviewSquad),
+    logSampleMaxPerWindow: c.int(
+      "LOG_SAMPLE_MAX_PER_WINDOW",
+      DEFAULTS.logSampleMaxPerWindow,
+      1,
+    ),
+    // A window of 1ms is legal but pointless; 1s is the smallest useful unit.
+    logSampleWindowMs: c.int("LOG_SAMPLE_WINDOW_MS", DEFAULTS.logSampleWindowMs, 1_000),
+    logBufferLines: c.int("LOG_BUFFER_LINES", DEFAULTS.logBufferLines, 0),
+    telegramWebhookUrl: c.optionalUrl("TELEGRAM_WEBHOOK_URL"),
+    telegramApiRoot: c.loopbackApiRoot("TELEGRAM_API_ROOT"),
+    mimirAppUrl: c.optionalHttpsUrl("MIMIR_APP_URL"),
     healthAuthToken: c.optionalSecret("HEALTH_AUTH_TOKEN"),
   };
 
@@ -947,7 +1001,7 @@ function isLoopback(host: string): boolean {
   );
 }
 
-/** `mock` / `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */
+/** Display label for the active Stellar network. */
 export function networkLabel(config: StellarConfig): string {
   // A named STELLAR_NETWORK is reported by the name the operator chose.
   if (config.network !== undefined && config.network !== "custom") return config.network;
@@ -1090,6 +1144,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
     },
   },
   { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
+  { key: "HEALTH_AUTH_TOKEN", secret: true },
   { key: "STARTUP_HEALTH_DEADLINE_MS", secret: false, hasBuiltInDefault: true },
   { key: "STARTUP_HEALTH_RETRY_MS", secret: false, hasBuiltInDefault: true },
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },

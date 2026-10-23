@@ -25,14 +25,19 @@ import { writeStatusFile } from "../dist/status.js";
  */
 
 const isWindows = process.platform === "win32";
+// root bypasses POSIX permission checks, so a read-only directory injects no
+// fault there.
+const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
 const BOT_TOKEN = "123456789:" + "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
 
 function faultTest(name, fn) {
-  const full = isWindows
-    ? `${name} (skipped on Windows: chmod read-only directories are not enforced)`
-    : name;
-  return test(full, { skip: isWindows }, async () => {
-    await withReadOnlyDir(fn);
+  const skip = isWindows
+    ? "chmod read-only directories are not enforced on Windows"
+    : isRoot
+      ? "running as root, which ignores file permissions"
+      : false;
+  return test(name, { skip }, async () => {
+    await withFaultDir(fn);
   });
 }
 
@@ -80,9 +85,13 @@ function captureErrors() {
   return { errors, restore };
 }
 
-async function withReadOnlyDir(run) {
+/**
+ * Run `run(dir)` in a fresh temp directory. The directory starts writable so a
+ * case can seed its "previous" file first; each case then makes the directory
+ * (or the file) read-only itself before exercising the writer.
+ */
+async function withFaultDir(run) {
   const dir = await mkdtemp(path.join(tmpdir(), "mimir-fs-"));
-  await chmod(dir, 0o555);
   try {
     return await run(dir);
   } finally {
@@ -99,6 +108,7 @@ faultTest(
     const file = path.join(dir, "status.json");
     const previous = JSON.stringify({ cycles: 1, generatedAt: "2026-01-01T00:00:00.000Z" }) + "\n";
     await writeFile(file, previous, "utf8");
+    await chmod(dir, 0o555);
 
     const { errors, restore } = captureErrors();
     try {
@@ -139,6 +149,7 @@ faultTest(
       entries: [],
     });
     await writeFile(file, previous, "utf8");
+    await chmod(dir, 0o555);
 
     const { errors, restore } = captureErrors();
     try {
