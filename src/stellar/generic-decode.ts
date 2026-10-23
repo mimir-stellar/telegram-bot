@@ -92,12 +92,35 @@ function clipBytesHex(hex: string, max: number = MAX_GENERIC_BYTES_CHARS): strin
 
 // ── ScVal Detection Helpers ──────────────────────────────────────────────────
 
+// `@stellar/stellar-sdk` 17 (#527) replaced the union accessors: an ScVal now
+// carries its arm name as a `type` string and its payload as a `value` getter,
+// where 16 exposed `switch()` and `value()` methods. Both shapes are accepted
+// so hand-built ScVal-like objects keep rendering the same way.
+
 function isScValLike(val: unknown): val is xdr.ScVal {
-  return (
-    val !== null &&
-    typeof val === "object" &&
-    typeof (val as { switch?: unknown }).switch === "function"
-  );
+  if (val === null || typeof val !== "object") return false;
+  const v = val as { switch?: unknown; type?: unknown };
+  if (typeof v.switch === "function") return true;
+  return typeof v.type === "string" && v.type.startsWith("scv") && "value" in val;
+}
+
+/** The ScVal arm name (`scvBool`, `scvVec`, …). Throws on a malformed value. */
+function scValSwitchName(val: xdr.ScVal): string {
+  const v = val as unknown as { switch?: () => unknown; type?: unknown };
+  if (typeof v.switch === "function") {
+    const sw = v.switch();
+    return typeof sw === "object" && sw !== null && "name" in sw
+      ? String((sw as { name: unknown }).name)
+      : String(sw);
+  }
+  if (typeof v.type === "string") return v.type;
+  throw new TypeError("ScVal has no discriminator");
+}
+
+/** The ScVal payload: the `value` getter (SDK 17) or `value()` method (SDK 16). */
+function scValPayload(val: xdr.ScVal): unknown {
+  const raw = (val as unknown as { value?: unknown }).value;
+  return typeof raw === "function" ? (raw as () => unknown).call(val) : raw;
 }
 
 // ── Recursive Renderer ───────────────────────────────────────────────────────
@@ -153,8 +176,7 @@ function renderScValInstance(
 ): string {
   let switchName = "";
   try {
-    const sw = val.switch();
-    switchName = typeof sw === "object" && sw !== null && "name" in sw ? String(sw.name) : String(sw);
+    switchName = scValSwitchName(val);
   } catch {
     return "malformed";
   }
@@ -311,7 +333,7 @@ function renderScValInstance(
         return "vec:[...]";
       }
       try {
-        const rawItems = (val as { value?: () => unknown[] }).value?.();
+        const rawItems = scValPayload(val);
         if (!Array.isArray(rawItems)) {
           // Fallback via scValToNative if value() is absent
           const native = scValToNative(val);
@@ -340,7 +362,7 @@ function renderScValInstance(
         return "map:{...}";
       }
       try {
-        const rawEntries = (val as { value?: () => unknown[] }).value?.();
+        const rawEntries = scValPayload(val);
         if (!Array.isArray(rawEntries)) {
           const native = scValToNative(val);
           if (native && typeof native === "object") {

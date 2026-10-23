@@ -8,8 +8,9 @@
 
 import { escapeMd } from "../notifications/format.js";
 import { networkLabel, type BotConfig } from "../config.js";
+import { COMMAND_DESCRIPTIONS } from "../i18n.js";
 import { contractExplorerUrl } from "../stellar/client.js";
-import { defineCommand } from "./registry.js";
+import { createCommandModule } from "./registry.js";
 import { TELEGRAM_OPTIONS } from "./runtime.js";
 
 export function contractsMessage(config: BotConfig): string {
@@ -44,10 +45,13 @@ export function contractsMessage(config: BotConfig): string {
   return lines.join("\n");
 }
 
-export const contractsCommand = defineCommand({
+export const contractsCommand = createCommandModule({
   command: "contracts",
-  chatAllowlist: true,
-  handler: async (ctx, deps) => {
+  description: COMMAND_DESCRIPTIONS.contracts,
+  operatorOnly: false,
+  // Deployment details: only answered in ALLOWED_CHAT_IDS.
+  allowlisted: true,
+  handle: async (ctx, deps) => {
     await ctx.reply(contractsMessage(deps.config), TELEGRAM_OPTIONS);
   },
 });

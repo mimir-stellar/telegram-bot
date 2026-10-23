@@ -1,38 +1,61 @@
 /**
  * The command catalogue — the one place that knows which commands exist.
  *
- * Every module below calls `defineCommand` when it loads, and the import order
- * here is the order Telegram's menu and `/help` list them in. Adding a command:
+ * {@link COMMAND_MODULES} is the ordered list of slash commands; its order is
+ * the order Telegram's menu and `/help` list them in. Adding a command:
  *
- *   1. create `src/commands/<name>.ts` and export a module from
- *      `defineCommand({ command, operatorOnly?, chatAllowlist?, hidden?, handler })`
- *   2. add one import line here — in menu order — and re-export anything
- *      `src/bot.ts` or the tests need
+ *   1. create `src/commands/<name>.ts` exporting a module from
+ *      `createCommandModule({ command, description?, operatorOnly?, allowlisted?, hidden?, handle })`
+ *      (see `CommandModule` in `./types.ts`)
+ *   2. add it to `COMMAND_MODULES` below — in menu order — and re-export
+ *      anything `src/bot.ts` or the tests need
  *   3. if the command is advertised, add its description to
  *      `COMMAND_DESCRIPTIONS` (both locales) in `src/i18n.ts` and its entry to
  *      `COMMAND_DETAILS` in `src/commands/help-detail.ts`
  *
- * `src/bot.ts` never needs editing: it registers whatever the registry holds.
+ * `src/bot.ts` never needs editing: it registers whatever the registry holds
+ * and applies `operatorOnly` / `allowlisted` centrally.
  */
 
-// Registration order = menu order. Keep this list in sync with the menu.
-import "./help.js"; // registers /start and /help, in that order
-import "./about.js";
-import "./status.js";
-import "./audit.js";
-import "./contracts.js";
-import "./health.js";
-import "./preview.js";
-import "./pause.js";
-import "./resume.js";
-import "./log-export.js"; // hidden: operator log export
+import { aboutCommand } from "./about.js";
+import { auditCommand } from "./audit.js";
+import { contractsCommand } from "./contracts.js";
+import { healthCommand } from "./health.js";
+import { helpCommand, startCommand } from "./help.js";
+import { logExportCommand } from "./log-export.js";
+import { pauseCommand } from "./pause.js";
+import { previewCommand } from "./preview.js";
+import { registerCommandModules } from "./registry.js";
+import { resumeCommand } from "./resume.js";
+import { statusCommand } from "./status.js";
+import type { CommandModule } from "./types.js";
+
+/** Every slash command, in menu order. */
+export const COMMAND_MODULES: readonly CommandModule[] = Object.freeze([
+  startCommand,
+  helpCommand,
+  aboutCommand,
+  statusCommand,
+  auditCommand,
+  contractsCommand,
+  healthCommand,
+  previewCommand,
+  pauseCommand,
+  resumeCommand,
+  logExportCommand, // hidden: operator log export
+]);
+
+registerCommandModules(COMMAND_MODULES);
 
 export {
   commandMetadata,
   commandModule,
+  createCommandModule,
   defineCommand,
+  registerCommandModules,
   registeredCommands,
   visibleCommandMetadata,
+  type CommandDefinition,
   type CommandDeps,
   type CommandHandler,
   type CommandMetadata,

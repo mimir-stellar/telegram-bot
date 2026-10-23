@@ -234,7 +234,10 @@ test("market_settled at the i128 maximum keeps every amount field exact", () => 
   const expected =
     "💰 *Claim \\#7 settled*\n" +
     "Paid out: *17014118346046923173168730371588\\.4105727 USDC* · fees 0\\.0000000 USDC\n" +
-    "Owed to challengers: 1\\.0000000 USDC" +
+    // #639 lists every share of the gross with its percentage.
+    "Owed to challengers: 1\\.0000000 USDC \\(0\\.00%\\)\n" +
+    "Total fees: 0\\.0000000 USDC \\(0\\.00%\\)\n" +
+    "Dust: 0\\.0000001 USDC \\(0\\.00%\\)" +
     EXPLORER_FOOTER;
   assert.equal(formatEvent(config, decoded), expected);
 });

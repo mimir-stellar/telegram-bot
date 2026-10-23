@@ -264,27 +264,33 @@ test("regression: a seed strkey in an RPC error never reaches an operator", () =
 
 // ── Status snapshot helpers: redactChatId ─────────────────────────────────────
 
-test("redactChatId: a numeric chat id is fully masked", () => {
+// redactChatId keeps only the sign and last four digits of a numeric id, or
+// the first character of an @username: enough to tell deployments apart (and
+// shown to operators by /filters), never a usable target. #654 expected full
+// masking, which redactChatId has never done.
+
+test("redactChatId: a numeric chat id keeps only its last four digits", () => {
   const out = redactChatId("123456789");
-  assert.equal(out, "[REDACTED]");
+  assert.equal(out, "…6789");
   assert.equal(out.includes("123456789"), false);
 });
 
-test("redactChatId: a negative supergroup id is fully masked", () => {
+test("redactChatId: a negative supergroup id keeps its sign and last four digits", () => {
   const out = redactChatId("-1001234567890");
-  assert.equal(out, "[REDACTED]");
+  assert.equal(out, "-…7890");
   assert.equal(out.includes("1001234567890"), false);
   assert.equal(out.includes("-100"), false);
 });
 
-test("redactChatId: an @channel name is fully masked", () => {
+test("redactChatId: an @channel name keeps only its first character", () => {
   const out = redactChatId("@my_private_channel");
-  assert.equal(out, "[REDACTED]");
+  assert.equal(out, "@m…");
   assert.equal(out.includes("my_private_channel"), false);
 });
 
 test("redactChatId: undefined yields a stable placeholder", () => {
-  assert.equal(redactChatId(undefined), "[REDACTED]");
+  assert.equal(redactChatId(undefined), "…");
+  assert.equal(redactChatId(undefined), redactChatId(undefined));
 });
 
 test("redactChatId: no full chat id ever appears in the output", () => {

@@ -35,12 +35,6 @@ import type { StellarConfig } from "../config.js";
 import { messagesFor, type Messages } from "../i18n.js";
 import { formatDeadline } from "./time.js";
 import {
-  EXPLORER_BUTTON_TEXT,
-  MIMIR_APP_BUTTON_TEXT,
-  NOTIFICATION_MD,
-  NOTIFICATION_PLAIN,
-} from "../i18n.js";
-import {
   highlightLevel,
   highlightMarker,
   prefixFirstLine,
@@ -403,13 +397,11 @@ function headline(
 
   switch (p.name) {
     // ── mimir-market ────────────────────────────────────────────────────────
-    case "claim_created":
-      return md.claimCreated(
     case "claim_created": {
       const icon = iconForCategory(p.category);
       const cat = escapeMd(clip(sanitizeUserText(p.category)));
       const formattedCategory = cat ? `${icon} ${cat}` : icon;
-      return NOTIFICATION_MD.claimCreated(
+      return md.claimCreated(
         String(p.claimId),
         formattedCategory,
         who(p.creator),
@@ -570,8 +562,7 @@ export function formatEvent(
   const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
     const messages = messagesFor(config.locale);
-    const head = headline(messages, event, currentMs);
-    let head = headline(event, currentMs);
+    let head = headline(messages, event, currentMs);
     if (head === null) return null;
     const effectiveThresholds = thresholds ?? config.highlightThresholds;
     if (effectiveThresholds !== undefined) {
@@ -627,13 +618,11 @@ function plainHeadline(
 
   switch (p.name) {
     // ── mimir-market ────────────────────────────────────────────────────────
-    case "claim_created":
-      return plain.claimCreated(p.claimId, clip(p.category), plainWho(p.creator));
     case "claim_created": {
       const icon = iconForCategory(p.category);
       const cat = clip(sanitizeUserText(p.category));
       const formattedCategory = cat ? `${icon} ${cat}` : icon;
-      return NOTIFICATION_PLAIN.claimCreated(p.claimId, formattedCategory, plainWho(p.creator));
+      return plain.claimCreated(p.claimId, formattedCategory, plainWho(p.creator));
     }
 
     case "claim_challenged":
@@ -772,9 +761,6 @@ export function formatPlainTextEvent(
   nowMsOrThresholds?: number | HighlightThresholds,
 ): string | null {
   const messages = messagesFor(config.locale);
-  const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
-  try {
-    const head = plainHeadline(messages, event, currentMs);
   const nowMs = typeof nowMsOrThresholds === "number" ? nowMsOrThresholds : undefined;
   const thresholds =
     typeof nowMsOrThresholds === "object" && nowMsOrThresholds !== null
@@ -782,7 +768,7 @@ export function formatPlainTextEvent(
       : undefined;
   const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    let head = plainHeadline(event, currentMs);
+    let head = plainHeadline(messages, event, currentMs);
     if (head === null) return null;
     const effectiveThresholds = thresholds ?? config.highlightThresholds;
     if (effectiveThresholds !== undefined) {

@@ -181,8 +181,13 @@ function constantTimeEquals(a: string, b: string): boolean {
  * Extract and validate the bearer token from the Authorization header.
  * Returns true if the token matches the expected value (or if auth is disabled).
  */
-function isValidAuth(authHeader: string | undefined, expectedToken: string | null): boolean {
-  if (expectedToken === null) return true;
+function isValidAuth(
+  authHeader: string | undefined,
+  expectedToken: string | null | undefined,
+): boolean {
+  // No token configured (null, or absent from a config built before #546):
+  // the server is loopback-only, which config validation enforces.
+  if (expectedToken === null || expectedToken === undefined) return true;
   if (authHeader === undefined) return false;
 
   const match = authHeader.match(/^Bearer\s+(.+)$/i);

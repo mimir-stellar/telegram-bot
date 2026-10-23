@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+**Command module registry**
+
+- Slash commands are `CommandModule`s (`src/commands/types.ts`: `command`,
+  `description`, `operatorOnly`, `allowlisted`, `hidden`, `handle(ctx, deps)`)
+  listed in menu order by `COMMAND_MODULES` in `src/commands/index.ts`.
+  `registerCommandHandlers` and `registerCommands` iterate that registry, so
+  `/help` and the Telegram command menu follow registry order, and the
+  operator-only and `ALLOWED_CHAT_IDS` gates are applied centrally from each
+  module's flags. `/contracts` and `/preview` are written in the full module
+  shape as examples. Replies and message text are unchanged (#327).
+- `CONTRIBUTING.md` documents adding a command as a module;
+  `tests/command-registry.test.mjs` covers order and authorization.
+
 ### Added
 
 **Selectable bot language**

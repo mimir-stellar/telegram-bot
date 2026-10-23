@@ -125,7 +125,7 @@ test("generated events decode with decodeEvent without falling back to unknown (
     ...rawEvent,
     topic: [
       xdr.ScVal.scvSymbol("claim_created"),
-      xdr.ScVal.scvU64(new xdr.Uint64(BigInt(claimId))),
+      xdr.ScVal.scvU64(BigInt(claimId)),
       Address.fromString(TEST_ADDR).toScVal(),
     ],
     value: xdr.ScVal.scvMap([
@@ -168,13 +168,13 @@ test("generated events decode with decodeEvent without falling back to unknown (
     ...rawEvent,
     topic: [
       xdr.ScVal.scvSymbol("market_created"),
-      xdr.ScVal.scvU64(new xdr.Uint64(BigInt(marketId))),
+      xdr.ScVal.scvU64(BigInt(marketId)),
       Address.fromString(TEST_ADDR).toScVal(),
     ],
     value: xdr.ScVal.scvMap([
       new xdr.ScMapEntry({
         key: xdr.ScVal.scvSymbol("deadline"),
-        val: xdr.ScVal.scvU64(new xdr.Uint64(1800000000n)),
+        val: xdr.ScVal.scvU64(1800000000n),
       }),
       new xdr.ScMapEntry({
         key: xdr.ScVal.scvSymbol("fee_bps"),
@@ -225,7 +225,7 @@ test("generated events decode with decodeEvent using custom version decoder with
       ...rawEvent,
       topic: [
         xdr.ScVal.scvSymbol("synthetic_event"),
-        xdr.ScVal.scvU64(new xdr.Uint64(999n)),
+        xdr.ScVal.scvU64(999n),
       ],
       value: xdr.ScVal.scvMap([
         new xdr.ScMapEntry({

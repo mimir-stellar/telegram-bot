@@ -14,7 +14,7 @@ import { networkLabel, type BotConfig } from "../config.js";
 import { chainClockLabel } from "../health.js";
 import { formatFeatureFlags } from "../notifications/featureFlags.js";
 import type { PollerStatus } from "../poller.js";
-import { defineCommand } from "./registry.js";
+import { createCommandModule } from "./registry.js";
 import { TELEGRAM_OPTIONS } from "./runtime.js";
 
 function ago(timestamp: number | null, nowMs: number = Date.now()): string {
@@ -149,10 +149,10 @@ export function lastEventMessage(config: BotConfig, status: PollerStatus): strin
   return lines.join("\n").trimEnd();
 }
 
-export const statusCommand = defineCommand({
+export const statusCommand = createCommandModule({
   command: "status",
-  chatAllowlist: true,
-  handler: async (ctx, deps) => {
+  allowlisted: true,
+  handle: async (ctx, deps) => {
     const startedAt = performance.now();
     let sent = false;
     try {

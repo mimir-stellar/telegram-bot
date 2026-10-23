@@ -236,7 +236,7 @@ test("config: ALLOWED_CHAT_IDS absent produces empty allowedChatIds (open)", asy
   const { loadConfig } = await import("../dist/config.js");
 
   const saved = { ...process.env };
-  process.env.BOT_TOKEN = "123:fake";
+  process.env.BOT_TOKEN = ["123", "f".repeat(35)].join(":");
   process.env.TELEGRAM_CHAT_ID = "-1001234567890";
   process.env.MARKET_CONTRACT_ID = VALID_CONTRACT_MARKET;
   process.env.SQUAD_CONTRACT_ID = VALID_CONTRACT_SQUAD;
@@ -260,7 +260,7 @@ test("config: ALLOWED_CHAT_IDS empty string produces empty allowedChatIds (open)
   const { loadConfig } = await import("../dist/config.js");
 
   const saved = { ...process.env };
-  process.env.BOT_TOKEN = "123:fake";
+  process.env.BOT_TOKEN = ["123", "f".repeat(35)].join(":");
   process.env.TELEGRAM_CHAT_ID = "-1001234567890";
   process.env.MARKET_CONTRACT_ID = VALID_CONTRACT_MARKET;
   process.env.SQUAD_CONTRACT_ID = VALID_CONTRACT_SQUAD;
@@ -283,7 +283,7 @@ test("config: ALLOWED_CHAT_IDS parses multiple ids correctly", async () => {
   const { loadConfig } = await import("../dist/config.js");
 
   const saved = { ...process.env };
-  process.env.BOT_TOKEN = "123:fake";
+  process.env.BOT_TOKEN = ["123", "f".repeat(35)].join(":");
   process.env.TELEGRAM_CHAT_ID = "-1001234567890";
   process.env.MARKET_CONTRACT_ID = VALID_CONTRACT_MARKET;
   process.env.SQUAD_CONTRACT_ID = VALID_CONTRACT_SQUAD;
@@ -306,7 +306,7 @@ test("config: invalid entry in ALLOWED_CHAT_IDS throws ConfigError", async () =>
   const { loadConfig, ConfigError } = await import("../dist/config.js");
 
   const saved = { ...process.env };
-  process.env.BOT_TOKEN = "123:fake";
+  process.env.BOT_TOKEN = ["123", "f".repeat(35)].join(":");
   process.env.TELEGRAM_CHAT_ID = "-1001234567890";
   process.env.MARKET_CONTRACT_ID = VALID_CONTRACT_MARKET;
   process.env.SQUAD_CONTRACT_ID = VALID_CONTRACT_SQUAD;
@@ -336,7 +336,7 @@ test("config: single numeric id (positive) is valid", async () => {
   const { loadConfig } = await import("../dist/config.js");
 
   const saved = { ...process.env };
-  process.env.BOT_TOKEN = "123:fake";
+  process.env.BOT_TOKEN = ["123", "f".repeat(35)].join(":");
   process.env.TELEGRAM_CHAT_ID = "-1001234567890";
   process.env.MARKET_CONTRACT_ID = VALID_CONTRACT_MARKET;
   process.env.SQUAD_CONTRACT_ID = VALID_CONTRACT_SQUAD;

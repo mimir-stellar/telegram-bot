@@ -120,12 +120,16 @@ npm run validate:fixtures
 ```
 
 The script (`scripts/validate-fixtures.mjs`) checks `tests/fixtures/events.json`
-and `tests/fixtures/events.mmj` for:
+for:
 
-- required config and case fields (`id`, `kind`, `expect`, `event`),
+- the `config` object and the required case fields (`id`, `kind`, `expect`, `event`),
 - unique case `id` values,
-- monotonic `ledger` values per contract, and
-- known event names (as decoded by `src/stellar/decode.ts`).
+- known `kind` and `expect` values,
+- a well-formed `event` (`source`, `contractId`, non-negative integer `ledger`), and
+- known event names in `event.payload.name` (as decoded by `src/stellar/decode.ts`,
+  plus `unknown`).
+
+Cases are independent, so ledgers are not required to be monotonic across them.
 
 Each problem is printed as a one-line message; the script exits non-zero if any
 are found. To validate a copy in another directory (for example a deliberately

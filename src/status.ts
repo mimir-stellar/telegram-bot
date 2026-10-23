@@ -48,7 +48,10 @@ export const MAX_SEND_DURATION_CHARS = 32;
  * outside this process (RPC errors, Telegram errors, cursors), so the snapshot
  * and the logs derived from it stay bounded and single-line.
  */
-export function boundText(value: string, max = MAX_ERROR_CHARS): string {
+export function boundText(value: string | null | undefined, max = MAX_ERROR_CHARS): string {
+  // A missing message (an error without one) bounds to "", never a TypeError
+  // while the status snapshot is being written.
+  if (typeof value !== "string") return "";
   const collapsed = value.replace(/\s+/g, " ").trim();
   if (collapsed.length <= max) return collapsed;
   return `${collapsed.slice(0, max - 1)}…`;

@@ -5,7 +5,7 @@
 
 import { escapeMd } from "../notifications/format.js";
 import { networkLabel, type BotConfig } from "../config.js";
-import { defineCommand } from "./registry.js";
+import { createCommandModule } from "./registry.js";
 import { replyMarkdown } from "./runtime.js";
 
 const REPOSITORY_URL = "https://github.com/example/stellar-bot";
@@ -21,9 +21,9 @@ export function aboutMessage(config: BotConfig, version: string): string {
   ].join("\n");
 }
 
-export const aboutCommand = defineCommand({
+export const aboutCommand = createCommandModule({
   command: "about",
-  handler: async (ctx, deps) => {
+  handle: async (ctx, deps) => {
     await replyMarkdown(ctx, aboutMessage(deps.config, deps.version ?? "unknown"));
   },
 });

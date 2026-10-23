@@ -7,14 +7,18 @@ import {
   DEFAULT_LOG_FORMAT,
   LOG_LEVELS,
   LOG_FORMATS,
-} from "../src/logger.js";
+} from "../dist/logger.js";
+
+// Levels and formats are lowercase (LOG_LEVEL=warn -> "warn"); the only
+// formats are "text" (default) and "json". #673 expected uppercase values and
+// a "pretty" format the logger has never had.
 
 test("parseLogLevel resolves valid and invalid inputs", () => {
   const cases = [
-    { description: "lowercase known level", input: "warn", expected: "WARN" },
-    { description: "uppercase known level", input: "WARN", expected: "WARN" },
-    { description: "mixed case known level", input: "Info", expected: "INFO" },
-    { description: "whitespace around known level", input: " debug ", expected: "DEBUG" },
+    { description: "lowercase known level", input: "warn", expected: "warn" },
+    { description: "uppercase known level", input: "WARN", expected: "warn" },
+    { description: "mixed case known level", input: "Info", expected: "info" },
+    { description: "whitespace around known level", input: " debug ", expected: "debug" },
     { description: "unknown verbose level", input: "verbose", expected: DEFAULT_LOG_LEVEL },
     { description: "numeric zero", input: 0, expected: DEFAULT_LOG_LEVEL },
     { description: "null", input: null, expected: DEFAULT_LOG_LEVEL },
@@ -35,10 +39,11 @@ test("parseLogLevel returns a valid level for every input", () => {
 
 test("parseLogFormat resolves valid and invalid inputs", () => {
   const cases = [
-    { description: "lowercase known format", input: "json", expected: "JSON" },
-    { description: "uppercase known format", input: "JSON", expected: "JSON" },
-    { description: "whitespace around known format", input: " json ", expected: "JSON" },
-    { description: "mixed case known format", input: "Pretty", expected: "PRETTY" },
+    { description: "lowercase known format", input: "json", expected: "json" },
+    { description: "uppercase known format", input: "JSON", expected: "json" },
+    { description: "whitespace around known format", input: " json ", expected: "json" },
+    { description: "mixed case known format", input: "Json", expected: "json" },
+    { description: "unsupported pretty format", input: "pretty", expected: DEFAULT_LOG_FORMAT },
     { description: "unknown verbose format", input: "verbose", expected: DEFAULT_LOG_FORMAT },
     { description: "numeric zero", input: 0, expected: DEFAULT_LOG_FORMAT },
     { description: "null", input: null, expected: DEFAULT_LOG_FORMAT },

@@ -12,7 +12,7 @@ import {
 } from "../audit.js";
 import { messagesFor, type Locale } from "../i18n.js";
 import { safeErrorMessage } from "../notifications/format.js";
-import { defineCommand } from "./registry.js";
+import { createCommandModule } from "./registry.js";
 
 /** How many recent audit lines `/audit` renders. A chat message is not a file. */
 const AUDIT_TAIL = 10;
@@ -33,10 +33,10 @@ export function renderAuditForTelegram(
   return `${header}\n\n${report}\n\n${messagesFor(locale).auditCliHint}`;
 }
 
-export const auditCommand = defineCommand({
+export const auditCommand = createCommandModule({
   command: "audit",
   operatorOnly: true,
-  handler: async (ctx, deps) => {
+  handle: async (ctx, deps) => {
     const { config } = deps;
     try {
       const file = deps.auditFile ?? config.auditFile;

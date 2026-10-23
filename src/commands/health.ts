@@ -8,7 +8,7 @@ import { escapeMd } from "../notifications/format.js";
 import { formatProvenanceSummary, networkLabel, type BotConfig } from "../config.js";
 import { buildHealthReport, chainClockLabel } from "../health.js";
 import type { PollerStatus } from "../poller.js";
-import { defineCommand } from "./registry.js";
+import { createCommandModule } from "./registry.js";
 import { TELEGRAM_OPTIONS } from "./runtime.js";
 
 function ago(timestamp: number | null, nowMs: number = Date.now()): string {
@@ -102,12 +102,12 @@ export function healthMessage(
   return lines.join("\n");
 }
 
-export const healthCommand = defineCommand({
+export const healthCommand = createCommandModule({
   // Config-only, so this never fails on account of poller or RPC state —
   // unlike /status, it has nothing to report failure on.
   command: "health",
-  chatAllowlist: true,
-  handler: async (ctx, deps) => {
+  allowlisted: true,
+  handle: async (ctx, deps) => {
     await ctx.reply(healthMessage(deps.config, deps.status()), TELEGRAM_OPTIONS);
   },
 });

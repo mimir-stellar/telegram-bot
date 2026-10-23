@@ -139,7 +139,6 @@ export const COMMAND_DESCRIPTIONS: Readonly<Record<CommandName, string>> = {
   contracts: "Contract ids and explorer links",
   health: "Health assessment and operational readiness",
   preview: "Preview channel notification formatting",
-  ping: "Measure Telegram round-trip latency",
   pause: "Operator only: pause new scans",
   resume: "Operator only: resume polling now",
 } as const;
