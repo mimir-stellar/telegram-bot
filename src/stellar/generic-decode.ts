@@ -153,8 +153,8 @@ function renderScValInstance(
 ): string {
   let switchName = "";
   try {
-    const sw = val.switch();
-    switchName = typeof sw === "object" && sw !== null && "name" in sw ? String(sw.name) : String(sw);
+    const sw = (val as unknown as { switch?: () => unknown }).switch?.();
+    switchName = typeof sw === "object" && sw !== null && "name" in sw ? String((sw as { name: unknown }).name) : String(sw);
   } catch {
     return "malformed";
   }
@@ -311,7 +311,7 @@ function renderScValInstance(
         return "vec:[...]";
       }
       try {
-        const rawItems = (val as { value?: () => unknown[] }).value?.();
+        const rawItems = (val as unknown as { value?: () => unknown[] }).value?.();
         if (!Array.isArray(rawItems)) {
           // Fallback via scValToNative if value() is absent
           const native = scValToNative(val);
@@ -340,7 +340,7 @@ function renderScValInstance(
         return "map:{...}";
       }
       try {
-        const rawEntries = (val as { value?: () => unknown[] }).value?.();
+        const rawEntries = (val as unknown as { value?: () => unknown[] }).value?.();
         if (!Array.isArray(rawEntries)) {
           const native = scValToNative(val);
           if (native && typeof native === "object") {

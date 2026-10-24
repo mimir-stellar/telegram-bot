@@ -122,6 +122,7 @@ export const COMMAND_NAMES = [
   "contracts",
   "health",
   "preview",
+  "ping",
   "pause",
   "resume",
 ] as const;
@@ -600,6 +601,7 @@ const ES_COMMAND_DESCRIPTIONS: Readonly<Record<CommandName, string>> = {
   contracts: "Ids de contratos y enlaces al explorador",
   health: "Evaluación de salud y preparación operativa",
   preview: "Previsualizar el formato de las notificaciones del canal",
+  ping: "Medir la latencia de ida y vuelta de Telegram",
   pause: "Solo operadores: pausar nuevos escaneos",
   resume: "Solo operadores: reanudar el sondeo ahora",
 };

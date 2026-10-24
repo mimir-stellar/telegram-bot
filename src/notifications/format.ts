@@ -34,12 +34,7 @@ import { settlementLines } from "./settlement.js";
 import type { StellarConfig } from "../config.js";
 import { messagesFor, type Messages } from "../i18n.js";
 import { formatDeadline } from "./time.js";
-import {
-  EXPLORER_BUTTON_TEXT,
-  MIMIR_APP_BUTTON_TEXT,
-  NOTIFICATION_MD,
-  NOTIFICATION_PLAIN,
-} from "../i18n.js";
+import { buildSampleEvents } from "./samples.js";
 import {
   highlightLevel,
   highlightMarker,
@@ -403,13 +398,11 @@ function headline(
 
   switch (p.name) {
     // ── mimir-market ────────────────────────────────────────────────────────
-    case "claim_created":
-      return md.claimCreated(
     case "claim_created": {
       const icon = iconForCategory(p.category);
       const cat = escapeMd(clip(sanitizeUserText(p.category)));
       const formattedCategory = cat ? `${icon} ${cat}` : icon;
-      return NOTIFICATION_MD.claimCreated(
+      return md.claimCreated(
         String(p.claimId),
         formattedCategory,
         who(p.creator),
@@ -570,8 +563,7 @@ export function formatEvent(
   const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
     const messages = messagesFor(config.locale);
-    const head = headline(messages, event, currentMs);
-    let head = headline(event, currentMs);
+    let head = headline(messages, event, currentMs);
     if (head === null) return null;
     const effectiveThresholds = thresholds ?? config.highlightThresholds;
     if (effectiveThresholds !== undefined) {
@@ -627,13 +619,11 @@ function plainHeadline(
 
   switch (p.name) {
     // ── mimir-market ────────────────────────────────────────────────────────
-    case "claim_created":
-      return plain.claimCreated(p.claimId, clip(p.category), plainWho(p.creator));
     case "claim_created": {
       const icon = iconForCategory(p.category);
       const cat = clip(sanitizeUserText(p.category));
       const formattedCategory = cat ? `${icon} ${cat}` : icon;
-      return NOTIFICATION_PLAIN.claimCreated(p.claimId, formattedCategory, plainWho(p.creator));
+      return plain.claimCreated(p.claimId, formattedCategory, plainWho(p.creator));
     }
 
     case "claim_challenged":
@@ -772,9 +762,6 @@ export function formatPlainTextEvent(
   nowMsOrThresholds?: number | HighlightThresholds,
 ): string | null {
   const messages = messagesFor(config.locale);
-  const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
-  try {
-    const head = plainHeadline(messages, event, currentMs);
   const nowMs = typeof nowMsOrThresholds === "number" ? nowMsOrThresholds : undefined;
   const thresholds =
     typeof nowMsOrThresholds === "object" && nowMsOrThresholds !== null
@@ -782,7 +769,7 @@ export function formatPlainTextEvent(
       : undefined;
   const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    let head = plainHeadline(event, currentMs);
+    let head = plainHeadline(messages, event, currentMs);
     if (head === null) return null;
     const effectiveThresholds = thresholds ?? config.highlightThresholds;
     if (effectiveThresholds !== undefined) {
@@ -835,62 +822,45 @@ export function formatFallbackEvent(
 
 /**
  * Generate a channel preview message for on-demand preview commands.
- * Shows a sample notification and current link preview settings for the specified contract.
+ * Shows a sample notification and current link preview settings for the specified contract or event.
+ * If an unknown event or target is requested, returns a usage message listing valid names.
  */
-export function previewMessage(config: StellarConfig & { linkPreviewMarket?: boolean; linkPreviewSquad?: boolean }, target = "market"): string {
+export function previewMessage(
+  config: StellarConfig & { linkPreviewMarket?: boolean; linkPreviewSquad?: boolean },
+  target = "market",
+): string {
   const messages = messagesFor(config.locale);
-  const isSquad = target.trim().toLowerCase() === "squad";
-  const linkPreviewEnabled = isSquad
-    ? config.linkPreviewSquad ?? false
-    : config.linkPreviewMarket ?? false;
+  const normalized = target.trim().toLowerCase();
+  const samples = buildSampleEvents(config);
 
-  const settingsLine = `Link previews: ${linkPreviewEnabled ? "enabled" : "disabled"}`;
-
-  if (isSquad) {
-    const sampleEvent: DecodedEvent = {
-      source: "squad",
-      contractId: config.squadContractId,
-      version: "v1",
-      ledger: 1000000,
-      txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-      at: Math.floor(Date.now() / 1000),
-      eventId: "1000000-1",
-      eventType: "contract",
-      transactionIndex: 0,
-      operationIndex: 0,
-      inSuccessfulContractCall: true,
-      payload: {
-        name: "market_created",
-        marketId: 1,
-        question: "Will Stellar process 1M Soroban operations in 24 hours?",
-        captain: "GDZCB3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
-        feeBps: 100,
-        deadline: 1770000000,
-      },
-    };
+  const render = (sampleEvent: DecodedEvent): string => {
+    const isSquad = sampleEvent.source === "squad";
+    const linkPreviewEnabled = isSquad
+      ? config.linkPreviewSquad ?? false
+      : config.linkPreviewMarket ?? false;
+    const settingsLine = `Link previews: ${linkPreviewEnabled ? "enabled" : "disabled"}`;
+    const header = isSquad
+      ? messages.notificationMd.channelPreviewSquad
+      : messages.notificationMd.channelPreviewMarket;
     const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
-    return `${messages.notificationMd.channelPreviewSquad}\n${settingsLine}\n\n${formatted}`;
+    return `${header}\n${settingsLine}\n\n${formatted}`;
+  };
+
+  if (normalized === "squad") return render(samples["market_created"]);
+  if (normalized === "market") return render(samples["claim_created"]);
+
+  if (Object.prototype.hasOwnProperty.call(samples, normalized)) {
+    return render(samples[normalized as keyof typeof samples]);
   }
 
-  const sampleEvent: DecodedEvent = {
-    source: "market",
-    contractId: config.marketContractId,
-    version: "v1",
-    ledger: 1000000,
-    txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-    at: Math.floor(Date.now() / 1000),
-    eventId: "1000000-0",
-    eventType: "contract",
-    transactionIndex: 0,
-    operationIndex: 0,
-    inSuccessfulContractCall: true,
-    payload: {
-      name: "claim_created",
-      claimId: 1,
-      category: "crypto",
-      creator: "GBMGZ3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
-    },
-  };
-  const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
-  return `${messages.notificationMd.channelPreviewMarket}\n${settingsLine}\n\n${formatted}`;
+  const validNames = Object.keys(samples)
+    .sort()
+    .map((name) => escapeMd(name))
+    .join(", ");
+  return (
+    `Unknown preview event: \`${escapeMd(clip(target, 40))}\`\n\n` +
+    `Usage: \`/preview <event_name>\`\n` +
+    `Valid names:\n${validNames}\n\n` +
+    `Shortcuts: \`market\`, \`squad\``
+  );
 }

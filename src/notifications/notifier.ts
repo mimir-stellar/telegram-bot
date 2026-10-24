@@ -43,6 +43,8 @@ export interface SendExtra {
    * absent, so the send is byte-identical to the unthreaded one.
    */
   replyToMessageId?: number | undefined;
+  /** Decoded contract event name used to apply silent-notification policy. */
+  eventName?: string | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────

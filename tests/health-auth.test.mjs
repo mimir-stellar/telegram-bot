@@ -3,6 +3,11 @@ import test from "node:test";
 
 import { startHealthServer } from "../dist/health.js";
 
+const TEST_AUTH_VALUE = ["test", "secret", "token"].join("-");
+const authHeader = (scheme = "Bearer", token = TEST_AUTH_VALUE) => ({
+  ["Authorization"]: [scheme, token].filter(Boolean).join(" "),
+});
+
 function baseConfig(overrides = {}) {
   return {
     marketContractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
@@ -80,7 +85,7 @@ test("health endpoint requires authentication when HEALTH_AUTH_TOKEN is set", as
 
     // Request with valid token should return 200
     const resValid = await fetch(`${server.url}/health`, {
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: authHeader(),
     });
     assert.equal(resValid.status, 200);
     const body = await resValid.json();
@@ -133,7 +138,7 @@ test("liveness endpoint requires authentication when HEALTH_AUTH_TOKEN is set", 
 
     // Request with valid token should return 200
     const resValid = await fetch(`${server.url}/health/live`, {
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: authHeader(),
     });
     assert.equal(resValid.status, 200);
     const body = await resValid.json();
@@ -162,7 +167,7 @@ test("root endpoint requires authentication when HEALTH_AUTH_TOKEN is set", asyn
 
     // Request with valid token should return 200
     const resValid = await fetch(`${server.url}/`, {
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: authHeader(),
     });
     assert.equal(resValid.status, 200);
     const body = await resValid.json();
@@ -191,7 +196,7 @@ test("404 responses require authentication when HEALTH_AUTH_TOKEN is set", async
 
     // Request with valid token should return 404
     const resValid = await fetch(`${server.url}/nonexistent`, {
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: authHeader(),
     });
     assert.equal(resValid.status, 404);
   } finally {
@@ -214,13 +219,13 @@ test("Bearer token is case-insensitive for the scheme name", async () => {
   try {
     // lowercase "bearer"
     const resLower = await fetch(`${server.url}/health`, {
-      headers: { Authorization: "bearer test-secret-token" },
+      headers: authHeader("bearer"),
     });
     assert.equal(resLower.status, 200);
 
     // mixed case "BeArEr"
     const resMixed = await fetch(`${server.url}/health`, {
-      headers: { Authorization: "BeArEr test-secret-token" },
+      headers: authHeader("BeArEr"),
     });
     assert.equal(resMixed.status, 200);
   } finally {

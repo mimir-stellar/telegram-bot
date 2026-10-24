@@ -37,15 +37,15 @@ export function displayUsdc(
     );
   }
 
-  const raw = formatUsdc(units);
+  const raw = formatUsdc(typeof units === "string" ? BigInt(units) : units);
   const negative = raw.startsWith('-');
   const unsigned = negative ? raw.slice(1) : raw;
   const [parts, fractionPart = ''] = unsigned.split('.');
   const integerPart = parts ?? '0';
 
-  // formatUsdc always emits USCD_DECIMALS fraction digits. Trim trailing
+  // formatUsdc always emits USDC_DECIMALS fraction digits. Trim trailing
   // zeros down to minDecimals, and cap at maxDecimals.
-  const padded = fractionPart.padEnd(USCD_DECIMALS, '0').slice(0, USDC_DECIMALS);
+  const padded = fractionPart.padEnd(USDC_DECIMALS, '0').slice(0, USDC_DECIMALS);
   const capped = padded.slice(0, maxDecimals);
   let trimmed = capped.replace(/0+$/, '');
   if (trimmed.length < minDecimals) {
