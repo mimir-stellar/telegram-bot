@@ -784,7 +784,7 @@ export function registerCommandHandlers(
     },
 
     audit: async (ctx) => {
-      if (!isOperator(ctx, config)) {
+      if (!(await canControl(ctx, config, ctx.api))) {
         // Same authorization model as /pause and /resume: the report is only
         // meant for the operator, so other users get silence, not an error that
         // would confirm the command exists. The standalone `npm run audit` CLI
@@ -841,7 +841,7 @@ export function registerCommandHandlers(
     },
 
     pause: async (ctx) => {
-      if (!isOperator(ctx, config)) {
+      if (!(await canControl(ctx, config, ctx.api))) {
         console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
         return;
       }
@@ -852,7 +852,7 @@ export function registerCommandHandlers(
     },
 
     resume: async (ctx) => {
-      if (!isOperator(ctx, config)) {
+      if (!(await canControl(ctx, config, ctx.api))) {
         console.warn(`[bot] ignored unauthorized /resume on update ${ctx.update.update_id}`);
         return;
       }
