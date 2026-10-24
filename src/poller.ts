@@ -93,6 +93,7 @@ import {
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
+import { topicCategoryForEvent } from "./notifications/topics.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
@@ -2081,6 +2082,7 @@ export function createPoller(deps: PollerDeps) {
           extra = {
             eventName: event.payload.name,
             ...(reply_markup ? { reply_markup } : {}),
+            category: topicCategoryForEvent(event.source, event.payload.name),
             ...(plainText !== null ? { plainText, eventRef } : {}),
           };
         }

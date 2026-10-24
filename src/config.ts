@@ -30,6 +30,7 @@
  * value the machine provided from one the file provided.
  */
 
+import { parseTopicMap } from "./notifications/topics.js";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -202,6 +203,8 @@ export interface BotConfig extends StellarConfig {
   /** Optional per-contract destinations; absent values use `chatId`. */
   marketChatId?: string;
   squadChatId?: string;
+  /** Optional forum-topic routing from TELEGRAM_TOPIC_MAP (category -> thread id). */
+  topicMap?: ReadonlyMap<string, number>;
   /** Chats allowed to use /status. Empty array means no restriction. */
   allowedChatIds: string[];
   /** Telegram user id allowed to run operator-only commands. Null disables them. */
@@ -663,6 +666,15 @@ function collector(profile: Record<string, string>) {
       return parsed;
     },
 
+    topicMap(name: string): ReadonlyMap<string, number> {
+      try {
+        return parseTopicMap(read(name));
+      } catch (err) {
+        problems.push(`${name} is invalid: ${err instanceof Error ? err.message : String(err)}`);
+        return new Map();
+      }
+    },
+
     optionalChatId(name: string, fallback: string): string {
       const value = read(name) ?? fallback;
       if (value === "") return value;
@@ -859,6 +871,7 @@ export function loadConfig(): BotConfig {
     chatIds,
     marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
     squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
+    topicMap: c.topicMap("TELEGRAM_TOPIC_MAP"),
     allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
@@ -1054,6 +1067,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "TELEGRAM_CHAT_ID", secret: true },
   { key: "TELEGRAM_MARKET_CHAT_ID", secret: true, derivedFrom: { key: "TELEGRAM_CHAT_ID" } },
   { key: "TELEGRAM_SQUAD_CHAT_ID", secret: true, derivedFrom: { key: "TELEGRAM_CHAT_ID" } },
+  { key: "TELEGRAM_TOPIC_MAP", secret: false },
   { key: "ALLOWED_CHAT_IDS", secret: true },
   { key: "OPERATOR_TELEGRAM_USER_ID", secret: true },
   { key: "POLL_INTERVAL_MS", secret: false, hasBuiltInDefault: true },

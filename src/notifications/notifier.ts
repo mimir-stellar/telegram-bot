@@ -15,6 +15,7 @@ import type { Bot } from "grammy";
 
 import type { BotConfig } from "../config.js";
 import type { ContractSource } from "../stellar/decode.js";
+import { resolveTopicThreadId } from "./topics.js";
 import {
   safeErrorMessage,
   splitTelegramMessage,
@@ -43,6 +44,8 @@ export interface SendExtra {
    * absent, so the send is byte-identical to the unthreaded one.
    */
   replyToMessageId?: number | undefined;
+  /** Event category used to pick a forum topic via TELEGRAM_TOPIC_MAP; falls back to the contract source. */
+  category?: string | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -116,7 +119,7 @@ export const notifierSkips = { emptyText: 0 };
 export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
-    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad">>,
+    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "topicMap">>,
 ) {
   return async (
     text: string | null,
@@ -150,7 +153,11 @@ export function createNotifier(
         ? !config.linkPreviewSquad
         : true;
 
+    // Unmapped events omit the field so the send is byte-identical.
+    const threadId = resolveTopicThreadId(config.topicMap, extra?.category ?? source);
+
     const notificationOptions = {
+      ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
       parse_mode: "MarkdownV2" as const,
       link_preview_options: { is_disabled: linkPreviewDisabled },
     };
@@ -202,6 +209,7 @@ export function createNotifier(
       );
       // Plain text (no parse mode), same per-source link preview setting.
       await bot.api.sendMessage(chatId, fallback, {
+        ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
         link_preview_options: notificationOptions.link_preview_options,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(extra?.replyToMessageId !== undefined
