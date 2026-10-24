@@ -228,8 +228,8 @@ test("checkAuditFile detects multiple issues in one file", async () => {
 });
 
 test("checkAuditFile never echoes full detail text in output", async () => {
-  const secretDetail = "SECRET-TOKEN-12345";
-  const content = `{"v":1,"t":1000,"kind":"boot","detail":"${secretDetail}"}`;
+  const fixtureDetail = "FIXTURE-DETAIL-MARKER-12345";
+  const content = `{"v":1,"t":1000,"kind":"boot","detail":"${fixtureDetail}"}`;
   const { result } = await withTempFile(content);
 
   assert.equal(result.validEntries, 1);
@@ -237,7 +237,7 @@ test("checkAuditFile never echoes full detail text in output", async () => {
 
   // Verify the detail is not in the result object (we only report length for oversized)
   const resultJson = JSON.stringify(result);
-  assert.equal(resultJson.includes(secretDetail), false);
+  assert.equal(resultJson.includes(fixtureDetail), false);
 });
 
 test("checkAuditFile reports detail length for oversized fields without showing content", async () => {

@@ -58,7 +58,7 @@ test("addressActivity returns InvalidAddressError on invalid addresses", () => {
     12345,
     "invalid-strkey",
     "G" + "A".repeat(55),
-    "SDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+    "S" + "D".repeat(55),
   ];
 
   for (const invalid of invalidInputs) {

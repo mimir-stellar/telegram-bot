@@ -1,0 +1,43 @@
+name: Notification wording change
+description: Request a change to the wording of a Telegram notification
+title: "[Wording]: "
+labels: ["area/telegram"]
+body:
+  - type: dropdown
+    id: event
+    attributes:
+      label: Event name
+      description: Which notification event does this wording apply to?
+      options:
+        - Market: new market listed
+        - Market: price change
+        - Market: market resolved
+        - Market: market closed
+        - Squad: member joined
+        - Squad: member left
+        - Squad: lineup changed
+        - Squad: match starting
+        - Other (describe in rationale)
+    validations:
+      required: true
+  - type: textarea
+    id: current_text
+    attributes:
+      label: Current text
+      description: Paste the notification text as it currently appears.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_text
+    attributes:
+      label: Proposed text
+      description: Paste the wording you would like to see instead.
+    validations:
+      required: true
+  - type: textarea
+    id: rationale
+    attributes:
+      label: Rationale
+      description: Why should the wording change?
+    validations:
+      required: true

@@ -3,6 +3,13 @@ import test from "node:test";
 
 import { startHealthServer } from "../dist/health.js";
 
+const TEST_AUTH_TOKEN = process.env.TEST_HEALTH_AUTH_TOKEN ?? "test-secret-token";
+const WRONG_AUTH_TOKEN = "wrong-token";
+
+function bearer(token) {
+  return `Bearer ${token}`;
+}
+
 function baseConfig(overrides = {}) {
   return {
     marketContractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
@@ -56,7 +63,7 @@ function baseStatus(overrides = {}) {
 test("health endpoint requires authentication when HEALTH_AUTH_TOKEN is set", async () => {
   const config = baseConfig({
     healthPort: 18788,
-    healthAuthToken: "test-secret-token",
+    healthAuthToken: TEST_AUTH_TOKEN,
   });
   const server = startHealthServer({
     config,
@@ -73,14 +80,14 @@ test("health endpoint requires authentication when HEALTH_AUTH_TOKEN is set", as
 
     // Request with invalid token should return 401
     const resInvalid = await fetch(`${server.url}/health`, {
-      headers: { Authorization: "Bearer wrong-token" },
+      headers: { Authorization: bearer(WRONG_AUTH_TOKEN) },
     });
     assert.equal(resInvalid.status, 401);
     assert.equal(await resInvalid.text(), "");
 
     // Request with valid token should return 200
     const resValid = await fetch(`${server.url}/health`, {
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: { Authorization: bearer(TEST_AUTH_TOKEN) },
     });
     assert.equal(resValid.status, 200);
     const body = await resValid.json();
@@ -117,7 +124,7 @@ test("health endpoint accessible without authentication when HEALTH_AUTH_TOKEN i
 test("liveness endpoint requires authentication when HEALTH_AUTH_TOKEN is set", async () => {
   const config = baseConfig({
     healthPort: 18790,
-    healthAuthToken: "test-secret-token",
+    healthAuthToken: TEST_AUTH_TOKEN,
   });
   const server = startHealthServer({
     config,
@@ -133,7 +140,7 @@ test("liveness endpoint requires authentication when HEALTH_AUTH_TOKEN is set", 
 
     // Request with valid token should return 200
     const resValid = await fetch(`${server.url}/health/live`, {
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: { Authorization: bearer(TEST_AUTH_TOKEN) },
     });
     assert.equal(resValid.status, 200);
     const body = await resValid.json();
@@ -146,7 +153,7 @@ test("liveness endpoint requires authentication when HEALTH_AUTH_TOKEN is set", 
 test("root endpoint requires authentication when HEALTH_AUTH_TOKEN is set", async () => {
   const config = baseConfig({
     healthPort: 18791,
-    healthAuthToken: "test-secret-token",
+    healthAuthToken: TEST_AUTH_TOKEN,
   });
   const server = startHealthServer({
     config,
@@ -162,7 +169,7 @@ test("root endpoint requires authentication when HEALTH_AUTH_TOKEN is set", asyn
 
     // Request with valid token should return 200
     const resValid = await fetch(`${server.url}/`, {
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: { Authorization: bearer(TEST_AUTH_TOKEN) },
     });
     assert.equal(resValid.status, 200);
     const body = await resValid.json();
@@ -175,7 +182,7 @@ test("root endpoint requires authentication when HEALTH_AUTH_TOKEN is set", asyn
 test("404 responses require authentication when HEALTH_AUTH_TOKEN is set", async () => {
   const config = baseConfig({
     healthPort: 18792,
-    healthAuthToken: "test-secret-token",
+    healthAuthToken: TEST_AUTH_TOKEN,
   });
   const server = startHealthServer({
     config,
@@ -191,7 +198,7 @@ test("404 responses require authentication when HEALTH_AUTH_TOKEN is set", async
 
     // Request with valid token should return 404
     const resValid = await fetch(`${server.url}/nonexistent`, {
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: { Authorization: bearer(TEST_AUTH_TOKEN) },
     });
     assert.equal(resValid.status, 404);
   } finally {
@@ -202,7 +209,7 @@ test("404 responses require authentication when HEALTH_AUTH_TOKEN is set", async
 test("Bearer token is case-insensitive for the scheme name", async () => {
   const config = baseConfig({
     healthPort: 18793,
-    healthAuthToken: "test-secret-token",
+    healthAuthToken: TEST_AUTH_TOKEN,
   });
   const server = startHealthServer({
     config,
@@ -214,13 +221,13 @@ test("Bearer token is case-insensitive for the scheme name", async () => {
   try {
     // lowercase "bearer"
     const resLower = await fetch(`${server.url}/health`, {
-      headers: { Authorization: "bearer test-secret-token" },
+      headers: { Authorization: `bearer ${TEST_AUTH_TOKEN}` },
     });
     assert.equal(resLower.status, 200);
 
     // mixed case "BeArEr"
     const resMixed = await fetch(`${server.url}/health`, {
-      headers: { Authorization: "BeArEr test-secret-token" },
+      headers: { Authorization: `BeArEr ${TEST_AUTH_TOKEN}` },
     });
     assert.equal(resMixed.status, 200);
   } finally {
@@ -231,7 +238,7 @@ test("Bearer token is case-insensitive for the scheme name", async () => {
 test("malformed Authorization header returns 401", async () => {
   const config = baseConfig({
     healthPort: 18794,
-    healthAuthToken: "test-secret-token",
+    healthAuthToken: TEST_AUTH_TOKEN,
   });
   const server = startHealthServer({
     config,
@@ -243,7 +250,7 @@ test("malformed Authorization header returns 401", async () => {
   try {
     // Missing "Bearer" prefix
     const resNoPrefix = await fetch(`${server.url}/health`, {
-      headers: { Authorization: "test-secret-token" },
+      headers: { Authorization: TEST_AUTH_TOKEN },
     });
     assert.equal(resNoPrefix.status, 401);
 
