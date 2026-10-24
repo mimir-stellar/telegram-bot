@@ -39,6 +39,7 @@
         "notificationsFailed",
         "eventsSkipped",
         "eventsDeduplicated",
+        "activity",
         "notificationsDropped",
         "cursorRewinds",
         "deadLetter",
@@ -77,6 +78,35 @@
         "notificationsFailed": { "type": "integer", "minimum": 0 },
         "eventsSkipped": { "type": "integer", "minimum": 0 },
         "eventsDeduplicated": { "type": "integer", "minimum": 0, "description": "Events suppressed as already seen across overlapping pages and resumes." },
+        "activity": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Comparison of the latest complete cycle's event count with a rolling baseline of recent complete cycles. Counts only.",
+          "required": [
+            "windowSize",
+            "minSamples",
+            "zThreshold",
+            "samples",
+            "lastValue",
+            "baselineMean",
+            "baselineStdDev",
+            "zScore",
+            "deviation",
+            "anomalies"
+          ],
+          "properties": {
+            "windowSize": { "type": "integer", "minimum": 1, "description": "Maximum observations retained in the rolling window." },
+            "minSamples": { "type": "integer", "minimum": 1, "description": "Prior observations required before a deviation is classified." },
+            "zThreshold": { "type": "number", "minimum": 0, "description": "Absolute z-score at or above which a cycle is a spike or drop." },
+            "samples": { "type": "integer", "minimum": 0, "description": "Observations currently retained (0 before the first complete cycle)." },
+            "lastValue": { "type": ["integer", "null"], "minimum": 0, "description": "Events observed in the most recent complete cycle, or null before the first one." },
+            "baselineMean": { "type": ["number", "null"], "minimum": 0, "description": "Mean events per cycle in the window used for the last comparison, or null while warming up." },
+            "baselineStdDev": { "type": ["number", "null"], "minimum": 0, "description": "Sample standard deviation of that window, or null while warming up." },
+            "zScore": { "type": ["number", "null"], "description": "Deviation of lastValue from the baseline in standard deviations, or null while warming up." },
+            "deviation": { "enum": ["warming-up", "normal", "spike", "drop"], "description": "Classification of the most recent complete cycle." },
+            "anomalies": { "type": "integer", "minimum": 0, "description": "Complete cycles classified as a spike or drop since process start." }
+          }
+        },
         "notificationsDropped": { "type": "integer", "minimum": 0 },
         "cursorRewinds": { "type": "integer", "minimum": 0, "description": "Cursors rewound to the RPC's retained floor this run." },
         "deadLetter": {

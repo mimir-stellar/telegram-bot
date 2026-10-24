@@ -81,10 +81,10 @@ test("snapshot: renderEvent renders expected MarkdownV2, plain-text and explorer
     bothOutput,
     [
       "=== MarkdownV2 ===",
-      "🆕 *New claim* \\#7\nCategory: crypto\nCreator: `GABCD…TUVW`\n_ledger 4226691_ · [tx](https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef)",
+      "🆕 *New claim* \\#7\nCategory: 🪙 crypto\nCreator: `GABCD…TUVW`\n_ledger 4226691_ · [tx](https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef)",
       "",
       "=== Plain Text ===",
-      "New claim #7\nCategory: crypto\nCreator: GABCD…TUVW\nledger 4226691\ntx: https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "New claim #7\nCategory: 🪙 crypto\nCreator: GABCD…TUVW\nledger 4226691\ntx: https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       "",
       "=== Explorer URL ===",
       "https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -94,13 +94,13 @@ test("snapshot: renderEvent renders expected MarkdownV2, plain-text and explorer
   const mdOutput = renderEvent(config, event, "md");
   assert.equal(
     mdOutput,
-    "🆕 *New claim* \\#7\nCategory: crypto\nCreator: `GABCD…TUVW`\n_ledger 4226691_ · [tx](https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef)\nExplorer URL: https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "🆕 *New claim* \\#7\nCategory: 🪙 crypto\nCreator: `GABCD…TUVW`\n_ledger 4226691_ · [tx](https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef)\nExplorer URL: https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   );
 
   const plainOutput = renderEvent(config, event, "plain");
   assert.equal(
     plainOutput,
-    "New claim #7\nCategory: crypto\nCreator: GABCD…TUVW\nledger 4226691\ntx: https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nExplorer URL: https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "New claim #7\nCategory: 🪙 crypto\nCreator: GABCD…TUVW\nledger 4226691\ntx: https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nExplorer URL: https://stellar.expert/explorer/testnet/tx/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   );
 });
 
@@ -135,10 +135,10 @@ test("snapshot: renderEvent renders expected MarkdownV2, plain-text and explorer
     bothOutput,
     [
       "=== MarkdownV2 ===",
-      "🆕 *New squad market* \\#1\nWill Stellar process 1M Soroban operations in 24 hours?\nCaptain: `GDZCB…PKZI` · fee 100 bps · deadline 2026\\-02\\-02T02:40:00\\.000Z\n_ledger 1000000_ · [tx](https://stellar.expert/explorer/testnet/tx/1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef)",
+      "🆕 *New squad market* \\#1\nWill Stellar process 1M Soroban operations in 24 hours?\nCaptain: `GDZCB…PKZI` · fee 100 bps · deadline ended \\(2026\\-02\\-02T02:40:00\\.000Z\\)\n_ledger 1000000_ · [tx](https://stellar.expert/explorer/testnet/tx/1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef)",
       "",
       "=== Plain Text ===",
-      "New squad market #1\nWill Stellar process 1M Soroban operations in 24 hours?\nCaptain: GDZCB…PKZI · fee 100 bps · deadline 2026-02-02T02:40:00.000Z\nledger 1000000\ntx: https://stellar.expert/explorer/testnet/tx/1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "New squad market #1\nWill Stellar process 1M Soroban operations in 24 hours?\nCaptain: GDZCB…PKZI · fee 100 bps · deadline ended (2026-02-02T02:40:00.000Z)\nledger 1000000\ntx: https://stellar.expert/explorer/testnet/tx/1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
       "",
       "=== Explorer URL ===",
       "https://stellar.expert/explorer/testnet/tx/1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",

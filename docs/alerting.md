@@ -24,6 +24,24 @@ scrape_configs:
       - targets: ["127.0.0.1:8787"]
 ```
 
+### Activity baseline
+
+Both endpoints also export a comparison of the latest **complete** poll cycle with a rolling baseline of the twenty cycles before it (ten prior cycles are required before a classification is made; partial cycles with a failed or backed-off target are not recorded):
+
+| Metric | Meaning |
+| :--- | :--- |
+| `mimir_telegram_activity_last_cycle_events` / `mimir_bot_last_cycle_events` | Events observed in the most recent complete cycle. |
+| `mimir_telegram_activity_baseline_events` / `mimir_bot_activity_baseline_events` | Mean events per cycle in the rolling baseline (0 while warming up). |
+| `mimir_telegram_activity_deviation` | z-score of the latest cycle against the baseline (0 while warming up). |
+| `mimir_telegram_activity_anomalies_total` / `mimir_bot_activity_anomalies_total` | Complete cycles classified as a spike (z ≥ 3) or drop (z ≤ −3). |
+
+The same snapshot is available from `curl -s http://127.0.0.1:8787/health | jq .poller.activity`. A spike is not a fault by itself — a genuinely busy chain should not page anyone — so read it as context next to `eventsSkipped`, the notification cap, and `poller.error`. A sustained *drop* on an otherwise active contract more often means a broken filter, a cursor problem, or an upstream outage:
+
+```promql
+# Latest complete cycle is far below its rolling baseline (drop).
+mimir_telegram_activity_deviation < -3
+```
+
 ---
 
 ## 2. Validating the Rules with `promtool`

@@ -238,6 +238,6 @@ being replaced.
 npm run cursor -- backup --out data/cursor-backup.json
 ```
 
-Restore only after stopping the notifier. See [Cursor CLI reference](cursor-cli.md)
+Restore only after stopping the notifier. See [Cursor CLI reference](../README.md#cursor-backup-and-restore)
 for the full subcommand and flag reference, including how to inspect a cursor
 file and what `--force` overrides.

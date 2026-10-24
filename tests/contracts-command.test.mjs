@@ -17,7 +17,7 @@ function fakeConfig(overrides = {}) {
     networkPassphrase: "Test SDF Network ; September 2015",
     pollIntervalMs: 30_000,
     startLookbackLedgers: 60,
-    cursorFile: "./data/cursor.json",
+    cursorFile: "/tmp/unused-cursor.json",
     maxNotificationsPerCycle: 20,
     ...overrides,
   };
@@ -227,5 +227,5 @@ test("registerCommands includes /contracts alongside the existing commands", asy
 
   assert.equal(calls.length, 1);
   const commands = calls[0].commands.map((c) => c.command);
-  assert.deepEqual(commands, ["start", "help", "status", "audit", "contracts", "health", "preview", "pause", "resume"]);
+  assert.deepEqual(commands, ["start", "help", "about", "status", "audit", "contracts", "health", "preview", "pause", "resume"]);
 });

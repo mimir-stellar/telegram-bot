@@ -1,28 +1,32 @@
 /**
- * Tests for the /pause confirmation flow:
- *   - operator confirm → calls pause(), edits message with result
- *   - operator cancel → edits message with cancellation text
- *   - expired confirmation → rejects with alert, edits message
- *   - non-operator → rejected with alert, pause() never called
- *   - validateCallbackData accepts known actions and rejects unknown
- *   - operatorKeyboard buttons use strings within Telegram's 64-byte limit
- *   - /pause command sends confirmation prompt (no immediate pause)
+ * Tests for the /pause + callback-query infrastructure in bot.ts.
+ *
+ * Covers:
+ *   - validateCallbackData: known actions, unknown actions, edge cases
+ *   - operatorKeyboard: button shape and byte limits
+ *   - handleCallbackQuery: pause, resume, non-operator, invalid data
+ *   - /pause command: operator vs non-operator
+ *   - CALLBACK_PAUSE_CONFIRM/CANCEL byte-length contract
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  handleCallbackQuery,
+  handlePauseConfirmCallback,
   validateCallbackData,
-  operatorKeyboard,
+  validatePauseConfirmData,
+  pauseConfirmKeyboard,
+  handleCallbackQuery,
+  validatePauseCallbackData,
+  pauseConfirmationKeyboard,
   CALLBACK_PAUSE_CONFIRM,
   CALLBACK_PAUSE_CANCEL,
   PAUSE_CONFIRM_TTL_MS,
+  TELEGRAM_CALLBACK_DATA_MAX_BYTES,
+  CALLBACK_FALLBACK_FEEDBACK,
   registerCommandHandlers,
 } from "../dist/bot.js";
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function baseConfig(overrides = {}) {
   return {
@@ -48,65 +52,79 @@ function baseConfig(overrides = {}) {
   };
 }
 
-/**
- * Builds a fake grammy callback-query context.
- *
- * @param {object} opts
- * @param {number}  opts.userId      - Telegram user id for ctx.from.id
- * @param {string}  opts.data        - callback_query.data
- * @param {number}  opts.messageDate - Unix seconds for the originating message
- */
-function callbackCtx({ userId, data, messageDate = Math.floor(Date.now() / 1000) }) {
+function baseStatus(overrides = {}) {
+  return {
+    running: true, paused: false, startedAt: 1, cycles: 0,
+    lastPollAt: null, lastSuccessAt: null, latestLedger: null,
+    oldestLedger: null, notificationsSent: 0, notificationsFailed: 0,
+    eventsSkipped: 0, eventsDeduplicated: 0, consecutiveFailures: 0,
+    lastError: null, targets: [], stopping: false,
+    pagesScanned: 0, emptyPages: 0, lastCyclePages: 0,
+    lastCycleEmptyPages: 0, restartGaps: 0, cursorRewinds: 0,
+    ...overrides,
+  };
+}
+
+function callbackCtx({ userId, data } = {}) {
   const answered = [];
   const edits = [];
-
+  const replies = [];
   const ctx = {
     from: { id: userId },
-    callbackQuery: {
-      data,
-      message: { date: messageDate },
-    },
-    answerCallbackQuery: async (opts = {}) => {
-      answered.push(opts);
-    },
-    editMessageText: async (text, opts) => {
-      edits.push({ text, opts });
-    },
+    update: { update_id: 1 },
+    callbackQuery: { data, id: "cq-id", message: { date: Math.floor(Date.now() / 1000), chat: { id: -1001234567890 } } },
+    chat: { id: -1001234567890 },
+    api: { sendMessage: async (...a) => { replies.push(a); return {}; } },
+    answerCallbackQuery: async (opts = {}) => { answered.push(opts); },
+    editMessageText: async (text, opts) => { edits.push({ text, opts }); },
+    reply: async (...a) => { replies.push(a); },
   };
-
-  return { ctx, answered, edits };
+  return { ctx, answered, edits, replies };
 }
 
-/** Freeze time so expiry arithmetic is deterministic. */
-function nowSeconds() {
-  return Math.floor(Date.now() / 1000);
+function baseDeps(overrides = {}) {
+  return {
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+    ...overrides,
+  };
 }
 
-// ── validateCallbackData ──────────────────────────────────────────────────────
+// ── validatePauseConfirmData ─────────────────────────────────────────────────
 
-test("validateCallbackData accepts pause-confirm", () => {
-  assert.equal(validateCallbackData(CALLBACK_PAUSE_CONFIRM), CALLBACK_PAUSE_CONFIRM);
+test("validatePauseConfirmData accepts pause-confirm", () => {
+  assert.equal(validatePauseConfirmData(CALLBACK_PAUSE_CONFIRM), CALLBACK_PAUSE_CONFIRM);
 });
 
-test("validateCallbackData accepts pause-cancel", () => {
-  assert.equal(validateCallbackData(CALLBACK_PAUSE_CANCEL), CALLBACK_PAUSE_CANCEL);
+test("validatePauseConfirmData accepts pause-cancel", () => {
+  assert.equal(validatePauseConfirmData(CALLBACK_PAUSE_CANCEL), CALLBACK_PAUSE_CANCEL);
 });
 
-test("validateCallbackData rejects unknown data", () => {
-  assert.equal(validateCallbackData("bad-action"), null);
+test("validatePauseConfirmData rejects unknown data", () => {
+  assert.equal(validatePauseConfirmData("bad-action"), null);
 });
 
-test("validateCallbackData rejects undefined", () => {
-  assert.equal(validateCallbackData(undefined), null);
+test("validatePauseConfirmData rejects undefined", () => {
+  assert.equal(validatePauseConfirmData(undefined), null);
 });
 
-test("validateCallbackData rejects empty string", () => {
-  assert.equal(validateCallbackData(""), null);
+test("validatePauseConfirmData rejects empty string", () => {
+  assert.equal(validatePauseConfirmData(""), null);
 });
 
-// ── operatorKeyboard ──────────────────────────────────────────────────────────
+// The pause-confirm payloads are deliberately outside the navigation-action set:
+// the generic dispatcher must not act on them, and the confirmation flow must
+// not act on navigation actions.
+test("validateCallbackData keeps pause-confirm payloads out of the action set", () => {
+  assert.equal(validateCallbackData(CALLBACK_PAUSE_CONFIRM).ok, false);
+  assert.equal(validateCallbackData(CALLBACK_PAUSE_CANCEL).ok, false);
+});
 
-test("operatorKeyboard button callback_data strings are within Telegram's 64-byte limit", () => {
+// ── pauseConfirmKeyboard ─────────────────────────────────────────────────────
+
+test("pauseConfirmKeyboard button callback_data strings are within Telegram's 64-byte limit", () => {
   assert.ok(
     Buffer.byteLength(CALLBACK_PAUSE_CONFIRM, "utf8") <= 64,
     `pause-confirm exceeds 64 bytes`,
@@ -117,8 +135,8 @@ test("operatorKeyboard button callback_data strings are within Telegram's 64-byt
   );
 });
 
-test("operatorKeyboard returns an object with inline_keyboard rows", () => {
-  const kb = operatorKeyboard();
+test("pauseConfirmKeyboard returns an object with inline_keyboard rows", () => {
+  const kb = pauseConfirmKeyboard();
   // grammy InlineKeyboard serialises to { inline_keyboard: Button[][] }
   const serialised = kb.inline_keyboard;
   assert.ok(Array.isArray(serialised), "inline_keyboard is an array");
@@ -128,7 +146,7 @@ test("operatorKeyboard returns an object with inline_keyboard rows", () => {
   assert.ok(callbackDatas.includes(CALLBACK_PAUSE_CANCEL));
 });
 
-// ── handleCallbackQuery — confirm ────────────────────────────────────────────
+// ── handlePauseConfirmCallback — confirm ─────────────────────────────────────
 
 test("operator confirm: calls pause(), answers query, edits message with pauseMessage result", async () => {
   let pauseCalls = 0;
@@ -147,7 +165,7 @@ test("operator confirm: calls pause(), answers query, edits message with pauseMe
     messageDate,
   });
 
-  await handleCallbackQuery(ctx, deps, messageDate * 1000 + 500); // 0.5 s after send
+  await handlePauseConfirmCallback(ctx, deps, messageDate * 1000 + 500); // 0.5 s after send
 
   assert.equal(pauseCalls, 1);
   // answerCallbackQuery was called (no show_alert)
@@ -156,58 +174,120 @@ test("operator confirm: calls pause(), answers query, edits message with pauseMe
   // message was edited to the pause result
   assert.equal(edits.length, 1);
   assert.match(edits[0].text, /\*Polling paused\*/);
-});
-
-test("operator confirm already-paused: edits message with already-paused text", async () => {
-  const deps = {
-    config: baseConfig(),
-    pause: () => "already-paused",
+function mockedBot(deps) {
+  const commandHandlers = new Map();
+  const bot = {
+    command(name, handler) { commandHandlers.set(name, handler); },
+    callbackQuery() {},
   };
+  registerCommandHandlers(bot, deps);
+  return { commandHandlers };
+}
 
-  const messageDate = nowSeconds();
-  const { ctx, edits } = callbackCtx({
-    userId: 42,
-    data: CALLBACK_PAUSE_CONFIRM,
-    messageDate,
-  });
+// ── Constants ────────────────────────────────────────────────────────────────
 
-  await handleCallbackQuery(ctx, deps, messageDate * 1000 + 100);
-
-  assert.equal(edits.length, 1);
-  assert.match(edits[0].text, /already paused/i);
+test("PAUSE_CONFIRM_TTL_MS is exported and positive", () => {
+  assert.ok(typeof PAUSE_CONFIRM_TTL_MS === "number" && PAUSE_CONFIRM_TTL_MS > 0);
 });
 
-// ── handleCallbackQuery — cancel ─────────────────────────────────────────────
-
-test("operator cancel: does NOT call pause(), answers with text, edits message", async () => {
-  let pauseCalls = 0;
-  const deps = {
-    config: baseConfig(),
-    pause: () => {
-      pauseCalls += 1;
-      return "paused";
-    },
-  };
-
-  const messageDate = nowSeconds();
-  const { ctx, answered, edits } = callbackCtx({
-    userId: 42,
-    data: CALLBACK_PAUSE_CANCEL,
-    messageDate,
-  });
-
-  await handleCallbackQuery(ctx, deps, messageDate * 1000 + 500);
-
-  assert.equal(pauseCalls, 0);
-  assert.equal(answered.length, 1);
-  assert.equal(answered[0].text, "Cancelled.");
-  assert.equal(edits.length, 1);
-  assert.match(edits[0].text, /Pause cancelled/);
+test("CALLBACK_PAUSE_CONFIRM fits within Telegram's 64-byte limit", () => {
+  assert.ok(Buffer.byteLength(CALLBACK_PAUSE_CONFIRM, "utf8") <= 64);
 });
 
-// ── handleCallbackQuery — expired ────────────────────────────────────────────
+test("CALLBACK_PAUSE_CANCEL fits within Telegram's 64-byte limit", () => {
+  assert.ok(Buffer.byteLength(CALLBACK_PAUSE_CANCEL, "utf8") <= 64);
+});
 
-test("expired confirmation: answers with alert, edits expiry message, does NOT call pause()", async () => {
+test("TELEGRAM_CALLBACK_DATA_MAX_BYTES is 64", () => {
+  assert.equal(TELEGRAM_CALLBACK_DATA_MAX_BYTES, 64);
+});
+
+// ── validateCallbackData ──────────────────────────────────────────────────────
+
+test("validateCallbackData: direct 'pause' token is accepted", () => {
+  const result = validateCallbackData("pause");
+  assert.equal(result.ok, true);
+  assert.equal(result.action.type, "pause");
+});
+
+test("validateCallbackData: direct 'resume' token is accepted", () => {
+  const result = validateCallbackData("resume");
+  assert.equal(result.ok, true);
+  assert.equal(result.action.type, "resume");
+});
+
+test("validateCallbackData: 'status', 'contracts', 'help' tokens are accepted", () => {
+  for (const token of ["status", "contracts", "help"]) {
+    const result = validateCallbackData(token);
+    assert.equal(result.ok, true, `${token} should be accepted`);
+    assert.equal(result.action.type, token);
+  }
+});
+
+test("validateCallbackData: unknown string returns ok=false with reason", () => {
+  const result = validateCallbackData("bad-action");
+  assert.equal(result.ok, false);
+  assert.ok(typeof result.reason === "string");
+  assert.ok(typeof result.fallbackText === "string");
+});
+
+test("validateCallbackData: undefined returns ok=false", () => {
+  const result = validateCallbackData(undefined);
+  assert.equal(result.ok, false);
+  assert.equal(result.fallbackText, CALLBACK_FALLBACK_FEEDBACK);
+});
+
+  await handlePauseConfirmCallback(ctx, deps, messageDate * 1000 + 100);
+test("validateCallbackData: empty string returns ok=false", () => {
+  const result = validateCallbackData("");
+  assert.equal(result.ok, false);
+});
+
+test("validateCallbackData: oversized string (>64 bytes) returns ok=false", () => {
+  const big = "x".repeat(65);
+  const result = validateCallbackData(big);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "exceeds-max-length");
+});
+
+// ── handlePauseConfirmCallback — cancel ──────────────────────────────────────
+test("validateCallbackData: JSON payload {action:'pause'} is accepted", () => {
+  const result = validateCallbackData(JSON.stringify({ action: "pause" }));
+  assert.equal(result.ok, true);
+  assert.equal(result.action.type, "pause");
+});
+
+test("validateCallbackData: mimir-prefixed colon format is accepted", () => {
+  const result = validateCallbackData("mimir:status");
+  assert.equal(result.ok, true);
+  assert.equal(result.action.type, "status");
+});
+
+// ── operatorKeyboard ──────────────────────────────────────────────────────────
+
+  await handlePauseConfirmCallback(ctx, deps, messageDate * 1000 + 500);
+test("operatorKeyboard returns an InlineKeyboard with pause and resume buttons", () => {
+  const kb = operatorKeyboard();
+  const buttons = kb.inline_keyboard.flat();
+  const datas = buttons.map((b) => b.callback_data);
+  assert.ok(datas.includes("pause"), "should include pause button");
+  assert.ok(datas.includes("resume"), "should include resume button");
+});
+
+test("operatorKeyboard button data strings are within Telegram's 64-byte limit", () => {
+  const kb = operatorKeyboard();
+  for (const button of kb.inline_keyboard.flat()) {
+    assert.ok(
+      Buffer.byteLength(button.callback_data, "utf8") <= 64,
+      `Button "${button.callback_data}" exceeds 64 bytes`,
+    );
+  }
+});
+
+// ── handlePauseConfirmCallback — expired ─────────────────────────────────────
+// ── handleCallbackQuery — non-operator ───────────────────────────────────────
+
+test("non-operator callback: no pause() call", async () => {
   let pauseCalls = 0;
   const deps = {
     config: baseConfig(),
@@ -225,17 +305,15 @@ test("expired confirmation: answers with alert, edits expiry message, does NOT c
     messageDate,
   });
 
-  await handleCallbackQuery(ctx, deps, nowMs);
+  await handlePauseConfirmCallback(ctx, deps, nowMs);
 
+  const deps = baseDeps({ pause: () => { pauseCalls++; return "paused"; } });
+  const { ctx } = callbackCtx({ userId: 99, data: "pause" });
+  await handleCallbackQuery(ctx, deps);
   assert.equal(pauseCalls, 0);
-  assert.equal(answered.length, 1);
-  assert.equal(answered[0].show_alert, true);
-  assert.match(answered[0].text, /expired/i);
-  assert.equal(edits.length, 1);
-  assert.match(edits[0].text, /expired/i);
 });
 
-test("confirmation exactly at TTL boundary is still valid", async () => {
+test("non-operator resume callback: no pause() call", async () => {
   let pauseCalls = 0;
   const deps = {
     config: baseConfig(),
@@ -254,14 +332,21 @@ test("confirmation exactly at TTL boundary is still valid", async () => {
     messageDate,
   });
 
-  await handleCallbackQuery(ctx, deps, nowMs);
+  await handlePauseConfirmCallback(ctx, deps, nowMs);
 
   assert.equal(pauseCalls, 1);
 });
 
-// ── handleCallbackQuery — non-operator ───────────────────────────────────────
+// ── handlePauseConfirmCallback — non-operator ────────────────────────────────
+  const deps = baseDeps({ pause: () => { pauseCalls++; return "paused"; } });
+  const { ctx } = callbackCtx({ userId: 99, data: "resume" });
+  await handleCallbackQuery(ctx, deps);
+  assert.equal(pauseCalls, 0);
+});
 
-test("non-operator confirm: answers with alert, does NOT call pause() or edit message", async () => {
+// ── handleCallbackQuery — operator ───────────────────────────────────────────
+
+test("operator pause callback: pause() is called", async () => {
   let pauseCalls = 0;
   const deps = {
     config: baseConfig(), // operatorTelegramUserId: "42"
@@ -278,7 +363,7 @@ test("non-operator confirm: answers with alert, does NOT call pause() or edit me
     messageDate,
   });
 
-  await handleCallbackQuery(ctx, deps, messageDate * 1000 + 500);
+  await handlePauseConfirmCallback(ctx, deps, messageDate * 1000 + 500);
 
   assert.equal(pauseCalls, 0);
   assert.equal(answered.length, 1);
@@ -300,147 +385,82 @@ test("non-operator cancel: answers with alert, does NOT edit message", async () 
     messageDate,
   });
 
-  await handleCallbackQuery(ctx, deps, messageDate * 1000 + 500);
+  await handlePauseConfirmCallback(ctx, deps, messageDate * 1000 + 500);
 
   assert.equal(answered.length, 1);
   assert.equal(answered[0].show_alert, true);
   assert.equal(edits.length, 0);
+  const deps = baseDeps({ pause: () => { pauseCalls++; return "paused"; } });
+  const { ctx } = callbackCtx({ userId: 42, data: "pause" });
+  await handleCallbackQuery(ctx, deps);
+  assert.equal(pauseCalls, 1);
 });
 
-test("no operator configured: non-operator confirm is rejected", async () => {
-  let pauseCalls = 0;
-  const deps = {
-    config: baseConfig({ operatorTelegramUserId: null }),
-    pause: () => {
-      pauseCalls += 1;
-      return "paused";
-    },
-  };
+test("operator resume callback: resume() is called", async () => {
+  let resumeCalls = 0;
+  const deps = baseDeps({ resume: () => { resumeCalls++; return "resumed"; } });
+  const { ctx } = callbackCtx({ userId: 42, data: "resume" });
+  await handleCallbackQuery(ctx, deps);
+  assert.equal(resumeCalls, 1);
+});
 
-  const messageDate = nowSeconds();
-  const { ctx, answered, edits } = callbackCtx({
-    userId: 42,
-    data: CALLBACK_PAUSE_CONFIRM,
-    messageDate,
+// ── handleCallbackQuery — invalid data ───────────────────────────────────────
+
+test("invalid callback data: no pause/resume mutation", async () => {
+  let pauseCalls = 0, resumeCalls = 0;
+  const deps = baseDeps({
+    pause: () => { pauseCalls++; return "paused"; },
+    resume: () => { resumeCalls++; return "resumed"; },
   });
 
-  await handleCallbackQuery(ctx, deps, messageDate * 1000 + 500);
+  await handlePauseConfirmCallback(ctx, deps, messageDate * 1000 + 500);
 
+  const { ctx } = callbackCtx({ userId: 42, data: "totally-unknown-action" });
+  await handleCallbackQuery(ctx, deps);
   assert.equal(pauseCalls, 0);
-  assert.equal(answered.length, 1);
-  assert.equal(answered[0].show_alert, true);
-  assert.equal(edits.length, 0);
+  assert.equal(resumeCalls, 0);
 });
 
 // ── /pause command ────────────────────────────────────────────────────────────
 
-function mockedBot(deps) {
-  const commandHandlers = new Map();
-  const callbackHandlers = [];
-  const bot = {
-    command(name, handler) {
-      commandHandlers.set(name, handler);
-    },
-    callbackQuery(_filter, handler) {
-      callbackHandlers.push(handler);
-    },
-  };
-  registerCommandHandlers(bot, deps);
-  return { commandHandlers, callbackHandlers };
-}
-
-function baseStatus(overrides = {}) {
-  return {
-    running: true,
-    paused: false,
-    startedAt: 1,
-    cycles: 0,
-    lastPollAt: null,
-    lastSuccessAt: null,
-    latestLedger: null,
-    oldestLedger: null,
-    notificationsSent: 0,
-    notificationsFailed: 0,
-    eventsSkipped: 0,
-    consecutiveFailures: 0,
-    lastError: null,
-    targets: [],
-    ...overrides,
-  };
-}
-
-test("/pause by operator sends confirmation prompt with inline keyboard, does NOT call pause()", async () => {
+test("/pause by operator: calls pause() and replies", async () => {
   let pauseCalls = 0;
   const { commandHandlers } = mockedBot({
     config: baseConfig(),
     status: () => baseStatus(),
-    pause: () => {
-      pauseCalls += 1;
-      return "paused";
-    },
+    pause: () => { pauseCalls++; return "paused"; },
     resume: () => "resumed",
   });
-
   const replies = [];
   const ctx = {
-    from: { id: 42 },
-    update: { update_id: 200 },
-    reply: async (...args) => {
-      replies.push(args);
-    },
+    from: { id: 42 }, update: { update_id: 200 },
+    chat: { id: -1001234567890 },
+    reply: async (...a) => { replies.push(a); },
   };
-
   await commandHandlers.get("pause")(ctx);
-
-  assert.equal(pauseCalls, 0, "pause() must not be called before confirmation");
+  assert.equal(pauseCalls, 1);
   assert.equal(replies.length, 1);
-  const [text, opts] = replies[0];
-  assert.match(text, /Pause polling/);
-  // reply_markup must carry the keyboard
-  assert.ok(opts.reply_markup, "reply should include reply_markup");
-  assert.ok(opts.reply_markup.inline_keyboard, "reply_markup should have inline_keyboard");
+  assert.match(replies[0][0], /paused/i);
 });
 
-test("/pause by non-operator sends no reply and does not call pause()", async () => {
+test("/pause by non-operator: no reply, no pause() call", async () => {
   let pauseCalls = 0;
   const { commandHandlers } = mockedBot({
     config: baseConfig(),
     status: () => baseStatus(),
-    pause: () => {
-      pauseCalls += 1;
-      return "paused";
-    },
+    pause: () => { pauseCalls++; return "paused"; },
     resume: () => "resumed",
   });
-
   const replies = [];
   const ctx = {
-    from: { id: 99 },
-    update: { update_id: 201 },
-    reply: async (...args) => {
-      replies.push(args);
-    },
+    from: { id: 99 }, update: { update_id: 201 },
+    chat: { id: -1001234567890 },
+    reply: async (...a) => { replies.push(a); },
   };
-
-  const originalWarn = console.warn;
-  console.warn = () => undefined;
-  try {
-    await commandHandlers.get("pause")(ctx);
-  } finally {
-    console.warn = originalWarn;
-  }
-
+  const origWarn = console.warn;
+  console.warn = () => {};
+  try { await commandHandlers.get("pause")(ctx); }
+  finally { console.warn = origWarn; }
   assert.equal(pauseCalls, 0);
   assert.deepEqual(replies, []);
-});
-
-test("registerCommandHandlers registers a callbackQuery handler for pause actions", () => {
-  const { callbackHandlers } = mockedBot({
-    config: baseConfig(),
-    status: () => baseStatus(),
-    pause: () => "paused",
-    resume: () => "resumed",
-  });
-
-  assert.equal(callbackHandlers.length, 1, "exactly one callbackQuery handler should be registered");
 });

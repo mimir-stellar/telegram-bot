@@ -65,7 +65,9 @@ import {
   type DecodedEvent,
 } from "./decode.js";
 import { formatRpcTiming, RpcTiming, type RpcTimingSummary } from "./metrics.js";
+import { assertEventsResponse } from "./rpc-guard.js";
 import { formatScanJsonl } from "./scan-jsonl.js";
+import { formatScanMarkdown } from "./scan-markdown.js";
 
 /** Events per request. The RPC caps this; 200 is well inside it. */
 export const EVENT_PAGE_LIMIT = 200;
@@ -105,6 +107,11 @@ export interface ScanOptions {
    * scan — the `scan` CLI, a test — fetches its own tip.
    */
   ledgerTip?: LedgerTip | undefined;
+  /**
+   * Optional hook to filter which events have full values decoded.
+   * If `shouldDecode(name)` returns false, value decoding is skipped.
+   */
+  shouldDecode?: (name: string) => boolean;
 }
 
 export interface RawScan {
@@ -286,6 +293,7 @@ export async function paginatedGetEvents(
         ? server.getEvents({ filters, cursor, limit })
         : server.getEvents({ filters, startLedger: firstStartLedger, limit }),
     );
+    assertEventsResponse(response);
 
     // A malformed page (non-array `events`) is an empty page, not a crash.
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
@@ -369,7 +377,7 @@ export async function readContractEvents(
   const decoded: DecodedEvent[] = [];
   for (const event of rawEvents) {
     if (!event || typeof event !== "object") continue;
-    decoded.push(decodeEvent(target.source, event, target.version));
+    decoded.push(decodeEvent(target.source, event, target.version, { shouldDecode: opts.shouldDecode }));
   }
 
   // Deterministic order from chain metadata (ledger → transaction index →
@@ -687,13 +695,14 @@ async function main(): Promise<void> {
   }
   const asJson = hasFlag("json");
   const asJsonl = hasFlag("jsonl");
-  const machineOutput = asJson || asJsonl;
+  const asMarkdown = hasFlag("markdown");
+  const machineOutput = asJson || asJsonl || asMarkdown;
 
   const probeTiming = new RpcTiming();
   const health = await probeTiming.measure("health", () => server.getHealth());
   const network = networkLabel(config);
 
-  // When `--json` or `--jsonl` is set, stdout is reserved for machine output.
+  // When `--json`, `--jsonl`, or `--markdown` is set, stdout is reserved for machine output.
   // Progress goes to stderr so piping (`npm run scan -- --json | jq`) stays valid.
   const progress = machineOutput ? console.error.bind(console) : console.log.bind(console);
 
@@ -736,7 +745,7 @@ async function main(): Promise<void> {
       continue;
     }
 
-    if (asJson) {
+    if (asJson || asMarkdown) {
       jsonTargets.push(buildScanJsonTarget(scan, show));
       progress(
         `scanned ${target.source}: events=${scan.events.length} pages=${scan.pages} truncated=${scan.truncated}`,
@@ -765,7 +774,7 @@ async function main(): Promise<void> {
 
   if (asJsonl) {
     process.stdout.write(formatScanJsonl(jsonlEvents));
-  } else if (asJson) {
+  } else if (asJson || asMarkdown) {
     const report = buildScanJsonReport({
       network,
       rpcUrl: config.rpcUrl,
@@ -774,7 +783,7 @@ async function main(): Promise<void> {
       rpcTiming: probeTiming.summary(),
       targets: jsonTargets,
     });
-    process.stdout.write(formatScanJson(report));
+    process.stdout.write(asMarkdown ? formatScanMarkdown(report) : formatScanJson(report));
   }
 }
 

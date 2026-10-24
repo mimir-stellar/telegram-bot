@@ -10,7 +10,8 @@
 
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { BotConfig } from "../config.js";
-import { isOperator, safeAnswerCallback, type BotDeps } from "../bot.js";
+import { isOperator, safeAnswerCallback } from "./runtime.js";
+import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
 
 /** Telegram Bot API maximum message length limit. */

@@ -1140,6 +1140,23 @@ notification:
 This is driven by the presence of a non-empty `txHash` field on each event, not
 configuration. All persisted state and cursor format remain unchanged.
 
+### Language
+
+All user-facing text comes from `src/i18n.ts`, which ships a message catalog per
+locale. Set `MIMIR_LOCALE` to choose one:
+
+| `MIMIR_LOCALE` | Language |
+| --- | --- |
+| `en` (default) | English |
+| `es` | Spanish |
+
+A region suffix (`es-MX`, `es_419`) is accepted and ignored. Anything else
+fails startup with the supported list, so a typo cannot silently fall back to
+English. The locale covers notifications, `/help`, the Telegram command menu,
+pause/resume replies and notification buttons; the selected value is logged at
+boot (`[boot] locale …`). See [`docs/translating.md`](docs/translating.md) for
+adding a language.
+
 ## Layout
 
 ```

@@ -58,6 +58,11 @@ import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
 
+import {
+  ActivityBaseline,
+  type ActivityBaselineOptions,
+  type ActivityBaselineSnapshot,
+} from "./activity-baseline.js";
 import type { Metrics } from "./metrics.js";
 import type { SendExtra } from "./bot.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
@@ -179,6 +184,21 @@ export interface RestartGap {
   missedLedgers: number;
 }
 
+/**
+ * Format an unrecoverable restart gap alert for the operator as plain text.
+ */
+export function formatRestartGapAlert(gap: {
+  source: ContractSource;
+  cursorLedger: number;
+  oldestLedger: number;
+}): string {
+  return (
+    `[Restart Gap Alert] Unrecoverable restart gap detected for ${gap.source}.\n` +
+    `Missed ledger range: ${gap.cursorLedger} to ${gap.oldestLedger}.\n` +
+    `Suggested replay command: npm run replay -- --from ${gap.oldestLedger} --contract ${gap.source} --send`
+  );
+}
+
 export type PollerPauseResult = "paused" | "already-paused" | "stopped";
 export type PollerResumeResult = "resumed" | "already-running" | "stopped";
 
@@ -187,6 +207,45 @@ export interface PollerCounters {
   notificationsSent: number;
   notificationsFailed: number;
   eventsSkipped: number;
+}
+
+/**
+ * Per-target summary fields included in the structured `cycle_summary` log entry.
+ *
+ * Stable field names (documented for log consumers and alerts):
+ * - `source`: `"market" | "squad"` — contract target identifier
+ * - `fetched`: number of events returned by the RPC scan for this target in the cycle
+ * - `decoded`: number of fetched events with a known decoded payload (`payload.name !== "unknown"`)
+ * - `sent`: number of notifications delivered to Telegram for this target in the cycle
+ * - `skipped`: number of events skipped for this target in the cycle
+ * - `cursorLedger`: ledger number parsed from the target's cursor at the end of the cycle
+ *   (`null` when no cursor is held or the cursor is opaque; never the raw cursor string)
+ */
+export interface CycleTargetSummary {
+  source: ContractSource;
+  fetched: number;
+  decoded: number;
+  sent: number;
+  skipped: number;
+  cursorLedger: number | null;
+}
+
+/**
+ * Structured JSON fields emitted by `Logger.info("poller", ...)` at the end of each poll cycle.
+ *
+ * Stable field names (documented for log consumers and alerts):
+ * - `action`: always `"cycle_summary"`
+ * - `cycle`: 1-based poll cycle number (`PollerStatus.cycles`)
+ * - `durationMs`: elapsed duration of the cycle in milliseconds
+ * - `targets`: per-target summary keyed by `ContractSource` (`market`, `squad`)
+ * - `suppressed`: number of idle-cycle summary lines suppressed in the previous `LogSampler` window
+ */
+export interface CycleSummaryFields {
+  action: "cycle_summary";
+  cycle: number;
+  durationMs: number;
+  targets: Record<ContractSource, CycleTargetSummary>;
+  suppressed: number;
 }
 
 /** Current on-disk counters schema version. */
@@ -244,6 +303,12 @@ export interface PollerStatus {
   emptyPages: number;
   /** Cumulative pages walked across all successful target scans. */
   pagesScanned: number;
+  /**
+   * Rolling comparison of this cycle's event count against recent complete
+   * cycles. Updated only when every target was scanned, so a partial cycle is
+   * never mistaken for a quiet chain.
+   */
+  activityBaseline?: ActivityBaselineSnapshot;
   /** Empty pages in the most recent completed cycle (all targets). */
   lastCycleEmptyPages: number;
   /** Pages walked in the most recent completed cycle (all targets). */
@@ -447,6 +512,11 @@ export interface PollerDeps {
    */
   send: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>;
   /**
+   * Optional direct notification hook for the operator (e.g. restart gaps).
+   * Plain-text message sent to the operator's private chat.
+   */
+  notifyOperator?: ((text: string) => Promise<void>) | undefined;
+  /**
    * Operator audit trail. A fresh one is created when omitted, so the poller
    * keeps working in callers that do not care about auditing (tests, tooling).
    */
@@ -461,6 +531,11 @@ export interface PollerDeps {
   targetBackoffOptions?: TargetBackoffOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
+  /**
+   * Tuning for the rolling activity baseline. Defaults are production values;
+   * tests can shrink the window to observe a comparison quickly.
+   */
+  activityBaselineOptions?: ActivityBaselineOptions;
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
   now?: () => number;
   /**
@@ -1255,6 +1330,7 @@ export function buildDigests(
 }
 
 export function createPoller(deps: PollerDeps) {
+  const notifiedGaps = new Set<string>();
   const { config, server, send } = deps;
   const metrics = deps.metrics;
   const audit: AuditLog = deps.audit ?? createAuditLog();
@@ -1272,6 +1348,7 @@ export function createPoller(deps: PollerDeps) {
   };
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? defaultSleep;
+  const activityBaseline = new ActivityBaseline(deps.activityBaselineOptions);
   const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
   const targetMaxBackoff = deps.targetBackoffOptions?.maxBackoffMs ?? DEFAULT_TARGET_MAX_BACKOFF_MS;
   const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
@@ -1308,7 +1385,8 @@ export function createPoller(deps: PollerDeps) {
   };
   const cursorPreview = (cursor: string | null): string => {
     if (cursor === null) return "none";
-    return boundedLabel(cursor, 24);
+    const ledger = eventCursorLedger(cursor);
+    return ledger !== null ? `ledger:${ledger}` : "opaque";
   };
 
   const targets: WatchTarget[] = [
@@ -1428,6 +1506,7 @@ export function createPoller(deps: PollerDeps) {
     },
     emptyPages: 0,
     pagesScanned: 0,
+    activityBaseline: activityBaseline.snapshot(),
     lastCycleEmptyPages: 0,
     lastCyclePages: 0,
     notificationsDropped: 0,
@@ -1696,7 +1775,7 @@ export function createPoller(deps: PollerDeps) {
           cursorFile: config.cursorFile,
           targets: [...state.values()].map((t) => ({
             source: t.source,
-            cursor: t.cursor,
+            cursorLedger: t.cursor ? eventCursorLedger(t.cursor) : null,
             lastEventLedger: t.lastEventLedger,
             rewindFromLedger: t.rewindFromLedger,
           })),
@@ -1956,19 +2035,11 @@ export function createPoller(deps: PollerDeps) {
         );
         // Event name and reason come from remote contract data: bound them so
         // they cannot produce unbounded log output.
-        Logger.info(
-          "poller",
+        console.log(
           `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
             `at ledger ${event.ledger}` +
             (event.payload.reason ? ` (${boundedLabel(event.payload.reason, 160)})` : "") +
             ` correlation=${correlationId}`,
-          {
-            action: "event_skipped",
-            source: event.source,
-            eventName: boundedLabel(event.payload.eventName, 80),
-            ledger: event.ledger,
-            reason: boundedLabel(event.payload.reason ?? "", 160),
-          },
         );
         continue;
       }
@@ -2313,6 +2384,20 @@ export function createPoller(deps: PollerDeps) {
       oldestLedger: window.oldestLedger,
       missedLedgers: missed,
     };
+    const gapKey = `${target.source}:${cursorLedger ?? window.oldestLedger}:${window.oldestLedger}`;
+    if (!notifiedGaps.has(gapKey)) {
+      notifiedGaps.add(gapKey);
+      if (deps.notifyOperator && config.operatorTelegramUserId) {
+        const alertText = formatRestartGapAlert({
+          source: target.source,
+          cursorLedger: cursorLedger ?? window.oldestLedger,
+          oldestLedger: window.oldestLedger,
+        });
+        void deps.notifyOperator(alertText).catch((err) => {
+          console.error(`[poller] failed to notify operator of restart gap: ${safeErrorMessage(err)}`);
+        });
+      }
+    }
     markDirty();
     console.warn(
       `[poller] ${target.source}: restart gap — cursor at ledger ${cursorLedger} is ` +
@@ -2412,6 +2497,33 @@ export function createPoller(deps: PollerDeps) {
     let cyclePages = 0;
     let cycleEmptyPages = 0;
     let cycleFailures = 0;
+    let cycleScans = 0;
+    // Events handed back by every successful scan in this cycle. Compared with
+    // the rolling baseline only when every target was scanned, so a target in
+    // backoff cannot make a normal cycle look quiet.
+    let cycleEvents = 0;
+    const cycleTargets: Record<ContractSource, CycleTargetSummary> = {
+      market: {
+        source: "market",
+        fetched: 0,
+        decoded: 0,
+        sent: 0,
+        skipped: 0,
+        cursorLedger: state.get("market")?.cursor
+          ? eventCursorLedger(state.get("market")!.cursor!)
+          : null,
+      },
+      squad: {
+        source: "squad",
+        fetched: 0,
+        decoded: 0,
+        sent: 0,
+        skipped: 0,
+        cursorLedger: state.get("squad")?.cursor
+          ? eventCursorLedger(state.get("squad")!.cursor!)
+          : null,
+      },
+    };
 
     // Drain parked sends before this cycle's events, so a recovered channel
     // catches up in order. Budgeted like the burst below: one recovery must
@@ -2465,6 +2577,7 @@ export function createPoller(deps: PollerDeps) {
                 !rewinding && current.cursor === null ? config.startLookbackLedgers : undefined,
               seenEventIds: dedupWindow.toJSON(),
               dedupWindow: config.dedupWindow,
+              shouldDecode: (name) => isNotificationAllowed(config.featureFlags, target.source, name),
             }),
             SCAN_TIMEOUT_MS,
             "RPC scan",
@@ -2482,6 +2595,8 @@ export function createPoller(deps: PollerDeps) {
           current.nextEligibleAt = null;
           anyOk = true;
 
+          cycleScans += 1;
+          cycleEvents += scan.events.length;
           cyclePages += scan.pages;
           cycleEmptyPages += scan.emptyPages;
           status.pagesScanned += scan.pages;
@@ -2616,6 +2731,19 @@ export function createPoller(deps: PollerDeps) {
           const newest = scan.events[scan.events.length - 1];
           if (newest !== undefined) current.lastEvent = newest;
 
+          const decodedCount = scan.events.reduce(
+            (acc, event) => (event.payload.name !== "unknown" ? acc + 1 : acc),
+            0,
+          );
+          cycleTargets[target.source] = {
+            source: target.source,
+            fetched: scan.events.length,
+            decoded: decodedCount,
+            sent: delivery.sent,
+            skipped: delivery.skipped,
+            cursorLedger: current.cursor ? eventCursorLedger(current.cursor) : null,
+          };
+
           trackCursorAdvance(current, previousCursor, scan.latestLedger);
         } catch (err) {
           cycleFailures++;
@@ -2657,6 +2785,10 @@ export function createPoller(deps: PollerDeps) {
             await rewindFromRetainedFloor(target, current);
           }
 
+          cycleTargets[target.source].cursorLedger = current.cursor
+            ? eventCursorLedger(current.cursor)
+            : null;
+
           const retryAfterMs = extractRetryAfterMs(err);
           if (retryAfterMs !== null) {
             console.warn(`[poller] RPC requested backoff for ${retryAfterMs}ms`);
@@ -2693,10 +2825,59 @@ export function createPoller(deps: PollerDeps) {
         status.lastSuccessAt = now();
         status.consecutiveFailures = 0;
         metrics?.consecutiveFailures.set(0);
+
+        // Compare this cycle's activity with what recent complete cycles
+        // looked like. Incomplete cycles are skipped rather than recorded at a
+        // lower count: an RPC backoff is not a quiet chain.
+        if (cycleScans === targets.length) {
+          const comparison = activityBaseline.record(cycleEvents);
+          status.activityBaseline = activityBaseline.snapshot();
+          metrics?.lastCycleEvents.set(cycleEvents);
+          if (comparison.mean !== null) {
+            metrics?.activityBaselineEvents.set(Math.round(comparison.mean));
+          }
+          if (comparison.anomalous) {
+            metrics?.activityAnomalies.inc();
+            // Counts only: no event payloads, cursors, or RPC text. One line
+            // per anomalous cycle, which is exactly when an operator wants it.
+            console.warn(
+              `[poller] activity ${comparison.deviation}: ${cycleEvents} event(s) this cycle ` +
+                `vs baseline mean ${(comparison.mean ?? 0).toFixed(1)} ` +
+                `(z=${(comparison.zScore ?? 0).toFixed(2)}, ${comparison.samples} prior cycles)`,
+            );
+          }
+        }
       } else {
         status.consecutiveFailures += 1;
         metrics?.consecutiveFailures.set(status.consecutiveFailures);
         emitCircuitBreakerWarning();
+      }
+
+      const durationMs = Math.max(0, now() - currentTime);
+      const isIdleCycle =
+        cycleFailures === 0 &&
+        Object.values(cycleTargets).every(
+          (t) => t.fetched === 0 && t.decoded === 0 && t.sent === 0 && t.skipped === 0,
+        );
+      const sample = isIdleCycle ? errorSampler.record("cycle:idle") : { log: true, suppressed: 0 };
+      if (sample.log) {
+        const m = cycleTargets.market;
+        const s = cycleTargets.squad;
+        const summaryFields: CycleSummaryFields = {
+          action: "cycle_summary",
+          cycle: status.cycles,
+          durationMs,
+          targets: cycleTargets,
+          suppressed: sample.suppressed,
+        };
+        Logger.info(
+          "poller",
+          `[poller] cycle #${status.cycles} in ${durationMs}ms ` +
+            `market(fetched=${m.fetched} decoded=${m.decoded} sent=${m.sent} skipped=${m.skipped} cursorLedger=${m.cursorLedger ?? "none"}) ` +
+            `squad(fetched=${s.fetched} decoded=${s.decoded} sent=${s.sent} skipped=${s.skipped} cursorLedger=${s.cursorLedger ?? "none"})` +
+            formatSuppressedRepeats(sample.suppressed, errorSampler.windowMs),
+          summaryFields as unknown as Record<string, unknown>,
+        );
       }
     } finally {
       // The write and the tracking promise are what a shutdown waits for, so

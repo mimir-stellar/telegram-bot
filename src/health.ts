@@ -8,9 +8,14 @@
  * to publish is where it came from.
  */
 
+import crypto from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
+import {
+  emptyActivityBaseline,
+  type ActivityBaselineSnapshot,
+} from "./activity-baseline.js";
 import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
 import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
@@ -79,6 +84,12 @@ export interface HealthReport {
     eventsSkipped: number;
     /** Events suppressed as already-seen across overlapping pages / resumes. */
     eventsDeduplicated: number;
+    /**
+     * Rolling comparison of the latest complete cycle's event count with the
+     * recent baseline. A spike is not a fault by itself; it is context for the
+     * counters and the per-cycle log lines.
+     */
+    activity: ActivityBaselineSnapshot;
     notificationsDropped: number;
     /** Cursors automatically rewound to the RPC's retained floor this run. */
     cursorRewinds: number;
@@ -155,6 +166,30 @@ const CURSOR_PREVIEW_LEN = 24;
 
 function iso(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString();
+}
+
+/**
+ * Constant-time comparison for bearer token authentication.
+ * Prevents timing attacks that could reveal the token.
+ */
+function constantTimeEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+/**
+ * Extract and validate the bearer token from the Authorization header.
+ * Returns true if the token matches the expected value (or if auth is disabled).
+ */
+function isValidAuth(authHeader: string | undefined, expectedToken: string | null): boolean {
+  if (expectedToken === null) return true;
+  if (authHeader === undefined) return false;
+
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match || match[1] === undefined) return false;
+
+  const providedToken = match[1];
+  return constantTimeEquals(providedToken, expectedToken);
 }
 
 function previewCursor(cursor: string | null): string | null {
@@ -269,6 +304,7 @@ export function buildHealthReport(
       notificationsFailed: poller.notificationsFailed,
       eventsSkipped: poller.eventsSkipped,
       eventsDeduplicated: poller.eventsDeduplicated ?? 0,
+      activity: poller.activityBaseline ?? emptyActivityBaseline(),
       notificationsDropped: poller.notificationsDropped ?? 0,
       cursorRewinds: poller.cursorRewinds ?? 0,
       deadLetter: {
@@ -331,6 +367,7 @@ export function buildMetricsReport(
 ): string {
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
   const network = networkLabel(config);
+  const activity = poller.activityBaseline ?? emptyActivityBaseline();
 
   const lines: string[] = [
     `# HELP mimir_telegram_uptime_ms Uptime in milliseconds`,
@@ -360,6 +397,22 @@ export function buildMetricsReport(
     `# HELP mimir_telegram_consecutive_failures Current number of consecutive failed poll cycles`,
     `# TYPE mimir_telegram_consecutive_failures gauge`,
     `mimir_telegram_consecutive_failures{network="${network}"} ${poller.consecutiveFailures}`,
+    ``,
+    `# HELP mimir_telegram_activity_last_cycle_events Events observed in the most recent complete poll cycle`,
+    `# TYPE mimir_telegram_activity_last_cycle_events gauge`,
+    `mimir_telegram_activity_last_cycle_events{network="${network}"} ${activity.lastValue ?? 0}`,
+    ``,
+    `# HELP mimir_telegram_activity_baseline_events Mean events per cycle in the rolling baseline (0 while warming up)`,
+    `# TYPE mimir_telegram_activity_baseline_events gauge`,
+    `mimir_telegram_activity_baseline_events{network="${network}"} ${activity.baselineMean ?? 0}`,
+    ``,
+    `# HELP mimir_telegram_activity_deviation Z-score of the latest complete cycle against the rolling baseline (0 while warming up)`,
+    `# TYPE mimir_telegram_activity_deviation gauge`,
+    `mimir_telegram_activity_deviation{network="${network}"} ${activity.zScore ?? 0}`,
+    ``,
+    `# HELP mimir_telegram_activity_anomalies_total Complete cycles classified as a spike or drop against the rolling baseline`,
+    `# TYPE mimir_telegram_activity_anomalies_total counter`,
+    `mimir_telegram_activity_anomalies_total{network="${network}"} ${activity.anomalies}`,
   ];
 
   if (poller.latestLedger !== null) {
@@ -402,6 +455,15 @@ function sendJson(
   res.end(payload);
 }
 
+function sendUnauthorized(res: http.ServerResponse): void {
+  res.writeHead(401, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": "0",
+  });
+  res.end();
+}
+
 /**
  * Start the local health HTTP server.
  *
@@ -422,8 +484,9 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
-    if (deps.webhookHandler && method === "POST" && url.pathname === "/telegram-webhook") {
-      deps.webhookHandler(req, res);
+    // Check authentication for all routes when token is configured
+    if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
+      sendUnauthorized(res);
       return;
     }
 

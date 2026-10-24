@@ -81,6 +81,14 @@ export interface MetricsRegistry {
   /** Current count of consecutive full-cycle failures (gauge: resets to 0 on
    *  any success). */
   consecutiveFailures: Gauge;
+  /** Events observed in the most recent complete poll cycle. */
+  lastCycleEvents: Gauge;
+  /** Rolling mean events per cycle at the most recent baseline comparison,
+   *  rounded to a whole event. */
+  activityBaselineEvents: Gauge;
+  /** Complete cycles classified as a spike or drop against the rolling
+   *  activity baseline. */
+  activityAnomalies: Counter;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -175,6 +183,18 @@ export function createMetrics(): MetricsRegistry {
     `${METRICS_PREFIX}consecutive_failures`,
     "Current number of consecutive full-cycle RPC failures (resets to 0 on any success).",
   );
+  const lastCycleEvents = makeGauge(
+    `${METRICS_PREFIX}last_cycle_events`,
+    "Events observed in the most recent complete poll cycle.",
+  );
+  const activityBaselineEvents = makeGauge(
+    `${METRICS_PREFIX}activity_baseline_events`,
+    "Rolling mean events per cycle at the most recent baseline comparison (rounded).",
+  );
+  const activityAnomalies = makeCounter(
+    `${METRICS_PREFIX}activity_anomalies_total`,
+    "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
+  );
 
   const counters = [
     pollCycles,
@@ -185,8 +205,9 @@ export function createMetrics(): MetricsRegistry {
     notificationsSent,
     notificationsFailed,
     staleCursorEvents,
+    activityAnomalies,
   ];
-  const gauges = [consecutiveFailures];
+  const gauges = [consecutiveFailures, lastCycleEvents, activityBaselineEvents];
 
   function render(): string {
     const lines: string[] = [];
@@ -282,6 +303,9 @@ export function createMetrics(): MetricsRegistry {
     notificationsFailed,
     staleCursorEvents,
     consecutiveFailures,
+    lastCycleEvents,
+    activityBaselineEvents,
+    activityAnomalies,
     render,
     startServer,
   };

@@ -4,9 +4,32 @@ This guide explains how user-facing strings are organized, formatted, and escape
 
 ---
 
+## 0. Choosing the Language
+
+`MIMIR_LOCALE` selects the locale used for every bot reply and notification. Supported values are listed in `SUPPORTED_LOCALES`:
+
+| `MIMIR_LOCALE` | Language |
+| --- | --- |
+| unset or `en` | English (default) |
+| `es` | Español |
+
+Region tags (`es-MX`, `en-GB`) are accepted and resolve to their base language. Any other value fails fast at startup, listing the accepted locales. The selected locale is carried on the config as `config.locale`; product code reads strings through `messagesFor(config.locale)` rather than importing the English constants directly.
+
+The named exports in the table below (`HELP_TITLE`, `NOTIFICATION_MD`, ...) are the English reference strings. They remain exported for backwards compatibility and are also available as `messagesFor("en")`. Every locale registers a complete `Messages` object in `MESSAGES`, so TypeScript rejects a locale that omits a template.
+
+To add a language:
+
+1. Add its code to `SUPPORTED_LOCALES` and its label to `LOCALE_LABELS`.
+2. Copy `EN_MESSAGES`, translate every string, and follow the escaping rules below.
+3. Register the new catalog in `MESSAGES`.
+4. Add the code to the table above and to `.env.example`.
+5. Add a rendering test for the new locale next to the existing ones.
+
+---
+
 ## 1. String Organization: MarkdownV2 vs. Plain Text
 
-All user-facing localization templates live in [`src/i18n.ts`](../src/i18n.ts). Strings are strictly separated based on whether the caller dispatches them with `parse_mode: "MarkdownV2"` or as raw plain text (no `parse_mode`):
+All user-facing localization templates live in [`src/i18n.ts`](../src/i18n.ts). Strings are strictly separated based on whether the caller dispatches them with `parse_mode: "MarkdownV2"` or as raw plain text (no `parse_mode`). The table shows the English exports; every locale's catalog has the same fields.
 
 | Export in `src/i18n.ts` | Mode | Purpose & Caller Behavior |
 | --- | --- | --- |
@@ -19,6 +42,7 @@ All user-facing localization templates live in [`src/i18n.ts`](../src/i18n.ts). 
 | `NOTIFICATION_MD` | **MarkdownV2** | Primary event notification templates (`claimCreated`, `claimChallenged`, etc.), fallback template (`fallbackEvent`), and preview headers (`previewModePrefix`, `channelPreviewMarket`, `channelPreviewSquad`). |
 | `NOTIFICATION_PLAIN` | **Plain text** | 1-to-1 plain-text mirror of `NOTIFICATION_MD` (plus `minimal`), sent without `parse_mode` if Telegram rejects the MarkdownV2 payload or when plain text is requested. |
 | `EXPLORER_BUTTON_TEXT` | **Plain text** | Label on the inline keyboard button linking to Stellar Expert (`"View on Explorer"`). Inline button labels do not parse Markdown. |
+| `MIMIR_APP_BUTTON_TEXT` | **Plain text** | Label on the inline keyboard button that opens the Mimir web app (`"Open in Mimir"`), present only when `MIMIR_APP_URL` is configured. |
 
 ### Why Both `NOTIFICATION_MD` and `NOTIFICATION_PLAIN` Exist
 
@@ -213,7 +237,7 @@ Translators should keep strings concise ("One event, one message, one line of su
 
 Before opening a pull request that edits or adds strings in [`src/i18n.ts`](../src/i18n.ts), verify every item below:
 
-- [ ] **Both `NOTIFICATION_MD` and `NOTIFICATION_PLAIN` are updated in lockstep**: Every event template change in `NOTIFICATION_MD` has a corresponding update in `NOTIFICATION_PLAIN` with the exact same parameter order and meaning.
+- [ ] **Every locale is updated in lockstep**: A template change is made in the English reference exports and in each locale's catalog (`ES_MESSAGES` today), with `NOTIFICATION_MD` and `NOTIFICATION_PLAIN` keeping the exact same parameter order and meaning.
 - [ ] **All literal MarkdownV2 reserved characters are pre-escaped in MarkdownV2 strings**: Check `HELP_TITLE`, `PAUSE_MESSAGES`, `RESUME_MESSAGES`, and `NOTIFICATION_MD` for any unescaped `_ * [ ] ( ) ~ ` > # + - = | { } . !` outside formatting entities (remembering to write `\\.` / `\\#` / `\\-` / `\\(` / `\\)` in `.ts` files).
 - [ ] **No MarkdownV2 syntax or backslash escapes leak into plain-text strings**: Verify that `HELP_INTRO`, `AUDIT_CLI_HINT`, `COMMAND_DESCRIPTIONS`, `NOTIFICATION_PLAIN`, and `EXPLORER_BUTTON_TEXT` contain no `\\` escape sequences and that `NOTIFICATION_PLAIN` contains none of `* _ ` [ ] \`.
 - [ ] **`COMMAND_DESCRIPTIONS` contain no forbidden punctuation**: Confirm no command description in `COMMAND_DESCRIPTIONS` uses periods (`.`), exclamation marks (`!`), hashes (`#`), or Markdown formatting characters (`/[*_`[\]~>#+|{}.!\\]/`), and each is non-empty and under 256 characters.
@@ -228,3 +252,5 @@ Before opening a pull request that edits or adds strings in [`src/i18n.ts`](../s
   npm test
   ```
   Specifically confirm that both [`tests/i18n.test.mjs`](../tests/i18n.test.mjs) (snapshot and plain-text boundary checks) and [`tests/markdown-lint.test.mjs`](../tests/markdown-lint.test.mjs) (MarkdownV2 tokenizer and reserved-character linter) pass with zero errors.
+
+---

@@ -31,12 +31,25 @@ import type { StellarConfig } from "../config.js";
 import { eventKey } from "../dedup.js";
 import { txExplorerUrl } from "./client.js";
 import { redactText } from "../redact.js";
+import { peekEventName } from "./peek.js";
+
+export { peekEventName };
 
 /** Which of the two Mimir contracts an event came from. */
 export type ContractSource = "market" | "squad";
 
 /** Supported contract versions for decoder selection. */
 export type ContractVersion = "v1" | "v2" | string;
+
+export interface DecodeOptions {
+  /**
+   * Optional hook to test if full value decoding is needed for `eventName`.
+   * When `shouldDecode(name)` returns `false` (and the event is not an admin
+   * or unknown event), full value XDR decoding is skipped while preserving
+   * the event name and metadata for metrics and filtering.
+   */
+  shouldDecode?: (name: string) => boolean;
+}
 
 export const DEFAULT_CONTRACT_VERSION: ContractVersion = "v1";
 export const SUPPORTED_CONTRACT_VERSIONS: ContractVersion[] = ["v1", "v2"];
@@ -1054,6 +1067,29 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
   return "";
 }
 
+/** Check if an event name represents an admin event. */
+export function isAdminEventName(name: string): boolean {
+  return (
+    name === "admin" ||
+    name === "oracle_changed" ||
+    name === "ownership_transferred" ||
+    name === "agent_attributed" ||
+    name === "fee_accrued" ||
+    name === "fee_policy_set" ||
+    name === "fee_policy_changed" ||
+    name === "fee_policy_updated" ||
+    name === "fee_policy_removed" ||
+    name.startsWith("fee_policy_") ||
+    name.startsWith("admin_")
+  );
+}
+
+/** Check if an event name is a known non-admin event for the given source. */
+function isKnownEventName(source: ContractSource, name: string): boolean {
+  const schemas = source === "market" ? MARKET_TOPIC_SCHEMAS : SQUAD_TOPIC_SCHEMAS;
+  return Object.prototype.hasOwnProperty.call(schemas, name);
+}
+
 /**
  * Decode one RPC event for a specific contract version.
  *
@@ -1067,8 +1103,11 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
 export function decodeEvent(
   source: ContractSource,
   event: rpc.Api.EventResponse,
-  version: string = DEFAULT_CONTRACT_VERSION,
+  versionOrOptions: string | DecodeOptions = DEFAULT_CONTRACT_VERSION,
+  options?: DecodeOptions,
 ): DecodedEvent {
+  const version = typeof versionOrOptions === "string" ? versionOrOptions : DEFAULT_CONTRACT_VERSION;
+  const opts = typeof versionOrOptions === "object" ? versionOrOptions : options;
   const normVersion = normalizeContractVersion(version);
   const meta: EventMeta = { ...safeMeta(source, event), version: normVersion };
 
@@ -1094,23 +1133,8 @@ export function decodeEvent(
       throw new DecodeError("invalid or missing event object");
     }
 
-    const rawTopics = Array.isArray(event.topic) ? event.topic : [];
-    const topics = rawTopics.map((t) => {
-      try {
-        return native(t as xdr.ScVal);
-      } catch {
-        return null;
-      }
-    });
-
-    const first = topics[0];
-    if (typeof first === "string") {
-      eventName = first;
-    } else if (first instanceof Uint8Array) {
-      eventName = Buffer.from(first).toString("utf8");
-    } else {
-      eventName = "";
-    }
+    // Fast-peek topic[0] first
+    eventName = peekEventName(event);
     if (eventName === "") {
       // Without a name no decoder can be chosen; say why instead of "no decoder".
       recordDecodeOutcome(source, eventName, "malformed");
@@ -1119,6 +1143,26 @@ export function decodeEvent(
         payload: { name: "unknown", eventName, reason: "topic[0] is not an event name string" },
       };
     }
+
+    // If caller provided shouldDecode, and it returned false, and the event is neither admin nor unknown:
+    // skip full value XDR decoding and return a minimal decoded event.
+    if (opts?.shouldDecode && !opts.shouldDecode(eventName)) {
+      if (!isAdminEventName(eventName) && isKnownEventName(source, eventName)) {
+        return {
+          ...meta,
+          payload: { name: eventName } as unknown as EventPayload,
+        };
+      }
+    }
+
+    const rawTopics = Array.isArray(event.topic) ? event.topic : [];
+    const topics = rawTopics.map((t) => {
+      try {
+        return native(t as xdr.ScVal);
+      } catch {
+        return null;
+      }
+    });
 
     // Fail closed before native conversion allocates: an oversized value must
     // not turn one hostile event into a multi-megabyte payload. This runs after

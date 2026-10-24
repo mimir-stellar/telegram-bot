@@ -1,17 +1,10 @@
-/**
- * Decode statistics tracking.
- *
- * Records the outcome of event decoding for metrics and monitoring.
- * This is a lightweight implementation that can be extended with actual
- * metrics collection if needed.
- */
+/** Decode outcome telemetry stub — no-op placeholder. */
+export type DecodeOutcome = "decoded" | "admin" | "unknown" | "malformed";
 
 export function recordDecodeOutcome(
   _source: string,
   _eventName: string,
-  _outcome: string,
+  _outcome: DecodeOutcome,
 ): void {
-  // Stub implementation - metrics collection can be added here
-  // For now, this is a no-op to allow decode.ts to compile
-  // without requiring a full metrics infrastructure.
+  // No-op stub.
 }

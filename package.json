@@ -18,6 +18,7 @@
     "lockfile:reproduce": "node scripts/check-lockfile.mjs --reproduce",
     "test": "npm run build && node --test --test-timeout=120000 tests/*.test.mjs",
     "test:mock": "npm run build && node --test --test-timeout=120000 tests/mock-*.test.mjs",
+    "test:fast": "node --import ./scripts/tsx-dist-loader.mjs --test --test-timeout=120000 tests/*.test.mjs",
     "scan": "tsx src/stellar/events.ts",
     "scan:secrets": "node scripts/scan-secrets.mjs",
     "scan:mock": "tsx src/stellar/events.ts --mock",
@@ -28,12 +29,14 @@
     "mock:stack:down": "docker compose -f docker-compose.mock.yml down -v",
     "audit": "tsx src/audit-cli.ts",
     "audit:report": "tsx src/audit-cli.ts",
+    "audit:check": "tsx src/audit-check-cli.ts",
     "seed:cursor": "tsx src/dev/seedCursor.ts",
     "cursor": "node dist/cursor-cli.js",
     "replay": "tsx src/replay-cli.ts",
     "replay:mock": "tsx src/replay-cli.ts --mock",
     "decode": "tsx src/decode-cli.ts",
-    "doctor": "tsx src/doctor-cli.ts"
+    "doctor": "tsx src/doctor-cli.ts",
+    "rpc-compare": "tsx src/rpc-compare-cli.ts"
   },
   "c8": {
     "all": true,
@@ -53,14 +56,14 @@
     "branches": 80
   },
   "dependencies": {
-    "@stellar/stellar-sdk": "^16.2.0",
-    "dotenv": "^16.4.5",
-    "grammy": "^1.30.0"
+    "@stellar/stellar-sdk": "^17.2.1",
+    "dotenv": "^18.0.8",
+    "grammy": "^1.46.0"
   },
   "devDependencies": {
-    "@types/node": "^22.9.0",
-    "c8": "^10.1.2",
-    "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "@types/node": "^26.6.5",
+    "c8": "^12.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
   }
 }

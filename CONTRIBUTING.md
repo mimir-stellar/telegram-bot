@@ -57,6 +57,34 @@ This opt-in hook runs `scripts/pre-commit.mjs` on staged files prior to each com
 npm run test:mock
 ```
 
+### Fast unit-test loop (`test:fast`)
+
+`test:fast` runs the full test suite directly against `src/` using
+[tsx](https://tsx.is/) as a TypeScript transpiler — no `tsc` build step, no
+`dist/` output. A tiny loader shim (`scripts/tsx-dist-loader.mjs`) intercepts
+`../dist/*.js` import specifiers in the test files and rewrites them to their
+`src/*.ts` counterparts; `tsx` then transpiles each module in-memory.
+
+```bash
+# Run the whole suite
+npm run test:fast
+
+# Run only the formatter and decoder tests (common inner-loop targets)
+node --import tsx/esm --import ./scripts/tsx-dist-loader.mjs \
+  --test --test-timeout=120000 \
+  tests/format.test.mjs tests/decode.test.mjs
+```
+
+**When to use each script:**
+
+| Script | Builds `dist/`? | Type-checks? | When to run |
+|---|---|---|---|
+| `npm run test:fast` | No | No (transpile only) | Inner-loop iterations on formatter/decoder logic |
+| `npm test` | Yes | Yes (via tsc) | Before opening a PR; mirrors CI exactly |
+
+> **Note:** `test:fast` skips type-checking. Always run `npm test` (or
+> `npm run typecheck`) as a final check before submitting a PR.
+
 ### Local mock profile (no Testnet or Telegram)
 
 For a five-minute quickstart walking through the mock RPC, scanner, and rendered
@@ -126,11 +154,44 @@ The REPL context is preloaded with:
 - Keep tests and docs consistent with the behavior they describe; a behavior change
   updates its test and, where the operator surface changes, the README.
 
+## Adding a slash command
+
+Commands are self-contained modules under `src/commands/`; `src/bot.ts` only walks
+the registry, so a new command never needs to touch a shared handler table (and so
+rarely conflicts with another in-flight branch):
+
+1. Create `src/commands/<name>.ts` and export a module from `defineCommand({ … })`:
+
+   ```ts
+   export const widgetCommand = defineCommand({
+     command: "widget",
+     chatAllowlist: true, // optional: only chats in ALLOWED_CHAT_IDS
+     operatorOnly: false, // optional: operator-only, silently ignored otherwise
+     hidden: false,       // optional: registered but not advertised in the menu
+     handler: async (ctx, deps) => {
+       await ctx.reply(widgetMessage(deps.config), TELEGRAM_OPTIONS);
+     },
+   });
+   ```
+
+   The handler receives `(ctx, deps)`; `deps` is the same object `createBot` took
+   (config, poller status, pause/resume, audit, logs). Authorization is applied by
+   the registrar from `operatorOnly`/`chatAllowlist` — do not repeat it in the
+   handler.
+2. Add one import line to `src/commands/index.ts`, in menu order.
+3. If the command is advertised, add its description to `COMMAND_DESCRIPTIONS`
+   (both locales) in `src/i18n.ts` and its entry to `COMMAND_DETAILS` in
+   `src/commands/help-detail.ts`. `/help`, the Telegram menu and the detail pages
+   are generated from those tables.
+4. Cover the handler in `tests/` like any other command; `tests/command-modules.test.mjs`
+   checks the registry invariants (unique names, menu parity, central authorization).
+
 ## Where things live
 
 - `src/` — the TypeScript source (config, RPC client, decoder, poller, bot, audit).
+- `src/commands/` — one module per slash command plus the registry that lists them.
 - `src/dev/repl.ts` — interactive developer REPL with preloaded decoders, formatters, and mock helpers.
 - `tests/` — Node built-in test runner suites compiled against `dist/`.
-- `docs/quickstart-mock.md` — five-minute quickstart using the local mock RPC.
+- `scripts/tsx-dist-loader.mjs` — ESM loader that maps `dist/*.js` → `src/*.ts` for `test:fast`.
 - `docs/contributor-fixtures.md` — credential-free fixture guide and failure modes.
 - `.env.example` — the documented runtime settings (not required for testing).
