@@ -701,6 +701,28 @@ export function isOperator(ctx: Pick<Context, "from">, config: BotConfig): boole
 /** Everything a command handler may need. Kept as an alias for callers/tests. */
 export type BotDeps = CommandDeps;
 
+/** The commands the bot advertises in Telegram's command menu. */
+export const COMMANDS = [
+  { command: "start", description: COMMAND_DESCRIPTIONS.start, operatorOnly: false },
+  { command: "help", description: COMMAND_DESCRIPTIONS.help, operatorOnly: false },
+  { command: "about", description: COMMAND_DESCRIPTIONS.about, operatorOnly: false },
+  { command: "status", description: COMMAND_DESCRIPTIONS.status, operatorOnly: false },
+  { command: "audit", description: COMMAND_DESCRIPTIONS.audit, operatorOnly: true },
+  { command: "contracts", description: COMMAND_DESCRIPTIONS.contracts, operatorOnly: false },
+  { command: "health", description: COMMAND_DESCRIPTIONS.health, operatorOnly: false },
+  { command: "preview", description: COMMAND_DESCRIPTIONS.preview, operatorOnly: false },
+  { command: "pause", description: COMMAND_DESCRIPTIONS.pause, operatorOnly: true },
+  { command: "resume", description: COMMAND_DESCRIPTIONS.resume, operatorOnly: true },
+  { command: "events", description: "Recent delivered notifications", operatorOnly: false },
+] as const;
+
+/** Commands visible to a chat, gating operator-only commands behind the operator id. */
+function visibleCommands(config?: BotConfig) {
+  return COMMANDS.filter((command) =>
+    !command.operatorOnly || config === undefined || config.operatorTelegramUserId !== null,
+  );
+}
+
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
 export function registerCommandHandlers(
   bot: Bot | {
@@ -857,6 +879,11 @@ export function registerCommandHandlers(
         return;
       }
       await ctx.reply(resumeMessage(resume()), TELEGRAM_OPTIONS);
+    },
+
+    events: async (ctx) => {
+      if (!chatAllowed(ctx, "events")) return;
+      await createEventsHandler(recentEvents, config)(ctx);
     },
   };
 
