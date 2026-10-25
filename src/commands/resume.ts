@@ -5,7 +5,7 @@
 
 import { messagesFor, type Locale } from "../i18n.js";
 import type { PollerResumeResult } from "../poller.js";
-import { defineCommand } from "./registry.js";
+import { createCommandModule } from "./registry.js";
 import { TELEGRAM_OPTIONS } from "./runtime.js";
 
 export function resumeMessage(result: PollerResumeResult, locale?: Locale): string {
@@ -20,10 +20,10 @@ export function resumeMessage(result: PollerResumeResult, locale?: Locale): stri
   }
 }
 
-export const resumeCommand = defineCommand({
+export const resumeCommand = createCommandModule({
   command: "resume",
   operatorOnly: true,
-  handler: async (ctx, deps) => {
+  handle: async (ctx, deps) => {
     const resume = deps.resume ?? (() => "stopped" as const);
     await ctx.reply(resumeMessage(resume(), deps.config.locale), TELEGRAM_OPTIONS);
   },

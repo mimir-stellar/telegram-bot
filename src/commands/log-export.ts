@@ -7,13 +7,13 @@
  */
 
 import { renderLogExport } from "../logger.js";
-import { defineCommand } from "./registry.js";
+import { createCommandModule } from "./registry.js";
 
-export const logExportCommand = defineCommand({
+export const logExportCommand = createCommandModule({
   command: "export",
   hidden: true,
   operatorOnly: true,
-  handler: async (ctx, deps) => {
+  handle: async (ctx, deps) => {
     const { config, logs } = deps;
     if (!logs || logs.capacity() === 0) {
       await ctx.reply("Log export is disabled (LOG_BUFFER_LINES=0).");

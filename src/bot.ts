@@ -273,13 +273,13 @@ function dispatch(
   ctx: CommandContext<Context>,
   deps: BotDeps,
 ): Promise<void> {
-  if (module.operatorOnly === true && !operatorAllowed(ctx, deps.config, module.command)) {
+  if (module.operatorOnly && !operatorAllowed(ctx, deps.config, module.command)) {
     return Promise.resolve();
   }
-  if (module.chatAllowlist === true && !chatAllowed(ctx, deps.config, module.command)) {
+  if (module.allowlisted && !chatAllowed(ctx, deps.config, module.command)) {
     return Promise.resolve();
   }
-  return module.handler(ctx, deps);
+  return module.handle(ctx, deps);
 }
 
 /**

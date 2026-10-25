@@ -158,33 +158,47 @@ The REPL context is preloaded with:
 
 Commands are self-contained modules under `src/commands/`; `src/bot.ts` only walks
 the registry, so a new command never needs to touch a shared handler table (and so
-rarely conflicts with another in-flight branch):
+rarely conflicts with another in-flight branch). The module shape is
+`CommandModule` in `src/commands/types.ts`:
 
-1. Create `src/commands/<name>.ts` and export a module from `defineCommand({ … })`:
+| Field          | Meaning                                                                 |
+| -------------- | ----------------------------------------------------------------------- |
+| `command`      | Telegram command name, without the slash                                |
+| `description`  | English menu line; defaults to its `COMMAND_DESCRIPTIONS` entry          |
+| `operatorOnly` | Only the configured operator; others are silently ignored               |
+| `allowlisted`  | Only chats in `ALLOWED_CHAT_IDS`; others are silently ignored           |
+| `hidden`       | Registered and usable, but not in the menu or `/help` (e.g. `/export`)  |
+| `handle`       | `async (ctx, deps) => …`, called only after the gates above pass        |
+
+1. Create `src/commands/<name>.ts` and export a module from `createCommandModule({ … })`
+   (`src/commands/contracts.ts` and `src/commands/preview.ts` are small examples):
 
    ```ts
-   export const widgetCommand = defineCommand({
+   export const widgetCommand = createCommandModule({
      command: "widget",
-     chatAllowlist: true, // optional: only chats in ALLOWED_CHAT_IDS
-     operatorOnly: false, // optional: operator-only, silently ignored otherwise
-     hidden: false,       // optional: registered but not advertised in the menu
-     handler: async (ctx, deps) => {
+     description: COMMAND_DESCRIPTIONS.widget, // optional: this is the default
+     operatorOnly: false, // optional, default false
+     allowlisted: true,   // optional, default false
+     hidden: false,       // optional, default false
+     handle: async (ctx, deps) => {
        await ctx.reply(widgetMessage(deps.config), TELEGRAM_OPTIONS);
      },
    });
    ```
 
    The handler receives `(ctx, deps)`; `deps` is the same object `createBot` took
-   (config, poller status, pause/resume, audit, logs). Authorization is applied by
-   the registrar from `operatorOnly`/`chatAllowlist` — do not repeat it in the
-   handler.
-2. Add one import line to `src/commands/index.ts`, in menu order.
+   (config, poller status, pause/resume, audit, logs). Authorization is applied
+   centrally by the registrar from `operatorOnly`/`allowlisted`, with the usual
+   silent ignore and log line — do not repeat it in the handler.
+2. Add the module to `COMMAND_MODULES` in `src/commands/index.ts`, in menu order.
+   That array's order is the order of the Telegram menu (`setMyCommands`) and `/help`.
 3. If the command is advertised, add its description to `COMMAND_DESCRIPTIONS`
    (both locales) in `src/i18n.ts` and its entry to `COMMAND_DETAILS` in
    `src/commands/help-detail.ts`. `/help`, the Telegram menu and the detail pages
    are generated from those tables.
-4. Cover the handler in `tests/` like any other command; `tests/command-modules.test.mjs`
-   checks the registry invariants (unique names, menu parity, central authorization).
+4. Cover the handler in `tests/` like any other command. `tests/command-registry.test.mjs`
+   pins catalogue order and the central authorization gates, and
+   `tests/command-modules.test.mjs` checks the registry invariants (unique names, menu parity).
 
 ## Where things live
 

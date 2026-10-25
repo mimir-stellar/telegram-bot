@@ -11,7 +11,7 @@
 import { messagesFor, type Locale } from "../i18n.js";
 import type { PollerPauseResult } from "../poller.js";
 import { pauseConfirmKeyboard } from "./keyboards.js";
-import { defineCommand } from "./registry.js";
+import { createCommandModule } from "./registry.js";
 import { TELEGRAM_OPTIONS } from "./runtime.js";
 
 /** Operator-facing text for the pause confirmation prompt. */
@@ -31,10 +31,10 @@ export function pauseMessage(result: PollerPauseResult, locale?: Locale): string
   }
 }
 
-export const pauseCommand = defineCommand({
+export const pauseCommand = createCommandModule({
   command: "pause",
   operatorOnly: true,
-  handler: async (ctx) => {
+  handle: async (ctx) => {
     await ctx.reply(PAUSE_PROMPT, {
       ...TELEGRAM_OPTIONS,
       reply_markup: pauseConfirmKeyboard(),

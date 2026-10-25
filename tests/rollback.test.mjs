@@ -321,7 +321,7 @@ test("poller treats a missing cursor file as a cold start (no crash)", async () 
   assert.ok(status.cycles >= 1,    "at least one cycle should have run");
   assert.ok(!status.lastError,     "should have no errors on a clean RPC stub");
 
-  await rm(dir, { recursive: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 test("poller treats a corrupt cursor file as a cold start (no crash)", async () => {
@@ -345,7 +345,7 @@ test("poller treats a corrupt cursor file as a cold start (no crash)", async () 
   const status = poller.status();
   assert.ok(status.cycles >= 1, "poller should continue after corrupt cursor");
 
-  await rm(dir, { recursive: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 test("poller resumes from a valid v1 cursor file written by the previous release", async () => {
@@ -393,7 +393,7 @@ test("poller resumes from a valid v1 cursor file written by the previous release
   assert.equal(marketCursor, cursor, "market should resume from saved cursor");
   assert.equal(squadCursor,  cursor, "squad should resume from saved cursor");
 
-  await rm(dir, { recursive: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 test("cursor file written after a cycle is valid JSON with a version field", async () => {
@@ -418,7 +418,7 @@ test("cursor file written after a cycle is valid JSON with a version field", asy
   assert.ok(parsed.targets?.market,     "market target must be persisted");
   assert.ok(parsed.targets?.squad,      "squad target must be persisted");
 
-  await rm(dir, { recursive: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -457,7 +457,7 @@ test("an RPC failure in one cycle does not stop the poller", async () => {
   assert.ok(status.cycles >= 2,
     `expected ≥2 cycles after RPC recovery, got ${status.cycles}`);
 
-  await rm(dir, { recursive: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 test("RPC failure leaves the cursor unchanged so the next cycle resumes correctly", async () => {
@@ -494,7 +494,7 @@ test("RPC failure leaves the cursor unchanged so the next cycle resumes correctl
       "RPC failure must not overwrite the cursor with null or a stale value");
   }
 
-  await rm(dir, { recursive: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -527,7 +527,7 @@ test("a Telegram send failure does not stop the poller or prevent cursor advance
   // notificationsFailed is only incremented when an event was actually sent,
   // so it may be 0 if the stub emits no events — that is acceptable.
 
-  await rm(dir, { recursive: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -596,7 +596,7 @@ test("cursor file schema is backward-compatible: extra unknown keys are ignored"
     "poller must not throw when reading a cursor file with extra fields",
   );
 
-  await rm(dir, { recursive: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 test("cursor file written by the bot is valid JSON that JSON.parse accepts without loss", async () => {
@@ -619,5 +619,5 @@ test("cursor file written by the bot is valid JSON that JSON.parse accepts witho
   assert.doesNotThrow(() => JSON.parse(raw),
     "cursor file must be valid JSON with no BigInt or undefined values");
 
-  await rm(dir, { recursive: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });

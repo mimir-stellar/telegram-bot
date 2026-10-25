@@ -139,9 +139,11 @@ looks healthy but notifies nobody.
 command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
 the help and menu omit `/audit`, `/pause`, and `/resume`; configured operator
 commands are labelled "Operator only". Help uses static metadata, so it remains
-available when the poller or RPC is unhealthy. Adding a command requires its
-metadata and handler in `src/bot.ts`; TypeScript checks that every registry entry
-has a handler. This changes no cursor files or deployment settings.
+available when the poller or RPC is unhealthy. Each command is a self-contained
+module under `src/commands/`, listed in menu order by `COMMAND_MODULES` in
+`src/commands/index.ts`; operator-only and `ALLOWED_CHAT_IDS` checks come from the
+module's flags (see "Adding a slash command" in `CONTRIBUTING.md`). This changes no
+cursor files or deployment settings.
 
 Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
 response and cannot mutate poller state — this includes `/audit`, whose report
