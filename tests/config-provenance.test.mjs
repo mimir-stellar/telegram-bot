@@ -15,9 +15,9 @@ const dist = (name) => fileURLToPath(new URL(`../dist/${name}`, import.meta.url)
 const DIST_CONFIG = new URL("../dist/config.js", import.meta.url).href;
 const DIST_INDEX = dist("index.js");
 
-const CANARY_TOKEN = "123456789:" + "CANARY-TOKEN-MUST-NEVER-LEAK";
+const CANARY_TOKEN = "123456789:" + "CANARY-TOKEN-MUST-NEVER-LEAK-IN-OUTPUT";
 const CANARY_CHAT = "-1009999999999";
-const FILE_TOKEN = "123456789:" + "CANARY-FILE-TOKEN-MUST-NEVER-LEAK";
+const FILE_TOKEN = "123456789:" + "CANARY-FILE-TOKEN-MUST-NEVER-LEAK-ANYWHERE";
 
 /**
  * Config provenance tests.

@@ -31,8 +31,8 @@ export interface FollowStoreOptions {
   filePath: string;
   maxPerChat?: number;
   maxTotal?: number;
-  // Aliases for aPI compatibility.
-pathMaxFollowsPerChat?: number;
+  // Aliases for API compatibility.
+  maxFollowsPerChat?: number;
   maxTotalEntries?: number;
 }
 
@@ -48,8 +48,9 @@ export function parseRef(ref: string): Ref | null {
   const id = ref.slice(idx + 1);
   if (kind !== "market" && kind !== "squad") return null;
   if (!id) return null;
-  // Reject whitespace and control characters in id.
-  if (/[\s\u0000-\u001F]/.test(id)) return null;
+  // Reject whitespace, control characters and a second ':' in id, so a ref
+  // always splits into exactly one kind and one id.
+  if (/[\s\u0000-\u001F:]/.test(id)) return null;
   return { kind, id };
 }
 
@@ -113,7 +114,7 @@ export class FollowStore {
   constructor(options: FollowStoreOptions) {
     this.filePath = options.filePath;
     this.maxPerChat =
-      options.maxPerChat ?? options.pathMaxFollowsPerChat ?? DEFAULT_MAX_PER_CHAT;
+      options.maxPerChat ?? options.maxFollowsPerChat ?? DEFAULT_MAX_PER_CHAT;
     this.maxTotal = options.maxTotal ?? options.maxTotalEntries ?? DEFAULT_MAX_TOTAL;
   }
 

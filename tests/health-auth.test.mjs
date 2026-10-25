@@ -22,7 +22,7 @@ function baseConfig(overrides = {}) {
     operatorTelegramUserId: null,
     pollIntervalMs: 30_000,
     startLookbackLedgers: 60,
-    cursorFile: "./data/cursor.json",
+    cursorFile: "/tmp/unused-cursor.json", // never read or written by these tests
     maxNotificationsPerCycle: 20,
     healthHost: "127.0.0.1",
     healthPort: 0,

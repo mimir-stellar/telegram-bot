@@ -3,7 +3,9 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 
-const modulePath = new URL('../src/subscriptions/store.js', import.meta.url);
+// The follow store (#676) is synchronous: follow() and friends return or throw
+// directly, so failures are asserted with assert.throws, not assert.rejects.
+const modulePath = new URL('../dist/subscriptions/store.js', import.meta.url);
 
 async function importStore() {
   return import(modulePath.href);
@@ -75,7 +77,7 @@ test('rejects malformed refs', async () => {
     const store = createFollowStore({ filePath: pathJoin(dir, 'follows.json') });
     const bad = ['', 'market:', 'market: ', 'foo', 'foo:bar', 'market:a:b', 'squad:', 'MARKET:abc', 'market:abc '];
     for (const ref of bad) {
-      await assert.rejects(() => store.follow('chat:1', ref), undefined, `ref ${JSON.stringify(ref)} should be rejected`);
+      assert.throws(() => store.follow('chat:1', ref), { name: 'FollowStoreError' }, `ref ${JSON.stringify(ref)} should be rejected`);
     }
     assert.deepStrictEqual(await store.list('chat:1'), []);
   });
@@ -90,7 +92,7 @@ test('enforces per-chat cap', async () => {
     });
     await store.follow('chat:1', 'market:a1');
     await store.follow('chat:1', 'market:a2');
-    await assert.rejects(() => store.follow('chat:1', 'market:a3'));
+    assert.throws(() => store.follow('chat:1', 'market:a3'), /per-chat follow limit reached \(2\)/);
     assert.deepStrictEqual(await store.list('chat:1'), ['market:a1', 'market:a2']);
     // Other chats unaffected.
     await store.follow('chat:2', 'market:a1');
@@ -108,7 +110,7 @@ test('enforces total cap', async () => {
     await store.follow('chat:1', 'market:a1');
     await store.follow('chat:1', 'market:a2');
     await store.follow('chat:2', 'market:a3');
-    await assert.rejects(() => store.follow('chat:2', 'market:a4'));
+    assert.throws(() => store.follow('chat:2', 'market:a4'), /total follow limit reached \(3\)/);
     // Idempotent re-follow of existing entry is allowed even at cap.
     await store.follow('chat:1', 'market:a1');
     assert.deepStrictEqual(await store.list('chat:1'), ['market:a1', 'market:a2']);

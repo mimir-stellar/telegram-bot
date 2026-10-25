@@ -35,17 +35,18 @@ export function levenshtein(a: string, b: string): number {
     curr[0] = i;
     for (let j = 1; j <= b.length; j++) {
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      // Indices stay within 0..b.length, so every read below is defined.
       curr[j] = Math.min(
-        curr[j - 1] + 1,       // insert
-        prev[j] + 1,           // delete
-        prev[j - 1] + cost,    // substitute
+        curr[j - 1]! + 1,       // insert
+        prev[j]! + 1,           // delete
+        prev[j - 1]! + cost,    // substitute
       );
     }
     // Swap rows: curr becomes the new prev for the next iteration.
     [prev, curr] = [curr, prev];
   }
 
-  return prev[b.length];
+  return prev[b.length]!;
 }
 
 /**

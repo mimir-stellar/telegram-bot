@@ -218,13 +218,9 @@ for (const eventName of MARKET_SHARED_EVENTS) {
 
     // Convert topics and fields to native values for decoder input
     const nativeTopics = topics.map((t) => scValToNative(t));
-    const nativeFields = {};
-    const fieldsMap = fields.map();
-    for (const entry of fieldsMap) {
-      const key = scValToNative(entry.key());
-      const val = scValToNative(entry.val());
-      nativeFields[key] = val;
-    }
+    // stellar-sdk 17 (#527) has no ScVal.map()/entry.key() accessors; the
+    // decoders take native values anyway.
+    const nativeFields = scValToNative(fields);
 
     const v1 = decodeMarketV1(eventName, nativeTopics, nativeFields);
     const v2 = decodeMarketV2(eventName, nativeTopics, nativeFields);
@@ -320,13 +316,9 @@ for (const eventName of SQUAD_SHARED_EVENTS) {
 
     // Convert topics and fields to native values for decoder input
     const nativeTopics = topics.map((t) => scValToNative(t));
-    const nativeFields = {};
-    const fieldsMap = fields.map();
-    for (const entry of fieldsMap) {
-      const key = scValToNative(entry.key());
-      const val = scValToNative(entry.val());
-      nativeFields[key] = val;
-    }
+    // stellar-sdk 17 (#527) has no ScVal.map()/entry.key() accessors; the
+    // decoders take native values anyway.
+    const nativeFields = scValToNative(fields);
 
     const v1 = decodeSquadV1(eventName, nativeTopics, nativeFields);
     const v2 = decodeSquadV2(eventName, nativeTopics, nativeFields);
@@ -358,13 +350,9 @@ test("market: boundary amounts - zero, max safe integer, large bigint", () => {
     const fields = scMap([["stake", i128(stake)]]);
 
     const nativeTopics = topics.map((t) => scValToNative(t));
-    const nativeFields = {};
-    const fieldsMap = fields.map();
-    for (const entry of fieldsMap) {
-      const key = scValToNative(entry.key());
-      const val = scValToNative(entry.val());
-      nativeFields[key] = val;
-    }
+    // stellar-sdk 17 (#527) has no ScVal.map()/entry.key() accessors; the
+    // decoders take native values anyway.
+    const nativeFields = scValToNative(fields);
 
     const v1 = decodeMarketV1(eventName, nativeTopics, nativeFields);
     const v2 = decodeMarketV2(eventName, nativeTopics, nativeFields);
@@ -388,13 +376,9 @@ test("squad: boundary string lengths", () => {
     ]);
 
     const nativeTopics = topics.map((t) => scValToNative(t));
-    const nativeFields = {};
-    const fieldsMap = fields.map();
-    for (const entry of fieldsMap) {
-      const key = scValToNative(entry.key());
-      const val = scValToNative(entry.val());
-      nativeFields[key] = val;
-    }
+    // stellar-sdk 17 (#527) has no ScVal.map()/entry.key() accessors; the
+    // decoders take native values anyway.
+    const nativeFields = scValToNative(fields);
 
     const v1 = decodeSquadV1(eventName, nativeTopics, nativeFields);
     const v2 = decodeSquadV2(eventName, nativeTopics, nativeFields);

@@ -19,6 +19,8 @@
  * Clock injection is supported for deterministic time-travel testing.
  */
 
+import type { LogSampler } from "../log-sampler.js";
+
 export interface RateLimiterOptions {
   /** Maximum number of tokens a bucket can hold. Defaults to 5. */
   capacity?: number;
@@ -190,3 +192,17 @@ export class CommandRateLimiter {
 }
 
 export { CommandRateLimiter as TokenBucket, CommandRateLimiter as ChatRateLimiter };
+
+// `registerCommandHandlers` in src/bot.ts reads the limiter, the sampler for
+// its "rate limit exceeded" warning and the injected clock from the command
+// deps, so tests and embedders can supply their own.
+declare module "./registry.js" {
+  interface CommandDeps {
+    /** Per-chat command rate limiter. Defaults to a fresh limiter per bot. */
+    rateLimiter?: CommandRateLimiter | undefined;
+    /** Sampler for the "rate limit exceeded" warning. */
+    rateLimitSampler?: LogSampler | undefined;
+    /** Injected clock (epoch ms) for the default rate limiter and sampler. */
+    now?: (() => number) | undefined;
+  }
+}
