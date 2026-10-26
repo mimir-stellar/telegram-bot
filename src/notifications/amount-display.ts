@@ -37,15 +37,20 @@ export function displayUsdc(
     );
   }
 
-  const raw = formatUsdc(units);
+  // BigInt("") and BigInt("  ") are 0n; an empty amount is a caller bug, not
+  // zero, so it must not render as "0".
+  if (typeof units === 'string' && units.trim() === '') {
+    throw new SyntaxError('USDC amount must not be empty');
+  }
+  const raw = formatUsdc(typeof units === 'bigint' ? units : BigInt(units));
   const negative = raw.startsWith('-');
   const unsigned = negative ? raw.slice(1) : raw;
   const [parts, fractionPart = ''] = unsigned.split('.');
   const integerPart = parts ?? '0';
 
-  // formatUsdc always emits USCD_DECIMALS fraction digits. Trim trailing
+  // formatUsdc always emits USDC_DECIMALS fraction digits. Trim trailing
   // zeros down to minDecimals, and cap at maxDecimals.
-  const padded = fractionPart.padEnd(USCD_DECIMALS, '0').slice(0, USDC_DECIMALS);
+  const padded = fractionPart.padEnd(USDC_DECIMALS, '0').slice(0, USDC_DECIMALS);
   const capped = padded.slice(0, maxDecimals);
   let trimmed = capped.replace(/0+$/, '');
   if (trimmed.length < minDecimals) {
@@ -58,10 +63,12 @@ export function displayUsdc(
 }
 
 /**
- * Escape a string for Telegram MarkdownV2.
+ * Escape a string for Telegram MarkdownV2: every reserved character
+ * (`_*[]()~\`>#+-=|{}.!`) gets a backslash. `-` matters most here, since a
+ * negative amount would otherwise be rejected by Telegram's entity parser.
  */
 export function escapeMarkdownV2(text: string): string {
-  return text.replace(/[_\*\[\](\)~`>#++=|{}.!]/g, (match) => `\\${match}`);
+  return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, (match) => `\\${match}`);
 }
 
 /**

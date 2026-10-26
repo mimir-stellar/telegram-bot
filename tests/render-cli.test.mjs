@@ -151,7 +151,7 @@ test("CLI execution against fixtures snapshots stdout", async () => {
 
   const { stdout: stdoutClaimCreated } = await execFileP(
     process.execPath,
-    ["run", compiledCli, CLAIM_CREATED_FIXTURE, "--format", "both"],
+    [compiledCli, CLAIM_CREATED_FIXTURE, "--format", "both"],
   );
 
   assert.match(stdoutClaimCreated, /=== MarkdownV2 ===/);
@@ -161,7 +161,7 @@ test("CLI execution against fixtures snapshots stdout", async () => {
 
   const { stdout: stdoutChallengedPlain } = await execFileP(
     process.execPath,
-    ["run", compiledCli, CLAIM_CHALLENGED_FIXTURE, "--format", "plain"],
+    [compiledCli, CLAIM_CHALLENGED_FIXTURE, "--format", "plain"],
   );
   assert.match(stdoutChallengedPlain, /Claim #7 challenged/);
   assert.match(stdoutChallengedPlain, /Stake: 2\.0000000 USDC/);
@@ -170,7 +170,7 @@ test("CLI execution against fixtures snapshots stdout", async () => {
 
   const { stdout: stdoutMarketCreatedMd } = await execFileP(
     process.execPath,
-    ["run", compiledCli, MARKET_CREATED_FIXTURE, "--format", "md"],
+    [compiledCli, MARKET_CREATED_FIXTURE, "--format", "md"],
   );
   assert.match(stdoutMarketCreatedMd, /🆕 \*New squad market\* \\#1/);
   assert.match(stdoutMarketCreatedMd, /Explorer URL:/);
@@ -182,7 +182,7 @@ test("CLI execution exits with code 2 on invalid JSON or unknown event name", as
 
   // Unknown option
   await assert.rejects(
-    execFileP(process.execPath, ["run", compiledCli, "--invalid-flag"]),
+    execFileP(process.execPath, [compiledCli, "--invalid-flag"]),
     (err) => {
       assert.equal(err.code, 2);
       assert.match(err.stderr || err.stdout, /Unknown option/);
@@ -192,7 +192,7 @@ test("CLI execution exits with code 2 on invalid JSON or unknown event name", as
 
   // Non-existent file
   await assert.rejects(
-    execFileP(process.execPath, ["run", compiledCli, "nonexistent-file.json"]),
+    execFileP(process.execPath, [compiledCli, "nonexistent-file.json"]),
     (err) => {
       assert.equal(err.code, 2);
       assert.match(err.stderr || err.stdout, /Failed to read input/);

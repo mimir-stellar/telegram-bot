@@ -18,6 +18,6 @@
       "category": ""
     }
   },
-  "md": "🆕 *New claim* \\#2\nCategory: \nCreator: `GABCD…TUVW`\n_ledger 5001_",
-  "plain": "New claim #2\nCategory: \nCreator: GABCD…TUVW\nledger 5001"
+  "md": "🆕 *New claim* \\#2\nCategory: 🏷️\nCreator: `GABCD…TUVW`\n_ledger 5001_",
+  "plain": "New claim #2\nCategory: 🏷️\nCreator: GABCD…TUVW\nledger 5001"
 }

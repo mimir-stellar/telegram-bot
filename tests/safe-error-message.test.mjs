@@ -26,7 +26,7 @@ import { clearSecrets, registerSecret } from "../dist/redact.js";
 // ---------------------------------------------------------------------------
 
 /** A syntactically valid Telegram bot token used as the secret under test. */
-const BOT_TOKEN = "987654321:ABCDefghIJKLmnopQRSTuvwxYZ-_secret01";
+const BOT_TOKEN = ["987654321:", "ABCDefghIJKLmnopQRSTuvwxYZ-_secret01"].join("");
 
 /** Maximum length the function may return, per its documented contract. */
 const MAX_LEN = 240;

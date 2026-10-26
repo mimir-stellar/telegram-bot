@@ -31,7 +31,7 @@
 
 import assert     from "node:assert/strict";
 import { tmpdir } from "node:os";
-import { join }   from "node:path";
+import { dirname, join } from "node:path";
 import {
   mkdtemp,
   rm,
@@ -46,7 +46,7 @@ import { createPoller } from "../dist/poller.js";
 // ── Valid environment for tests that need a full config ──────────────────────
 
 const VALID_ENV = {
-  BOT_TOKEN:                "123456789:" + "AAHello_test_token",
+  BOT_TOKEN:                "123456789:" + "AAHello_test_token_padded_to_35_chars",
   TELEGRAM_CHAT_ID:         "-1001234567890",
   MARKET_CONTRACT_ID:       "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
   SQUAD_CONTRACT_ID:        "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
@@ -276,12 +276,26 @@ test("loadConfig error message includes the fix hint about .env.example", () => 
 /**
  * Build a minimal BotConfig from VALID_ENV + a tmpdir cursor file path.
  * Uses low POLL_INTERVAL_MS so the poller can run one cycle in tests.
+ * Every other state file goes next to the cursor file: loadConfig's defaults
+ * point into the repo's data/, which tests must never write.
  */
 function makeConfig(cursorFile) {
   const restore = withEnv({ ...VALID_ENV, POLL_INTERVAL_MS: "5000" });
   try {
     const c = loadConfig();
-    return { ...c, cursorFile, pollIntervalMs: 5_000 };
+    const dir = dirname(cursorFile);
+    return {
+      ...c,
+      cursorFile,
+      countersFile: join(dir, "counters.json"),
+      lockFile: join(dir, "poller.lock"),
+      statusFile: join(dir, "status.json"),
+      auditFile: join(dir, "audit.jsonl"),
+      deadLetterFile: join(dir, "dead-letter.json"),
+      sendJournalFile: join(dir, "send-journal.jsonl"),
+      csvOutputFile: join(dir, "scanner_output.csv"),
+      pollIntervalMs: 5_000,
+    };
   } finally {
     restore();
   }

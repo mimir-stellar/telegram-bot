@@ -19,6 +19,6 @@
       "poolB": "90000000"
     }
   },
-  "md": "🏁 *Squad \\#2 resolved* — *Side B*\nPools: A 5\\.0000000 USDC · B 9\\.0000000 USDC\n_ledger 5049_",
-  "plain": "Squad #2 resolved — Side B\nPools: A 5.0000000 USDC · B 9.0000000 USDC\nledger 5049"
+  "md": "🏁 *Squad \\#2 resolved* — *Side B*\nPools: A 5\\.0000000 USDC · B 9\\.0000000 USDC\nPayout: 1\\.5555555 USDC per 1 USDC staked \\(gross\\)\n_ledger 5049_",
+  "plain": "Squad #2 resolved — Side B\nPools: A 5.0000000 USDC · B 9.0000000 USDC\nPayout: 1.5555555 USDC per 1 USDC staked (gross)\nledger 5049"
 }

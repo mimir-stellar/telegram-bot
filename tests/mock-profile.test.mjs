@@ -64,7 +64,7 @@ test("without a profile, defaults are exactly the pre-profile behaviour", () => 
     {
       MARKET_CONTRACT_ID: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
       SQUAD_CONTRACT_ID: "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
-      BOT_TOKEN: "123456789:" + "TEST-ONLY-TOKEN-NEVER-USE",
+      BOT_TOKEN: "123456789:" + "TEST-ONLY-TOKEN-NEVER-USE-PADDED-TO-35",
       TELEGRAM_CHAT_ID: "-1001234567890",
     },
     () => {
@@ -77,7 +77,7 @@ test("without a profile, defaults are exactly the pre-profile behaviour", () => 
 
       const config = loadConfig();
       assert.equal(config.cursorFile, path.resolve("./data/cursor.json")); // hermetic-data: allow (verifies testnet default)
-      assert.equal(config.botToken, "123456789:TEST-ONLY-TOKEN-NEVER-USE");
+      assert.equal(config.botToken, "123456789:" + "TEST-ONLY-TOKEN-NEVER-USE-PADDED-TO-35");
       assert.equal(config.marketContractId, "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI");
     },
   );
@@ -114,14 +114,14 @@ test("explicit environment values win over mock profile defaults", () => {
       MIMIR_PROFILE: "mock",
       STELLAR_RPC_URL: "https://example.invalid/custom-rpc",
       CURSOR_FILE: "./data/cursor.explicit.json", // hermetic-data: allow (verifies explicit override)
-      BOT_TOKEN: "123456789:" + "TEST-ONLY-TOKEN-NEVER-USE",
+      BOT_TOKEN: "123456789:" + "TEST-ONLY-TOKEN-NEVER-USE-PADDED-TO-35",
       TELEGRAM_CHAT_ID: "-1001234567890",
     },
     () => {
       const config = loadConfig();
       assert.equal(config.rpcUrl, "https://example.invalid/custom-rpc");
       assert.equal(config.cursorFile, path.resolve("./data/cursor.explicit.json")); // hermetic-data: allow (verifies explicit override)
-      assert.equal(config.botToken, "123456789:TEST-ONLY-TOKEN-NEVER-USE");
+      assert.equal(config.botToken, "123456789:" + "TEST-ONLY-TOKEN-NEVER-USE-PADDED-TO-35");
       // Values with no explicit override still come from the profile.
       assert.equal(config.marketContractId, MOCK_MARKET_CONTRACT_ID);
     },

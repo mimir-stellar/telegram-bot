@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 const execFileP = promisify(execFile);
 const DIST_CLI = fileURLToPath(new URL("../dist/config-cli.js", import.meta.url));
 
-const canaryAuth = ["123456789:", "CANARY_AUTH_VALUE_NEVER_LEAK"].join("");
+const canaryAuth = ["123456789:", "CANARY_AUTH_VALUE_NEVER_LEAK_IN_OUTPUT"].join("");
 const canaryChat = "-1001234567890";
 const VALID_MARKET_ID = "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI";
 const VALID_SQUAD_ID = "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY";

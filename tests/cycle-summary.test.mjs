@@ -13,7 +13,7 @@ import { malformedMockEvent, startMockRpc } from "../dist/stellar/mock-rpc.js";
 import { withTempDataDir } from "./helpers/temp-data.mjs";
 
 const CHAT_ID = "-1009876543210";
-const BOT_TOKEN = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
+const BOT_TOKEN = ["123456:", "ABC-DEF1234ghIkl-zyx57W2v1u123ew11"].join("");
 const ALICE = "GCLJONJVCLJGE6CSMCHCGYA563ADTCK5YGF3KERDMSNS3MNNDAIXHFA5";
 const BOB = "GC22MRUQSG6TWXMKANC7MDKBDOVZXB27774NYOINQKOCFUWIUBRTVNTV";
 

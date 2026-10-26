@@ -117,7 +117,7 @@ test("decodeEvent handles missing, empty, or non-string topics gracefully", () =
 
 test("decodeEvent handles synthetic ScVal topics and values", () => {
   const eventNameVal = xdr.ScVal.scvSymbol("claim_cancelled");
-  const claimIdVal = xdr.ScVal.scvU64(new xdr.Uint64(42n));
+  const claimIdVal = xdr.ScVal.scvU64(42n);
 
   const syntheticEvent = {
     contractId: VALID_CONTRACT,

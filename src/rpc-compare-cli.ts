@@ -28,8 +28,7 @@ import { pathToFileURL } from "node:url";
 
 import { rpc } from "@stellar/stellar-sdk";
 
-import { createRpcServer } from "./stellar/client.js";
-import { EVENT_MAX_PAGES, EVENT_PAGE_LIMIT, paginatedGetEvents } from "./stellar/events.js";
+import { EVENT_MAX_PAGES, paginatedGetEvents } from "./stellar/events.js";
 import { redactText, redactUrl } from "./redact.js";
 
 /** Max differing/missing/extra events listed per category in human output. */
@@ -283,7 +282,7 @@ export async function compareEndpoints(opts: CompareOptions): Promise<CompareRes
 
   // ── Validate inputs before any network call ─────────────────────────────
   if (!isValidContractId(opts.contractId)) {
-    return { ...base, exitCode: 2, error: `Invalid contract ID: ${opts.contractId.slice(0, 60)}` };
+    return { ...base, exitCode: 2, error: `Invalid contract ID: ${String(opts.contractId).slice(0, 60)}` };
   }
 
   let budget = opts.budget ?? DEFAULT_BUDGET;
@@ -449,7 +448,7 @@ export function formatCompareResult(result: CompareResult): string {
   lines.push(`Differences: ${result.diffCount} total`);
 
   const byStatus: Record<string, EventDiff[]> = { missing: [], extra: [], differing: [] };
-  for (const d of result.diffs) byStatus[d.status].push(d);
+  for (const d of result.diffs) byStatus[d.status]?.push(d);
 
   const show = (status: string, label: string) => {
     const items = byStatus[status] ?? [];
@@ -475,7 +474,7 @@ export function formatCompareResult(result: CompareResult): string {
 
 /** Machine-readable JSON report. */
 export function formatCompareJson(result: CompareResult): string {
-  return JSON.stringify(result, (key, value) => (typeof value === "bigint" ? value.toString() : value), 2) + "\n";
+  return JSON.stringify(result, (_key, value) => (typeof value === "bigint" ? value.toString() : value), 2) + "\n";
 }
 
 // ── CLI entrypoint ────────────────────────────────────────────────────────

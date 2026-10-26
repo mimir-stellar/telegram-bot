@@ -179,18 +179,22 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     const next = nextRun(schedule, now);
     const delay = Math.max(0, next - now);
     timer = clock.setTimeout(() => {
-      void tick();
+      void tick(true);
     }, delay);
   };
 
-  const tick = async () => {
+  // `atBoundary` is true when the timer fired at a scheduled time and false
+  // for the check made on start().
+  const tick = async (atBoundary: boolean) => {
     if (stopped) return;
     timer = null;
     try {
       const now = clock.now();
       const last = await lastRunStore.read();
       // Fire at most once for any missed runs since the last recorded run.
-      const shouldFire = last === null || nextRun(schedule, last) <= now;
+      // With no recorded run there is nothing missed: a first start waits for
+      // the next boundary instead of firing early (and then again at it).
+      const shouldFire = last === null ? atBoundary : nextRun(schedule, last) <= now;
       if (shouldFire) {
         await run(nextRun(schedule, last ?? now - 1));
         await lastRunStore.write(now);
@@ -208,7 +212,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     async start() {
       if (!stopped) return;
       stopped = false;
-      chain = chain.then(() => tick());
+      chain = chain.then(() => tick(false));
       await chain;
     },
     async stop() {

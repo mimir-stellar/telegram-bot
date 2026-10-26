@@ -407,6 +407,13 @@ function assertEventXdrWithinCap(event: rpc.Api.EventResponse): void {
   }
 }
 function native(value: xdr.ScVal): unknown {
+  // stellar-sdk 16 threw on anything that was not an ScVal; 17 (#527) quietly
+  // returns undefined, which would let garbage decode as an empty payload.
+  // Keep failing closed so malformed values still surface as `unknown`.
+  const v = value as unknown as { type?: unknown } | null;
+  if (v === null || typeof v !== "object" || typeof v.type !== "string") {
+    throw new DecodeError(`expected an ScVal, got ${v === null ? "null" : typeof v}`);
+  }
   return scValToNative(value);
 }
 
@@ -1311,10 +1318,13 @@ function safeMeta(
 /**
  * A transaction hash is usable for ordering display and explorer links only
  * when it is a 64-character hex string (32-byte Stellar transaction hash).
+ * The all-zero hash is a placeholder, never a real transaction (it would be a
+ * SHA-256 preimage of zero), so it is not usable either.
  * Anything else stays on the event but is never turned into a link.
  */
 export function isUsableTxHash(txHash: string): boolean {
-  return /^[0-9a-fA-F]{64}$/.test((txHash ?? "").trim());
+  const hash = (txHash ?? "").trim();
+  return /^[0-9a-fA-F]{64}$/.test(hash) && !/^0{64}$/.test(hash);
 }
 
 /** Rank a position for ordering: known indexes first (ascending), `null` last. */

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
-import { clipGraphemes } from "../src/notifications/grapheme.js";
+import { clipGraphemes } from "../dist/notifications/grapheme.js";
 
 test("ASCII clip matches code-unit behavior", () => {
   assert.strictEqual(clipGraphemes("hello world", 5), "hello");

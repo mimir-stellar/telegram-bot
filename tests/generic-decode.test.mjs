@@ -78,11 +78,11 @@ function scI64(n) {
 }
 
 function scTimepoint(n) {
-  return xdr.ScVal.scvTimepoint(new xdr.TimePoint(xdr.Uint64.fromString(String(n))));
+  return xdr.ScVal.scvTimepoint(xdr.Uint64.fromString(String(n)));
 }
 
 function scDuration(n) {
-  return xdr.ScVal.scvDuration(new xdr.Duration(xdr.Uint64.fromString(String(n))));
+  return xdr.ScVal.scvDuration(xdr.Uint64.fromString(String(n)));
 }
 
 function scU128(n) {
@@ -90,7 +90,7 @@ function scU128(n) {
   const lo = bn & 0xffff_ffff_ffff_ffffn;
   const hi = bn >> 64n;
   return xdr.ScVal.scvU128(
-    new xdr.UInt128Parts({
+    new xdr.Uint128Parts({
       hi: xdr.Uint64.fromString(String(hi)),
       lo: xdr.Uint64.fromString(String(lo)),
     }),
@@ -124,7 +124,7 @@ function scI128(n) {
 function scU256(n) {
   const bn = BigInt(n);
   return xdr.ScVal.scvU256(
-    new xdr.UInt256Parts({
+    new xdr.Uint256Parts({
       hiHi: xdr.Uint64.fromString("0"),
       hiLo: xdr.Uint64.fromString("0"),
       loHi: xdr.Uint64.fromString("0"),

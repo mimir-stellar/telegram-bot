@@ -37,7 +37,7 @@ test("decodeEvent positive: market v1 event claim_created", () => {
     id: "100-1",
     topic: [
       xdr.ScVal.scvSymbol("claim_created"),
-      xdr.ScVal.scvU64(new xdr.Uint64(1, 0)),
+      xdr.ScVal.scvU64(1n),
       creatorAddr,
     ],
     value: xdr.ScVal.scvMap([
@@ -68,7 +68,7 @@ test("decodeEvent positive: market v2 event claim_created with title extension",
     id: "101-1",
     topic: [
       xdr.ScVal.scvSymbol("claim_created"),
-      xdr.ScVal.scvU64(new xdr.Uint64(2, 0)),
+      xdr.ScVal.scvU64(2n),
       creatorAddr,
     ],
     value: xdr.ScVal.scvMap([
@@ -136,7 +136,7 @@ test("decodeEvent boundary: invalid strkey address in topic yields unknown paylo
     txHash: "tx127",
     topic: [
       xdr.ScVal.scvSymbol("claim_created"),
-      xdr.ScVal.scvU64(new xdr.Uint64(1, 0)),
+      xdr.ScVal.scvU64(1n),
       xdr.ScVal.scvString("NOT_A_VALID_STELLAR_ADDRESS"),
     ],
     value: xdr.ScVal.scvMap([

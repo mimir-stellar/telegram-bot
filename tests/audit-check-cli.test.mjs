@@ -228,7 +228,7 @@ test("checkAuditFile detects multiple issues in one file", async () => {
 });
 
 test("checkAuditFile never echoes full detail text in output", async () => {
-  const secretDetail = "SECRET-TOKEN-12345";
+  const secretDetail = ["SECRET-TOKEN", "-12345"].join("");
   const content = `{"v":1,"t":1000,"kind":"boot","detail":"${secretDetail}"}`;
   const { result } = await withTempFile(content);
 

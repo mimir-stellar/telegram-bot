@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
-import { menuMessage, menuKeyboard } from "../src/commands/menu.js";
+import { menuMessage, menuKeyboard } from "../dist/commands/menu.js";
 
 test("menuMessage returns a non-empty string", () => {
   const message = menuMessage();

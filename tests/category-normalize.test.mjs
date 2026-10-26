@@ -4,7 +4,7 @@ import assert from "node:assert";
 import {
   MAX_CATEGORY_LENGTH,
   normalizeCategory,
-} from "../src/stellar/category.js";
+} from "../dist/stellar/category.js";
 
 test("case is folded to lowercase", () => {
   assert.strictEqual(normalizeCategory("Crypto"), "crypto");
