@@ -32,6 +32,7 @@ import { resumeMessage } from "./commands/resume.js";
 import { statusMessage } from "./commands/status.js";
 import type { CommandDeps } from "./commands/registry.js";
 import { TELEGRAM_OPTIONS, isOperator, safeAnswerCallback } from "./commands/runtime.js";
+import { canControl } from "./commands/admin-check.js";
 
 // ── Callback payload validation ──────────────────────────────────────────────
 
@@ -237,7 +238,7 @@ export async function handleCallbackQuery(
 
   // Enforce operator role authorization
   if (action.type === "pause" || action.type === "resume" || action.type === "broadcast") {
-    if (!isOperator(ctx, config)) {
+    if (!(await canControl(ctx, config, ctx.api))) {
       console.warn(
         `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
       );

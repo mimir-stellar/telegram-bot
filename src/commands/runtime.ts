@@ -11,6 +11,7 @@ import type { CommandContext, Context } from "grammy";
 
 import type { BotConfig } from "../config.js";
 import { safeErrorMessage, splitTelegramMessage } from "../notifications/format.js";
+import { canControl } from "./admin-check.js";
 
 /** MarkdownV2 reply options used by every command message. */
 export const TELEGRAM_OPTIONS = {
@@ -81,12 +82,12 @@ export function chatAllowed(
  * Gate for operator commands. Non-operators get no reply at all, matching the
  * silent-ignore policy above; the log records the ignored attempt.
  */
-export function operatorAllowed(
+export async function operatorAllowed(
   ctx: CommandContext<Context>,
   config: BotConfig,
   command: string,
-): boolean {
-  if (isOperator(ctx, config)) return true;
+): Promise<boolean> {
+  if (await canControl(ctx, config, ctx.api)) return true;
   console.warn(`[bot] ignored unauthorized /${command} on update ${ctx.update.update_id}`);
   return false;
 }

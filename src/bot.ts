@@ -54,6 +54,14 @@ import {
 // implementations live with the commands.
 
 export { previewMessage } from "./notifications/format.js";
+export {
+  AdminCache,
+  canControl,
+  clearAdminCache,
+  DEFAULT_ADMIN_CACHE_MAX_SIZE,
+  DEFAULT_ADMIN_CACHE_TTL_MS,
+  isChatAdmin,
+} from "./commands/admin-check.js";
 export { helpDetailMessage, COMMAND_DETAILS, type CommandDetail } from "./commands/help-detail.js";
 export {
   CALLBACK_PAUSE_CANCEL,
@@ -268,12 +276,12 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
  * the handler. Gating here — instead of inside each handler — means a new
  * operator-only or allowlisted command cannot forget its check.
  */
-function dispatch(
+async function dispatch(
   module: CommandModule,
   ctx: CommandContext<Context>,
   deps: BotDeps,
 ): Promise<void> {
-  if (module.operatorOnly === true && !operatorAllowed(ctx, deps.config, module.command)) {
+  if (module.operatorOnly === true && !(await operatorAllowed(ctx, deps.config, module.command))) {
     return Promise.resolve();
   }
   if (module.chatAllowlist === true && !chatAllowed(ctx, deps.config, module.command)) {
