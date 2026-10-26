@@ -6,6 +6,15 @@ All notable changes to this project are documented here.
 
 ### Added
 
+**Event-rate spike and silence detection** (#450)
+
+- New `src/stellar/rate-monitor.ts`: `createRateMonitor({ windowMs, baselineWindows, clock })`
+  buckets per-source event counts into fixed windows and `check()` reports a
+  spike (latest window above `spikeFactor` × baseline) or a silence (zero events
+  for `silenceWindows` windows after a non-zero baseline). No alert during
+  warm-up; memory is bounded per source and by `maxSources`. Detection only,
+  nothing is sent.
+
 **Selectable bot language**
 
 - `src/i18n.ts` now ships a message catalog per locale behind
