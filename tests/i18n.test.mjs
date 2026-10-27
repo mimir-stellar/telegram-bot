@@ -17,6 +17,7 @@ import test from "node:test";
 import {
   AUDIT_CLI_HINT,
   COMMAND_DESCRIPTIONS,
+  ES_MESSAGES,
   EXPLORER_BUTTON_TEXT,
   HELP_INTRO,
   HELP_TITLE,
@@ -35,6 +36,9 @@ import {
 } from "../dist/notifications/format.js";
 
 import {
+  CALLBACK_PAUSE_CONFIRM,
+  handlePauseConfirmCallback,
+  helpMessage,
   pauseMessage,
   resumeMessage,
   registerCommandHandlers,
@@ -277,17 +281,23 @@ test("NOTIFICATION_MD.claimResolved with summary produces correct snapshot", () 
   const result = NOTIFICATION_MD.claimResolved(
     "7",
     "challengers",
-    "100",
+    "██████████ 100%",
     "Onchain smoke \\— challengers awarded",
   );
   assert.match(result, /⚖️ \*Claim \\#7 resolved\* — winner: \*challengers\*/);
-  assert.match(result, /Confidence: 100%/);
+  assert.match(result, /Confidence: ██████████ 100%/);
   assert.match(result, /_Onchain smoke/);
 });
 
 test("NOTIFICATION_MD.claimResolved without summary omits the summary line", () => {
-  const result = NOTIFICATION_MD.claimResolved("7", "claimant", "85", null);
+  const result = NOTIFICATION_MD.claimResolved(
+    "7",
+    "claimant",
+    "████████░░ 85%",
+    null,
+  );
   assert.match(result, /⚖️ \*Claim \\#7 resolved\*/);
+  assert.match(result, /Confidence: ████████░░ 85%/);
   assert.equal(result.trimEnd(), result); // no trailing whitespace/newline
   assert.equal(result.includes("_"), false); // no italic syntax
 });
@@ -436,14 +446,14 @@ test("NOTIFICATION_PLAIN.claimChallenged produces plain-text snapshot", () => {
 });
 
 test("NOTIFICATION_PLAIN.claimResolved with summary", () => {
-  const result = NOTIFICATION_PLAIN.claimResolved(7, "challengers", "100", "summary text");
+  const result = NOTIFICATION_PLAIN.claimResolved(7, "challengers", "██████████ 100%", "summary text");
   assert.match(result, /Claim #7 resolved — winner: challengers/);
   assert.match(result, /\nsummary text/);
 });
 
 test("NOTIFICATION_PLAIN.claimResolved without summary omits the line", () => {
-  const result = NOTIFICATION_PLAIN.claimResolved(7, "claimant", "85", null);
-  assert.match(result, /Confidence: 85%/);
+  const result = NOTIFICATION_PLAIN.claimResolved(7, "claimant", "████████░░ 85%", null);
+  assert.match(result, /Confidence: ████████░░ 85%/);
   assert.equal(result.endsWith("%"), true);
 });
 
@@ -571,7 +581,7 @@ test("formatPlainTextEvent for claim_created uses NOTIFICATION_PLAIN.claimCreate
   const result = formatPlainTextEvent(config, event);
   assert.ok(result !== null);
   assert.match(result, /New claim #99/);
-  assert.match(result, /Category: sports/);
+  assert.match(result, /Category: ⚽ sports/);
   assert.equal(result.includes("*"), false); // no Markdown
 });
 
@@ -632,7 +642,7 @@ test("claim_created MarkdownV2 snapshot matches i18n template exactly", () => {
   const event = marketEvent({ name: "claim_created", claimId: 7, category: "crypto", creator: "GABCD" });
   const result = formatEvent(config, event);
   const expected =
-    "🆕 *New claim* \\#7\nCategory: crypto\nCreator: `GABCD`\n_ledger 42_";
+    "🆕 *New claim* \\#7\nCategory: 🪙 crypto\nCreator: `GABCD`\n_ledger 42_";
   assert.equal(result, expected);
 });
 
@@ -676,8 +686,54 @@ test("squad market_created MarkdownV2 snapshot matches i18n template", () => {
 
 // ── Regression: operator command replies are wired through i18n ───────────────
 
-test("/pause and /resume bot replies are sourced from PAUSE_MESSAGES and RESUME_MESSAGES", async () => {
+/**
+ * `/pause` is a two-step flow: the command asks for confirmation, and the
+ * confirmed callback performs the pause and renders the localized result. Both
+ * steps are asserted here so the i18n strings stay wired end to end.
+ */
+async function confirmedPauseReply(pauseResult) {
+  const config = baseConfig();
+  const pause = () => pauseResult;
+  const { handlers } = mockedBot({
+    config,
+    status: () => baseStatus(),
+    pause,
+    resume: () => "resumed",
+  });
+
+  const promptReplies = [];
+  await handlers.get("pause")({
+    from: { id: 42 },
+    update: { update_id: 200 },
+    reply: async (...args) => promptReplies.push(args),
+  });
+  assert.equal(promptReplies.length, 1);
+  assert.ok(promptReplies[0][1].reply_markup, "/pause must ask for confirmation");
+
+  const edits = [];
+  const messageDate = Math.floor(Date.now() / 1000);
+  await handlePauseConfirmCallback(
+    {
+      from: { id: 42 },
+      update: { update_id: 201 },
+      callbackQuery: { data: CALLBACK_PAUSE_CONFIRM, message: { date: messageDate } },
+      answerCallbackQuery: async () => undefined,
+      editMessageText: async (text, opts) => edits.push([text, opts]),
+    },
+    { config, pause },
+    messageDate * 1000 + 500,
+  );
+
+  assert.equal(edits.length, 1);
+  return edits[0];
+}
+
+test("/pause confirmation renders PAUSE_MESSAGES.paused and /resume replies from RESUME_MESSAGES", async () => {
   const TELEGRAM_OPTIONS = { parse_mode: "MarkdownV2", link_preview_options: { is_disabled: true } };
+  const [pauseText, pauseOptions] = await confirmedPauseReply("paused");
+  assert.equal(pauseText, PAUSE_MESSAGES.paused);
+  assert.deepEqual(pauseOptions, TELEGRAM_OPTIONS);
+
   const { handlers } = mockedBot({
     config: baseConfig(),
     status: () => baseStatus(),
@@ -685,63 +741,70 @@ test("/pause and /resume bot replies are sourced from PAUSE_MESSAGES and RESUME_
     resume: () => "resumed",
   });
 
-  const pauseReplies = [];
-  const pauseCtx = {
-    from: { id: 42 },
-    update: { update_id: 200 },
-    reply: async (...args) => pauseReplies.push(args),
-  };
-  await handlers.get("pause")(pauseCtx);
-  assert.equal(pauseReplies.length, 1);
-  assert.equal(pauseReplies[0][0], PAUSE_MESSAGES.paused);
-  assert.deepEqual(pauseReplies[0][1], TELEGRAM_OPTIONS);
-
   const resumeReplies = [];
-  const resumeCtx = {
+  await handlers.get("resume")({
     from: { id: 42 },
-    update: { update_id: 201 },
+    update: { update_id: 202 },
     reply: async (...args) => resumeReplies.push(args),
-  };
-  await handlers.get("resume")(resumeCtx);
+  });
   assert.equal(resumeReplies.length, 1);
   assert.equal(resumeReplies[0][0], RESUME_MESSAGES.resumed);
   assert.deepEqual(resumeReplies[0][1], TELEGRAM_OPTIONS);
 });
 
-test("/pause already-paused reply matches PAUSE_MESSAGES.alreadyPaused", async () => {
-  const { handlers } = mockedBot({
-    config: baseConfig(),
-    status: () => baseStatus(),
-    pause: () => "already-paused",
-    resume: () => "already-running",
-  });
-
-  const replies = [];
-  const ctx = {
-    from: { id: 42 },
-    update: { update_id: 202 },
-    reply: async (...args) => replies.push(args),
-  };
-  await handlers.get("pause")(ctx);
-  assert.equal(replies[0][0], PAUSE_MESSAGES.alreadyPaused);
+test("/pause already-paused confirmation matches PAUSE_MESSAGES.alreadyPaused", async () => {
+  const [text] = await confirmedPauseReply("already-paused");
+  assert.equal(text, PAUSE_MESSAGES.alreadyPaused);
 });
 
-test("/pause stopped reply matches PAUSE_MESSAGES.stopped", async () => {
-  const { handlers } = mockedBot({
-    config: baseConfig(),
-    status: () => baseStatus(),
-    pause: () => "stopped",
-    resume: () => "stopped",
-  });
+test("/pause stopped confirmation matches PAUSE_MESSAGES.stopped", async () => {
+  const [text] = await confirmedPauseReply("stopped");
+  assert.equal(text, PAUSE_MESSAGES.stopped);
+});
 
-  const replies = [];
-  const ctx = {
-    from: { id: 42 },
-    update: { update_id: 203 },
-    reply: async (...args) => replies.push(args),
-  };
-  await handlers.get("pause")(ctx);
-  assert.equal(replies[0][0], PAUSE_MESSAGES.stopped);
+// ── Locale selection: config.locale drives every i18n lookup ────────────────
+
+test("pauseMessage and resumeMessage render the selected locale", () => {
+  assert.equal(pauseMessage("paused", "es"), ES_MESSAGES.pauseMessages.paused);
+  assert.equal(pauseMessage("already-paused", "es"), ES_MESSAGES.pauseMessages.alreadyPaused);
+  assert.equal(resumeMessage("resumed", "es"), ES_MESSAGES.resumeMessages.resumed);
+  assert.equal(pauseMessage("paused", "en"), PAUSE_MESSAGES.paused);
+  assert.equal(pauseMessage("paused"), PAUSE_MESSAGES.paused);
+});
+
+test("helpMessage uses the configured locale for title and commands", () => {
+  const text = helpMessage({ ...baseConfig(), locale: "es" });
+  assert.ok(text.startsWith(ES_MESSAGES.helpTitle));
+  assert.ok(text.includes(ES_MESSAGES.commandDescriptions.pause));
+  assert.equal(text.includes(COMMAND_DESCRIPTIONS.pause), false);
+});
+
+test("formatEvent renders the Spanish MarkdownV2 template when locale is es", () => {
+  const config = testnetConfig({ locale: "es" });
+  const event = marketEvent({ name: "claim_created", claimId: 7, category: "crypto", creator: "GABCD" });
+  const result = formatEvent(config, event);
+  assert.ok(result.startsWith("🆕 *Nueva reclamación* \\#7"));
+  assert.equal(result.includes("New claim"), false);
+});
+
+test("formatPlainTextEvent renders Spanish when locale is es", () => {
+  const config = testnetConfig({ locale: "es" });
+  const event = marketEvent({ name: "claim_cancelled", claimId: 3 });
+  assert.equal(formatPlainTextEvent(config, event), "Reclamación #3 cancelada — apuestas devueltas\nledger 42");
+});
+
+test("explorerKeyboard uses the localized button labels", () => {
+  const config = testnetConfig({
+    locale: "es",
+    mimirAppUrl: "https://app.example.test",
+  });
+  const event = marketEvent({}, {
+    txHash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  });
+  const keyboard = explorerKeyboard(config, event);
+  assert.ok(keyboard !== undefined);
+  assert.equal(keyboard.inline_keyboard[0][0].text, ES_MESSAGES.explorerButtonText);
+  assert.equal(keyboard.inline_keyboard[0][1].text, ES_MESSAGES.mimirAppButtonText);
 });
 
 // ── Boundary: no reserved character in plain-text templates ──────────────────

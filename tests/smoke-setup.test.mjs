@@ -120,7 +120,7 @@ function baseConfig(overrides = {}) {
     operatorTelegramUserId: null,
     pollIntervalMs: 30_000,
     startLookbackLedgers: 60,
-    cursorFile: "./data/cursor.json",
+    cursorFile: "/tmp/unused-cursor.json",
     maxNotificationsPerCycle: 20,
     healthHost: "127.0.0.1",
     healthPort: 0,
@@ -173,7 +173,7 @@ test("mock profile loads without any environment variables", () => {
     assert.equal(config.rpcUrl, `http://127.0.0.1:${MOCK_RPC_DEFAULT_PORT}`);
     assert.equal(config.marketContractId, MOCK_MARKET_CONTRACT_ID);
     assert.equal(config.squadContractId, MOCK_SQUAD_CONTRACT_ID);
-    assert.equal(config.cursorFile, path.resolve("./data/cursor.mock.json"));
+    assert.equal(config.cursorFile, path.resolve("./data/cursor.mock.json")); // hermetic-data: allow
     assert.equal(config.networkPassphrase, MOCK_NETWORK_PASSPHRASE);
     assert.equal(networkLabel(config), "mock");
     assert.equal(config.botToken, "MOCK-PROFILE-NOT-A-BOT-TOKEN");
@@ -367,7 +367,7 @@ test("config provenance never includes setting values", () => {
   withEnv(
     {
       MIMIR_PROFILE: "mock",
-      BOT_TOKEN: "123456789:" + "REAL-SECRET-TOKEN",
+      BOT_TOKEN: "123456789:" + "REAL-SECRET-TOKEN-PADDED-TO-35-CHARS",
       TELEGRAM_CHAT_ID: "-1001234567890",
     },
     () => {
@@ -466,10 +466,13 @@ test("clean checkout: mock RPC, poller, and health server start without credenti
       const pollerConfig = {
         ...config,
         cursorFile,
+        countersFile: path.join(dir, "counters.json"),
         lockFile: path.join(dir, "poller.lock"),
         statusFile: path.join(dir, "status.json"),
         auditFile: path.join(dir, "audit.jsonl"),
         deadLetterFile: path.join(dir, "dead-letter.json"),
+        sendJournalFile: path.join(dir, "send-journal.jsonl"),
+        csvOutputFile: path.join(dir, "scanner_output.csv"),
         healthPort: 18799, // unique across suites: test files run in parallel
         rpcUrl: mock.url,
       };

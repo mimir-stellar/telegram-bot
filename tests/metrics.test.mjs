@@ -133,6 +133,36 @@ test("gauge: can decrease (unlike a counter)", () => {
   assert.equal(m.consecutiveFailures.value(), 3);
 });
 
+test("activity baseline: gauges start at zero and can be updated independently", () => {
+  const m = createMetrics();
+  assert.equal(m.lastCycleEvents.value(), 0);
+  assert.equal(m.activityBaselineEvents.value(), 0);
+  assert.equal(m.activityAnomalies.value(), 0);
+
+  m.lastCycleEvents.set(7);
+  m.activityBaselineEvents.set(4);
+  m.activityAnomalies.inc();
+
+  assert.equal(m.lastCycleEvents.value(), 7);
+  assert.equal(m.activityBaselineEvents.value(), 4);
+  assert.equal(m.activityAnomalies.value(), 1);
+});
+
+test("activity baseline: rendered metrics expose the last count and baseline", () => {
+  const m = createMetrics();
+  m.lastCycleEvents.set(12);
+  m.activityBaselineEvents.set(5);
+  m.activityAnomalies.inc(2);
+
+  const output = m.render();
+  assert.ok(output.includes("# TYPE mimir_bot_last_cycle_events gauge"), output);
+  assert.ok(output.includes("mimir_bot_last_cycle_events 12"), output);
+  assert.ok(output.includes("# TYPE mimir_bot_activity_baseline_events gauge"), output);
+  assert.ok(output.includes("mimir_bot_activity_baseline_events 5"), output);
+  assert.ok(output.includes("# TYPE mimir_bot_activity_anomalies_total counter"), output);
+  assert.ok(output.includes("mimir_bot_activity_anomalies_total 2"), output);
+});
+
 // ── render() format tests ─────────────────────────────────────────────────────
 
 test("render: output ends with a newline", () => {
@@ -155,6 +185,9 @@ test("render: contains all expected metric names", () => {
     "mimir_bot_notifications_failed_total",
     "mimir_bot_stale_cursor_events_total",
     "mimir_bot_consecutive_failures",
+    "mimir_bot_last_cycle_events",
+    "mimir_bot_activity_baseline_events",
+    "mimir_bot_activity_anomalies_total",
   ];
 
   for (const name of expectedNames) {

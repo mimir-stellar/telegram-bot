@@ -48,7 +48,10 @@ export const MAX_SEND_DURATION_CHARS = 32;
  * outside this process (RPC errors, Telegram errors, cursors), so the snapshot
  * and the logs derived from it stay bounded and single-line.
  */
-export function boundText(value: string, max = MAX_ERROR_CHARS): string {
+export function boundText(value: string | null | undefined, max = MAX_ERROR_CHARS): string {
+  // A missing message (an error without one) bounds to "", never a TypeError
+  // while the status snapshot is being written.
+  if (typeof value !== "string") return "";
   const collapsed = value.replace(/\s+/g, " ").trim();
   if (collapsed.length <= max) return collapsed;
   return `${collapsed.slice(0, max - 1)}…`;
@@ -94,6 +97,13 @@ export interface StatusTargetSnapshot {
   lastSendTimeout: string | null;
 }
 
+export interface PollerCounterSnapshot {
+  cycles: number;
+  notificationsSent: number;
+  notificationsFailed: number;
+  eventsSkipped: number;
+}
+
 export interface StatusSnapshot {
   schemaVersion: number;
   /** ISO-8601, so a reader needs no clock agreement with the writer. */
@@ -114,6 +124,10 @@ export interface StatusSnapshot {
   notificationsSent: number;
   notificationsFailed: number;
   eventsSkipped: number;
+  /** Counter values accumulated since this process started. */
+  sinceStart: PollerCounterSnapshot;
+  /** Cumulative counter values persisted across restarts for the current contract IDs. */
+  cumulative: PollerCounterSnapshot;
   /** Suppressed by the bounded dedup window as already-processed. */
   eventsDeduplicated: number;
   /** Cursors automatically rewound to the RPC's retained floor this run. */
@@ -139,6 +153,29 @@ export function buildStatusSnapshot(
   status: PollerStatus,
   now: number = Date.now(),
 ): StatusSnapshot {
+  const defaultCounters: PollerCounterSnapshot = {
+    cycles: status.cycles,
+    notificationsSent: status.notificationsSent,
+    notificationsFailed: status.notificationsFailed,
+    eventsSkipped: status.eventsSkipped,
+  };
+  const sinceStart: PollerCounterSnapshot = status.sinceStart
+    ? {
+        cycles: status.sinceStart.cycles,
+        notificationsSent: status.sinceStart.notificationsSent,
+        notificationsFailed: status.sinceStart.notificationsFailed,
+        eventsSkipped: status.sinceStart.eventsSkipped,
+      }
+    : { ...defaultCounters };
+  const cumulative: PollerCounterSnapshot = status.cumulative
+    ? {
+        cycles: status.cumulative.cycles,
+        notificationsSent: status.cumulative.notificationsSent,
+        notificationsFailed: status.cumulative.notificationsFailed,
+        eventsSkipped: status.cumulative.eventsSkipped,
+      }
+    : { ...defaultCounters };
+
   return {
     schemaVersion: STATUS_SCHEMA_VERSION,
     generatedAt: new Date(now).toISOString(),
@@ -157,6 +194,8 @@ export function buildStatusSnapshot(
     notificationsSent: status.notificationsSent,
     notificationsFailed: status.notificationsFailed,
     eventsSkipped: status.eventsSkipped,
+    sinceStart,
+    cumulative,
     eventsDeduplicated: status.eventsDeduplicated ?? 0,
     cursorRewinds: status.cursorRewinds ?? 0,
     consecutiveFailures: status.consecutiveFailures,

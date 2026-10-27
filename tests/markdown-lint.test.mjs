@@ -18,6 +18,8 @@ import {
   NOTIFICATION_MD,
   PAUSE_MESSAGES,
   RESUME_MESSAGES,
+  SUPPORTED_LOCALES,
+  messagesFor,
 } from "../dist/i18n.js";
 
 /** Telegram's MarkdownV2 reserved characters. */
@@ -719,6 +721,31 @@ test("i18n export: NOTIFICATION_MD template functions produce valid MarkdownV2 w
     NOTIFICATION_MD.fallbackEvent("{source}", "{contract}", "{ledger}", "{reason}", ""),
     "fallbackEvent (without tx link)",
   );
+});
+
+test("i18n export: every locale's MarkdownV2 strings are valid", () => {
+  for (const locale of SUPPORTED_LOCALES) {
+    const messages = messagesFor(locale);
+    assertValidMarkdownV2(messages.helpTitle, `${locale}.helpTitle`);
+
+    for (const [key, value] of Object.entries(messages.pauseMessages)) {
+      assertValidMarkdownV2(value, `${locale}.PAUSE_MESSAGES.${key}`);
+    }
+    for (const [key, value] of Object.entries(messages.resumeMessages)) {
+      assertValidMarkdownV2(value, `${locale}.RESUME_MESSAGES.${key}`);
+    }
+
+    for (const [key, value] of Object.entries(messages.notificationMd)) {
+      if (typeof value === "string") {
+        assertValidMarkdownV2(value, `${locale}.NOTIFICATION_MD.${key}`);
+      } else if (typeof value === "function") {
+        const args = Array.from({ length: value.length }, (_, idx) => `{arg${idx}}`);
+        assertValidMarkdownV2(value(...args), `${locale}.NOTIFICATION_MD.${key}`);
+      } else {
+        assert.fail(`Unexpected entry type for ${locale}.NOTIFICATION_MD.${key}`);
+      }
+    }
+  }
 });
 
 test("i18n export: every entry in NOTIFICATION_MD is exhaustively verified", () => {

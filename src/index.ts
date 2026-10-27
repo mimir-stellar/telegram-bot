@@ -148,6 +148,7 @@ async function main(): Promise<void> {
   );
   console.log(`[boot] cursor file  ${config.cursorFile}`);
   console.log(`[boot] flags        ${formatFeatureFlags(config.featureFlags)}`);
+  console.log(`[boot] locale       ${config.locale}`);
   console.log(`[boot] audit file   ${config.auditFile}`);
   console.log(`[boot] lock file    ${config.lockFile}`);
   console.log(`[boot] shutdown     ${config.shutdownTimeoutMs}ms drain budget`);
@@ -255,6 +256,11 @@ async function main(): Promise<void> {
     config,
     server,
     send: (text, source, extra) => notify(text, source, extra),
+    notifyOperator: config.operatorTelegramUserId
+      ? async (text: string) => {
+          await bot.api.sendMessage(config.operatorTelegramUserId!, text);
+        }
+      : undefined,
     audit,
     metrics,
   });

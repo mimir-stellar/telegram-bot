@@ -89,6 +89,7 @@ deployments continue unchanged and the operator commands are ignored.
 ```bash
 cp .env.example .env     # then fill in BOT_TOKEN and TELEGRAM_CHAT_ID
 npm install
+npm run doctor           # verify environment and .env configuration
 npm run dev              # tsx, restarts on change
 ```
 
@@ -1013,6 +1014,10 @@ deadline.
 The process exposes a **loopback HTTP** probe for supervisors and deploy
 checks (default `http://127.0.0.1:8787`):
 
+Webhook deployments reuse this listener. See the
+[Telegram webhook mode runbook](docs/webhook-mode.md) for the exact route,
+proxy requirements, secret lifecycle, verification, and rollback steps.
+
 | Path | Meaning |
 | --- | --- |
 | `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
@@ -1134,6 +1139,23 @@ notification:
 
 This is driven by the presence of a non-empty `txHash` field on each event, not
 configuration. All persisted state and cursor format remain unchanged.
+
+### Language
+
+All user-facing text comes from `src/i18n.ts`, which ships a message catalog per
+locale. Set `MIMIR_LOCALE` to choose one:
+
+| `MIMIR_LOCALE` | Language |
+| --- | --- |
+| `en` (default) | English |
+| `es` | Spanish |
+
+A region suffix (`es-MX`, `es_419`) is accepted and ignored. Anything else
+fails startup with the supported list, so a typo cannot silently fall back to
+English. The locale covers notifications, `/help`, the Telegram command menu,
+pause/resume replies and notification buttons; the selected value is logged at
+boot (`[boot] locale …`). See [`docs/translating.md`](docs/translating.md) for
+adding a language.
 
 ## Layout
 
