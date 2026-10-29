@@ -56,8 +56,8 @@
     "branches": 80
   },
   "dependencies": {
-    "@stellar/stellar-sdk": "^17.2.1",
-    "dotenv": "^18.0.8",
+    "@stellar/stellar-sdk": "^17.4.0",
+    "dotenv": "^18.0.9",
     "grammy": "^1.46.0"
   },
   "devDependencies": {
