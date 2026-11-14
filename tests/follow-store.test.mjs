@@ -158,3 +158,49 @@ test('writes atomically via temp + rename', async () => {
     assert.deepStrictEqual(files, ['follows.json']);
   });
 });
+
+test('retains corrupt follow file bytes and throws redacted actionable error when quarantine rename fails', async () => {
+  await withTempDir(async (dir) => {
+    const { createFollowStore } = await importStore();
+    const filePath = pathJoin(dir, 'follows.json');
+    const raw = '{"version":1,"follows":{"chat:1":["market:precious"';
+    await fs.promises.writeFile(filePath, raw, 'utf8');
+    const ts = 1_700_000_000_000;
+    await fs.promises.mkdir(pathJoin(dir, `follows.json.corrupt.${ts}`), { recursive: true });
+    await fs.promises.writeFile(pathJoin(dir, `follows.json.corrupt.${ts}`, 'k'), 'x', 'utf8');
+    const realNow = Date.now;
+    Date.now = () => ts;
+    try {
+      const s = createFollowStore({ filePath, now: () => ts });
+      for (const op of [() => s.list('c'), () => s.followersOf('market:a'), () => s.follow('c', 'market:a'), () => s.unfollow('c', 'market:a')]) {
+        assert.throws(op, (e) => e.name === 'FollowStoreError' && /quarantine.*retained in place/i.test(e.message));
+      }
+    } finally {
+      Date.now = realNow;
+    }
+    assert.strictEqual(await fs.promises.readFile(filePath, 'utf8'), raw);
+  });
+});
+
+test('preserves unreadable follow file and redacts credentials when read and quarantine both fail', async () => {
+  await withTempDir(async (dir) => {
+    const { createFollowStore } = await importStore();
+    const filePath = pathJoin(dir, 'follows.json');
+    const raw = Buffer.from([0xff, 0xfe, 0x00, 0x7b]);
+    await fs.promises.writeFile(filePath, raw);
+    const url = 'https://' + 'op' + ':' + 'hunter2secret' + '@rpc.example.invalid';
+    let unlinked = false;
+    const s = createFollowStore({
+      filePath,
+      now: () => 1_700_000_000_123,
+      fs: {
+        readFileSync: () => { throw new Error(`EACCES: ${url}`); },
+        renameSync: () => { throw new Error(`EROFS: ${url}`); },
+        unlinkSync: () => { unlinked = true; },
+      },
+    });
+    assert.throws(() => s.follow('c', 'market:a'), (e) => e.name === 'FollowStoreError' && !e.message.includes('hunter2secret') && e.message.includes('[REDACTED]') && /EROFS/.test(e.message));
+    assert.strictEqual(unlinked, false);
+    assert.strictEqual(Buffer.compare(await fs.promises.readFile(filePath), raw), 0);
+  });
+});
