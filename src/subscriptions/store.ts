@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { redactError, redactText } from "../redact.js";
 
 export type RefKind = "market" | "squad";
 
@@ -27,6 +28,17 @@ export class FollowStoreError extends Error {
   }
 }
 
+export interface FollowStoreFs {
+  readFileSync: (filePath: fs.PathOrFileDescriptor, encoding: BufferEncoding) => string;
+  renameSync: (oldPath: fs.PathLike, newPath: fs.PathLike) => void;
+  unlinkSync?: (filePath: fs.PathLike) => void;
+}
+
+/**
+ * Configuration for `FollowStore`. Corrupt or unreadable files are moved to
+ * `${filePath}.corrupt.<timestamp>`; if quarantine `rename` fails, source bytes
+ * are retained in place (never unlinked) and a redacted `FollowStoreError` is thrown.
+ */
 export interface FollowStoreOptions {
   filePath: string;
   maxPerChat?: number;
@@ -34,6 +46,8 @@ export interface FollowStoreOptions {
   // Aliases for API compatibility.
   maxFollowsPerChat?: number;
   maxTotalEntries?: number;
+  fs?: Partial<FollowStoreFs>;
+  now?: () => number;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -89,20 +103,23 @@ function validateStoreFile(data: unknown): StoreFile {
   return { version: STORE_VERSION, follows };
 }
 
-function quarantineFile(filePath: string): void {
-  const timestamp = Date.now();
+function quarantineFile(
+  renameSync: FollowStoreFs["renameSync"],
+  now: () => number,
+  filePath: string,
+  reason: string,
+): void {
+  const timestamp = now();
   const dir = path.dirname(filePath);
   const base = path.basename(filePath);
   const target = path.join(dir, `${base}.corrupt.${timestamp}`);
   try {
-    fs.renameSync(filePath, target);
-  } catch {
-    // If quarantine fails (e.g. permission), remove the corrupt file so we can start fresh.
-    try {
-      fs.unlinkSync(filePath);
-    } catch {
-      // ignore - best effort
-    }
+    renameSync(filePath, target);
+  } catch (renameErr) {
+    // Retain unreadable/corrupt bytes in place and raise a redacted actionable error.
+    throw new FollowStoreError(
+      `failed to quarantine unreadable follow store ${redactText(filePath)} to ${redactText(target)} (${redactText(reason)}): ${redactError(renameErr)}; source file retained in place — check directory permissions or move/repair the file`,
+    );
   }
 }
 
@@ -110,12 +127,19 @@ export class FollowStore {
   private readonly filePath: string;
   private readonly maxPerChat: number;
   private readonly maxTotal: number;
+  private readonly readFileSync: FollowStoreFs["readFileSync"];
+  private readonly renameSync: FollowStoreFs["renameSync"];
+  private readonly now: () => number;
 
   constructor(options: FollowStoreOptions) {
     this.filePath = options.filePath;
     this.maxPerChat =
       options.maxPerChat ?? options.maxFollowsPerChat ?? DEFAULT_MAX_PER_CHAT;
     this.maxTotal = options.maxTotal ?? options.maxTotalEntries ?? DEFAULT_MAX_TOTAL;
+    this.readFileSync =
+      options.fs?.readFileSync ?? ((p, enc) => fs.readFileSync(p, enc));
+    this.renameSync = options.fs?.renameSync ?? fs.renameSync;
+    this.now = options.now ?? Date.now;
   }
 
   private read(): StoreFile {
@@ -124,9 +148,9 @@ export class FollowStore {
     }
     let raw: string;
     try {
-      raw = fs.readFileSync(this.filePath, "utf8");
-    } catch {
-      quarantineFile(this.filePath);
+      raw = this.readFileSync(this.filePath, "utf8");
+    } catch (err) {
+      quarantineFile(this.renameSync, this.now, this.filePath, redactError(err));
       return emptyStore();
     }
     if (raw.trim() === "") {
@@ -135,14 +159,14 @@ export class FollowStore {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
-    } catch {
-      quarantineFile(this.filePath);
+    } catch (err) {
+      quarantineFile(this.renameSync, this.now, this.filePath, redactError(err));
       return emptyStore();
     }
     try {
       return validateStoreFile(parsed);
-    } catch {
-      quarantineFile(this.filePath);
+    } catch (err) {
+      quarantineFile(this.renameSync, this.now, this.filePath, redactError(err));
       return emptyStore();
     }
   }
