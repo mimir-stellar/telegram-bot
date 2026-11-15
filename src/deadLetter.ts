@@ -36,6 +36,8 @@ export interface DeadLetterEntry {
   source: string;
   ledger: number;
   eventName: string;
+  /** Optional on-chain `ledgerClosedAt` Unix timestamp in seconds when known. */
+  ledgerClosedAtSeconds?: number;
   /** Already-formatted MarkdownV2 message body, truncated to {@link TEXT_TRUNCATE}. */
   text: string;
   attempts: number;
@@ -168,6 +170,11 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
             source: typeof e.source === "string" ? e.source : "unknown",
             ledger: e.ledger,
             eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
+            ...(typeof e.ledgerClosedAtSeconds === "number" &&
+            Number.isFinite(e.ledgerClosedAtSeconds) &&
+            e.ledgerClosedAtSeconds > 0
+              ? { ledgerClosedAtSeconds: e.ledgerClosedAtSeconds }
+              : {}),
             text: truncate(e.text, TEXT_TRUNCATE),
             attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
             lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
@@ -219,6 +226,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     source: string;
     ledger: number;
     eventName: string;
+    ledgerClosedAtSeconds?: number;
     text: string;
     error: unknown;
   }): Promise<DeadLetterEntry> {
@@ -248,6 +256,11 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       source: input.source,
       ledger: input.ledger,
       eventName: input.eventName,
+      ...(typeof input.ledgerClosedAtSeconds === "number" &&
+      Number.isFinite(input.ledgerClosedAtSeconds) &&
+      input.ledgerClosedAtSeconds > 0
+        ? { ledgerClosedAtSeconds: input.ledgerClosedAtSeconds }
+        : {}),
       text: truncate(input.text, TEXT_TRUNCATE),
       attempts: 1,
       lastError: safeError(input.error),

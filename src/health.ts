@@ -21,6 +21,10 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import {
+  EndToEndNotificationAgeTracker,
+  renderNotificationAgeSnapshotLines,
+} from "./stellar/metrics.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -442,6 +446,13 @@ export function buildMetricsReport(
       );
     }
   }
+
+  const notificationAge =
+    poller.notificationAge ?? new EndToEndNotificationAgeTracker().snapshot();
+  lines.push(
+    ``,
+    ...renderNotificationAgeSnapshotLines(notificationAge, `mimir_telegram_`, { network }),
+  );
 
   return lines.join("\\n") + "\\n";
 }

@@ -97,6 +97,11 @@ import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./sta
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
 import {
+  EndToEndNotificationAgeTracker,
+  type EndToEndNotificationAgeSnapshot,
+  type NotificationIngressStamp,
+} from "./stellar/metrics.js";
+import {
   eventCursorLedger,
   readContractEvents,
   resumeCursorProblem,
@@ -344,6 +349,8 @@ export interface PollerStatus {
   suppressedLogs: number;
   /** Dead-letter queue counters (see src/deadLetter.ts). */
   deadLetter: DeadLetterStats;
+  /** End-to-end notification age summary from ledger close time to confirmed send. */
+  notificationAge?: EndToEndNotificationAgeSnapshot;
   /** Telegram sends abandoned by the per-send timeout, when tracked. */
   sendTimeouts?: number;
   /** Bounded description of the most recent send timeout, when tracked. */
@@ -537,6 +544,11 @@ export interface PollerDeps {
   activityBaselineOptions?: ActivityBaselineOptions;
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Monotonic clock (ms) used to measure in-process notification send durations
+   * without wall-clock / NTP drift. Defaults to `performance.now`.
+   */
+  monotonicNow?: () => number;
   /**
    * Async delay used for send-spacing and retry back-off.
    * Defaults to a real `setTimeout`-based sleep. Inject a no-op in tests to
@@ -1346,6 +1358,24 @@ export function createPoller(deps: PollerDeps) {
       DEFAULT_SEND_TIMEOUT_MS,
   };
   const now = deps.now ?? Date.now;
+  let monoFallbackAcc = 0;
+  let monoFallbackPrevWall: number | null = null;
+  const monotonicNow: () => number =
+    deps.monotonicNow ??
+    (deps.now !== undefined
+      ? () => {
+          const w = now();
+          if (monoFallbackPrevWall !== null && Number.isFinite(w) && w > monoFallbackPrevWall) {
+            monoFallbackAcc += w - monoFallbackPrevWall;
+          }
+          if (Number.isFinite(w)) monoFallbackPrevWall = w;
+          return monoFallbackAcc;
+        }
+      : () => performance.now());
+  const pollerAgeTracker = new EndToEndNotificationAgeTracker({
+    wallClock: now,
+    monotonicClock: monotonicNow,
+  });
   const sleep = deps.sleep ?? defaultSleep;
   const activityBaseline = new ActivityBaseline(deps.activityBaselineOptions);
   const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
@@ -1468,6 +1498,8 @@ export function createPoller(deps: PollerDeps) {
 
   /** Event ids that may already have been sent (crash recovery); never re-notified. */
   const maybeSent = new Set<string>();
+  const maxParkedStamps = Math.max(1, config.deadLetterMax ?? DEAD_LETTER_MAX_ENTRIES);
+  const parkedIngressStamps = new Map<string, NotificationIngressStamp>();
 
   /** Mirror the queue's counters into the status this poller reports. */
   function refreshDeadLetterStatus(): void {
@@ -1510,6 +1542,7 @@ export function createPoller(deps: PollerDeps) {
     lastCyclePages: 0,
     notificationsDropped: 0,
     deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0 },
+    notificationAge: pollerAgeTracker.snapshot(),
     eventsDeduplicated: 0,
     cursorRewinds: 0,
     restartGaps: 0,
@@ -1998,6 +2031,8 @@ export function createPoller(deps: PollerDeps) {
     events: DecodedEvent[],
     correlationId: string,
   ): Promise<NotificationResult> {
+    const batchIngestedWallMs = now();
+    const batchIngestedMonoMs = monotonicNow();
     let sentThisCycle = 0;
     let failed = 0;
     let skipped = 0;
@@ -2191,6 +2226,11 @@ export function createPoller(deps: PollerDeps) {
         }
       }
 
+      const ingressStamp = pollerAgeTracker.begin(
+        event.at > 0 ? event.at : null,
+        batchIngestedWallMs,
+        batchIngestedMonoMs,
+      );
       try {
         // Use bounded retry for Telegram sends to handle transient failures
         await sendWithRetry(
@@ -2201,6 +2241,10 @@ export function createPoller(deps: PollerDeps) {
           () => !status.stopping,
           sleep,
         );
+        const confirmedMonoMs = monotonicNow();
+        pollerAgeTracker.confirm(ingressStamp, confirmedMonoMs);
+        metrics?.notificationAge.confirm(ingressStamp, confirmedMonoMs);
+        status.notificationAge = pollerAgeTracker.snapshot();
         recordSentIncrement();
         metrics?.notificationsSent.inc();
         sentThisCycle += 1;
@@ -2235,13 +2279,20 @@ export function createPoller(deps: PollerDeps) {
             `${errorMessage(err)} correlation=${correlationId}`,
         );
         if (deadLetterEnabled) {
-          await deadLetter.enqueue({
+          const parkedEntry = await deadLetter.enqueue({
             source: event.source,
             ledger: event.ledger,
             eventName: event.payload.name,
+            ...(event.at > 0 ? { ledgerClosedAtSeconds: event.at } : {}),
             text,
             error: err,
           });
+          parkedIngressStamps.set(parkedEntry.id, ingressStamp);
+          while (parkedIngressStamps.size > maxParkedStamps) {
+            const oldestKey = parkedIngressStamps.keys().next().value;
+            if (oldestKey === undefined) break;
+            parkedIngressStamps.delete(oldestKey);
+          }
           refreshDeadLetterStatus();
         }
       }
@@ -2271,6 +2322,10 @@ export function createPoller(deps: PollerDeps) {
     if (!deadLetterEnabled || status.stopping) return;
     try {
       const flushed = await deadLetter.flush(async (text, entry) => {
+        const savedStamp = parkedIngressStamps.get(entry.id);
+        const replayStamp: NotificationIngressStamp =
+          savedStamp ??
+          pollerAgeTracker.begin(entry.ledgerClosedAtSeconds ?? null, now(), monotonicNow());
         await sendWithRetry(
           (message) => send(message, entry.source as ContractSource),
           text,
@@ -2279,6 +2334,11 @@ export function createPoller(deps: PollerDeps) {
           () => !status.stopping,
           sleep,
         );
+        const confirmedMonoMs = monotonicNow();
+        parkedIngressStamps.delete(entry.id);
+        pollerAgeTracker.confirm(replayStamp, confirmedMonoMs);
+        metrics?.notificationAge.confirm(replayStamp, confirmedMonoMs);
+        status.notificationAge = pollerAgeTracker.snapshot();
       }, Math.max(0, config.maxNotificationsPerCycle));
       if (flushed.sent > 0) {
         recordSentIncrement(flushed.sent);
@@ -3169,6 +3229,7 @@ export function createPoller(deps: PollerDeps) {
         },
         ledgerCache: ledgerCache.stats(),
         suppressedLogs: errorSampler.suppressedTotal(),
+        notificationAge: pollerAgeTracker.snapshot(),
         targets: [...state.values()].map((t) => ({ ...t })),
       };
     },

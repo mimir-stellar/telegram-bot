@@ -238,6 +238,16 @@ The `mimir_telegram_latest_ledger` and `mimir_telegram_target_last_event_ledger`
 lines are omitted when no ledger has been observed yet (cold start or no
 events seen).
 
+End-to-end notification age from on-chain ledger close time to confirmed
+Telegram delivery is exposed on both scrape endpoints
+(`mimir_telegram_notification_end_to_end_age_ms` and
+`mimir_bot_notification_end_to_end_age_ms`), pairing the initial wall-clock
+chain-to-ingestion delta with a monotonic clock (`performance.now()`) for
+in-process queuing, retry, and send duration. Events that omit a plausible
+`ledgerClosedAt` increment `*_notification_missing_ledger_time_total` without
+recording a `0` age sample, keeping missing ledger timestamps distinct from
+genuine zero delivery lag (`*_notification_zero_lag_total`, `last_age_ms 0`).
+
 ```bash
 curl -s http://127.0.0.1:8787/metrics
 
@@ -317,6 +327,13 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_notification_end_to_end_age_ms` | histogram | End-to-end notification age in ms from ledger close time to confirmed send across fixed finite buckets (`1000`..`900000` ms + `+Inf`) |
+| `mimir_bot_notification_missing_ledger_time_total` | counter | Confirmed sends whose on-chain event omitted a plausible `ledgerClosedAt` timestamp (never recorded as `0` lag) |
+| `mimir_bot_notification_age_clock_skew_total` | counter | Confirmed sends excluded from age stats because local ingestion wall clock preceded `ledgerClosedAt` |
+| `mimir_bot_notification_zero_lag_total` | counter | Confirmed sends with a valid ledger close timestamp and `0ms` end-to-end age |
+| `mimir_bot_notification_send_duration_ms_total` | counter | Cumulative monotonic in-process send duration in ms across confirmed sends |
+| `mimir_bot_notification_last_age_ms` | gauge | Most recent valid end-to-end notification age in ms (omitted until at least one valid ledger-timed send is confirmed) |
+| `mimir_bot_notification_max_age_ms` | gauge | Maximum valid end-to-end notification age in ms since process start (omitted until first valid sample) |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment

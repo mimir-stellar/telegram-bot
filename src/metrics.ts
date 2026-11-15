@@ -25,6 +25,14 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import {
+  EndToEndNotificationAgeTracker,
+  type EndToEndNotificationAgeOptions,
+  type EndToEndNotificationAgeSnapshot,
+  type NotificationAgeObservation,
+  type NotificationIngressStamp,
+} from "./stellar/metrics.js";
+
 // ── Metric types ──────────────────────────────────────────────────────────────
 
 export interface Counter {
@@ -39,6 +47,19 @@ export interface Gauge {
   set(value: number): void;
   /** Current value. */
   value(): number;
+}
+
+export interface NotificationAgeMetrics {
+  begin(
+    ledgerClosedAtSeconds: number | null | undefined,
+    ingestedWallMs?: number,
+    ingestedMonoMs?: number,
+  ): NotificationIngressStamp;
+  confirm(
+    stamp: NotificationIngressStamp,
+    confirmedMonoMs?: number,
+  ): NotificationAgeObservation;
+  snapshot(): EndToEndNotificationAgeSnapshot;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -89,6 +110,8 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** End-to-end notification age tracker (ledger close time -> confirmed send). */
+  notificationAge: NotificationAgeMetrics;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -146,7 +169,8 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
-export function createMetrics(): MetricsRegistry {
+export function createMetrics(options: EndToEndNotificationAgeOptions = {}): MetricsRegistry {
+  const notificationAgeTracker = new EndToEndNotificationAgeTracker(options);
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -223,6 +247,8 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`# TYPE ${g._name} gauge`);
       lines.push(`${g._name} ${g.value()}`);
     }
+
+    lines.push(...notificationAgeTracker.renderPrometheusLines(METRICS_PREFIX));
 
     // Prometheus text format requires a trailing newline.
     return lines.join("\n") + "\n";
@@ -306,6 +332,13 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    notificationAge: {
+      begin: (ledgerClosedAtSeconds, ingestedWallMs, ingestedMonoMs) =>
+        notificationAgeTracker.begin(ledgerClosedAtSeconds, ingestedWallMs, ingestedMonoMs),
+      confirm: (stamp, confirmedMonoMs) =>
+        notificationAgeTracker.confirm(stamp, confirmedMonoMs),
+      snapshot: () => notificationAgeTracker.snapshot(),
+    },
     render,
     startServer,
   };
