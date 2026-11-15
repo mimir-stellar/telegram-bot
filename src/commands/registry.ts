@@ -87,6 +87,15 @@ export interface CommandMetadata {
   readonly operatorOnly: boolean;
 }
 
+export type CommandMenuScope =
+  | { readonly type: "default" }
+  | { readonly type: "chat"; readonly chat_id: number | string };
+
+export interface ScopedCommandMenu {
+  readonly scope?: CommandMenuScope;
+  readonly commands: readonly { readonly command: string; readonly description: string }[];
+}
+
 const registered = new Map<string, CommandModule>();
 
 /**
@@ -158,4 +167,58 @@ export function visibleCommandMetadata(config?: BotConfig): CommandMetadata[] {
         descriptionFor(module.command),
       operatorOnly: module.operatorOnly === true,
     }));
+}
+
+/**
+ * Public (non-operator) commands safe to advertise in Telegram's default menu
+ * and in `/help` replies shown to non-operators or shared chats.
+ */
+export function publicCommandMetadata(config?: BotConfig): CommandMetadata[] {
+  return visibleCommandMetadata(config).filter((cmd) => !cmd.operatorOnly);
+}
+
+/**
+ * Build Telegram `setMyCommands` payloads scoped so privileged operator
+ * commands are advertised only in the configured operator's private chat,
+ * never in the global default menu seen by unrelated users.
+ */
+export function scopedCommandMenus(config?: BotConfig): ScopedCommandMenu[] {
+  if (config === undefined) {
+    return [
+      {
+        commands: visibleCommandMetadata(undefined).map(({ command, description }) => ({
+          command,
+          description,
+        })),
+      },
+    ];
+  }
+
+  const menus: ScopedCommandMenu[] = [
+    {
+      scope: { type: "default" },
+      commands: publicCommandMetadata(config).map(({ command, description }) => ({
+        command,
+        description,
+      })),
+    },
+  ];
+
+  const rawOperatorId =
+    typeof config.operatorTelegramUserId === "string"
+      ? config.operatorTelegramUserId.trim()
+      : "";
+  if (/^\d+$/.test(rawOperatorId)) {
+    const parsed = Number(rawOperatorId);
+    const chatId = Number.isSafeInteger(parsed) ? parsed : rawOperatorId;
+    menus.push({
+      scope: { type: "chat", chat_id: chatId },
+      commands: visibleCommandMetadata(config).map(({ command, description }) => ({
+        command,
+        description,
+      })),
+    });
+  }
+
+  return menus;
 }

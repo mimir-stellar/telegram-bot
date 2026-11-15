@@ -30,7 +30,7 @@ import {
   isOperator,
   operatorAllowed,
   registeredCommands,
-  visibleCommandMetadata,
+  scopedCommandMenus,
   type CommandDeps,
   type CommandModule,
 } from "./commands/index.js";
@@ -71,8 +71,12 @@ export {
   healthMessage,
   lastEventMessage,
   pauseMessage,
+  publicCommandMetadata,
   resumeMessage,
+  scopedCommandMenus,
   statusMessage,
+  type CommandMenuScope,
+  type ScopedCommandMenu,
 } from "./commands/index.js";
 export {
   CALLBACK_FALLBACK_FEEDBACK,
@@ -348,9 +352,9 @@ export function createBot(deps: BotDeps): Bot {
       ? { botInfo: deps.botInfo, ...clientOptions }
       : clientOptions,
   );
+  registerBroadcastHandlers(bot, deps);
   registerCommandHandlers(bot, deps);
   registerCallbackHandlers(bot, deps);
-  registerBroadcastHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.
@@ -373,12 +377,23 @@ export {
   type SendExtra,
 } from "./notifications/notifier.js";
 
-/** Registers the command list so Telegram's UI offers autocompletion. */
+/**
+ * Registers the command list so Telegram's UI offers autocompletion.
+ *
+ * When a `config` is supplied, the global default scope receives only public
+ * commands so privileged operator commands are never advertised to unrelated
+ * users; the full operator menu is registered solely under the configured
+ * operator's `chat` scope.
+ */
 export async function registerCommands(bot: Bot, config?: BotConfig): Promise<void> {
   try {
-    await bot.api.setMyCommands(
-      visibleCommandMetadata(config).map(({ command, description }) => ({ command, description })),
-    );
+    for (const entry of scopedCommandMenus(config)) {
+      if (entry.scope !== undefined) {
+        await bot.api.setMyCommands([...entry.commands], { scope: entry.scope });
+      } else {
+        await bot.api.setMyCommands([...entry.commands]);
+      }
+    }
   } catch (err) {
     // Cosmetic. Never worth failing a boot over, and never log an unbounded API error.
     console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);

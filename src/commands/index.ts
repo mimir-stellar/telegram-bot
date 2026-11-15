@@ -31,12 +31,16 @@ export {
   commandMetadata,
   commandModule,
   defineCommand,
+  publicCommandMetadata,
   registeredCommands,
+  scopedCommandMenus,
   visibleCommandMetadata,
   type CommandDeps,
   type CommandHandler,
+  type CommandMenuScope,
   type CommandMetadata,
   type CommandModule,
+  type ScopedCommandMenu,
 } from "./registry.js";
 export {
   TELEGRAM_OPTIONS,

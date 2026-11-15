@@ -28,18 +28,24 @@ function fixture(operatorTelegramUserId) {
   const config = { operatorTelegramUserId };
   const handlers = new Map();
   const menus = [];
+  const menuCalls = [];
   const unexpected = () => { throw new Error("help must not access poller state"); };
   const bot = {
     command: (name, handler) => handlers.set(name, handler),
-    api: { setMyCommands: async (commands) => menus.push(commands) },
+    api: {
+      setMyCommands: async (commands, other) => {
+        menus.push(commands);
+        menuCalls.push({ commands, other });
+      },
+    },
   };
   registerCommandHandlers(bot, { config, status: unexpected, pause: unexpected, resume: unexpected });
-  return { bot, config, handlers, menus };
+  return { bot, config, handlers, menus, menuCalls };
 }
 
 for (const operatorId of [null, "42"]) {
   test(`help and start snapshot the registered command list (operator=${operatorId})`, async () => {
-    const { bot, config, handlers, menus } = fixture(operatorId);
+    const { bot, config, handlers, menus, menuCalls } = fixture(operatorId);
     await registerCommands(bot, config);
     const lines = operatorId === null ? PUBLIC_LINES : ALL_LINES;
     for (const command of ["help", "start"]) {
@@ -48,10 +54,27 @@ for (const operatorId of [null, "42"]) {
       assert.deepEqual(replies, [[INTRO + lines.join("\n"), OPTIONS]]);
       assert.ok(replies[0][0].length < 4096);
     }
-    assert.deepEqual(menus[0].map(({ command }) => command), lines.map((line) => line.split(" ")[0].slice(1)));
-    for (const { command, description } of menus[0]) {
-      assert.ok(handlers.has(command), `${command} has a handler`);
-      assert.ok(description.length >= 1 && description.length <= 256);
+    // Default scope always advertises only public commands to unrelated users
+    assert.deepEqual(menuCalls[0].other, { scope: { type: "default" } });
+    assert.deepEqual(
+      menus[0].map(({ command }) => command),
+      PUBLIC_LINES.map((line) => line.split(" ")[0].slice(1)),
+    );
+    if (operatorId !== null) {
+      assert.equal(menuCalls.length, 2);
+      assert.deepEqual(menuCalls[1].other, { scope: { type: "chat", chat_id: Number(operatorId) } });
+      assert.deepEqual(
+        menus[1].map(({ command }) => command),
+        ALL_LINES.map((line) => line.split(" ")[0].slice(1)),
+      );
+    } else {
+      assert.equal(menuCalls.length, 1);
+    }
+    for (const menu of menus) {
+      for (const { command, description } of menu) {
+        assert.ok(handlers.has(command), `${command} has a handler`);
+        assert.ok(description.length >= 1 && description.length <= 256);
+      }
     }
     assert.equal(handlers.size, 11, "disabled operator handlers still enforce authorization");
   });
@@ -62,7 +85,9 @@ test("a new registration reflects operator configuration after restart", async (
   await registerCommands(first.bot, first.config);
   const restarted = fixture(null);
   await registerCommands(restarted.bot, restarted.config);
-  assert.equal(first.menus[0].some(({ command }) => command === "audit"), true);
+  assert.equal(first.menus[0].some(({ command }) => ["audit", "pause", "resume"].includes(command)), false);
+  assert.equal(first.menus[1].some(({ command }) => command === "audit"), true);
+  assert.equal(restarted.menus.length, 1);
   assert.equal(restarted.menus[0].some(({ command }) => ["audit", "pause", "resume"].includes(command)), false);
 });
 

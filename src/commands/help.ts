@@ -11,38 +11,69 @@
 import { escapeMd } from "../notifications/format.js";
 import { messagesFor } from "../i18n.js";
 import type { BotConfig } from "../config.js";
-import { helpDetailMessage } from "./help-detail.js";
-import { defineCommand, visibleCommandMetadata } from "./registry.js";
-import { commandArgument, replyMarkdown } from "./runtime.js";
+import { COMMAND_DETAILS, helpDetailMessage } from "./help-detail.js";
+import { defineCommand, publicCommandMetadata, visibleCommandMetadata } from "./registry.js";
+import { commandArgument, isOperator, replyMarkdown } from "./runtime.js";
+
+export interface HelpMessageOptions {
+  includeOperator?: boolean | undefined;
+}
 
 /** The help overview: title, intro, and one line per advertised command. */
-export function helpMessage(config?: BotConfig): string {
+export function helpMessage(config?: BotConfig, options?: HelpMessageOptions): string {
   const messages = messagesFor(config?.locale);
+  const entries =
+    options?.includeOperator === false
+      ? publicCommandMetadata(config)
+      : visibleCommandMetadata(config);
   return [
     messages.helpTitle,
     "",
     escapeMd(messages.helpIntro),
     "",
-    ...visibleCommandMetadata(config).map(({ command, description }) =>
-      escapeMd(`/${command} — ${description}`),
-    ),
+    ...entries.map(({ command, description }) => escapeMd(`/${command} — ${description}`)),
   ].join("\n");
+}
+
+function shouldShowOperatorCommands(
+  ctx: { from?: { id: number } | undefined; chat?: { type?: string } | undefined },
+  config: BotConfig,
+): boolean {
+  if (ctx.from === undefined) {
+    return config.operatorTelegramUserId !== null;
+  }
+  if (!isOperator(ctx as Parameters<typeof isOperator>[0], config)) {
+    return false;
+  }
+  if (ctx.chat?.type !== undefined && ctx.chat.type !== "private") {
+    return false;
+  }
+  return true;
 }
 
 export const startCommand = defineCommand({
   command: "start",
   handler: async (ctx, deps) => {
-    await replyMarkdown(ctx, helpMessage(deps.config));
+    const includeOperator = shouldShowOperatorCommands(ctx, deps.config);
+    await replyMarkdown(ctx, helpMessage(deps.config, { includeOperator }));
   },
 });
 
 export const helpCommand = defineCommand({
   command: "help",
   handler: async (ctx, deps) => {
+    const includeOperator = shouldShowOperatorCommands(ctx, deps.config);
     const arg = commandArgument(ctx);
-    await replyMarkdown(
-      ctx,
-      arg ? helpDetailMessage(arg, deps.config) : helpMessage(deps.config),
-    );
+    if (!arg) {
+      await replyMarkdown(ctx, helpMessage(deps.config, { includeOperator }));
+      return;
+    }
+    const normalized = arg.trim().replace(/^\//, "").toLowerCase();
+    const detail = COMMAND_DETAILS[normalized];
+    if (!detail || (detail.operatorOnly && !includeOperator)) {
+      await replyMarkdown(ctx, helpMessage(deps.config, { includeOperator }));
+      return;
+    }
+    await replyMarkdown(ctx, helpDetailMessage(arg, deps.config));
   },
 });
