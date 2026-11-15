@@ -167,3 +167,14 @@ cat mimir.log | jq 'select(.component == "boot") | {ts, level, action, warning, 
 ```bash
 cat mimir.log | jq 'select(.action == "event_skipped" or .action == "notification_cap_reached") | {ts, eventName, ledger, reason}'
 ```
+
+---
+
+## Incident Timeline Export (`exportIncidentTimeline` & `formatIncidentTimeline`)
+
+Operators and incident scripts can build a deterministic, redacted incident timeline from newline-delimited JSON (`LOG_FORMAT=json`) logs via `exportIncidentTimeline(input, options)` and `formatIncidentTimeline(report, format)` exported by `src/logger.ts`:
+
+- **Bounded time window**: Requires inclusive `from` and `to` timestamps (`string | number | Date`) spanning at most `MAX_INCIDENT_TIMELINE_WINDOW_MS` (`24` hours by default, or tighter via `maxWindowMs`). Inverted or unbounded windows throw `RangeError`.
+- **Correlation ID filter**: Optional `correlationId` (`1..256` chars) matches structured `correlationId` / `correlation` fields or `correlation=<id>` tokens in `msg`.
+- **Streaming & bounded memory**: Streams files in 64 KiB chunks without `fs.readFile`, skips oversized single lines exceeding `MAX_INCIDENT_TIMELINE_LINE_CHARS` (`65,536` chars), optionally stops at `maxScanBytes`, and retains at most `maxEntries` (`DEFAULT_INCIDENT_TIMELINE_MAX_ENTRIES = 500`, ceiling `MAX_INCIDENT_TIMELINE_ENTRIES = 5,000`).
+- **Redaction & determinism**: Every retained entry and extra field passes through `src/redact.ts` (`redactText`), extra object keys are sorted canonically, entries are ordered by `(tsMs, line)`, and `formatIncidentTimeline(report, "text" | "json")` produces byte-identical output with no wall-clock timestamps.

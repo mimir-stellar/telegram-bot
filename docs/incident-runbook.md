@@ -54,8 +54,12 @@ Check:
 
 The correlation ID identifies the most recently started poll cycle. Use it to
 group the bounded scan, malformed-event, rate-limit, send, and cycle-error log
-lines for that cycle. A new process creates new IDs; they are intentionally not
-stored in the version-1 cursor file or sent to Telegram.
+lines for that cycle, or pass `--` / `correlationId` with a bounded `[from, to]`
+window to `exportIncidentTimeline` (`src/logger.ts`; see
+[Structured Logging Reference](logging.md)) to export a deterministic, redacted
+timeline without loading an unbounded JSONL file into memory. A new process
+creates new IDs; they are intentionally not stored in the version-1 cursor file
+or sent to Telegram.
 
 For a read-only chain diagnostic without a Telegram token:
 

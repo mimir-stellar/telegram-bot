@@ -28,8 +28,12 @@
  * or holding anything richer than the lines the bot already printed.
  */
 
+import { createReadStream } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
+
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import { redactText } from "./redact.js";
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -367,3 +371,514 @@ export const Logger = {
     emit("fatal", component, message, fields);
   },
 };
+
+// ── Incident timeline export from redacted structured logs ───────────────────
+//
+// Reads newline-delimited JSON structured logs incrementally in bounded chunks,
+// filters by a bounded [from, to] time window and optional correlation ID,
+// scrubs secrets through `redact.ts`, retains at most `maxEntries` records in
+// deterministic (timestamp, line) order, and renders deterministic text or JSON
+// without ever buffering an unbounded file or oversized line in memory.
+
+/** Maximum allowed incident timeline query window (24 hours). */
+export const MAX_INCIDENT_TIMELINE_WINDOW_MS = 24 * 60 * 60 * 1_000;
+
+/** Default number of matching entries retained in a timeline export. */
+export const DEFAULT_INCIDENT_TIMELINE_MAX_ENTRIES = 500;
+
+/** Hard upper bound on retained timeline entries per export. */
+export const MAX_INCIDENT_TIMELINE_ENTRIES = 5_000;
+
+/** Maximum character length of a single raw JSONL line before it is skipped. */
+export const MAX_INCIDENT_TIMELINE_LINE_CHARS = 65_536;
+
+const TIMELINE_READ_CHUNK_BYTES = 64 * 1024;
+const MSG_CORRELATION_RE = /\bcorrelation=([^\s,;]+)/;
+
+export type IncidentTimelineInput =
+  | string
+  | Iterable<string | Uint8Array>
+  | AsyncIterable<string | Uint8Array>;
+
+export interface IncidentTimelineOptions {
+  /** Inclusive window start (ISO-8601 string, Date, or unix epoch ms). */
+  from: string | number | Date;
+  /** Inclusive window end (ISO-8601 string, Date, or unix epoch ms). */
+  to: string | number | Date;
+  /** Optional correlation ID to match (`correlationId`, `correlation`, or `correlation=…` in `msg`). */
+  correlationId?: string;
+  /** Optional tighter window bound in ms (must be > 0 and <= MAX_INCIDENT_TIMELINE_WINDOW_MS). */
+  maxWindowMs?: number;
+  /** Maximum retained entries (clamped to 1..MAX_INCIDENT_TIMELINE_ENTRIES). */
+  maxEntries?: number;
+  /** Maximum characters buffered for a single JSONL line before discarding it. */
+  maxLineChars?: number;
+  /** Optional byte budget on scanned input; stops streaming cleanly when reached. */
+  maxScanBytes?: number;
+  /** Extra secret strings to redact in addition to registered/Logger secrets. */
+  secrets?: readonly string[];
+}
+
+export interface IncidentTimelineEntry {
+  ts: string;
+  tsMs: number;
+  line: number;
+  level: LogLevel;
+  component: string;
+  msg: string;
+  correlationId: string | null;
+  action?: string;
+  source?: string;
+  ledger?: number;
+  eventId?: string;
+  error?: string;
+  fields: Record<string, unknown>;
+}
+
+export interface IncidentTimelineStats {
+  scannedLines: number;
+  scannedBytes: number;
+  matchedEntries: number;
+  exportedEntries: number;
+  droppedEntries: number;
+  malformedLines: number;
+  oversizedLines: number;
+  truncated: boolean;
+}
+
+export interface IncidentTimelineReport {
+  window: {
+    from: string;
+    to: string;
+    durationMs: number;
+  };
+  correlationId: string | null;
+  entries: IncidentTimelineEntry[];
+  stats: IncidentTimelineStats;
+}
+
+function parseTimelineTimestamp(value: string | number | Date, label: string): number {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    if (!Number.isFinite(ms) || ms < 0) {
+      throw new RangeError(`invalid incident timeline '${label}' timestamp`);
+    }
+    return ms;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new RangeError(`invalid incident timeline '${label}' timestamp`);
+    }
+    return Math.trunc(value);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+      throw new RangeError(`invalid incident timeline '${label}' timestamp`);
+    }
+    const parsed = Date.parse(trimmed);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      throw new RangeError(`invalid incident timeline '${label}' timestamp`);
+    }
+    return parsed;
+  }
+  throw new RangeError(`invalid incident timeline '${label}' timestamp`);
+}
+
+function redactTimelineString(
+  value: string,
+  secrets: readonly string[],
+  maxLen: number = MAX_LOG_FIELD_CHARS,
+): string {
+  const step1 = redactText(value, { secrets, maxLen: maxLen + 64 });
+  const step2 = step1.replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED);
+  return step2.length <= maxLen ? step2 : `${step2.slice(0, Math.max(0, maxLen - 1))}…`;
+}
+
+function sanitizeTimelineField(
+  value: unknown,
+  secrets: readonly string[],
+  depth: number,
+): unknown {
+  if (typeof value === "string") {
+    return redactTimelineString(value, secrets, MAX_LOG_FIELD_CHARS);
+  }
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= MAX_FIELD_DEPTH) return "[depth-limit]";
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeTimelineField(item, secrets, depth + 1));
+  }
+  const obj = value as Record<string, unknown>;
+  const sortedKeys = Object.keys(obj).sort();
+  const out: Record<string, unknown> = {};
+  for (const key of sortedKeys) {
+    const item = obj[key];
+    if (item === undefined || typeof item === "function") continue;
+    out[key] = sanitizeTimelineField(item, secrets, depth + 1);
+  }
+  return out;
+}
+
+function extractRawCorrelationId(record: Record<string, unknown>, rawMsg: string): string | null {
+  if (typeof record.correlationId === "string" && record.correlationId.trim().length > 0) {
+    return record.correlationId.trim();
+  }
+  if (typeof record.correlation === "string" && record.correlation.trim().length > 0) {
+    return record.correlation.trim();
+  }
+  const match = MSG_CORRELATION_RE.exec(rawMsg);
+  if (match && match[1]) {
+    return match[1];
+  }
+  return null;
+}
+
+function compareTimelineEntries(a: IncidentTimelineEntry, b: IncidentTimelineEntry): number {
+  if (a.tsMs !== b.tsMs) return a.tsMs - b.tsMs;
+  return a.line - b.line;
+}
+
+function insertBoundedTimelineEntry(
+  kept: IncidentTimelineEntry[],
+  candidate: IncidentTimelineEntry,
+  maxEntries: number,
+): boolean {
+  if (kept.length < maxEntries) {
+    kept.push(candidate);
+    return false;
+  }
+  // Find the chronologically earliest retained entry (`minIdx`). Keep the
+  // newest `maxEntries` records deterministically regardless of arrival order.
+  let minIdx = 0;
+  for (let i = 1; i < kept.length; i += 1) {
+    if (compareTimelineEntries(kept[i]!, kept[minIdx]!) < 0) {
+      minIdx = i;
+    }
+  }
+  if (compareTimelineEntries(candidate, kept[minIdx]!) > 0) {
+    kept[minIdx] = candidate;
+  }
+  return true;
+}
+
+function isKnownLogLevel(value: string): value is LogLevel {
+  return value in LEVEL_RANK;
+}
+
+/**
+ * Stream structured JSONL logs from a file path or chunked iterable, filter by
+ * a bounded `[from, to]` time range and optional `correlationId`, and produce a
+ * redacted, deterministically ordered incident timeline without loading an
+ * unbounded file into memory.
+ */
+export async function exportIncidentTimeline(
+  input: IncidentTimelineInput,
+  options: IncidentTimelineOptions,
+): Promise<IncidentTimelineReport> {
+  const fromMs = parseTimelineTimestamp(options.from, "from");
+  const toMs = parseTimelineTimestamp(options.to, "to");
+  if (fromMs > toMs) {
+    throw new RangeError("incident timeline 'from' timestamp must be <= 'to' timestamp");
+  }
+
+  const maxWindowMs = options.maxWindowMs ?? MAX_INCIDENT_TIMELINE_WINDOW_MS;
+  if (
+    typeof maxWindowMs !== "number" ||
+    !Number.isFinite(maxWindowMs) ||
+    maxWindowMs <= 0 ||
+    maxWindowMs > MAX_INCIDENT_TIMELINE_WINDOW_MS
+  ) {
+    throw new RangeError(
+      `incident timeline maxWindowMs must be in 1..${MAX_INCIDENT_TIMELINE_WINDOW_MS}`,
+    );
+  }
+  const durationMs = toMs - fromMs;
+  if (durationMs > maxWindowMs) {
+    throw new RangeError(
+      `incident timeline window (${durationMs}ms) exceeds maximum bound (${maxWindowMs}ms)`,
+    );
+  }
+
+  let filterCorrelationId: string | null = null;
+  if (options.correlationId !== undefined) {
+    if (typeof options.correlationId !== "string") {
+      throw new RangeError("incident timeline correlationId must be a non-empty string");
+    }
+    const trimmed = options.correlationId.trim();
+    if (trimmed.length === 0 || trimmed.length > 256) {
+      throw new RangeError("incident timeline correlationId must be 1..256 characters");
+    }
+    filterCorrelationId = trimmed;
+  }
+
+  const rawMaxEntries = options.maxEntries ?? DEFAULT_INCIDENT_TIMELINE_MAX_ENTRIES;
+  if (typeof rawMaxEntries !== "number" || !Number.isFinite(rawMaxEntries) || rawMaxEntries < 1) {
+    throw new RangeError("incident timeline maxEntries must be a positive number");
+  }
+  const maxEntries = Math.min(MAX_INCIDENT_TIMELINE_ENTRIES, Math.floor(rawMaxEntries));
+
+  const maxLineChars =
+    options.maxLineChars !== undefined
+      ? Math.max(256, Math.floor(options.maxLineChars))
+      : MAX_INCIDENT_TIMELINE_LINE_CHARS;
+
+  const maxScanBytes = options.maxScanBytes;
+  if (maxScanBytes !== undefined && (!Number.isFinite(maxScanBytes) || maxScanBytes <= 0)) {
+    throw new RangeError("incident timeline maxScanBytes must be a positive number");
+  }
+
+  const secrets = [...state.secrets, ...(options.secrets ?? [])].filter(
+    (s) => typeof s === "string" && s.length > 0,
+  );
+
+  const chunks: Iterable<string | Uint8Array> | AsyncIterable<string | Uint8Array> =
+    typeof input === "string"
+      ? createReadStream(input, { highWaterMark: TIMELINE_READ_CHUNK_BYTES })
+      : input;
+
+  const decoder = new StringDecoder("utf8");
+  const kept: IncidentTimelineEntry[] = [];
+  let scannedLines = 0;
+  let scannedBytes = 0;
+  let matchedEntries = 0;
+  let droppedEntries = 0;
+  let malformedLines = 0;
+  let oversizedLines = 0;
+  let scanByteLimitHit = false;
+  let partialLine = "";
+  let discardingCurrentLine = false;
+
+  const processCompletedLine = (rawLine: string, lineNumber: number): void => {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const trimmed = line.trim();
+    if (trimmed.length === 0) return;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      malformedLines += 1;
+      return;
+    }
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      malformedLines += 1;
+      return;
+    }
+
+    const record = parsed as Record<string, unknown>;
+    if (
+      typeof record.ts !== "string" ||
+      typeof record.level !== "string" ||
+      typeof record.component !== "string" ||
+      typeof record.msg !== "string"
+    ) {
+      malformedLines += 1;
+      return;
+    }
+
+    const normalizedLevel = record.level.trim().toLowerCase();
+    if (!isKnownLogLevel(normalizedLevel)) {
+      malformedLines += 1;
+      return;
+    }
+
+    const tsMs = Date.parse(record.ts);
+    if (!Number.isFinite(tsMs)) {
+      malformedLines += 1;
+      return;
+    }
+
+    if (tsMs < fromMs || tsMs > toMs) {
+      return;
+    }
+
+    const rawCorr = extractRawCorrelationId(record, record.msg);
+    if (filterCorrelationId !== null && rawCorr !== filterCorrelationId) {
+      return;
+    }
+
+    matchedEntries += 1;
+
+    const extraKeys = Object.keys(record)
+      .filter((k) => k !== "ts" && k !== "level" && k !== "component" && k !== "msg")
+      .sort();
+    const fields: Record<string, unknown> = {};
+    for (const key of extraKeys) {
+      const val = record[key];
+      if (val === undefined || typeof val === "function") continue;
+      fields[key] = sanitizeTimelineField(val, secrets, 0);
+    }
+
+    const entry: IncidentTimelineEntry = {
+      ts: new Date(tsMs).toISOString(),
+      tsMs,
+      line: lineNumber,
+      level: normalizedLevel,
+      component: redactTimelineString(record.component, secrets, 120),
+      msg: redactTimelineString(record.msg, secrets, MAX_LOG_FIELD_CHARS),
+      correlationId: rawCorr !== null ? redactTimelineString(rawCorr, secrets, 256) : null,
+      ...(typeof record.action === "string" && record.action.length > 0
+        ? { action: redactTimelineString(record.action, secrets, 120) }
+        : {}),
+      ...(typeof record.source === "string" && record.source.length > 0
+        ? { source: redactTimelineString(record.source, secrets, 80) }
+        : {}),
+      ...(typeof record.ledger === "number" && Number.isFinite(record.ledger)
+        ? { ledger: record.ledger }
+        : {}),
+      ...(typeof record.eventId === "string" && record.eventId.length > 0
+        ? { eventId: redactTimelineString(record.eventId, secrets, 160) }
+        : {}),
+      ...(typeof record.error === "string" && record.error.length > 0
+        ? { error: redactTimelineString(record.error, secrets, MAX_LOG_FIELD_CHARS) }
+        : {}),
+      fields,
+    };
+
+    if (insertBoundedTimelineEntry(kept, entry, maxEntries)) {
+      droppedEntries += 1;
+    }
+  };
+
+  const appendSegment = (segment: string): void => {
+    if (discardingCurrentLine || segment.length === 0) return;
+    if (partialLine.length + segment.length > maxLineChars) {
+      partialLine = "";
+      discardingCurrentLine = true;
+      oversizedLines += 1;
+    } else {
+      partialLine += segment;
+    }
+  };
+
+  const consumeDecodedText = (text: string): void => {
+    let start = 0;
+    while (start < text.length) {
+      const nl = text.indexOf("\n", start);
+      if (nl === -1) {
+        appendSegment(text.slice(start));
+        break;
+      }
+      appendSegment(text.slice(start, nl));
+      scannedLines += 1;
+      if (discardingCurrentLine) {
+        discardingCurrentLine = false;
+        partialLine = "";
+      } else {
+        const completed = partialLine;
+        partialLine = "";
+        processCompletedLine(completed, scannedLines);
+      }
+      start = nl + 1;
+    }
+  };
+
+  for await (const rawChunk of chunks) {
+    const rawBuf =
+      typeof rawChunk === "string" ? Buffer.from(rawChunk, "utf8") : Buffer.from(rawChunk);
+    if (rawBuf.byteLength === 0) continue;
+
+    if (maxScanBytes !== undefined && scannedBytes + rawBuf.byteLength > maxScanBytes) {
+      const allowedBytes = Math.max(0, Math.floor(maxScanBytes - scannedBytes));
+      if (allowedBytes > 0) {
+        const prefixText = decoder.write(rawBuf.subarray(0, allowedBytes));
+        // Only consume up to the last newline within the byte budget so a
+        // truncated trailing fragment is never misclassified as malformed JSON.
+        const lastNl = prefixText.lastIndexOf("\n");
+        if (lastNl !== -1) {
+          consumeDecodedText(prefixText.slice(0, lastNl + 1));
+        }
+      }
+      scannedBytes = Math.floor(maxScanBytes);
+      scanByteLimitHit = true;
+      partialLine = "";
+      discardingCurrentLine = false;
+      break;
+    }
+
+    scannedBytes += rawBuf.byteLength;
+    consumeDecodedText(decoder.write(rawBuf));
+  }
+
+  if (!scanByteLimitHit) {
+    const tail = decoder.end();
+    if (tail.length > 0) {
+      consumeDecodedText(tail);
+    }
+    if (discardingCurrentLine) {
+      scannedLines += 1;
+      discardingCurrentLine = false;
+      partialLine = "";
+    } else if (partialLine.length > 0) {
+      scannedLines += 1;
+      const completed = partialLine;
+      partialLine = "";
+      processCompletedLine(completed, scannedLines);
+    }
+  }
+
+  kept.sort(compareTimelineEntries);
+
+  return {
+    window: {
+      from: new Date(fromMs).toISOString(),
+      to: new Date(toMs).toISOString(),
+      durationMs,
+    },
+    correlationId:
+      filterCorrelationId !== null ? redactTimelineString(filterCorrelationId, secrets, 256) : null,
+    entries: kept,
+    stats: {
+      scannedLines,
+      scannedBytes,
+      matchedEntries,
+      exportedEntries: kept.length,
+      droppedEntries,
+      malformedLines,
+      oversizedLines,
+      truncated: droppedEntries > 0 || scanByteLimitHit,
+    },
+  };
+}
+
+/**
+ * Render an {@link IncidentTimelineReport} deterministically as human-readable
+ * plain text or single-line/canonical JSON, with no wall-clock dependence.
+ */
+export function formatIncidentTimeline(
+  report: IncidentTimelineReport,
+  format: LogFormat = "text",
+): string {
+  if (format === "json") {
+    return JSON.stringify(report);
+  }
+
+  const corrLabel = report.correlationId ?? "all";
+  const lines: string[] = [
+    `Incident timeline · ${report.window.from} .. ${report.window.to} · correlation=${corrLabel}`,
+    `entries: ${report.stats.exportedEntries}/${report.stats.matchedEntries} ` +
+      `(dropped=${report.stats.droppedEntries}, malformed=${report.stats.malformedLines}, ` +
+      `oversized=${report.stats.oversizedLines}, truncated=${report.stats.truncated ? "yes" : "no"})`,
+  ];
+
+  if (report.entries.length === 0) {
+    lines.push("(no matching log entries)");
+    return lines.join("\n");
+  }
+
+  for (const entry of report.entries) {
+    const meta: string[] = [];
+    if (entry.action) meta.push(`action=${entry.action}`);
+    if (entry.correlationId) meta.push(`correlation=${entry.correlationId}`);
+    if (entry.source) meta.push(`source=${entry.source}`);
+    if (entry.ledger !== undefined) meta.push(`ledger=${entry.ledger}`);
+    if (entry.eventId) meta.push(`eventId=${entry.eventId}`);
+    const metaPart = meta.length > 0 ? ` ${meta.join(" ")}` : "";
+    lines.push(`${entry.ts} [${entry.level}] ${entry.component}${metaPart} — ${entry.msg}`);
+  }
+
+  return lines.join("\n");
+}
