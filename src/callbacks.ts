@@ -17,7 +17,31 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
 import { safeErrorMessage } from "./notifications/format.js";
-import { handleBroadcastCallback } from "./commands/broadcast.js";
+import {
+  CALLBACK_CONFIRMATION_RATE_LIMITED_FEEDBACK,
+  handleBroadcastCallback,
+} from "./commands/broadcast.js";
+import {
+  ConfirmationRateLimiter,
+  DEFAULT_CONFIRMATION_CAPACITY,
+  DEFAULT_CONFIRMATION_IDLE_TTL_MS,
+  DEFAULT_CONFIRMATION_MAX_ACTORS,
+  DEFAULT_CONFIRMATION_REFILL_MS,
+  tryConsumeConfirmationAction,
+  type ConfirmationLimiterDeps,
+  type ConfirmationRateLimiterOptions,
+} from "./commands/rate-limit.js";
+
+export {
+  CALLBACK_CONFIRMATION_RATE_LIMITED_FEEDBACK,
+  ConfirmationRateLimiter,
+  DEFAULT_CONFIRMATION_CAPACITY,
+  DEFAULT_CONFIRMATION_IDLE_TTL_MS,
+  DEFAULT_CONFIRMATION_MAX_ACTORS,
+  DEFAULT_CONFIRMATION_REFILL_MS,
+  type ConfirmationLimiterDeps,
+  type ConfirmationRateLimiterOptions,
+};
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
@@ -60,6 +84,11 @@ export const CALLBACK_UNAUTHORIZED_FEEDBACK = "Unauthorized: operator only";
 
 function isKnownAction(val: string): val is CallbackActionType {
   return ["status", "contracts", "help", "pause", "resume", "broadcast"].includes(val);
+}
+
+/** True when a callback action is read-only navigation rather than a state-changing operator action. */
+export function isReadOnlyCallbackAction(action: CallbackActionType): boolean {
+  return action === "status" || action === "contracts" || action === "help";
 }
 
 /**
@@ -235,14 +264,27 @@ export async function handleCallbackQuery(
 
   const { action } = validation;
 
-  // Enforce operator role authorization
-  if (action.type === "pause" || action.type === "resume" || action.type === "broadcast") {
+  // Enforce operator role authorization and independent confirmation action budget
+  if (!isReadOnlyCallbackAction(action.type)) {
     if (!isOperator(ctx, config)) {
       console.warn(
         `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
       );
       await safeAnswerCallback(ctx, config, {
         text: CALLBACK_UNAUTHORIZED_FEEDBACK,
+        show_alert: true,
+      });
+      return;
+    }
+
+    // `broadcast` enforces the per-actor confirmation budget inside `handleBroadcastCallback`
+    // after sub-action validation so direct and dispatched calls consume exactly one token.
+    if (
+      (action.type === "pause" || action.type === "resume") &&
+      !tryConsumeConfirmationAction(ctx.from?.id, action.type, deps)
+    ) {
+      await safeAnswerCallback(ctx, config, {
+        text: CALLBACK_CONFIRMATION_RATE_LIMITED_FEEDBACK,
         show_alert: true,
       });
       return;
@@ -369,8 +411,8 @@ export function validatePauseConfirmData(
  */
 export async function handlePauseConfirmCallback(
   ctx: Context,
-  deps: Pick<CommandDeps, "config" | "pause">,
-  nowMs: number = Date.now(),
+  deps: Pick<CommandDeps, "config" | "pause"> & ConfirmationLimiterDeps,
+  nowMs: number = deps.now ? deps.now() : Date.now(),
 ): Promise<void> {
   const { config, pause } = deps;
 
@@ -380,6 +422,14 @@ export async function handlePauseConfirmCallback(
   // Only the operator may act on these buttons.
   if (!isOperator(ctx, config)) {
     await ctx.answerCallbackQuery({ text: "Only the operator can do that.", show_alert: true });
+    return;
+  }
+
+  if (!tryConsumeConfirmationAction(ctx.from?.id, action, deps)) {
+    await ctx.answerCallbackQuery({
+      text: CALLBACK_CONFIRMATION_RATE_LIMITED_FEEDBACK,
+      show_alert: true,
+    });
     return;
   }
 

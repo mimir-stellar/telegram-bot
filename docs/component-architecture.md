@@ -281,6 +281,8 @@ Load from file (cursor + dedup window) → Use in RPC request → Receive new cu
 
 - **RPC**: No explicit handling; relies on public Testnet rate limits
 - **Telegram**: Message spacing and cap prevent rate-limiting
+- **Commands**: Per-chat token bucket (`CommandRateLimiter`) throttles rapid public command floods while exempting the configured operator
+- **Confirmation & Operator Callbacks**: Bounded per-actor token bucket (`ConfirmationRateLimiter` in `src/commands/rate-limit.ts`) throttles state-changing confirmation and operator actions (`pause`, `resume`, `pause-confirm`, `pause-cancel`, and `broadcast` confirm/cancel) independently of read-only navigation callbacks (`status`, `contracts`, `help`), so status/help navigation stays responsive even when confirmation actions are throttled
 - **No retry for rate limits**: Uses same retry logic as other failures
 
 ## Logging and Security

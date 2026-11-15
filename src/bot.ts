@@ -41,7 +41,7 @@ import {
 } from "./callbacks.js";
 import { registerBroadcastHandlers } from "./commands/broadcast.js";
 import { pauseConfirmKeyboard } from "./commands/keyboards.js";
-import { CommandRateLimiter } from "./commands/rate-limit.js";
+import { CommandRateLimiter, ConfirmationRateLimiter } from "./commands/rate-limit.js";
 import {
   canSendHint,
   closestCommand,
@@ -75,20 +75,29 @@ export {
   statusMessage,
 } from "./commands/index.js";
 export {
+  CALLBACK_CONFIRMATION_RATE_LIMITED_FEEDBACK,
   CALLBACK_FALLBACK_FEEDBACK,
   CALLBACK_FALLBACK_PAYLOAD,
   CALLBACK_UNAUTHORIZED_FEEDBACK,
   CALLBACK_UNAUTHORIZED_PAYLOAD,
+  ConfirmationRateLimiter,
+  DEFAULT_CONFIRMATION_CAPACITY,
+  DEFAULT_CONFIRMATION_IDLE_TTL_MS,
+  DEFAULT_CONFIRMATION_MAX_ACTORS,
+  DEFAULT_CONFIRMATION_REFILL_MS,
   PAUSE_CONFIRM_TTL_MS,
   TELEGRAM_CALLBACK_DATA_MAX_BYTES,
   handleCallbackQuery,
   handlePauseConfirmCallback,
+  isReadOnlyCallbackAction,
   registerCallbackHandlers,
   updateOrReplyMessage,
   validateCallbackData,
   validatePauseConfirmData,
   type CallbackActionType,
   type CallbackValidationResult,
+  type ConfirmationLimiterDeps,
+  type ConfirmationRateLimiterOptions,
   type ValidCallbackAction,
 } from "./callbacks.js";
 export {
@@ -251,6 +260,9 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
       handlePauseConfirmCallback(ctx, {
         config: deps.config,
         pause: deps.pause ?? (() => "stopped"),
+        confirmationRateLimiter: deps.confirmationRateLimiter,
+        confirmationRateLimitSampler: deps.confirmationRateLimitSampler,
+        now: deps.now,
       }),
   );
 
@@ -348,9 +360,18 @@ export function createBot(deps: BotDeps): Bot {
       ? { botInfo: deps.botInfo, ...clientOptions }
       : clientOptions,
   );
-  registerCommandHandlers(bot, deps);
-  registerCallbackHandlers(bot, deps);
-  registerBroadcastHandlers(bot, deps);
+  const sharedDeps: BotDeps =
+    deps.confirmationRateLimiter !== undefined
+      ? deps
+      : {
+          ...deps,
+          confirmationRateLimiter: new ConfirmationRateLimiter(
+            deps.now ? { now: deps.now } : {},
+          ),
+        };
+  registerCommandHandlers(bot, sharedDeps);
+  registerCallbackHandlers(bot, sharedDeps);
+  registerBroadcastHandlers(bot, sharedDeps);
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.

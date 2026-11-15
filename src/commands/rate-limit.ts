@@ -19,7 +19,7 @@
  * Clock injection is supported for deterministic time-travel testing.
  */
 
-import type { LogSampler } from "../log-sampler.js";
+import { formatSuppressedRepeats, LogSampler } from "../log-sampler.js";
 
 export interface RateLimiterOptions {
   /** Maximum number of tokens a bucket can hold. Defaults to 5. */
@@ -193,6 +193,171 @@ export class CommandRateLimiter {
 
 export { CommandRateLimiter as TokenBucket, CommandRateLimiter as ChatRateLimiter };
 
+// ── Per-actor confirmation action rate limiter ───────────────────────────────
+
+export interface ConfirmationRateLimiterOptions {
+  /** Maximum burst of confirmation actions an actor bucket can hold. Defaults to 5. */
+  capacity?: number;
+  /** Milliseconds required to refill 1 confirmation action token. Defaults to 10,000ms. */
+  refillMs?: number;
+  /** Injected clock returning epoch milliseconds. Defaults to Date.now. */
+  now?: () => number;
+  /** Inactivity duration in milliseconds before an idle actor bucket is evicted. Defaults to 300,000ms. */
+  idleTtlMs?: number;
+  /** Maximum distinct actors tracked before evicting the least recently active entry. Defaults to 1,000. */
+  maxActors?: number;
+}
+
+export const DEFAULT_CONFIRMATION_CAPACITY = 5;
+export const DEFAULT_CONFIRMATION_REFILL_MS = 10_000;
+export const DEFAULT_CONFIRMATION_IDLE_TTL_MS = 300_000;
+export const DEFAULT_CONFIRMATION_MAX_ACTORS = 1_000;
+
+/**
+ * Bounded per-actor token bucket dedicated to state-changing confirmation and
+ * operator callbacks (`pause`, `resume`, `pause-confirm`, `pause-cancel`, and
+ * `broadcast` confirm/cancel), independent of read-only navigation callbacks
+ * (`status`, `contracts`, `help`).
+ */
+export class ConfirmationRateLimiter {
+  readonly capacity: number;
+  readonly refillMs: number;
+  readonly idleTtlMs: number;
+  readonly maxActors: number;
+  private readonly inner: CommandRateLimiter;
+
+  constructor(options: ConfirmationRateLimiterOptions = {}) {
+    const capacity = Math.max(1, Math.trunc(options.capacity ?? DEFAULT_CONFIRMATION_CAPACITY));
+    const refillMs = Math.max(1, Math.trunc(options.refillMs ?? DEFAULT_CONFIRMATION_REFILL_MS));
+    const idleTtlMs = Math.max(1, Math.trunc(options.idleTtlMs ?? DEFAULT_CONFIRMATION_IDLE_TTL_MS));
+    const maxActors = Math.max(1, Math.trunc(options.maxActors ?? DEFAULT_CONFIRMATION_MAX_ACTORS));
+
+    this.inner = new CommandRateLimiter({
+      capacity,
+      refillMs,
+      idleTtlMs,
+      maxChats: maxActors,
+      ...(options.now ? { now: options.now } : {}),
+    });
+    this.capacity = this.inner.capacity;
+    this.refillMs = this.inner.refillMs;
+    this.idleTtlMs = this.inner.idleTtlMs;
+    this.maxActors = this.inner.maxChats;
+  }
+
+  get now(): () => number {
+    return this.inner.now;
+  }
+
+  consume(actorId: string | number, cost: number = 1): boolean {
+    return this.inner.consume(actorId, cost);
+  }
+
+  take(actorId: string | number, cost: number = 1): boolean {
+    return this.inner.take(actorId, cost);
+  }
+
+  getTokens(actorId: string | number): number {
+    return this.inner.getTokens(actorId);
+  }
+
+  /** Milliseconds until `cost` tokens are available for `actorId` (`0` if ready now). */
+  retryAfterMs(actorId: string | number, cost: number = 1): number {
+    if (cost > this.capacity) return Infinity;
+    const deficit = cost - this.getTokens(actorId);
+    if (deficit <= 0) return 0;
+    return Math.ceil(deficit * this.refillMs);
+  }
+
+  evictIdle(now?: number): number {
+    return this.inner.evictIdle(now);
+  }
+
+  reset(actorId?: string | number): void {
+    this.inner.reset(actorId);
+  }
+
+  size(): number {
+    return this.inner.size();
+  }
+}
+
+const defaultConfirmationLimiters = new WeakMap<object, ConfirmationRateLimiter>();
+const defaultConfirmationSamplers = new WeakMap<object, LogSampler>();
+const fallbackConfirmationLimiter = new ConfirmationRateLimiter();
+
+export interface ConfirmationLimiterDeps {
+  config?: object;
+  confirmationRateLimiter?: ConfirmationRateLimiter | undefined;
+  confirmationRateLimitSampler?: LogSampler | undefined;
+  now?: (() => number) | undefined;
+}
+
+export function resolveConfirmationRateLimiter(
+  deps: ConfirmationLimiterDeps,
+): ConfirmationRateLimiter {
+  if (deps.confirmationRateLimiter !== undefined) {
+    return deps.confirmationRateLimiter;
+  }
+  const cacheKey =
+    deps.config !== undefined && deps.config !== null && typeof deps.config === "object"
+      ? deps.config
+      : deps;
+  if (cacheKey && typeof cacheKey === "object") {
+    let cached = defaultConfirmationLimiters.get(cacheKey);
+    if (!cached) {
+      cached = new ConfirmationRateLimiter(deps.now ? { now: deps.now } : {});
+      defaultConfirmationLimiters.set(cacheKey, cached);
+    }
+    return cached;
+  }
+  return fallbackConfirmationLimiter;
+}
+
+export function resolveConfirmationRateLimitSampler(
+  deps: ConfirmationLimiterDeps,
+  limiter: ConfirmationRateLimiter,
+): LogSampler {
+  if (deps.confirmationRateLimitSampler !== undefined) {
+    return deps.confirmationRateLimitSampler;
+  }
+  let cached = defaultConfirmationSamplers.get(limiter);
+  if (!cached) {
+    cached = new LogSampler({
+      maxPerWindow: 1,
+      windowMs: 60_000,
+      now: deps.now ?? limiter.now,
+    });
+    defaultConfirmationSamplers.set(limiter, cached);
+  }
+  return cached;
+}
+
+/**
+ * Consume one confirmation action token for `actorId`, emitting a sampled
+ * warning when throttled. Returns `true` when allowed, `false` when throttled.
+ */
+export function tryConsumeConfirmationAction(
+  actorId: string | number | undefined,
+  actionLabel: string,
+  deps: ConfirmationLimiterDeps,
+): boolean {
+  const key = actorId !== undefined ? String(actorId) : "unknown";
+  const limiter = resolveConfirmationRateLimiter(deps);
+  if (limiter.consume(key)) {
+    return true;
+  }
+  const sampler = resolveConfirmationRateLimitSampler(deps, limiter);
+  const sample = sampler.record(`${key}:${actionLabel}`);
+  if (sample.log) {
+    const repeats = formatSuppressedRepeats(sample.suppressed, sampler.windowMs);
+    console.warn(
+      `[bot] confirmation rate limit exceeded for actor ${key}, throttling ${actionLabel}${repeats}`,
+    );
+  }
+  return false;
+}
+
 // `registerCommandHandlers` in src/bot.ts reads the limiter, the sampler for
 // its "rate limit exceeded" warning and the injected clock from the command
 // deps, so tests and embedders can supply their own.
@@ -202,6 +367,10 @@ declare module "./registry.js" {
     rateLimiter?: CommandRateLimiter | undefined;
     /** Sampler for the "rate limit exceeded" warning. */
     rateLimitSampler?: LogSampler | undefined;
+    /** Per-actor confirmation/operator callback rate limiter. */
+    confirmationRateLimiter?: ConfirmationRateLimiter | undefined;
+    /** Sampler for the confirmation rate-limit warning. */
+    confirmationRateLimitSampler?: LogSampler | undefined;
     /** Injected clock (epoch ms) for the default rate limiter and sampler. */
     now?: (() => number) | undefined;
   }

@@ -10,9 +10,13 @@
 
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { BotConfig } from "../config.js";
+import { tryConsumeConfirmationAction } from "./rate-limit.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
+
+export const CALLBACK_CONFIRMATION_RATE_LIMITED_FEEDBACK =
+  "Too many confirmation actions; try again shortly";
 
 /** Telegram Bot API maximum message length limit. */
 export const MAX_BROADCAST_LENGTH = 4096;
@@ -315,6 +319,14 @@ export async function handleBroadcastCallback(
 
   if (!broadcastId || (subAction !== "confirm" && subAction !== "cancel")) {
     await safeAnswerCallback(ctx, config, { text: "Invalid broadcast action" });
+    return;
+  }
+
+  if (!tryConsumeConfirmationAction(ctx.from?.id, `broadcast:${subAction}`, deps)) {
+    await safeAnswerCallback(ctx, config, {
+      text: CALLBACK_CONFIRMATION_RATE_LIMITED_FEEDBACK,
+      show_alert: true,
+    });
     return;
   }
 
