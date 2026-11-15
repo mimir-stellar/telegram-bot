@@ -73,13 +73,16 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--cap` | `<number>` | Maximum notifications to send/count per contract. | `config.maxNotificationsPerCycle` in `--send` mode; `20` in dry-run mode |
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
+| `--output` (`--out`) | `<path>` | Atomically write the JSON report (`mimir-replay-v1`) to a file. Must not resolve to the same file as `--progress-file`. | None |
+| `--progress-file` | `<path>` | Persist and resume per-page replay checkpoints (`mimir-replay-progress-v1`). Validated before opening so it never collides with `--output`. | None |
+| `--rpm` | `<number>` | Cap Soroban RPC requests per minute across health and event queries. | Unlimited |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
 
 ### Exit Codes
 
 * **`0`:** Scan completed successfully (even if some events were skipped, deduplicated, or capped).
-* **`1`:** Fatal runtime error (RPC unreachable, invalid network passphrase, or missing config in `--send` mode).
-* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, or invalid `--contract`).
+* **`1`:** Fatal runtime error (RPC unreachable, invalid network passphrase, output write failure, or missing config in `--send` mode).
+* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, invalid `--contract`, or `--output` and `--progress-file` resolving to the same file).
 
 ---
 

@@ -36,7 +36,8 @@
  * that was within the range.
  */
 
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -234,6 +235,8 @@ export interface ReplayOptions {
   dryRun?: boolean | undefined;
   /** Include individual event dispositions in the report. */
   show?: number | undefined;
+  /** Path to an optional output JSON report file. */
+  outputFile?: string | undefined;
   /** Path to an optional progress/checkpoint file. */
   progressFile?: string | undefined;
   /** Maximum RPC requests per minute. */
@@ -282,6 +285,123 @@ export async function writeProgressFileAtomic(filePath: string, data: ReplayProg
     try { await unlink(tmp); } catch {}
     throw err;
   }
+}
+
+export async function writeReplayOutputAtomic(filePath: string, report: ReplayReport): Promise<void> {
+  const dir = path.dirname(filePath);
+  await mkdir(dir, { recursive: true });
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(report, scanJsonReplacer, 2)}\n`, "utf8");
+    await rename(tmp, filePath);
+  } catch (err) {
+    try { await unlink(tmp); } catch {}
+    throw err;
+  }
+}
+
+function normalizePathForPlatform(resolvedPath: string): string {
+  const normalized = path.normalize(resolvedPath);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+/**
+ * Resolve a filesystem path to its canonical target without opening or creating
+ * the file. Walks ancestor directories until an existing prefix is found so
+ * directory symlinks/junctions are resolved even when the target file does not
+ * exist yet.
+ */
+export async function resolveCanonicalReplayPath(filePath: string): Promise<string> {
+  const absolute = path.resolve(filePath);
+  const trailingSegments: string[] = [];
+  let current = absolute;
+
+  for (;;) {
+    try {
+      const realCurrent = await realpath(current);
+      const joined =
+        trailingSegments.length > 0
+          ? path.join(realCurrent, ...trailingSegments.reverse())
+          : realCurrent;
+      return normalizePathForPlatform(joined);
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        throw err;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return normalizePathForPlatform(absolute);
+      }
+      trailingSegments.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+async function statIfExists(filePath: string): Promise<Stats | null> {
+  try {
+    return await stat(filePath);
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return null;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Validate replay `--output` and `--progress-file` paths before opening or
+ * mutating either file. Rejects empty paths, directory targets, and paths that
+ * resolve (lexically, via symlinks/junctions, or via hard links) to the same
+ * underlying file.
+ */
+export async function validateReplayFilePaths(opts: {
+  outputFile?: string | undefined;
+  progressFile?: string | undefined;
+}): Promise<{ outputFile?: string | undefined; progressFile?: string | undefined }> {
+  const outputRaw = opts.outputFile;
+  const progressRaw = opts.progressFile;
+
+  if (outputRaw !== undefined && outputRaw.trim().length === 0) {
+    throw new Error("--output path must not be empty");
+  }
+  if (progressRaw !== undefined && progressRaw.trim().length === 0) {
+    throw new Error("--progress-file path must not be empty");
+  }
+
+  const outputStat = outputRaw !== undefined ? await statIfExists(path.resolve(outputRaw)) : null;
+  if (outputStat?.isDirectory()) {
+    throw new Error(`replay output path "${outputRaw}" points to a directory, expected a file`);
+  }
+
+  const progressStat = progressRaw !== undefined ? await statIfExists(path.resolve(progressRaw)) : null;
+  if (progressStat?.isDirectory()) {
+    throw new Error(`replay progress path "${progressRaw}" points to a directory, expected a file`);
+  }
+
+  if (outputRaw !== undefined && progressRaw !== undefined) {
+    const [canonicalOutput, canonicalProgress] = await Promise.all([
+      resolveCanonicalReplayPath(outputRaw),
+      resolveCanonicalReplayPath(progressRaw),
+    ]);
+
+    const sameInode =
+      outputStat !== null &&
+      progressStat !== null &&
+      outputStat.dev === progressStat.dev &&
+      outputStat.ino === progressStat.ino &&
+      outputStat.ino > 0;
+
+    if (canonicalOutput === canonicalProgress || sameInode) {
+      throw new Error(
+        `replay output path "${outputRaw}" and progress path "${progressRaw}" point to the same file`,
+      );
+    }
+  }
+
+  return { outputFile: outputRaw, progressFile: progressRaw };
 }
 
 export function normalizeRangeFrom(from: string | number): string {
@@ -789,6 +909,12 @@ export async function runReplayCli(opts: {
   const show = flag("show") ? Math.max(0, Number(flag("show"))) : 0;
   const dryRun = !boolFlag("send"); // Default is dry-run; --send enables actual sending.
   const asJson = boolFlag("json");
+  const hasOutputFlag = boolFlag("output");
+  const hasOutFlag = boolFlag("out");
+  const hasProgressFlag = boolFlag("progress-file");
+  const outputFlagValue = flag("output");
+  const outFlagValue = flag("out");
+  const outputFile = outputFlagValue ?? outFlagValue;
   const progressFile = flag("progress-file");
   const rpmRaw = flag("rpm");
   const progress = overrideDeps.progress ?? (asJson ? console.error.bind(console) : console.log.bind(console));
@@ -796,7 +922,27 @@ export async function runReplayCli(opts: {
 
   if (!fromRaw) {
     console.error("[replay] error: --from <ledger|cursor> is required");
-    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N]");
+    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--output <path>] [--mock] [--progress-file <path>] [--rpm N]");
+    return { report: null, exitCode: 2 };
+  }
+
+  if (hasOutputFlag && hasOutFlag) {
+    console.error("[replay] error: pass either --output or --out, not both");
+    return { report: null, exitCode: 2 };
+  }
+  if ((hasOutputFlag || hasOutFlag) && (outputFile === undefined || outputFile.trim().length === 0)) {
+    console.error("[replay] error: --output requires a file path");
+    return { report: null, exitCode: 2 };
+  }
+  if (hasProgressFlag && (progressFile === undefined || progressFile.trim().length === 0)) {
+    console.error("[replay] error: --progress-file requires a file path");
+    return { report: null, exitCode: 2 };
+  }
+
+  try {
+    await validateReplayFilePaths({ outputFile, progressFile });
+  } catch (err: unknown) {
+    console.error(`[replay] error: ${err instanceof Error ? err.message : String(err)}`);
     return { report: null, exitCode: 2 };
   }
 
@@ -887,11 +1033,13 @@ export async function runReplayCli(opts: {
     progress(`[replay] network   ${network} · rpc ${config.rpcUrl}`);
     progress(`[replay] from      ${fromRaw}${toLedger !== undefined ? `  to ${toLedger}` : "  (to chain tip)"}`);
     progress(`[replay] mode      ${dryRun ? "dry-run (use --send to deliver to Telegram)" : "SEND"}`);
+    if (outputFile) progress(`[replay] output    ${outputFile}`);
     if (progressFile) progress(`[replay] progress  ${progressFile}`);
     if (rpm !== undefined) progress(`[replay] rpm       ${rpm}`);
   } else {
     progress(
       `replay ${network} from=${fromRaw} to=${toLedger ?? "tip"} mode=${dryRun ? "dry-run" : "send"}` +
+        (outputFile ? ` output=${outputFile}` : "") +
         (progressFile ? ` progress=${progressFile}` : "") +
         (rpm !== undefined ? ` rpm=${rpm}` : ""),
     );
@@ -981,6 +1129,7 @@ export async function runReplayCli(opts: {
           show,
           dryRun,
           contracts: requestedContracts,
+          outputFile,
           progressFile,
           rpm,
           targetProgress,
@@ -1053,6 +1202,15 @@ export async function runReplayCli(opts: {
     targets: targetResults,
     totals,
   };
+
+  if (outputFile && !fatalError) {
+    try {
+      await writeReplayOutputAtomic(outputFile, report);
+    } catch (err: unknown) {
+      console.error(`[replay] error: cannot write output file "${outputFile}": ${safeErr(err)}`);
+      return { report: null, exitCode: 1 };
+    }
+  }
 
   if (asJson) {
     process.stdout.write(JSON.stringify(report, scanJsonReplacer, 2) + "\n");
