@@ -129,6 +129,7 @@ Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's
 - **Bounded fields**: Contract strings clipped at 200 Unicode code points
 - **Explorer links**: Includes transaction links to stellar.expert
 - **Preview mode**: Optional `[PREVIEW MODE]` badge for testing
+- **Bounded digest continuation pages (`src/notifications/digest-grouping.ts`, `src/notifications/schedule.ts`)**: `paginateDigest()` and `validateDigestPageLimit()` split oversized digests strictly on complete event summaries within Telegram's 4096-character ceiling, repeat spanned group headers with `(cont.)`, and preserve a deterministic `totalEvents` count across all pages.
 
 ### Telegram Integration (`src/bot.ts`)
 

@@ -332,10 +332,12 @@ export interface FormatDigestOptions {
  * One digest line in the flat layout.  Extracted so both the flat path and the
  * grouped renderer share identical line formatting.
  */
-function flatLine(event: DecodedEvent): string {
+export function formatDigestEventLine(event: DecodedEvent): string {
   const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
   return `· mimir\\-${escapeMd(event.source)} \`${escapeMd(clip(name, 80))}\` at ledger ${event.ledger}`;
 }
+
+const flatLine = formatDigestEventLine;
 
 /**
  * Render a grouped digest.  Called only when `options.grouped` is `true`.

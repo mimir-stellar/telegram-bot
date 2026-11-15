@@ -111,6 +111,28 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+export const TELEGRAM_SAFE_PAGE_LIMIT = 4096;
+
+/**
+ * Validate a per-page character ceiling for scheduled digest continuation pages,
+ * enforcing Telegram's hard 4096-character `sendMessage` ceiling.
+ */
+export function validateDigestPageLimit(
+  maxPageChars: number = TELEGRAM_SAFE_PAGE_LIMIT,
+): number {
+  if (
+    typeof maxPageChars !== "number" ||
+    !Number.isInteger(maxPageChars) ||
+    maxPageChars < 1 ||
+    maxPageChars > TELEGRAM_SAFE_PAGE_LIMIT
+  ) {
+    throw new ScheduleParseError(
+      `maxPageChars must be an integer between 1 and ${TELEGRAM_SAFE_PAGE_LIMIT}, got ${String(maxPageChars)}`,
+    );
+  }
+  return maxPageChars;
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;
