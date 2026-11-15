@@ -15,6 +15,7 @@
  */
 
 import { InlineKeyboard, type Bot, type Context } from "grammy";
+import type { InlineKeyboardMarkup } from "grammy/types";
 
 import { safeErrorMessage } from "./notifications/format.js";
 import { handleBroadcastCallback } from "./commands/broadcast.js";
@@ -27,15 +28,28 @@ import {
 } from "./commands/keyboards.js";
 import { helpMessage } from "./commands/help.js";
 import { contractsMessage } from "./commands/contracts.js";
+import { menuBackKeyboard, menuKeyboard, menuMessage } from "./commands/menu.js";
 import { pauseMessage } from "./commands/pause.js";
 import { resumeMessage } from "./commands/resume.js";
 import { statusMessage } from "./commands/status.js";
 import type { CommandDeps } from "./commands/registry.js";
-import { TELEGRAM_OPTIONS, isOperator, safeAnswerCallback } from "./commands/runtime.js";
+import {
+  TELEGRAM_OPTIONS,
+  isChatAllowed,
+  isOperator,
+  safeAnswerCallback,
+} from "./commands/runtime.js";
 
 // ── Callback payload validation ──────────────────────────────────────────────
 
-export type CallbackActionType = "status" | "contracts" | "help" | "pause" | "resume" | "broadcast";
+export type CallbackActionType =
+  | "status"
+  | "contracts"
+  | "help"
+  | "menu"
+  | "pause"
+  | "resume"
+  | "broadcast";
 
 export interface ValidCallbackAction {
   type: CallbackActionType;
@@ -57,9 +71,10 @@ export const CALLBACK_UNAUTHORIZED_PAYLOAD =
 
 export const CALLBACK_FALLBACK_FEEDBACK = "Invalid or unrecognized action";
 export const CALLBACK_UNAUTHORIZED_FEEDBACK = "Unauthorized: operator only";
+export const CALLBACK_CHAT_UNAUTHORIZED_FEEDBACK = "Unauthorized: chat is not allowed";
 
 function isKnownAction(val: string): val is CallbackActionType {
-  return ["status", "contracts", "help", "pause", "resume", "broadcast"].includes(val);
+  return ["status", "contracts", "help", "menu", "pause", "resume", "broadcast"].includes(val);
 }
 
 /**
@@ -174,7 +189,7 @@ function isMessageNotModified(err: unknown): boolean {
 export async function updateOrReplyMessage(
   ctx: Context,
   text: string,
-  replyMarkup?: InlineKeyboard,
+  replyMarkup?: InlineKeyboard | InlineKeyboardMarkup,
 ): Promise<void> {
   const options = {
     ...TELEGRAM_OPTIONS,
@@ -249,11 +264,50 @@ export async function handleCallbackQuery(
     }
   }
 
+  // Enforce chat allowlist authorization on every navigation callback
+  if (
+    action.type === "menu" ||
+    action.type === "status" ||
+    action.type === "contracts" ||
+    action.type === "help"
+  ) {
+    const chatId = ctx.chat?.id ?? ctx.callbackQuery?.message?.chat?.id;
+    if (
+      config.allowedChatIds &&
+      config.allowedChatIds.length > 0 &&
+      (chatId === undefined || !isChatAllowed(config.allowedChatIds, chatId))
+    ) {
+      console.warn(
+        `[bot] callback /${action.type} denied for chat ${chatId ?? "unknown"} (not in ALLOWED_CHAT_IDS)`,
+      );
+      await safeAnswerCallback(ctx, config, {
+        text: CALLBACK_CHAT_UNAUTHORIZED_FEEDBACK,
+        show_alert: true,
+      });
+      return;
+    }
+  }
+
   // Execute validated action
   try {
     switch (action.type) {
       case "broadcast": {
         await handleBroadcastCallback(ctx, deps, action.raw);
+        break;
+      }
+
+      case "menu": {
+        const text = menuMessage();
+        const keyboard = menuKeyboard();
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text, keyboard);
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, {
+            ...TELEGRAM_OPTIONS,
+            reply_markup: keyboard,
+          });
+        }
+        await safeAnswerCallback(ctx, config, { text: "Menu" });
         break;
       }
 
@@ -284,10 +338,14 @@ export async function handleCallbackQuery(
 
       case "help": {
         const text = helpMessage(config);
+        const keyboard = menuBackKeyboard();
         if (ctx.callbackQuery?.message) {
-          await updateOrReplyMessage(ctx, text);
+          await updateOrReplyMessage(ctx, text, keyboard);
         } else {
-          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+          await ctx.api.sendMessage(config.chatId, text, {
+            ...TELEGRAM_OPTIONS,
+            reply_markup: keyboard,
+          });
         }
         await safeAnswerCallback(ctx, config, { text: "Help" });
         break;

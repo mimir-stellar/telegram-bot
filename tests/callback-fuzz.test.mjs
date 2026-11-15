@@ -19,8 +19,8 @@ import {
 
 const SEED = 0x6d696d72; // "mimr"
 const CASES_PER_CATEGORY = 500;
-const KNOWN_ACTIONS = new Set(["status", "contracts", "help", "pause", "resume"]);
-const ACTIONS = [...KNOWN_ACTIONS];
+const KNOWN_ACTIONS = new Set(["status", "contracts", "help", "menu", "pause", "resume", "broadcast"]);
+const ACTIONS = ["status", "contracts", "help", "pause", "resume"];
 
 /** mulberry32 — small deterministic PRNG. */
 function mulberry32(seed) {

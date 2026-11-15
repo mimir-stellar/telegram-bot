@@ -1,3 +1,8 @@
+import type { InlineKeyboardMarkup } from "grammy/types";
+
+import { defineCommand } from "./registry.js";
+import { TELEGRAM_OPTIONS } from "./runtime.js";
+
 export function menuMessage(): string {
   return [
     "📋 *Menu*",
@@ -9,7 +14,7 @@ export function menuMessage(): string {
   ].join("\n");
 }
 
-export function menuKeyboard() {
+export function menuKeyboard(): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
       [{ text: "📊 Status", callback_data: "status" }],
@@ -18,3 +23,20 @@ export function menuKeyboard() {
     ],
   };
 }
+
+export function menuBackKeyboard(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[{ text: "📋 Menu", callback_data: "menu" }]],
+  };
+}
+
+export const menuCommand = defineCommand({
+  command: "menu",
+  chatAllowlist: true,
+  handler: async (ctx) => {
+    await ctx.reply(menuMessage(), {
+      ...TELEGRAM_OPTIONS,
+      reply_markup: menuKeyboard(),
+    });
+  },
+});

@@ -70,11 +70,15 @@ export {
   contractsMessage,
   healthMessage,
   lastEventMessage,
+  menuBackKeyboard,
+  menuKeyboard,
+  menuMessage,
   pauseMessage,
   resumeMessage,
   statusMessage,
 } from "./commands/index.js";
 export {
+  CALLBACK_CHAT_UNAUTHORIZED_FEEDBACK,
   CALLBACK_FALLBACK_FEEDBACK,
   CALLBACK_FALLBACK_PAYLOAD,
   CALLBACK_UNAUTHORIZED_FEEDBACK,
