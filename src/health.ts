@@ -10,13 +10,21 @@
 
 import crypto from "node:crypto";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
 
 import {
   emptyActivityBaseline,
   type ActivityBaselineSnapshot,
 } from "./activity-baseline.js";
-import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
+import {
+  DEFAULT_HEALTH_SHUTDOWN_GRACE_MS,
+  configProvenance,
+  networkLabel,
+  type BotConfig,
+  type ConfigProvenance,
+} from "./config.js";
+
+export { DEFAULT_HEALTH_SHUTDOWN_GRACE_MS };
 import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
@@ -36,6 +44,17 @@ export interface HealthDeps {
    * {@link configProvenance}; either way only key names and origins are served.
    */
   provenance?: () => ConfigProvenance;
+  /**
+   * Optional grace period (ms) for active HTTP requests to complete during
+   * shutdown before stalled client sockets are destroyed. Defaults to
+   * `config.healthShutdownGraceMs` ({@link DEFAULT_HEALTH_SHUTDOWN_GRACE_MS}).
+   */
+  shutdownGraceMs?: number;
+}
+
+export interface HealthCloseOptions {
+  /** Override shutdown grace period in milliseconds (`0` closes immediately). */
+  graceMs?: number;
 }
 
 export interface HealthServer {
@@ -43,7 +62,7 @@ export interface HealthServer {
   url: string | null;
   /** Port actually bound (0 when disabled). */
   port: number;
-  close(): Promise<void>;
+  close(options?: HealthCloseOptions): Promise<void>;
 }
 
 /** Safe, redacted snapshot for HTTP clients. Never includes secrets. */
@@ -485,7 +504,16 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     return { url: null, port: 0, close: async () => undefined };
   }
 
+  let closing = false;
+  let closingPromise: Promise<void> | null = null;
+  let activeCloseGraceMs = DEFAULT_HEALTH_SHUTDOWN_GRACE_MS;
+  const sockets = new Set<Socket>();
+
   const server = http.createServer((req, res) => {
+    if (closing) {
+      res.shouldKeepAlive = false;
+      res.setHeader("connection", "close");
+    }
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
@@ -538,6 +566,17 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     sendJson(res, 404, { ok: false, error: "not_found" });
   });
 
+  server.on("connection", (socket) => {
+    if (closing && activeCloseGraceMs === 0) {
+      socket.destroy();
+      return;
+    }
+    sockets.add(socket);
+    socket.once("close", () => {
+      sockets.delete(socket);
+    });
+  });
+
   // Failures after listen (e.g. client aborts) must not take down the notifier.
   server.on("error", (err) => {
     console.error(`[health] server error: ${safeErrorMessage(err)}`);
@@ -556,9 +595,44 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   return {
     url,
     port,
-    close: () =>
-      new Promise((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      }),
+    close: (options?: HealthCloseOptions) => {
+      if (closingPromise !== null) return closingPromise;
+      closing = true;
+      const configuredGrace =
+        options?.graceMs ?? deps.shutdownGraceMs ?? config.healthShutdownGraceMs;
+      const graceMs =
+        typeof configuredGrace === "number" &&
+        Number.isFinite(configuredGrace) &&
+        configuredGrace >= 0
+          ? Math.floor(configuredGrace)
+          : DEFAULT_HEALTH_SHUTDOWN_GRACE_MS;
+      activeCloseGraceMs = graceMs;
+
+      closingPromise = new Promise<void>((resolve, reject) => {
+        const destroyStalledSockets = (): void => {
+          server.closeAllConnections?.();
+          for (const socket of sockets) {
+            if (!socket.destroyed) socket.destroy();
+          }
+        };
+
+        let graceTimer: NodeJS.Timeout | null = null;
+        server.close((err) => {
+          if (graceTimer !== null) clearTimeout(graceTimer);
+          if (err) reject(err);
+          else resolve();
+        });
+        server.closeIdleConnections?.();
+
+        if (graceMs === 0) {
+          destroyStalledSockets();
+        } else {
+          graceTimer = setTimeout(destroyStalledSockets, graceMs);
+          graceTimer.unref();
+        }
+      });
+
+      return closingPromise;
+    },
   };
 }

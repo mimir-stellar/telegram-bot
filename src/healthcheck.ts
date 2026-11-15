@@ -28,6 +28,8 @@ function main() {
       path: "/health",
       method: "GET",
       timeout: 2000,
+      agent: false,
+      headers: { connection: "close" },
     },
     (res) => {
       let body = "";

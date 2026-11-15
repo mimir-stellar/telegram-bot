@@ -40,6 +40,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Health Reporting
 - `HEALTH_HOST` & `HEALTH_PORT`: Binds a local HTTP endpoint for health probes (e.g., Kubernetes liveness probes). Set port to 0 to disable.
 - `HEALTH_STALE_MS`: Marks the health endpoint as degraded if no successful poll completes within this window (e.g., 90000ms).
+- `HEALTH_SHUTDOWN_GRACE_MS`: Bounds operational HTTP shutdown duration (default `2000` ms; `0` closes open client sockets immediately) so stalled probes cannot hang process exit.
 
 ## Operational Behavior
 

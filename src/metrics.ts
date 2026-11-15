@@ -24,6 +24,9 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { Socket } from "node:net";
+
+import { DEFAULT_HEALTH_SHUTDOWN_GRACE_MS } from "./config.js";
 
 // ── Metric types ──────────────────────────────────────────────────────────────
 
@@ -41,12 +44,17 @@ export interface Gauge {
   value(): number;
 }
 
+export interface MetricsServerOptions {
+  /** Short grace period (ms) before stalled HTTP client sockets are closed on shutdown. */
+  shutdownGraceMs?: number;
+}
+
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
 export interface MetricsServer {
   /** The port the server is actually listening on. */
   port: number;
-  /** Gracefully close the server. Resolves when the socket is released. */
-  close(): Promise<void>;
+  /** Gracefully close the server, destroying stalled sockets after `graceMs`. */
+  close(options?: { graceMs?: number }): Promise<void>;
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -109,8 +117,9 @@ export interface MetricsRegistry {
    * @param port TCP port (1–65535). Caller is responsible for validating this
    *             before calling startServer (see config.ts).
    * @param host Bind address (default: "127.0.0.1").
+   * @param options Optional server lifecycle settings such as `shutdownGraceMs`.
    */
-  startServer(port: number, host?: string): Promise<MetricsServer>;
+  startServer(port: number, host?: string, options?: MetricsServerOptions): Promise<MetricsServer>;
 }
 
 // ── Implementation ────────────────────────────────────────────────────────────
@@ -264,9 +273,35 @@ export function createMetrics(): MetricsRegistry {
     res.end("Not Found\n");
   }
 
-  function startServer(port: number, host = "127.0.0.1"): Promise<MetricsServer> {
+  function startServer(
+    port: number,
+    host = "127.0.0.1",
+    serverOptions?: MetricsServerOptions,
+  ): Promise<MetricsServer> {
     return new Promise((resolve, reject) => {
-      const server = createServer(handleRequest);
+      let closing = false;
+      let closingPromise: Promise<void> | null = null;
+      let activeCloseGraceMs = DEFAULT_HEALTH_SHUTDOWN_GRACE_MS;
+      const sockets = new Set<Socket>();
+
+      const server = createServer((req, res) => {
+        if (closing) {
+          res.shouldKeepAlive = false;
+          res.setHeader("connection", "close");
+        }
+        handleRequest(req, res);
+      });
+
+      server.on("connection", (socket) => {
+        if (closing && activeCloseGraceMs === 0) {
+          socket.destroy();
+          return;
+        }
+        sockets.add(socket);
+        socket.once("close", () => {
+          sockets.delete(socket);
+        });
+      });
 
       server.once("error", reject);
 
@@ -278,13 +313,44 @@ export function createMetrics(): MetricsRegistry {
 
         const metricsServer: MetricsServer = {
           port: actualPort,
-          close(): Promise<void> {
-            return new Promise((res, rej) => {
+          close(closeOptions?: { graceMs?: number }): Promise<void> {
+            if (closingPromise !== null) return closingPromise;
+            closing = true;
+            const configuredGrace =
+              closeOptions?.graceMs ?? serverOptions?.shutdownGraceMs;
+            const graceMs =
+              typeof configuredGrace === "number" &&
+              Number.isFinite(configuredGrace) &&
+              configuredGrace >= 0
+                ? Math.floor(configuredGrace)
+                : DEFAULT_HEALTH_SHUTDOWN_GRACE_MS;
+            activeCloseGraceMs = graceMs;
+
+            closingPromise = new Promise<void>((res, rej) => {
+              const destroyStalledSockets = (): void => {
+                server.closeAllConnections?.();
+                for (const socket of sockets) {
+                  if (!socket.destroyed) socket.destroy();
+                }
+              };
+
+              let graceTimer: NodeJS.Timeout | null = null;
               server.close((err) => {
+                if (graceTimer !== null) clearTimeout(graceTimer);
                 if (err) rej(err);
                 else res();
               });
+              server.closeIdleConnections?.();
+
+              if (graceMs === 0) {
+                destroyStalledSockets();
+              } else {
+                graceTimer = setTimeout(destroyStalledSockets, graceMs);
+                graceTimer.unref();
+              }
             });
+
+            return closingPromise;
           },
         };
 

@@ -14,6 +14,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   ConfigError,
+  DEFAULT_HEALTH_SHUTDOWN_GRACE_MS,
   activeProfileName,
   configProvenance,
   loadConfig,
@@ -68,6 +69,8 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "HEALTH_PORT",
   "PORT",
   "HEALTH_STALE_MS",
+  "HEALTH_SHUTDOWN_GRACE_MS",
+  "HEALTH_AUTH_TOKEN",
   "STARTUP_HEALTH_DEADLINE_MS",
   "STARTUP_HEALTH_RETRY_MS",
   "SHUTDOWN_TIMEOUT_MS",
@@ -208,6 +211,8 @@ function resolveSettingValue(
       return String(config.healthPort);
     case "HEALTH_STALE_MS":
       return String(config.healthStaleMs);
+    case "HEALTH_SHUTDOWN_GRACE_MS":
+      return String(config.healthShutdownGraceMs ?? DEFAULT_HEALTH_SHUTDOWN_GRACE_MS);
     case "SHUTDOWN_TIMEOUT_MS":
       return String(config.shutdownTimeoutMs);
     case "TELEGRAM_SEND_TIMEOUT_MS":

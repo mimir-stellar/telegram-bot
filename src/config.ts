@@ -306,10 +306,19 @@ export interface BotConfig extends StellarConfig {
   mimirAppUrl: string | null;
   /** Optional bearer token for health endpoint authentication. Null disables auth. */
   healthAuthToken: string | null;
+  /**
+   * Short grace period (ms) for operational HTTP servers to finish active
+   * requests during shutdown before stalled client sockets are destroyed.
+   * `0` closes open sockets immediately.
+   */
+  healthShutdownGraceMs?: number;
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+
+/** Default grace period for operational HTTP requests during shutdown. */
+export const DEFAULT_HEALTH_SHUTDOWN_GRACE_MS = 2_000;
 
 /** Fallback per-send budget when a config object predates `TELEGRAM_SEND_TIMEOUT_MS`. */
 export const DEFAULT_TELEGRAM_SEND_TIMEOUT_MS = 10_000;
@@ -354,6 +363,7 @@ const DEFAULTS = {
   healthPort: 8787,
   // 3Ã— default poll interval â€” one missed cycle is fine; three is not.
   healthStaleMs: 90_000,
+  healthShutdownGraceMs: DEFAULT_HEALTH_SHUTDOWN_GRACE_MS,
   // Retry RPC getHealth at boot for up to 30s (Testnet blips / deploy races).
   startupHealthDeadlineMs: 30_000,
   startupHealthRetryMs: 1_000,
@@ -942,6 +952,11 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
+    healthShutdownGraceMs: c.int(
+      "HEALTH_SHUTDOWN_GRACE_MS",
+      DEFAULTS.healthShutdownGraceMs,
+      0,
+    ),
     // 0 = single attempt (no retries) for the startup RPC probe.
     startupHealthDeadlineMs: c.int(
       "STARTUP_HEALTH_DEADLINE_MS",
@@ -1144,6 +1159,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
     },
   },
   { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
+  { key: "HEALTH_SHUTDOWN_GRACE_MS", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_AUTH_TOKEN", secret: true },
   { key: "STARTUP_HEALTH_DEADLINE_MS", secret: false, hasBuiltInDefault: true },
   { key: "STARTUP_HEALTH_RETRY_MS", secret: false, hasBuiltInDefault: true },
