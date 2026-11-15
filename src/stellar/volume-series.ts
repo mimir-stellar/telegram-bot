@@ -1,9 +1,16 @@
-import type { DecodedEvent } from "./decode.js";
+import { USDC_UNIT, formatUsdc, type DecodedEvent } from "./decode.js";
 
 export type VolumeBucketUnit = "hour" | "day";
 
+export const USDC_ATOMIC_DECIMALS = 7;
+
 export interface VolumeSeriesOptions {
   bucket: VolumeBucketUnit;
+  /**
+   * When true, non-integer, negative, or unsafe-number (`> Number.MAX_SAFE_INTEGER`)
+   * stake/deposit values throw a `RangeError` rather than being ignored as `0n`.
+   */
+  strictAmounts?: boolean;
 }
 
 export interface VolumeBucket {
@@ -40,8 +47,112 @@ export interface VolumeSeriesResult {
   processedEvents: number;
 }
 
+export interface ExportVolumeOptions {
+  /** Include 7-decimal formatted USDC strings alongside integer atomic strings. Defaults to true. */
+  includeDecimalDisplay?: boolean;
+}
+
+export interface ExportedVolumeBucket {
+  timestamp: string;
+  startAt: number;
+  /** Integer atomic USDC units (1 USDC = 10_000_000) as base-10 integer string. */
+  challengeStakeAtomic: string;
+  /** Integer atomic USDC units (1 USDC = 10_000_000) as base-10 integer string. */
+  squadDepositAtomic: string;
+  /** Combined challenge + squad volume in integer atomic USDC units. */
+  totalVolumeAtomic: string;
+  /** Optional 7-decimal USDC string formatted purely via integer division at the export boundary. */
+  challengeStakeUsdc?: string;
+  /** Optional 7-decimal USDC string formatted purely via integer division at the export boundary. */
+  squadDepositUsdc?: string;
+  /** Optional 7-decimal combined USDC string formatted at the export boundary. */
+  totalVolumeUsdc?: string;
+  challengeCount: number;
+  depositCount: number;
+  eventCount: number;
+}
+
+export interface ExportedVolumeTotals {
+  challengeStakeAtomic: string;
+  squadDepositAtomic: string;
+  totalVolumeAtomic: string;
+  challengeStakeUsdc?: string;
+  squadDepositUsdc?: string;
+  totalVolumeUsdc?: string;
+}
+
+export interface ExportedVolumeSeries {
+  bucketUnit?: VolumeBucketUnit;
+  usdcDecimals: typeof USDC_ATOMIC_DECIMALS;
+  usdcAtomicUnit: string;
+  buckets: ExportedVolumeBucket[];
+  totals: ExportedVolumeTotals;
+  skippedWithoutAt: number;
+  processedEvents: number;
+}
+
 const SECONDS_PER_HOUR = 3600;
 const SECONDS_PER_DAY = 86400;
+
+/**
+ * Parse an atomic USDC integer amount strictly without floating-point conversion.
+ *
+ * Accepts non-negative `bigint`, safe integer `number`, or base-10 integer `string`.
+ * Rejects floats (`12.34`), unsafe JS numbers (`> Number.MAX_SAFE_INTEGER`),
+ * decimal strings (`"12.3400000"`), negative amounts, and empty strings.
+ */
+export function parseAtomicUsdc(value: unknown): bigint {
+  if (typeof value === "bigint") {
+    if (value < 0n) {
+      throw new RangeError(`Atomic USDC amount must be non-negative, got ${value.toString()}`);
+    }
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RangeError(
+        `Atomic USDC number must be a non-negative safe integer, got ${String(value)}`,
+      );
+    }
+    return BigInt(value);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!/^\d+$/.test(trimmed)) {
+      throw new RangeError(
+        `Atomic USDC string must be a base-10 non-negative integer, got "${value}"`,
+      );
+    }
+    return BigInt(trimmed);
+  }
+  throw new RangeError(`Unsupported atomic USDC value type: ${typeof value}`);
+}
+
+function resolveAtomicDelta(value: unknown, strict: boolean): bigint {
+  if (value === undefined || value === null) {
+    if (strict) {
+      throw new RangeError("Missing atomic USDC amount");
+    }
+    return 0n;
+  }
+  try {
+    return parseAtomicUsdc(value);
+  } catch (err) {
+    if (strict) {
+      throw err;
+    }
+    return 0n;
+  }
+}
+
+/**
+ * Format an integer atomic USDC amount into a 7-decimal string at the export
+ * boundary using integer quotient/remainder arithmetic only (never IEEE-754 float).
+ */
+export function formatAtomicUsdcBoundary(atomicUnits: bigint | string): string {
+  const units = typeof atomicUnits === "bigint" ? parseAtomicUsdc(atomicUnits) : parseAtomicUsdc(atomicUnits);
+  return formatUsdc(units);
+}
 
 /**
  * Floor unix timestamp in seconds to the start of the UTC bucket.
@@ -56,8 +167,11 @@ export function floorToBucketUtc(unixSeconds: number, bucket: VolumeBucketUnit):
 /**
  * Produce time-bucketed volume series for stakes and deposits.
  *
- * Empty buckets between earliest and latest events are filled with zero values.
- * Events without a valid `at` timestamp are skipped and counted in `skippedWithoutAt`.
+ * All accumulation uses exact integer `bigint` atomic USDC units (`10_000_000`
+ * units per 1 USDC) — floating-point numbers and unsafe JS integers are never
+ * accumulated. Empty buckets between earliest and latest events are filled with
+ * zero values. Events without a valid `at` timestamp are skipped and counted in
+ * `skippedWithoutAt`.
  */
 export function volumeSeries(
   events: readonly DecodedEvent[] | null | undefined,
@@ -67,6 +181,7 @@ export function volumeSeries(
   if (bucketUnit !== "hour" && bucketUnit !== "day") {
     throw new Error(`Invalid bucket unit: expected "hour" or "day", got ${String(bucketUnit)}`);
   }
+  const strictAmounts = options?.strictAmounts === true;
 
   const stepSeconds = bucketUnit === "hour" ? SECONDS_PER_HOUR : SECONDS_PER_DAY;
 
@@ -125,27 +240,11 @@ export function volumeSeries(
 
     if (payloadName === "claim_challenged") {
       const stake = (payload as { stake?: unknown }).stake;
-      if (typeof stake === "bigint") {
-        challengeStakeDelta = stake;
-      } else if (typeof stake === "string" || typeof stake === "number") {
-        try {
-          challengeStakeDelta = BigInt(stake);
-        } catch {
-          challengeStakeDelta = 0n;
-        }
-      }
+      challengeStakeDelta = resolveAtomicDelta(stake, strictAmounts);
       isChallenge = true;
     } else if (payloadName === "deposited") {
       const amount = (payload as { amount?: unknown }).amount;
-      if (typeof amount === "bigint") {
-        squadDepositDelta = amount;
-      } else if (typeof amount === "string" || typeof amount === "number") {
-        try {
-          squadDepositDelta = BigInt(amount);
-        } catch {
-          squadDepositDelta = 0n;
-        }
-      }
+      squadDepositDelta = resolveAtomicDelta(amount, strictAmounts);
       isDeposit = true;
     }
 
@@ -224,4 +323,136 @@ export function volumeSeries(
     skippedWithoutAt,
     processedEvents,
   };
+}
+
+/**
+ * Convert a single `VolumeBucket` into a JSON-ready `ExportedVolumeBucket`
+ * preserving exact integer atomic USDC strings and applying 7-decimal formatting
+ * strictly at the export boundary.
+ */
+export function exportVolumeBucket(
+  bucket: VolumeBucket,
+  options: ExportVolumeOptions = {},
+): ExportedVolumeBucket {
+  const includeDecimalDisplay = options.includeDecimalDisplay ?? true;
+  const challengeAtomic = parseAtomicUsdc(bucket.challengeStake ?? bucket.challengeStakeTotal);
+  const depositAtomic = parseAtomicUsdc(bucket.squadDeposit ?? bucket.squadDepositTotal);
+  const totalAtomic = challengeAtomic + depositAtomic;
+
+  return {
+    timestamp: bucket.timestamp,
+    startAt: bucket.startAt,
+    challengeStakeAtomic: challengeAtomic.toString(),
+    squadDepositAtomic: depositAtomic.toString(),
+    totalVolumeAtomic: totalAtomic.toString(),
+    ...(includeDecimalDisplay
+      ? {
+          challengeStakeUsdc: formatUsdc(challengeAtomic),
+          squadDepositUsdc: formatUsdc(depositAtomic),
+          totalVolumeUsdc: formatUsdc(totalAtomic),
+        }
+      : {}),
+    challengeCount: bucket.challengeCount,
+    depositCount: bucket.depositCount,
+    eventCount: bucket.eventCount,
+  };
+}
+
+/**
+ * Export a `VolumeSeriesResult` into a JSON-safe boundary structure carrying
+ * integer atomic USDC strings throughout all buckets/totals and optional
+ * integer-derived 7-decimal USDC display strings.
+ */
+export function exportVolumeSeries(
+  series: VolumeSeriesResult,
+  options: ExportVolumeOptions & { bucketUnit?: VolumeBucketUnit } = {},
+): ExportedVolumeSeries {
+  const includeDecimalDisplay = options.includeDecimalDisplay ?? true;
+  const totalChallengeAtomic = parseAtomicUsdc(series.totalChallengeStake);
+  const totalDepositAtomic = parseAtomicUsdc(series.totalSquadDeposit);
+  const combinedTotalAtomic = totalChallengeAtomic + totalDepositAtomic;
+
+  return {
+    ...(options.bucketUnit !== undefined ? { bucketUnit: options.bucketUnit } : {}),
+    usdcDecimals: USDC_ATOMIC_DECIMALS,
+    usdcAtomicUnit: USDC_UNIT.toString(),
+    buckets: series.buckets.map((b) => exportVolumeBucket(b, { includeDecimalDisplay })),
+    totals: {
+      challengeStakeAtomic: totalChallengeAtomic.toString(),
+      squadDepositAtomic: totalDepositAtomic.toString(),
+      totalVolumeAtomic: combinedTotalAtomic.toString(),
+      ...(includeDecimalDisplay
+        ? {
+            challengeStakeUsdc: formatUsdc(totalChallengeAtomic),
+            squadDepositUsdc: formatUsdc(totalDepositAtomic),
+            totalVolumeUsdc: formatUsdc(combinedTotalAtomic),
+          }
+        : {}),
+    },
+    skippedWithoutAt: series.skippedWithoutAt,
+    processedEvents: series.processedEvents,
+  };
+}
+
+/**
+ * Serialize a `VolumeSeriesResult` directly to deterministic JSON without raw
+ * `bigint` serialization errors or floating-point rounding.
+ */
+export function serializeVolumeSeriesJson(
+  series: VolumeSeriesResult,
+  options: ExportVolumeOptions & { bucketUnit?: VolumeBucketUnit } = {},
+): string {
+  return `${JSON.stringify(exportVolumeSeries(series, options), null, 2)}\n`;
+}
+
+/**
+ * Render a deterministic CSV export of volume buckets keeping integer atomic
+ * columns alongside boundary-formatted 7-decimal USDC columns.
+ */
+export function formatVolumeSeriesCsv(
+  series: VolumeSeriesResult,
+  options: ExportVolumeOptions = {},
+): string {
+  const exported = exportVolumeSeries(series, options);
+  const includeDecimalDisplay = options.includeDecimalDisplay ?? true;
+
+  const header = includeDecimalDisplay
+    ? "timestamp,start_at,challenge_stake_atomic,squad_deposit_atomic,total_volume_atomic,challenge_stake_usdc,squad_deposit_usdc,total_volume_usdc,challenge_count,deposit_count,event_count"
+    : "timestamp,start_at,challenge_stake_atomic,squad_deposit_atomic,total_volume_atomic,challenge_count,deposit_count,event_count";
+
+  const rows = [header];
+  for (const b of exported.buckets) {
+    if (includeDecimalDisplay) {
+      rows.push(
+        [
+          b.timestamp,
+          b.startAt,
+          b.challengeStakeAtomic,
+          b.squadDepositAtomic,
+          b.totalVolumeAtomic,
+          b.challengeStakeUsdc ?? "0.0000000",
+          b.squadDepositUsdc ?? "0.0000000",
+          b.totalVolumeUsdc ?? "0.0000000",
+          b.challengeCount,
+          b.depositCount,
+          b.eventCount,
+        ].join(","),
+      );
+    } else {
+      rows.push(
+        [
+          b.timestamp,
+          b.startAt,
+          b.challengeStakeAtomic,
+          b.squadDepositAtomic,
+          b.totalVolumeAtomic,
+          b.challengeCount,
+          b.depositCount,
+          b.eventCount,
+        ].join(","),
+      );
+    }
+  }
+
+  return `${rows.join("\n")}\n`;
 }

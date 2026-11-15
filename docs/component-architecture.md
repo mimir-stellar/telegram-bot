@@ -119,6 +119,10 @@ The decoder converts raw Soroban events into typed TypeScript objects. It handle
 - **Squad**: `market_created`, `deposited`, `withdrawn`, `resolved`, `claimed`, `fees_claimed`
 - **Admin**: Recognized but not notified (`oracle_changed`, `ownership_transferred`, `fee_policy_*`, etc.)
 
+### Volume Series & Boundary Formatting (`src/stellar/volume-series.ts`)
+
+`volumeSeries()` accumulates challenge stakes and squad deposits into contiguous UTC `"hour"` and `"day"` buckets using strictly integer atomic USDC units (`bigint`, `1 USDC = 10_000_000` atomic units). Floating-point numbers and unsafe JavaScript integers (`> Number.MAX_SAFE_INTEGER`) are never accumulated. Export helpers (`exportVolumeBucket`, `exportVolumeSeries`, `serializeVolumeSeriesJson`, `formatVolumeSeriesCsv`) retain base-10 integer atomic strings throughout every bucket and apply 7-decimal USDC formatting (`formatUsdc`) only at the export boundary via integer division and remainder.
+
 ### Notification Formatter (`src/notifications/format.ts`)
 
 Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's MarkdownV2 format (not legacy Markdown) for reliable rendering.
