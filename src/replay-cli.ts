@@ -18,14 +18,29 @@
  * load a full bot config (BOT_TOKEN + TELEGRAM_CHAT_ID) and deliver events.
  *
  * Exit codes:
- *   0 — scan completed (even if some events were skipped or capped)
- *   1 — fatal runtime error (RPC failure, config error)
- *   2 — usage error (bad flags)
+ *   0   — scan completed (even if some events were skipped or capped)
+ *   1   — fatal runtime error (RPC failure, config error)
+ *   2   — usage error (bad flags)
+ *   130 — operator cancellation (SIGINT); committed progress flushed as resumable
  */
 
 import { pathToFileURL } from "node:url";
 
-import { runReplayCli } from "./stellar/replay.js";
+import {
+  REPLAY_EXIT_CANCELLED,
+  REPLAY_EXIT_ERROR,
+  REPLAY_EXIT_OK,
+  REPLAY_EXIT_USAGE,
+  runReplayCli,
+} from "./stellar/replay.js";
+
+export {
+  REPLAY_EXIT_CANCELLED,
+  REPLAY_EXIT_ERROR,
+  REPLAY_EXIT_OK,
+  REPLAY_EXIT_USAGE,
+  runReplayCli,
+};
 
 const invokedPath = process.argv[1];
 if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {

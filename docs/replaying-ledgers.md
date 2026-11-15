@@ -77,9 +77,10 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 
 ### Exit Codes
 
-* **`0`:** Scan completed successfully (even if some events were skipped, deduplicated, or capped).
-* **`1`:** Fatal runtime error (RPC unreachable, invalid network passphrase, or missing config in `--send` mode).
-* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, or invalid `--contract`).
+* **`0` (`REPLAY_EXIT_OK`):** Scan completed successfully (even if some events were skipped, deduplicated, or capped).
+* **`1` (`REPLAY_EXIT_ERROR`):** Fatal runtime error (RPC unreachable, invalid network passphrase, or missing config in `--send` mode).
+* **`2` (`REPLAY_EXIT_USAGE`):** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, or invalid `--contract`).
+* **`130` (`REPLAY_EXIT_CANCELLED`):** Cancelled via `SIGINT`. Replay never reports success on cancellation, discards uncommitted mid-page state, flushes only committed page checkpoints to `--progress-file` with `"status": "cancelled"` and `"resumable": true`, and can be resumed safely from the last committed checkpoint.
 
 ---
 

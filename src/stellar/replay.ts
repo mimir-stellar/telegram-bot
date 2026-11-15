@@ -75,6 +75,35 @@ import {
   EVENT_PAGE_LIMIT,
 } from "./events.js";
 
+// ── Exit codes & cancellation ────────────────────────────────────────────────
+
+export const REPLAY_EXIT_OK = 0;
+export const REPLAY_EXIT_ERROR = 1;
+export const REPLAY_EXIT_USAGE = 2;
+/** Standard POSIX `128 + SIGINT(2)` exit code for operator-cancelled replay runs. */
+export const REPLAY_EXIT_CANCELLED = 130;
+
+export type ReplayExitCode =
+  | typeof REPLAY_EXIT_OK
+  | typeof REPLAY_EXIT_ERROR
+  | typeof REPLAY_EXIT_USAGE
+  | typeof REPLAY_EXIT_CANCELLED;
+
+export type ReplayRunStatus = "completed" | "cancelled" | "failed";
+export type ReplayProgressStatus = "in_progress" | "completed" | "cancelled";
+
+export class ReplayCancelledError extends Error {
+  readonly signal: string;
+  readonly committedTarget?: ReplayTargetResult | undefined;
+
+  constructor(signal = "SIGINT", committedTarget?: ReplayTargetResult) {
+    super(`Replay cancelled (${signal})`);
+    this.name = "ReplayCancelledError";
+    this.signal = signal;
+    this.committedTarget = committedTarget;
+  }
+}
+
 // ── Replay report types ───────────────────────────────────────────────────────
 
 export interface ReplayEventSummary {
@@ -115,10 +144,17 @@ export interface ReplayTargetResult {
   lastProcessedEventId?: string | null | undefined;
   /** Failed send attempts (counted under skipped, never sent). */
   failedSends?: number | undefined;
+  /** True when the walk stopped early due to SIGINT / cancellation. */
+  cancelled?: boolean | undefined;
+  /** True when this target has remaining work that can be resumed. */
+  resumable?: boolean | undefined;
 }
 
 export interface ReplayReport {
   format: "mimir-replay-v1";
+  status?: ReplayRunStatus | undefined;
+  cancelled?: boolean | undefined;
+  resumable?: boolean | undefined;
   network: string;
   rpcUrl: string;
   fromLedger: number;
@@ -160,6 +196,9 @@ export interface ReplayProgressTarget {
 export interface ReplayProgressFile {
   format: "mimir-replay-progress-v1";
   version: 1;
+  status?: ReplayProgressStatus | undefined;
+  resumable?: boolean | undefined;
+  cancelledAt?: string | null | undefined;
   createdAt: string;
   updatedAt: string;
   network: string;
@@ -194,12 +233,53 @@ export class RpcBudgetTracker {
     return this.requestCount;
   }
 
-  async acquire(): Promise<void> {
+  async acquire(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      throw new ReplayCancelledError(
+        typeof signal.reason === "string" ? signal.reason : "SIGINT",
+      );
+    }
     const current = this.now();
     const elapsed = current - this.lastRequestAt;
     if (this.lastRequestAt > 0 && elapsed < this.minIntervalMs) {
       const waitMs = this.minIntervalMs - elapsed;
-      await this.sleep(waitMs);
+      if (signal) {
+        await new Promise<void>((resolve, reject) => {
+          let settled = false;
+          const onAbort = () => {
+            if (settled) return;
+            settled = true;
+            reject(
+              new ReplayCancelledError(
+                typeof signal.reason === "string" ? signal.reason : "SIGINT",
+              ),
+            );
+          };
+          if (signal.aborted) {
+            onAbort();
+            return;
+          }
+          signal.addEventListener("abort", onAbort, { once: true });
+          this.sleep(waitMs).then(
+            () => {
+              signal.removeEventListener("abort", onAbort);
+              if (!settled) {
+                settled = true;
+                resolve();
+              }
+            },
+            (err) => {
+              signal.removeEventListener("abort", onAbort);
+              if (!settled) {
+                settled = true;
+                reject(err);
+              }
+            },
+          );
+        });
+      } else {
+        await this.sleep(waitMs);
+      }
       this.lastRequestAt = Math.max(this.now(), this.lastRequestAt + waitMs);
     } else {
       this.lastRequestAt = current;
@@ -244,6 +324,13 @@ export interface ReplayOptions {
   onPageComplete?: ((targetUpdate: ReplayProgressTarget) => Promise<void>) | undefined;
   /** Global RPC budget tracker. */
   budget?: RpcBudgetTracker | undefined;
+  /** Cancellation signal (aborted on SIGINT or programmatic cancellation). */
+  signal?: AbortSignal | undefined;
+}
+
+export interface ReplaySignalSource {
+  on(event: "SIGINT", listener: () => void): unknown;
+  off(event: "SIGINT", listener: () => void): unknown;
 }
 
 export interface ReplayDeps {
@@ -266,6 +353,10 @@ export interface ReplayDeps {
   sleep?: ((ms: number) => Promise<void>) | undefined;
   /** Timestamp provider for deterministic rate-limit / delay tests. */
   now?: (() => number) | undefined;
+  /** Optional AbortSignal for programmatic cancellation. */
+  signal?: AbortSignal | undefined;
+  /** Signal emitter to subscribe to SIGINT (defaults to `process`). */
+  signalSource?: ReplaySignalSource | undefined;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -412,12 +503,91 @@ async function replayContract(
       resumedSkippedEvents: opts.targetProgress.eventsProcessed,
       lastProcessedEventId: opts.targetProgress.lastProcessedEventId,
       failedSends: opts.targetProgress.failedSends ?? 0,
+      cancelled: false,
+      resumable: false,
     };
   }
 
+  let committedSnapshot = {
+    pages: opts.targetProgress?.pagesProcessed ?? 0,
+    events: opts.targetProgress?.eventsProcessed ?? 0,
+    sent: opts.targetProgress?.eventsSent ?? 0,
+    skipped: opts.targetProgress?.eventsSkipped ?? 0,
+    capped: opts.targetProgress?.eventsCapped ?? 0,
+    adminLogged: opts.targetProgress?.adminLogged ?? 0,
+    duplicates: opts.targetProgress?.duplicates ?? 0,
+    failedSends: opts.targetProgress?.failedSends ?? 0,
+    resumedSkippedEvents: 0,
+    lastEventLedger: opts.targetProgress?.lastEventLedger ?? null,
+    lastProcessedEventId: opts.targetProgress?.lastProcessedEventId ?? null,
+    cursor: opts.targetProgress?.cursor ?? null,
+    startLedger: null as number | null,
+    startClamped: false,
+    eventLog: [] as ReplayEventSummary[],
+  };
+
+  const parsedFallbackFrom =
+    typeof opts.from === "number"
+      ? opts.from
+      : /^\d+$/.test(String(opts.from).trim())
+        ? parseInt(String(opts.from).trim(), 10)
+        : (opts.targetProgress?.lastEventLedger ?? 0);
+
+  const buildCommittedCancelledResult = (
+    fromFallback: number,
+    effectiveToBound: number | null,
+  ): ReplayTargetResult => ({
+    source: target.source,
+    contractId: target.contractId,
+    fromLedger: committedSnapshot.startLedger ?? fromFallback,
+    toLedger: effectiveToBound,
+    startLedger: committedSnapshot.startLedger,
+    startClamped: committedSnapshot.startClamped,
+    pages: committedSnapshot.pages,
+    events: committedSnapshot.events,
+    sent: committedSnapshot.sent,
+    skipped: committedSnapshot.skipped,
+    capped: committedSnapshot.capped,
+    adminLogged: committedSnapshot.adminLogged,
+    duplicates: committedSnapshot.duplicates,
+    truncated: true,
+    lastEventLedger: committedSnapshot.lastEventLedger,
+    cursor: committedSnapshot.cursor,
+    eventLog: showLog ? [...committedSnapshot.eventLog] : [],
+    resumedSkippedEvents: committedSnapshot.resumedSkippedEvents,
+    lastProcessedEventId: committedSnapshot.lastProcessedEventId,
+    failedSends: committedSnapshot.failedSends,
+    cancelled: true,
+    resumable: true,
+  });
+
+  const checkCancelled = (fromFallback: number, effectiveToBound: number | null): void => {
+    if (opts.signal?.aborted) {
+      const sig = typeof opts.signal.reason === "string" ? opts.signal.reason : "SIGINT";
+      throw new ReplayCancelledError(
+        sig,
+        buildCommittedCancelledResult(fromFallback, effectiveToBound),
+      );
+    }
+  };
+
+  checkCancelled(parsedFallbackFrom, toLedger);
+
   // Resolve the ledger window before the first page.
-  if (opts.budget) await opts.budget.acquire();
+  try {
+    if (opts.budget) await opts.budget.acquire(opts.signal);
+  } catch (err) {
+    if (err instanceof ReplayCancelledError) {
+      throw new ReplayCancelledError(
+        err.signal,
+        buildCommittedCancelledResult(parsedFallbackFrom, toLedger),
+      );
+    }
+    throw err;
+  }
+  checkCancelled(parsedFallbackFrom, toLedger);
   const window = validateLedgerWindow(await server.getHealth());
+  checkCancelled(parsedFallbackFrom || window.oldestLedger, toLedger);
 
   const isResuming = !!opts.targetProgress;
   let lastProcessedEventId: string | null = opts.targetProgress?.lastProcessedEventId ?? null;
@@ -501,6 +671,7 @@ async function replayContract(
   }
 
   for (;;) {
+    checkCancelled(usedStartLedger ?? firstStartLedger, effectiveTo);
     if (pagesInThisRun >= maxPages) {
       truncated = true;
       break;
@@ -508,11 +679,24 @@ async function replayContract(
     pagesInThisRun += 1;
     const totalPages = (opts.targetProgress?.pagesProcessed ?? 0) + pagesInThisRun;
 
-    if (opts.budget) await opts.budget.acquire();
+    try {
+      if (opts.budget) await opts.budget.acquire(opts.signal);
+    } catch (err) {
+      if (err instanceof ReplayCancelledError) {
+        throw new ReplayCancelledError(
+          err.signal,
+          buildCommittedCancelledResult(usedStartLedger ?? firstStartLedger, effectiveTo),
+        );
+      }
+      throw err;
+    }
+    checkCancelled(usedStartLedger ?? firstStartLedger, effectiveTo);
 
     const response: rpc.Api.GetEventsResponse = cursor
       ? await (server.getEvents({ filters: [{ type: "contract", contractIds: [target.contractId] }], cursor, limit: pageLimit }))
       : await (server.getEvents({ filters: [{ type: "contract", contractIds: [target.contractId] }], startLedger: firstStartLedger, limit: pageLimit }));
+
+    checkCancelled(usedStartLedger ?? firstStartLedger, effectiveTo);
 
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     const pageDecoded: DecodedEvent[] = [];
@@ -560,7 +744,9 @@ async function replayContract(
     totalProcessedEvents += filteredPage.length;
 
     // Notify / log each event in this page
+    const pageEventLog: ReplayEventSummary[] = [];
     for (const event of filteredPage) {
+      checkCancelled(usedStartLedger ?? firstStartLedger, effectiveTo);
       const entry: ReplayEventSummary = {
         ledger: event.ledger,
         txHash: event.txHash,
@@ -578,7 +764,7 @@ async function replayContract(
         progress(
           `[replay] ${target.source}: logged admin event "${event.payload.name}" at ledger ${event.ledger}`,
         );
-        if (showLog) eventLog.push(entry);
+        if (showLog) pageEventLog.push(entry);
         continue;
       }
 
@@ -591,7 +777,7 @@ async function replayContract(
           `[replay] ${target.source}: skipped unknown event "${(event.payload as { eventName?: string }).eventName ?? "?"}" at ledger ${event.ledger}` +
             (reason ? ` (${reason})` : ""),
         );
-        if (showLog) eventLog.push(entry);
+        if (showLog) pageEventLog.push(entry);
         continue;
       }
 
@@ -602,7 +788,7 @@ async function replayContract(
         progress(
           `[replay] ${target.source}: cap (${cap}) reached — skipping "${event.payload.name}" at ledger ${event.ledger}`,
         );
-        if (showLog) eventLog.push(entry);
+        if (showLog) pageEventLog.push(entry);
         continue;
       }
 
@@ -618,7 +804,7 @@ async function replayContract(
         );
         sent += 1;
         entry.sent = true;
-        if (showLog) eventLog.push(entry);
+        if (showLog) pageEventLog.push(entry);
       } else if (send) {
         let text: string | null = null;
         try {
@@ -635,7 +821,7 @@ async function replayContract(
             `[replay] ${target.source}: format failed for "${event.payload.name}" at ledger ${event.ledger}: ` +
               errorMsg(err),
           );
-          if (showLog) eventLog.push(entry);
+          if (showLog) pageEventLog.push(entry);
           continue;
         }
 
@@ -643,7 +829,7 @@ async function replayContract(
           skipped += 1;
           entry.skipped = true;
           entry.skipReason = "null-format";
-          if (showLog) eventLog.push(entry);
+          if (showLog) pageEventLog.push(entry);
           continue;
         }
 
@@ -652,6 +838,12 @@ async function replayContract(
           sent += 1;
           entry.sent = true;
         } catch (err) {
+          if (err instanceof ReplayCancelledError) {
+            throw new ReplayCancelledError(
+              err.signal,
+              buildCommittedCancelledResult(usedStartLedger ?? firstStartLedger, effectiveTo),
+            );
+          }
           skipped += 1;
           failedSends += 1;
           entry.skipped = true;
@@ -661,11 +853,11 @@ async function replayContract(
               errorMsg(err),
           );
         }
-        if (showLog) eventLog.push(entry);
+        if (showLog) pageEventLog.push(entry);
       } else {
         sent += 1;
         entry.sent = true;
-        if (showLog) eventLog.push(entry);
+        if (showLog) pageEventLog.push(entry);
       }
 
       const evKey = event.eventId || eventKey(event);
@@ -675,6 +867,12 @@ async function replayContract(
       if (event.ledger > 0 && (lastEventLedger === null || event.ledger > lastEventLedger)) {
         lastEventLedger = event.ledger;
       }
+
+      checkCancelled(usedStartLedger ?? firstStartLedger, effectiveTo);
+    }
+
+    if (showLog) {
+      eventLog.push(...pageEventLog);
     }
 
     const nextCursor = typeof response?.cursor === "string" ? response.cursor : "";
@@ -697,6 +895,7 @@ async function replayContract(
     }
 
     // Persist checkpoint after each completed page
+    const pageCompleted = isFinalPage && !truncated;
     if (opts.onPageComplete) {
       await opts.onPageComplete({
         contractId: target.contractId,
@@ -711,10 +910,28 @@ async function replayContract(
         eventsCapped: capped,
         adminLogged,
         duplicates,
-        completed: isFinalPage && !truncated,
+        completed: pageCompleted,
         failedSends,
       });
     }
+
+    committedSnapshot = {
+      pages: totalPages,
+      events: totalProcessedEvents,
+      sent,
+      skipped,
+      capped,
+      adminLogged,
+      duplicates,
+      failedSends,
+      resumedSkippedEvents,
+      lastEventLedger,
+      lastProcessedEventId,
+      cursor: lastCursor,
+      startLedger: usedStartLedger,
+      startClamped: usedStartClamped,
+      eventLog: showLog ? [...eventLog] : [],
+    };
 
     if (isFinalPage || stoppedByToLedger) {
       break;
@@ -722,11 +939,12 @@ async function replayContract(
   }
 
   const finalPages = (opts.targetProgress?.pagesProcessed ?? 0) + pagesInThisRun;
+  const isTruncated = truncated || stoppedByToLedger;
 
   progress(
     `[replay] ${target.source}: pages=${finalPages} events=${totalProcessedEvents} sent=${sent} ` +
       `skipped=${skipped} capped=${capped} admin=${adminLogged} duplicates=${duplicates} ` +
-      `truncated=${truncated || stoppedByToLedger}` +
+      `truncated=${isTruncated}` +
       (resumedSkippedEvents > 0 ? ` resumedSkipped=${resumedSkippedEvents}` : ""),
   );
 
@@ -744,13 +962,15 @@ async function replayContract(
     capped,
     adminLogged,
     duplicates,
-    truncated: truncated || stoppedByToLedger,
+    truncated: isTruncated,
     lastEventLedger,
     cursor: lastCursor,
     eventLog: showLog ? eventLog : [],
     resumedSkippedEvents,
     lastProcessedEventId,
     failedSends,
+    cancelled: false,
+    resumable: truncated,
   };
 }
 
@@ -758,13 +978,13 @@ async function replayContract(
  * Run the replay CLI. Exported so tests can call it directly with a fake
  * server and fake send function, without spawning a subprocess.
  *
- * Returns a `ReplayReport` and the process exit code (0 = success, 1 = fatal
- * error, 2 = usage error).
+ * Returns a `ReplayReport` and the process exit code (`0` = completed,
+ * `1` = fatal runtime error, `2` = usage error, `130` = cancelled via SIGINT).
  */
 export async function runReplayCli(opts: {
   argv?: string[];
   deps?: Partial<ReplayDeps>;
-} = {}): Promise<{ report: ReplayReport | null; exitCode: 0 | 1 | 2 }> {
+} = {}): Promise<{ report: ReplayReport | null; exitCode: ReplayExitCode }> {
   const argv = opts.argv ?? process.argv;
   const overrideDeps = opts.deps ?? {};
 
@@ -932,11 +1152,15 @@ export async function runReplayCli(opts: {
       if (progressData) {
         progress(`[replay] loaded progress file "${progressFile}"`);
       } else {
+        const nowIso = new Date(now()).toISOString();
         progressData = {
           format: "mimir-replay-progress-v1",
           version: 1,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
+          status: "in_progress",
+          resumable: true,
+          cancelledAt: null,
+          createdAt: nowIso,
+          updatedAt: nowIso,
           network,
           rpcUrl: config.rpcUrl,
           range: {
@@ -949,7 +1173,38 @@ export async function runReplayCli(opts: {
       }
     } catch (err: unknown) {
       console.error(`[replay] error: ${err instanceof Error ? err.message : String(err)}`);
-      return { report: null, exitCode: 2 };
+      return { report: null, exitCode: REPLAY_EXIT_USAGE };
+    }
+  }
+
+  // ── Cancellation wiring (SIGINT + optional AbortSignal) ───────────────────
+
+  const abortController = new AbortController();
+  const signalSource: ReplaySignalSource = overrideDeps.signalSource ?? process;
+  let cancelSignalName: string | null = null;
+
+  const triggerCancel = (reason: string) => {
+    if (!abortController.signal.aborted) {
+      cancelSignalName = reason;
+      abortController.abort(reason);
+    }
+  };
+
+  const onSigint = () => triggerCancel("SIGINT");
+  const onExternalAbort = () => {
+    const extReason =
+      typeof overrideDeps.signal?.reason === "string"
+        ? overrideDeps.signal.reason
+        : "SIGINT";
+    triggerCancel(extReason);
+  };
+
+  signalSource.on("SIGINT", onSigint);
+  if (overrideDeps.signal) {
+    if (overrideDeps.signal.aborted) {
+      onExternalAbort();
+    } else {
+      overrideDeps.signal.addEventListener("abort", onExternalAbort, { once: true });
     }
   }
 
@@ -957,64 +1212,139 @@ export async function runReplayCli(opts: {
 
   const targetResults: ReplayTargetResult[] = [];
   let fatalError: string | undefined;
+  let cancelled = false;
 
-  for (const target of targets) {
-    const targetProgress = progressData?.targets?.[target.source];
-    const onPageComplete = progressFile
-      ? async (update: ReplayProgressTarget) => {
-          if (!progressData) return;
-          progressData.targets[target.source] = update;
-          progressData.updatedAt = new Date().toISOString();
-          await writeProgressFileAtomic(progressFile, progressData);
+  try {
+    for (let i = 0; i < targets.length; i++) {
+      const target = targets[i]!;
+      const targetProgress = progressData?.targets?.[target.source];
+      const onPageComplete = progressFile
+        ? async (update: ReplayProgressTarget) => {
+            if (!progressData) return;
+            progressData.targets[target.source] = update;
+            progressData.status = "in_progress";
+            progressData.resumable = true;
+            progressData.cancelledAt = null;
+            progressData.updatedAt = new Date(now()).toISOString();
+            await writeProgressFileAtomic(progressFile, progressData);
+          }
+        : undefined;
+
+      try {
+        const result = await replayContract(
+          server,
+          target,
+          {
+            from: fromRaw,
+            to: toLedger,
+            maxPages,
+            cap,
+            show,
+            dryRun,
+            contracts: requestedContracts,
+            progressFile,
+            rpm,
+            targetProgress,
+            onPageComplete,
+            budget,
+            signal: abortController.signal,
+          },
+          dryRun ? undefined : send,
+          config,
+          progress,
+        );
+        targetResults.push(result);
+      } catch (err) {
+        if (err instanceof ReplayCancelledError) {
+          cancelled = true;
+          cancelSignalName = err.signal || cancelSignalName || "SIGINT";
+          if (err.committedTarget) {
+            targetResults.push(err.committedTarget);
+          }
+          // Record committed-only summaries for any subsequent unstarted targets
+          for (let k = i + 1; k < targets.length; k++) {
+            const rem = targets[k]!;
+            const remProg = progressData?.targets?.[rem.source];
+            targetResults.push({
+              source: rem.source,
+              contractId: rem.contractId,
+              fromLedger: remProg?.lastEventLedger ?? fromLedger ?? 0,
+              toLedger: toLedger ?? null,
+              startLedger: null,
+              startClamped: false,
+              pages: remProg?.pagesProcessed ?? 0,
+              events: remProg?.eventsProcessed ?? 0,
+              sent: remProg?.eventsSent ?? 0,
+              skipped: remProg?.eventsSkipped ?? 0,
+              capped: remProg?.eventsCapped ?? 0,
+              adminLogged: remProg?.adminLogged ?? 0,
+              duplicates: remProg?.duplicates ?? 0,
+              truncated: !remProg?.completed,
+              lastEventLedger: remProg?.lastEventLedger ?? null,
+              cursor: remProg?.cursor ?? null,
+              eventLog: [],
+              resumedSkippedEvents: remProg?.eventsProcessed ?? 0,
+              lastProcessedEventId: remProg?.lastProcessedEventId ?? null,
+              failedSends: remProg?.failedSends ?? 0,
+              cancelled: !remProg?.completed,
+              resumable: !remProg?.completed,
+            });
+          }
+          break;
         }
-      : undefined;
 
-    try {
-      const result = await replayContract(
-        server,
-        target,
-        {
-          from: fromRaw,
-          to: toLedger,
-          maxPages,
-          cap,
-          show,
-          dryRun,
-          contracts: requestedContracts,
-          progressFile,
-          rpm,
-          targetProgress,
-          onPageComplete,
-          budget,
-        },
-        dryRun ? undefined : send,
-        config,
-        progress,
+        const msg = safeErr(err);
+        progress(`[replay] ${target.source}: scan failed: ${msg}`);
+        fatalError = msg;
+        targetResults.push({
+          source: target.source,
+          contractId: target.contractId,
+          fromLedger: fromLedger ?? 0,
+          toLedger: toLedger ?? null,
+          startLedger: null,
+          startClamped: false,
+          pages: 0,
+          events: 0,
+          sent: 0,
+          skipped: 0,
+          capped: 0,
+          adminLogged: 0,
+          duplicates: 0,
+          truncated: false,
+          lastEventLedger: null,
+          cursor: null,
+          eventLog: [],
+          cancelled: false,
+          resumable: true,
+        });
+      }
+    }
+  } finally {
+    signalSource.off("SIGINT", onSigint);
+    if (overrideDeps.signal) {
+      overrideDeps.signal.removeEventListener("abort", onExternalAbort);
+    }
+  }
+
+  // ── Flush final or cancelled progress state (committed progress only) ─────
+
+  if (progressFile && progressData) {
+    const nowIso = new Date(now()).toISOString();
+    if (cancelled) {
+      progressData.status = "cancelled";
+      progressData.resumable = true;
+      progressData.cancelledAt = nowIso;
+      progressData.updatedAt = nowIso;
+      await writeProgressFileAtomic(progressFile, progressData);
+    } else if (!fatalError) {
+      const allCompleted = targets.every(
+        (t) => progressData?.targets?.[t.source]?.completed === true,
       );
-      targetResults.push(result);
-    } catch (err) {
-      const msg = safeErr(err);
-      progress(`[replay] ${target.source}: scan failed: ${msg}`);
-      fatalError = msg;
-      targetResults.push({
-        source: target.source,
-        contractId: target.contractId,
-        fromLedger: fromLedger ?? 0,
-        toLedger: toLedger ?? null,
-        startLedger: null,
-        startClamped: false,
-        pages: 0,
-        events: 0,
-        sent: 0,
-        skipped: 0,
-        capped: 0,
-        adminLogged: 0,
-        duplicates: 0,
-        truncated: false,
-        lastEventLedger: null,
-        cursor: null,
-        eventLog: [],
-      });
+      progressData.status = allCompleted ? "completed" : "in_progress";
+      progressData.resumable = !allCompleted;
+      progressData.cancelledAt = null;
+      progressData.updatedAt = nowIso;
+      await writeProgressFileAtomic(progressFile, progressData);
     }
   }
 
@@ -1043,8 +1373,21 @@ export async function runReplayCli(opts: {
     },
   );
 
+  const runStatus: ReplayRunStatus = cancelled
+    ? "cancelled"
+    : fatalError
+      ? "failed"
+      : "completed";
+  const isResumable =
+    cancelled ||
+    Boolean(fatalError) ||
+    targetResults.some((r) => r.resumable === true);
+
   const report: ReplayReport = {
     format: "mimir-replay-v1",
+    status: runStatus,
+    cancelled,
+    resumable: isResumable,
     network,
     rpcUrl: config.rpcUrl,
     fromLedger: fromLedger ?? 0,
@@ -1055,7 +1398,19 @@ export async function runReplayCli(opts: {
   };
 
   if (asJson) {
+    if (cancelled) {
+      progress(
+        `[replay] cancelled (${cancelSignalName ?? "SIGINT"}) — status=cancelled resumable=true` +
+          (progressFile ? ` progress=${progressFile}` : ""),
+      );
+    }
     process.stdout.write(JSON.stringify(report, scanJsonReplacer, 2) + "\n");
+  } else if (cancelled) {
+    progress(
+      `[replay] cancelled (${cancelSignalName ?? "SIGINT"}) — status=cancelled resumable=true ` +
+        `committedEvents=${totals.events} committedSent=${totals.sent}` +
+        (progressFile ? ` progress=${progressFile}` : ""),
+    );
   } else {
     progress(
       `[replay] done  events=${totals.events} sent=${totals.sent} skipped=${totals.skipped} ` +
@@ -1064,7 +1419,10 @@ export async function runReplayCli(opts: {
     );
   }
 
-  return { report, exitCode: fatalError ? 1 : 0 };
+  if (cancelled) {
+    return { report, exitCode: REPLAY_EXIT_CANCELLED };
+  }
+  return { report, exitCode: fatalError ? REPLAY_EXIT_ERROR : REPLAY_EXIT_OK };
 }
 
 // ── CLI entrypoint ─────────────────────────────────────────────────────────────
