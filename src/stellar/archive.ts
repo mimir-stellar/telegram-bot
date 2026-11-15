@@ -1,7 +1,28 @@
-import { open, mkdir, readdir, unlink, chmod } from "node:fs/promises";
+import { open, mkdir, readdir, stat, unlink, chmod } from "node:fs/promises";
 import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  formatPrivacyReviewReport,
+  reviewPrivacySegments,
+  reviewScanJsonlPrivacy,
+  type PrivacyFindingCategory,
+  type PrivacyFindingSeverity,
+  type PrivacyReviewFinding,
+  type PrivacyReviewOptions,
+  type PrivacyReviewReport,
+  type PrivacyScanSegment,
+} from "./scan-jsonl.js";
+
+export {
+  formatPrivacyReviewReport,
+  reviewScanJsonlPrivacy,
+  type PrivacyFindingCategory,
+  type PrivacyFindingSeverity,
+  type PrivacyReviewFinding,
+  type PrivacyReviewOptions,
+  type PrivacyReviewReport,
+};
 
 export interface EventArchiveOptions {
   dir: string;
@@ -155,4 +176,57 @@ export async function* readArchive(dir: string): AsyncGenerator<DecodedEvent, vo
       await handle.close();
     }
   }
+}
+
+/**
+ * Run offline privacy review across an event archive directory (or single
+ * `.jsonl` archive file) without contacting any external services.
+ *
+ * Scans all archive `.jsonl` and `.json` files in deterministic lexical order,
+ * detecting private chat/user identifiers, secret-shaped values, and malformed
+ * records without echoing raw sensitive payloads.
+ */
+export async function reviewArchivePrivacy(
+  targetPath: string,
+  options: PrivacyReviewOptions = {},
+): Promise<PrivacyReviewReport> {
+  const targetStat = await stat(targetPath);
+  const segments: PrivacyScanSegment[] = [];
+
+  if (targetStat.isFile()) {
+    const handle = await open(targetPath, "r");
+    try {
+      const content = await handle.readFile({ encoding: "utf8" });
+      segments.push({
+        source: options.sourceName ?? path.basename(targetPath),
+        content,
+      });
+    } finally {
+      await handle.close();
+    }
+    return reviewPrivacySegments(segments, options);
+  }
+
+  if (!targetStat.isDirectory()) {
+    throw new Error(`Archive privacy review target is neither a file nor a directory: ${targetPath}`);
+  }
+
+  const entries = (await readdir(targetPath))
+    .filter((name) => name.endsWith(".jsonl") || name.endsWith(".json"))
+    .sort();
+
+  for (const entry of entries) {
+    const fullPath = path.join(targetPath, entry);
+    const entryStat = await stat(fullPath);
+    if (!entryStat.isFile()) continue;
+    const handle = await open(fullPath, "r");
+    try {
+      const content = await handle.readFile({ encoding: "utf8" });
+      segments.push({ source: entry, content });
+    } finally {
+      await handle.close();
+    }
+  }
+
+  return reviewPrivacySegments(segments, options);
 }

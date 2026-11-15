@@ -135,3 +135,11 @@ The bot applies the following redaction rules to all operator-facing text (logs,
 - No personal data is collected beyond Telegram chat/user IDs, which are redacted where possible
 - No data is transmitted to third-party services beyond the configured Stellar RPC endpoints and Telegram API
 - Operators are responsible for ensuring their deployment complies with applicable privacy regulations for their jurisdiction
+
+## Privacy review for shareable event archives
+
+Before sharing exported event archives or JSONL captures in bug reports or contributor fixtures, run offline privacy review (`reviewArchivePrivacy` in `src/stellar/archive.ts` or `reviewScanJsonlPrivacy` in `src/stellar/scan-jsonl.ts`):
+
+- **Private chat & user identifiers**: Flags explicit chat/user identifier fields (`chatId`, `telegram_chat_id`, `adminUserIds`, `threadId`), negative Telegram group/supergroup IDs (`-100…`), `@handle` mentions, private `t.me/+…` invite links, and caller-supplied `knownChatIds`.
+- **Secret-shaped values**: Flags Telegram bot tokens, Stellar secret seeds (`S…`), PEM private key headers, credential-bearing URLs, `Bearer` headers, credential key-value assignments, and registered secrets (`registerSecret` / `knownSecrets`). Public `G…` and `C…` Stellar strkeys, transaction hashes, and ledger cursors pass cleanly unless `flagPublicAccountAddresses: true` is explicitly requested.
+- **Deterministic & offline**: Findings are sorted by `(source, line, fieldPath, category, ruleId)`, report zero raw secret or chat-ID values, mark malformed JSON lines as `shareable: false`, and never contact external services.
