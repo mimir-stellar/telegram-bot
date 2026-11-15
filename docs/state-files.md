@@ -13,6 +13,7 @@ Operational reference describing all on-disk state files maintained by the Mimir
 | **Audit Trail File** | `AUDIT_FILE` | `./data/audit.jsonl` | `src/audit.ts` | Append (`appendFile` with JSON line per entry) | If absent, automatically created on next append. Historical audit records prior to deletion are lost. | `/audit` skips unreadable/malformed lines (`unreadableLines` count incremented) and processes valid lines. poller append operations continue appending new entries. |
 | **Status Snapshot File** | `STATUS_FILE` | `./data/status.json` | `src/status.ts` | Atomic (write temporary file `${STATUS_FILE}.tmp` then rename) | Harmless to poller loop. Recreated atomically on the next poll cycle. CLI `--status` command will fail to find status until rewritten. | Overwritten atomically on the next poll cycle. External tools or CLI reading corrupt file before next cycle encounter parse errors. |
 | **Instance Lock File** | `INSTANCE_LOCK_FILE` | `./data/poller.lock` | `src/instanceLock.ts` | Exclusive file creation (`O_EXCL` / `wx` flag via `open`) | Poller will re-acquire lock on next startup if no other instance holds it. During runtime, removal removes concurrency protection against double instances. | Stale or unparseable lock payload (non-JSON, bad schema, or dead PID) is warned and automatically unlinked by next acquiring instance. |
+| **Follow Store File** | Caller-configured (`FollowStoreOptions.filePath`) | `./data/follows.json` (typical) | `src/subscriptions/store.ts` | Atomic (`${filePath}.<pid>.<ts>.tmp` then rename) | Treated as empty subscription set; recreated on first `follow` write with v2 `network` + `networkPassphrase` metadata when bound. | Corrupt JSON/shape is quarantined to `${base}.corrupt.<timestamp>`. Cross-network mismatches (`FollowStoreNetworkMismatchError`) and legacy unbound v1 files (`FollowStoreMigrationRequiredError`) are **not** quarantined or deleted; they fail fast until explicitly migrated with `migrateFollowStoreNetwork`. |
 
 ---
 
@@ -64,3 +65,9 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Follow Store File (`FollowStore`)
+- **Writer Module**: [`src/subscriptions/store.ts`](../src/subscriptions/store.ts) (`createFollowStore`, `createNetworkBoundFollowStore`, `migrateFollowStoreNetwork`)
+- **Schema**: Version `2` records `{ version: 2, network: { network, networkPassphrase }, follows }` so persisted market/squad IDs stay bound to one Stellar network.
+- **Cross-Network Protection**: Opening or registering (`createBot` / `registerCommandHandlers`) a store whose persisted `networkPassphrase` differs from the configured Stellar network throws `FollowStoreNetworkMismatchError` without quarantining or modifying the existing file.
+- **Explicit Migration**: Legacy unbound `version: 1` files throw `FollowStoreMigrationRequiredError` when opened by a network-bound store; call `migrateFollowStoreNetwork(filePath, config)` (or supply `expectedSourceNetwork` when re-binding across networks) to migrate atomically.

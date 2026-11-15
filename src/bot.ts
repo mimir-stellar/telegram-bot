@@ -100,6 +100,21 @@ export {
   sendBroadcast,
 } from "./commands/broadcast.js";
 export { clearHintState } from "./commands/unknown.js";
+export {
+  FollowStore,
+  FollowStoreError,
+  FollowStoreMigrationRequiredError,
+  FollowStoreNetworkMismatchError,
+  LEGACY_STORE_VERSION,
+  NETWORK_BOUND_STORE_VERSION,
+  createFollowStore,
+  createNetworkBoundFollowStore,
+  migrateFollowStoreNetwork,
+  resolveStoreNetworkIdentity,
+  type FollowStoreOptions,
+  type MigrateFollowStoreOptions,
+  type StoreNetworkIdentity,
+} from "./subscriptions/store.js";
 
 /** Older names for the pause-confirmation helpers, kept for existing imports. */
 export const validatePauseCallbackData = validatePauseConfirmData;
@@ -211,6 +226,9 @@ type CommandRegistrar = {
 
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
 export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDeps): void {
+  if (deps.followStore && typeof deps.config?.networkPassphrase === "string" && deps.config.networkPassphrase.trim() !== "") {
+    deps.followStore.verifyNetworkBinding(deps.config);
+  }
   const registrar = bot as CommandRegistrar;
 
   const rateLimiter =
