@@ -223,3 +223,13 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Malformed Archive Record Diagnostics
+
+When reading rotated event archives (`readArchive`, `readArchiveRecords` in `src/stellar/archive.ts`) or parsing/importing JSONL captures (`parseScanJsonl`, `importScanJsonlToArchive` in `src/stellar/scan-jsonl.ts` and `src/stellar/archive.ts`), malformed records raise `MalformedArchiveRecordError`:
+
+* **Exact 1-Based Line Number:** Reports `file` and exact 1-based physical `line` number (accounting for blank lines and CRLF/LF line endings) alongside `byteLength` and `reasonCode` (`INVALID_JSON`, `NON_OBJECT_RECORD`, or `INVALID_RECORD_SHAPE`).
+* **Bounded, Payload-Safe Diagnostic:** `error.diagnostic` and `error.message` are clamped to `MAX_DIAGNOSTIC_LENGTH` (160 characters) and never echo raw JSON payloads or field values (including V8 `SyntaxError` input snippets).
+* **Explicit Partial Retention (`retainCommittedOutput`):** By default (`retainCommittedOutput: false`), `importScanJsonlToArchive` commits zero partial files when a record fails validation and `error.retainedEvents` is empty (`[]`). Pass `retainCommittedOutput: true` explicitly to preserve already committed records prior to the malformed line.
