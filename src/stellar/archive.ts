@@ -1,7 +1,22 @@
 import { open, mkdir, readdir, unlink, chmod } from "node:fs/promises";
 import path from "node:path";
+import { eventKey } from "../dedup.js";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
+
+export interface ArchiveCompactionOptions {
+  minLedger?: number;
+  maxLedger?: number;
+  maxBytes?: number;
+  maxFiles?: number;
+}
+
+export interface ArchiveCompactionStats {
+  beforeCount: number;
+  afterCount: number;
+  duplicatesRemoved: number;
+  droppedByRange: number;
+}
 
 export interface EventArchiveOptions {
   dir: string;
@@ -155,4 +170,94 @@ export async function* readArchive(dir: string): AsyncGenerator<DecodedEvent, vo
       await handle.close();
     }
   }
+}
+
+/**
+ * Deterministically compact a sequence of archived events by deduplicating
+ * canonical event identities and optionally filtering to `[minLedger, maxLedger]`.
+ */
+export function compactArchiveEvents(
+  events: readonly DecodedEvent[],
+  options: Pick<ArchiveCompactionOptions, "minLedger" | "maxLedger"> = {},
+): { events: DecodedEvent[]; stats: ArchiveCompactionStats } {
+  const seenKeys = new Set<string>();
+  const retained: DecodedEvent[] = [];
+  let duplicatesRemoved = 0;
+  let droppedByRange = 0;
+
+  for (const ev of events) {
+    if (!ev || typeof ev !== "object") continue;
+    const ledger = typeof ev.ledger === "number" && Number.isFinite(ev.ledger) ? ev.ledger : null;
+    if (options.minLedger !== undefined && ledger !== null && ledger < options.minLedger) {
+      droppedByRange += 1;
+      continue;
+    }
+    if (options.maxLedger !== undefined && ledger !== null && ledger > options.maxLedger) {
+      droppedByRange += 1;
+      continue;
+    }
+
+    const key = eventKey(ev);
+    if (key !== null) {
+      if (seenKeys.has(key)) {
+        duplicatesRemoved += 1;
+        continue;
+      }
+      seenKeys.add(key);
+    }
+
+    retained.push(ev);
+  }
+
+  retained.sort((a, b) => {
+    if (a.ledger !== b.ledger) return a.ledger - b.ledger;
+    const aTx = a.transactionIndex ?? 0;
+    const bTx = b.transactionIndex ?? 0;
+    if (aTx !== bTx) return aTx - bTx;
+    const aOp = a.operationIndex ?? 0;
+    const bOp = b.operationIndex ?? 0;
+    if (aOp !== bOp) return aOp - bOp;
+    return String(a.eventId ?? "").localeCompare(String(b.eventId ?? ""));
+  });
+
+  return {
+    events: retained,
+    stats: {
+      beforeCount: events.length,
+      afterCount: retained.length,
+      duplicatesRemoved,
+      droppedByRange,
+    },
+  };
+}
+
+/**
+ * Compact an on-disk event archive directory into `targetDir`, removing duplicate
+ * lines and applying optional ledger retention bounds.
+ */
+export async function compactArchive(
+  sourceDir: string,
+  targetDir: string,
+  options: ArchiveCompactionOptions = {},
+): Promise<ArchiveCompactionStats> {
+  const rawEvents: DecodedEvent[] = [];
+  for await (const ev of readArchive(sourceDir)) {
+    rawEvents.push(ev);
+  }
+
+  const { events, stats } = compactArchiveEvents(rawEvents, options);
+  const writer = createEventArchive({
+    dir: targetDir,
+    ...(options.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}),
+    ...(options.maxFiles !== undefined ? { maxFiles: options.maxFiles } : {}),
+  });
+  try {
+    if (events.length > 0) {
+      await writer.append(events);
+    }
+  } finally {
+    await writer.close();
+  }
+
+  return stats;
 }

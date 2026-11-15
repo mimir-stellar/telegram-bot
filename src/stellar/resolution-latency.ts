@@ -84,6 +84,9 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
   const cancellations = new Map<number, { at: number; ledger: number }>();
 
   for (const event of events) {
+    if (!event || typeof event !== "object") {
+      continue;
+    }
     const payload = event.payload;
     if (!payload || !("name" in payload) || !("claimId" in payload)) {
       continue;
@@ -94,20 +97,32 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
       continue;
     }
 
+    if (
+      typeof event.ledger !== "number" ||
+      !Number.isFinite(event.ledger) ||
+      typeof event.at !== "number" ||
+      !Number.isFinite(event.at)
+    ) {
+      continue;
+    }
+
+    const rawLedger = event.ledger;
+    const rawAt = event.at;
+
     if (payload.name === "claim_created") {
       const existing = creations.get(claimId);
-      if (!existing || event.ledger < existing.ledger || (event.ledger === existing.ledger && event.at < existing.at)) {
-        creations.set(claimId, { at: Math.trunc(event.at), ledger: Math.trunc(event.ledger) });
+      if (!existing || rawLedger < existing.ledger || (rawLedger === existing.ledger && rawAt < existing.at)) {
+        creations.set(claimId, { at: Math.trunc(rawAt), ledger: Math.trunc(rawLedger) });
       }
     } else if (payload.name === "claim_resolved") {
       const existing = resolutions.get(claimId);
-      if (!existing || event.ledger < existing.ledger || (event.ledger === existing.ledger && event.at < existing.at)) {
-        resolutions.set(claimId, { at: Math.trunc(event.at), ledger: Math.trunc(event.ledger) });
+      if (!existing || rawLedger < existing.ledger || (rawLedger === existing.ledger && rawAt < existing.at)) {
+        resolutions.set(claimId, { at: Math.trunc(rawAt), ledger: Math.trunc(rawLedger) });
       }
     } else if (payload.name === "claim_cancelled") {
       const existing = cancellations.get(claimId);
-      if (!existing || event.ledger < existing.ledger || (event.ledger === existing.ledger && event.at < existing.at)) {
-        cancellations.set(claimId, { at: Math.trunc(event.at), ledger: Math.trunc(event.ledger) });
+      if (!existing || rawLedger < existing.ledger || (rawLedger === existing.ledger && rawAt < existing.at)) {
+        cancellations.set(claimId, { at: Math.trunc(rawAt), ledger: Math.trunc(rawLedger) });
       }
     }
   }
@@ -202,3 +217,21 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
     excludedCount,
   };
 }
+
+export {
+  buildAggregateSnapshot,
+  compareCompactedAggregates,
+  computeLedgerSpan,
+  formatReconciliationReport,
+  reconcileAggregateSnapshots,
+  reconcileArchiveCompaction,
+  type AggregateReconciliationReport,
+  type AggregateSnapshot,
+  type ArithmeticMismatchDetail,
+  type ArithmeticMismatchKind,
+  type LedgerSpan,
+  type RangeLossDetail,
+  type RangeLossKind,
+  type ReconcileOptions,
+  type ReconciliationStatus,
+} from "./aggregate-reconcile.js";

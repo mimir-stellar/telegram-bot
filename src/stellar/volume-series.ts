@@ -225,3 +225,21 @@ export function volumeSeries(
     processedEvents,
   };
 }
+
+export {
+  buildAggregateSnapshot,
+  compareCompactedAggregates,
+  computeLedgerSpan,
+  formatReconciliationReport,
+  reconcileAggregateSnapshots,
+  reconcileArchiveCompaction,
+  type AggregateReconciliationReport,
+  type AggregateSnapshot,
+  type ArithmeticMismatchDetail,
+  type ArithmeticMismatchKind,
+  type LedgerSpan,
+  type RangeLossDetail,
+  type RangeLossKind,
+  type ReconcileOptions,
+  type ReconciliationStatus,
+} from "./aggregate-reconcile.js";
