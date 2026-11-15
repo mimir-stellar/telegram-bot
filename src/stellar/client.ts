@@ -15,6 +15,54 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  assertEventsResponse,
+  canonicalEventFingerprint,
+  canonicalEventIdentity,
+  compareProviderWindowEvents,
+  DEFAULT_MAX_DISAGREEMENT_HISTORY,
+  DEFAULT_MAX_DISAGREEMENT_ITEMS,
+  DEFAULT_MAX_TRACKED_PROVIDER_PAIRS,
+  normalizeProviderIdentity,
+  ProviderDisagreementTracker,
+  ProviderWindowValidationError,
+  type CompareProviderWindowOptions,
+  type ProviderComparisonRecord,
+  type ProviderComparisonStatus,
+  type ProviderDisagreementItem,
+  type ProviderDisagreementSnapshot,
+  type ProviderDisagreementTrackerOptions,
+  type ProviderDivergentEvent,
+  type ProviderLedgerWindow,
+  type ProviderPairDisagreementSummary,
+  type ProviderWindowComparison,
+  type ProviderWindowProblem,
+  type ProviderWindowSample,
+} from "./rpc-guard.js";
+
+export {
+  canonicalEventFingerprint,
+  canonicalEventIdentity,
+  compareProviderWindowEvents,
+  DEFAULT_MAX_DISAGREEMENT_HISTORY,
+  DEFAULT_MAX_DISAGREEMENT_ITEMS,
+  DEFAULT_MAX_TRACKED_PROVIDER_PAIRS,
+  normalizeProviderIdentity,
+  ProviderDisagreementTracker,
+  ProviderWindowValidationError,
+  type CompareProviderWindowOptions,
+  type ProviderComparisonRecord,
+  type ProviderComparisonStatus,
+  type ProviderDisagreementItem,
+  type ProviderDisagreementSnapshot,
+  type ProviderDisagreementTrackerOptions,
+  type ProviderDivergentEvent,
+  type ProviderLedgerWindow,
+  type ProviderPairDisagreementSummary,
+  type ProviderWindowComparison,
+  type ProviderWindowProblem,
+  type ProviderWindowSample,
+};
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -364,6 +412,172 @@ export function clampStartLedger(
     return { startLedger: window.oldestLedger, clamped: true };
   }
   return { startLedger: requested, clamped: false };
+}
+
+// ── Cross-provider window inspection ─────────────────────────────────────────
+
+/** Default page cap per provider during bounded window comparison. */
+export const DEFAULT_PROVIDER_COMPARE_MAX_PAGES = 10;
+
+/** Default `getEvents` limit per page during bounded window comparison. */
+export const DEFAULT_PROVIDER_COMPARE_PAGE_LIMIT = 100;
+
+export interface RpcProviderEndpoint {
+  /** Provider endpoint URL or logical label (redacted before reporting). */
+  provider: string;
+  /** Read-only Soroban RPC client or test double. */
+  server: Pick<rpc.Server, "getEvents"> & Partial<Pick<rpc.Server, "getHealth">>;
+}
+
+export interface CompareRpcProvidersOptions extends CompareProviderWindowOptions {
+  /** Maximum pages queried per provider (defaults to `10`). */
+  maxPages?: number | undefined;
+  /** Maximum events requested per RPC page (defaults to `100`). */
+  limit?: number | undefined;
+  /** Optional tracker that records the resulting window comparison. */
+  tracker?: ProviderDisagreementTracker | undefined;
+}
+
+async function collectProviderWindowSample(
+  endpoint: RpcProviderEndpoint,
+  filters: rpc.Api.EventFilter[],
+  requestedWindow: ProviderLedgerWindow,
+  options: { maxPages: number; limit: number; maxEvents?: number | undefined },
+): Promise<{ sample: ProviderWindowSample; outOfRetention: boolean }> {
+  const provider = normalizeProviderIdentity(endpoint.provider);
+  let effectiveStart = requestedWindow.startLedger;
+  let effectiveEnd = requestedWindow.endLedger;
+
+  if (typeof endpoint.server.getHealth === "function") {
+    const health = await endpoint.server.getHealth();
+    const retained = validateLedgerWindow(health);
+    effectiveStart = Math.max(effectiveStart, retained.oldestLedger);
+    effectiveEnd = Math.min(effectiveEnd, retained.latestLedger);
+    if (effectiveStart > effectiveEnd) {
+      return {
+        sample: {
+          provider,
+          window: requestedWindow,
+          events: [],
+        },
+        outOfRetention: true,
+      };
+    }
+  }
+
+  const collected: rpc.Api.EventResponse[] = [];
+  let cursor: string | undefined;
+
+  for (let page = 0; page < options.maxPages; page++) {
+    const req: rpc.Api.GetEventsRequest = cursor
+      ? { filters, cursor, limit: options.limit }
+      : { filters, startLedger: effectiveStart, limit: options.limit };
+
+    const rawResp = await endpoint.server.getEvents(req);
+    const validated = assertEventsResponse(rawResp, { maxEvents: options.maxEvents });
+
+    for (const ev of validated.events) {
+      if (ev.ledger >= effectiveStart && ev.ledger <= effectiveEnd) {
+        collected.push(ev);
+      }
+    }
+
+    const lastEvent = validated.events[validated.events.length - 1];
+    const nextCursor =
+      typeof validated.cursor === "string" && validated.cursor.length > 0
+        ? validated.cursor
+        : undefined;
+
+    if (
+      validated.events.length === 0 ||
+      !nextCursor ||
+      nextCursor === cursor ||
+      (lastEvent !== undefined && lastEvent.ledger > effectiveEnd)
+    ) {
+      break;
+    }
+    cursor = nextCursor;
+  }
+
+  return {
+    sample: {
+      provider,
+      window: { startLedger: effectiveStart, endLedger: effectiveEnd },
+      events: collected,
+    },
+    outOfRetention: false,
+  };
+}
+
+/**
+ * Query two read-only RPC providers over the same requested ledger window,
+ * validate responses at the RPC boundary, and expose agreement/disagreement
+ * without choosing an unverified winner (`authoritativeProvider: null`).
+ */
+export async function compareRpcProvidersOnWindow(
+  first: RpcProviderEndpoint,
+  second: RpcProviderEndpoint,
+  filters: rpc.Api.EventFilter[],
+  window: ProviderLedgerWindow,
+  options: CompareRpcProvidersOptions = {},
+): Promise<ProviderWindowComparison> {
+  if (
+    !window ||
+    typeof window !== "object" ||
+    !isLedgerSequence(window.startLedger) ||
+    window.startLedger < 1 ||
+    !isLedgerSequence(window.endLedger) ||
+    window.startLedger > window.endLedger
+  ) {
+    throw new ProviderWindowValidationError(
+      "malformed-window",
+      "Requested comparison window must specify positive safe integers with startLedger <= endLedger",
+    );
+  }
+
+  const maxPages = Math.max(
+    1,
+    Math.floor(options.maxPages ?? DEFAULT_PROVIDER_COMPARE_MAX_PAGES),
+  );
+  const limit = Math.max(
+    1,
+    Math.floor(options.limit ?? DEFAULT_PROVIDER_COMPARE_PAGE_LIMIT),
+  );
+
+  const [firstResult, secondResult] = await Promise.all([
+    collectProviderWindowSample(first, filters, window, {
+      maxPages,
+      limit,
+      maxEvents: options.maxEvents,
+    }),
+    collectProviderWindowSample(second, filters, window, {
+      maxPages,
+      limit,
+      maxEvents: options.maxEvents,
+    }),
+  ]);
+
+  if (firstResult.outOfRetention || secondResult.outOfRetention) {
+    const firstNonOverlap: ProviderWindowSample = {
+      provider: firstResult.sample.provider,
+      window: { startLedger: 0, endLedger: 0 },
+      events: [],
+    };
+    const secondNonOverlap: ProviderWindowSample = {
+      provider: secondResult.sample.provider,
+      window: { startLedger: 1, endLedger: 1 },
+      events: [],
+    };
+    if (options.tracker) {
+      return options.tracker.record(firstNonOverlap, secondNonOverlap);
+    }
+    return compareProviderWindowEvents(firstNonOverlap, secondNonOverlap, options);
+  }
+
+  if (options.tracker) {
+    return options.tracker.record(firstResult.sample, secondResult.sample);
+  }
+  return compareProviderWindowEvents(firstResult.sample, secondResult.sample, options);
 }
 
 /**
