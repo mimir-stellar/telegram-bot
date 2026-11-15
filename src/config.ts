@@ -33,6 +33,7 @@
 import { createRequire } from "node:module";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { parseFilterExpression } from "./notifications/filter-expr.js";
 
 import { config as loadDotenv, type DotenvConfigOptions } from "dotenv";
 
@@ -227,6 +228,8 @@ export interface BotConfig extends StellarConfig {
   csvOutputFile: string;
   /** Coarse notification feature flags (see NOTIFY_* env vars). */
   featureFlags: NotificationFeatureFlags;
+  /** Optional typed filter expression validated before live polling starts (NOTIFY_FILTER). */
+  filterExpression?: string | null;
   /** Append-only JSONL audit trail (see src/audit.ts). Empty disables it. */
   auditFile: string;
   /**
@@ -891,6 +894,19 @@ export function loadConfig(): BotConfig {
     );
   }
 
+  const filterExpressionInput = read("NOTIFY_FILTER");
+  let filterExpression: string | null = null;
+  if (filterExpressionInput !== undefined) {
+    try {
+      parseFilterExpression(filterExpressionInput);
+      filterExpression = filterExpressionInput;
+    } catch (err) {
+      c.problems.push(
+        `NOTIFY_FILTER is invalid: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   const config: BotConfig = {
     ...stellar,
     locale: locale ?? DEFAULT_LOCALE,
@@ -919,6 +935,7 @@ export function loadConfig(): BotConfig {
     silentEvents: silentEventsFrom(c),
     csvOutputFile: path.resolve(process.cwd(), c.get("CSV_OUTPUT_FILE") ?? DEFAULTS.csvOutputFile),
     featureFlags: featureFlagsParsed.flags,
+    filterExpression,
     // Resolved like the cursor file: relative paths anchor to the process cwd.
     auditFile: path.resolve(process.cwd(), read("AUDIT_FILE") ?? DEFAULTS.auditFile),
     // 0 is the documented escape hatch: no redelivery suppression.
@@ -1121,6 +1138,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "NOTIFY_ENABLED", secret: false, hasBuiltInDefault: true },
   { key: "NOTIFY_MARKET", secret: false, hasBuiltInDefault: true },
   { key: "NOTIFY_SQUAD", secret: false, hasBuiltInDefault: true },
+  { key: "NOTIFY_FILTER", secret: false },
   { key: "SILENT_EVENTS", secret: false, hasBuiltInDefault: true },
   { key: "AUDIT_FILE", secret: false, hasBuiltInDefault: true },
   { key: "SEND_JOURNAL_FILE", secret: false, hasBuiltInDefault: true },

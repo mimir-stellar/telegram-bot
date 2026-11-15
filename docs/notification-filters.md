@@ -21,6 +21,7 @@ The eight variables fall into two distinct functional layers:
 | `NOTIFY_EVENT_CATEGORIES` | Category Allowlist (`notificationCategories`) | Alias merged into `notificationCategories`; identical filtering scope to `NOTIFY_CATEGORIES`. *(Despite having `EVENT` in the name, it filters only `claim_created.category`, not event names.)* | Comma- and/or whitespace-separated category strings | `[]` (allow all) |
 | `EVENT_CATEGORIES` | Category Allowlist (`notificationCategories`) | Alias merged into `notificationCategories`; identical filtering scope to `NOTIFY_CATEGORIES`. *(Filters only `claim_created.category`, not event names.)* | Comma- and/or whitespace-separated category strings | `[]` (allow all) |
 | `CLAIM_CATEGORIES` | Category Allowlist (`notificationCategories`) | Alias merged into `notificationCategories`; identical filtering scope to `NOTIFY_CATEGORIES`. | Comma- and/or whitespace-separated category strings | `[]` (allow all) |
+| `NOTIFY_FILTER` | Typed Filter Expression (`filterExpression`) | **Optional typed event/predicate filter.** Evaluates `[<eventName>] [where <condition>]` against decoded events in the poller; validated synchronously before live polling starts. | Valid filter expression (see [`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts)) | Unset (`null`, allow all) |
 
 ---
 
@@ -88,7 +89,18 @@ Key behavioral rules:
 - **Only `claim_created` events carry a category check**: If `event.payload.name !== "claim_created"`, `eventAllowedByCategory` **always returns `true`**.
 - **Other `mimir-market` events are never filtered by category**: On-chain events such as `claim_challenged`, `claim_resolved`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, and `withdrawal_pending` do not include a category field in their event payload and always pass `eventAllowedByCategory`.
 - **`mimir-squad` events are never filtered by category**: Squad events (`market_created`, `deposited`, `withdrawn`, `resolved`, `claimed`, `fees_claimed`) always pass `eventAllowedByCategory`.
-- **Cursor advancement**: Whenever an event is skipped—whether by `isNotificationAllowed` or `eventAllowedByCategory`—`status.eventsSkipped` increments and the poller still advances the contract cursor past the page.
+- **Cursor advancement**: Whenever an event is skipped—whether by `isNotificationAllowed`, `NOTIFY_FILTER`, or `eventAllowedByCategory`—`status.eventsSkipped` increments and the poller still advances the contract cursor past the page.
+
+### 2.4 Typed Filter Expressions & Mixed-Unit Validation (`NOTIFY_FILTER`)
+
+[`parseFilterExpression`](../src/notifications/filter-expr.ts) compiles `NOTIFY_FILTER` (`config.filterExpression`) during [`loadConfig`](../src/config.ts) and [`createPoller`](../src/poller.ts) **before live polling starts**. Each numeric or bigint field carries an explicit semantic unit (`FieldUnit`):
+
+- **`usdc_amount`** (7-decimal atomic USDC `bigint`, scaled by `10_000_000n`): `stake`, `amount`, `totalPaid`, `totalFees`, `owedToChallengers`, `dust`, `gross`, `fee`, `net`, `poolA`, `poolB`. Accepts integer/decimal numbers or explicit `$100` / `100 USDC` literals (up to 7 decimal places).
+- **`identifier`** (integer ID `number`): `claimId`, `marketId`. Accepts integer numbers or `#<id>` literals (e.g. `#42`).
+- **`ledger`** (chain ledger sequence `number`): built-in `ledger` field across all events. Accepts integer numbers or `<n> ledger` / `<n> ledgers` literals.
+- **`shares`** (squad share `bigint`): `shares`. Accepts integer numbers.
+
+Comparing incompatible units—such as an identifier or ledger sequence against a USDC amount (`claim_created where claimId == 100 USDC`, `where ledger >= $50`), a USDC amount against a ledger or `#id` literal (`claim_challenged where stake >= 5000 ledger`, `deposited where amount == #42`), fractional decimals on integer identifiers/ledgers/shares (`claim_created where claimId == 10.5`), or cross-unit fields (`claim_challenged where stake == claimId`, `deposited where amount == ledger`)—throws `MixedUnitFilterError` (a `FilterParseError` subclass) synchronously before any RPC poll or Telegram send begins.
 
 ---
 

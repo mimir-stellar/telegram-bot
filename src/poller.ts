@@ -93,6 +93,11 @@ import {
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
+import {
+  evaluateFilterRule,
+  parseFilterExpression,
+  type FilterRule,
+} from "./notifications/filter-expr.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
@@ -1347,6 +1352,10 @@ export function createPoller(deps: PollerDeps) {
   };
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? defaultSleep;
+  const compiledFilterRule: FilterRule | null =
+    typeof config.filterExpression === "string" && config.filterExpression.trim() !== ""
+      ? parseFilterExpression(config.filterExpression)
+      : null;
   const activityBaseline = new ActivityBaseline(deps.activityBaselineOptions);
   const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
   const targetMaxBackoff = deps.targetBackoffOptions?.maxBackoffMs ?? DEFAULT_TARGET_MAX_BACKOFF_MS;
@@ -2051,6 +2060,13 @@ export function createPoller(deps: PollerDeps) {
           `[poller] feature-flag skipped ${event.source} event "${boundedLabel(event.payload.name, 80)}" ` +
             `at ledger ${event.ledger} (NOTIFY_* flags)`,
         );
+        continue;
+      }
+
+      if (compiledFilterRule && !evaluateFilterRule(compiledFilterRule, event)) {
+        recordSkippedIncrement();
+        metrics?.eventsSkipped.inc();
+        skipped += 1;
         continue;
       }
 

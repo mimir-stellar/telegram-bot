@@ -8,6 +8,12 @@
 
 import type { DecodedEvent } from "../stellar/decode.js";
 
+/** Number of fractional decimal places in atomic Stellar USDC units. */
+export const USDC_ATOMIC_DECIMALS = 7 as const;
+
+/** Atomic unit scale factor for 7-decimal Stellar USDC (`10_000_000n`). */
+export const USDC_ATOMIC_SCALE = 10_000_000n;
+
 /** Error thrown when a threshold string is negative, malformed, or invalid. */
 export class InvalidThresholdError extends Error {
   constructor(message: string) {
@@ -54,6 +60,12 @@ export function parseUsdcThreshold(text: string): bigint {
     throw new InvalidThresholdError(`Threshold cannot have leading '+': "${trimmed}"`);
   }
 
+  if (/^#\d+$/.test(trimmed) || /\b(?:ledgers?|claimid|marketid|shares?)\b/i.test(trimmed)) {
+    throw new InvalidThresholdError(
+      `Threshold expects a USDC decimal amount, got mixed-unit input: "${trimmed}"`,
+    );
+  }
+
   // Must match integer or decimal with digits
   // Disallow leading '.' or trailing '.' without digits, disallow multiple '.'
   const parts = trimmed.split(".");
@@ -82,7 +94,7 @@ export function parseUsdcThreshold(text: string): bigint {
   const paddedFrac = fracStr.padEnd(7, "0");
   const frac = BigInt(paddedFrac);
 
-  return whole * 10_000_000n + frac;
+  return whole * USDC_ATOMIC_SCALE + frac;
 }
 
 /**

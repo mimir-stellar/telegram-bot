@@ -13,20 +13,35 @@
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
+import { USDC_ATOMIC_SCALE } from "./amount-threshold.js";
 
 /** USDC atomic unit divisor (7 decimal places). */
-export const USDC_SCALE = 10_000_000n;
+export const USDC_SCALE = USDC_ATOMIC_SCALE;
 
 /**
  * Expected schema type for fields.
  */
 export type FieldType = "string" | "number" | "bigint" | "boolean";
 
+/**
+ * Semantic domain unit for numeric/bigint fields so mixed-unit comparisons
+ * (e.g. comparing a USDC atomic amount with a numeric identifier or ledger sequence)
+ * are rejected at parse/startup validation time before live polling starts.
+ */
+export type FieldUnit = "usdc_amount" | "identifier" | "ledger" | "shares" | "scalar";
+
 export interface FieldDefinition {
   type: FieldType;
   /** Whether the field is an amount in atomic 7-decimal USDC units. */
   isUsdcAmount?: boolean;
+  /** Semantic domain unit for numeric/bigint comparisons. */
+  unit?: FieldUnit;
 }
+
+/** Built-in top-level DecodedEvent metadata fields available across all events. */
+export const BUILTIN_EVENT_FIELDS: Record<string, FieldDefinition> = {
+  ledger: { type: "number", unit: "ledger" },
+};
 
 /**
  * Known fields and types for each event payload name.
@@ -34,105 +49,105 @@ export interface FieldDefinition {
 export const EVENT_PAYLOAD_SCHEMAS: Record<string, Record<string, FieldDefinition>> = {
   claim_created: {
     name: { type: "string" },
-    claimId: { type: "number" },
+    claimId: { type: "number", unit: "identifier" },
     creator: { type: "string" },
     category: { type: "string" },
     title: { type: "string" },
   },
   claim_challenged: {
     name: { type: "string" },
-    claimId: { type: "number" },
+    claimId: { type: "number", unit: "identifier" },
     challenger: { type: "string" },
-    stake: { type: "bigint", isUsdcAmount: true },
+    stake: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
   },
   claim_resolved: {
     name: { type: "string" },
-    claimId: { type: "number" },
-    winnerSide: { type: "number" },
+    claimId: { type: "number", unit: "identifier" },
+    winnerSide: { type: "number", unit: "scalar" },
     summary: { type: "string" },
-    confidence: { type: "number" },
+    confidence: { type: "number", unit: "scalar" },
     evidenceHash: { type: "string" },
     resolver: { type: "string" },
   },
   claim_cancelled: {
     name: { type: "string" },
-    claimId: { type: "number" },
+    claimId: { type: "number", unit: "identifier" },
   },
   market_settled: {
     name: { type: "string" },
-    claimId: { type: "number" },
-    totalPaid: { type: "bigint", isUsdcAmount: true },
-    totalFees: { type: "bigint", isUsdcAmount: true },
-    owedToChallengers: { type: "bigint", isUsdcAmount: true },
-    dust: { type: "bigint", isUsdcAmount: true },
+    claimId: { type: "number", unit: "identifier" },
+    totalPaid: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
+    totalFees: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
+    owedToChallengers: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
+    dust: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
   },
   challenger_paid: {
     name: { type: "string" },
-    claimId: { type: "number" },
+    claimId: { type: "number", unit: "identifier" },
     challenger: { type: "string" },
-    stake: { type: "bigint", isUsdcAmount: true },
-    gross: { type: "bigint", isUsdcAmount: true },
-    fee: { type: "bigint", isUsdcAmount: true },
-    net: { type: "bigint", isUsdcAmount: true },
+    stake: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
+    gross: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
+    fee: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
+    net: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
   },
   fee_claimed: {
     name: { type: "string" },
     recipient: { type: "string" },
-    amount: { type: "bigint", isUsdcAmount: true },
+    amount: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
   },
   withdrawal: {
     name: { type: "string" },
     to: { type: "string" },
-    amount: { type: "bigint", isUsdcAmount: true },
+    amount: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
   },
   withdrawal_pending: {
     name: { type: "string" },
     to: { type: "string" },
-    amount: { type: "bigint", isUsdcAmount: true },
+    amount: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
   },
   market_created: {
     name: { type: "string" },
-    marketId: { type: "number" },
+    marketId: { type: "number", unit: "identifier" },
     captain: { type: "string" },
-    deadline: { type: "number" },
-    feeBps: { type: "number" },
+    deadline: { type: "number", unit: "scalar" },
+    feeBps: { type: "number", unit: "scalar" },
     question: { type: "string" },
     category: { type: "string" },
   },
   deposited: {
     name: { type: "string" },
-    marketId: { type: "number" },
-    side: { type: "number" },
+    marketId: { type: "number", unit: "identifier" },
+    side: { type: "number", unit: "scalar" },
     participant: { type: "string" },
-    amount: { type: "bigint", isUsdcAmount: true },
-    shares: { type: "bigint" },
+    amount: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
+    shares: { type: "bigint", unit: "shares" },
   },
   withdrawn: {
     name: { type: "string" },
-    marketId: { type: "number" },
-    side: { type: "number" },
+    marketId: { type: "number", unit: "identifier" },
+    side: { type: "number", unit: "scalar" },
     participant: { type: "string" },
-    amount: { type: "bigint", isUsdcAmount: true },
+    amount: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
   },
   resolved: {
     name: { type: "string" },
-    marketId: { type: "number" },
-    result: { type: "number" },
-    poolA: { type: "bigint", isUsdcAmount: true },
-    poolB: { type: "bigint", isUsdcAmount: true },
+    marketId: { type: "number", unit: "identifier" },
+    result: { type: "number", unit: "scalar" },
+    poolA: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
+    poolB: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
   },
   claimed: {
     name: { type: "string" },
-    marketId: { type: "number" },
+    marketId: { type: "number", unit: "identifier" },
     participant: { type: "string" },
-    gross: { type: "bigint", isUsdcAmount: true },
-    fee: { type: "bigint", isUsdcAmount: true },
-    net: { type: "bigint", isUsdcAmount: true },
+    gross: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
+    fee: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
+    net: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
   },
   fees_claimed: {
     name: { type: "string" },
     recipient: { type: "string" },
-    amount: { type: "bigint", isUsdcAmount: true },
+    amount: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
   },
   oracle_changed: {
     name: { type: "string" },
@@ -153,7 +168,7 @@ export const EVENT_PAYLOAD_SCHEMAS: Record<string, Record<string, FieldDefinitio
   fee_accrued: {
     name: { type: "string" },
     recipient: { type: "string" },
-    amount: { type: "bigint", isUsdcAmount: true },
+    amount: { type: "bigint", isUsdcAmount: true, unit: "usdc_amount" },
     admin: { type: "string" },
   },
 };
@@ -169,15 +184,37 @@ export class FilterParseError extends Error {
   }
 }
 
+/** Validation error raised when a filter expression compares incompatible semantic units. */
+export class MixedUnitFilterError extends FilterParseError {
+  public readonly code = "MIXED_UNIT_COMPARISON" as const;
+  public readonly leftUnit: string;
+  public readonly rightUnit: string;
+
+  constructor(
+    message: string,
+    position: number,
+    leftUnit: string,
+    rightUnit: string,
+  ) {
+    super(message, position);
+    this.name = "MixedUnitFilterError";
+    this.leftUnit = leftUnit;
+    this.rightUnit = rightUnit;
+  }
+}
+
 /** Supported comparison operators. */
 export type ComparisonOp = "==" | "!=" | "<" | "<=" | ">" | ">=";
 
-/** Value literals supported by the AST. */
+/** Value literals and field operands supported by the AST. */
 export type LiteralValue =
   | { kind: "string"; value: string }
-  | { kind: "number"; value: number }
+  | { kind: "number"; value: number; rawText?: string }
   | { kind: "boolean"; value: boolean }
-  | { kind: "usdc"; atomic: bigint; rawDecimal: string };
+  | { kind: "usdc"; atomic: bigint; rawDecimal: string }
+  | { kind: "ledger"; value: number; rawText: string }
+  | { kind: "identifier"; value: number; rawText: string }
+  | { kind: "field"; field: string };
 
 export type ExprNode =
   | { type: "logical"; op: "and" | "or"; left: ExprNode; right: ExprNode }
@@ -206,6 +243,8 @@ export type TokenType =
   | "STRING"
   | "NUMBER"
   | "USDC"
+  | "LEDGER"
+  | "ID_LITERAL"
   | "OP"
   | "AND"
   | "OR"
@@ -321,10 +360,33 @@ class Lexer {
       };
     }
 
+    // Hash-prefixed identifier literal: e.g. #42
+    if (ch === "#") {
+      this.pos++;
+      const numStr = this.readNumberString();
+      if (!numStr) {
+        throw new FilterParseError("Expected integer identifier after '#'", start);
+      }
+      if (numStr.includes(".")) {
+        throw new MixedUnitFilterError(
+          `Identifier "#${numStr}" must be an integer`,
+          start,
+          "identifier",
+          "decimal",
+        );
+      }
+      return {
+        type: "ID_LITERAL",
+        text: "#" + numStr,
+        pos: start,
+        value: parseInt(numStr, 10),
+      };
+    }
+
     // Number (digits, optional dot and decimal digits)
     if (this.isDigit(ch)) {
       const numStr = this.readNumberString();
-      // Check if immediately followed by optional whitespace and 'USDC'
+      // Check if immediately followed by optional whitespace and 'USDC' or 'ledger(s)'
       const savedPos = this.pos;
       this.skipWhitespace();
       const lookaheadWord = this.readWord();
@@ -336,7 +398,26 @@ class Lexer {
           value: parseUsdcStringToUnits(numStr, start),
         };
       }
-      // Revert if not USDC
+      if (
+        lookaheadWord &&
+        (lookaheadWord.toLowerCase() === "ledger" || lookaheadWord.toLowerCase() === "ledgers")
+      ) {
+        if (numStr.includes(".")) {
+          throw new MixedUnitFilterError(
+            `Ledger number "${numStr} ${lookaheadWord}" must be an integer`,
+            start,
+            "ledger",
+            "decimal",
+          );
+        }
+        return {
+          type: "LEDGER",
+          text: `${numStr} ${lookaheadWord}`,
+          pos: start,
+          value: parseInt(numStr, 10),
+        };
+      }
+      // Revert if not unit-suffixed
       this.pos = savedPos;
       return {
         type: "NUMBER",
@@ -506,9 +587,13 @@ export class FilterParser {
       );
     }
 
-    // Validate fields against schema if eventName is specified
-    if (condition && eventName) {
-      validateConditionAgainstSchema(condition, eventName);
+    // Validate fields and semantic units (both event-scoped and unscoped rules)
+    if (condition) {
+      if (eventName) {
+        validateConditionAgainstSchema(condition, eventName);
+      } else {
+        validateUnscopedConditionUnits(condition);
+      }
     }
 
     return {
@@ -609,9 +694,19 @@ export class FilterParser {
       return { kind: "usdc", atomic: tok.value as bigint, rawDecimal: tok.text };
     }
 
+    if (tok.type === "LEDGER") {
+      this.advance();
+      return { kind: "ledger", value: tok.value as number, rawText: tok.text };
+    }
+
+    if (tok.type === "ID_LITERAL") {
+      this.advance();
+      return { kind: "identifier", value: tok.value as number, rawText: tok.text };
+    }
+
     if (tok.type === "NUMBER") {
       this.advance();
-      return { kind: "number", value: tok.value as number };
+      return { kind: "number", value: tok.value as number, rawText: tok.text };
     }
 
     if (tok.type === "IDENTIFIER") {
@@ -620,6 +715,8 @@ export class FilterParser {
         this.advance();
         return { kind: "boolean", value: lower === "true" };
       }
+      this.advance();
+      return { kind: "field", field: tok.text };
     }
 
     throw new FilterParseError(
@@ -629,11 +726,192 @@ export class FilterParser {
   }
 }
 
-/** Validate fields and types in condition against the given event payload schema. */
+function effectiveUnit(def: FieldDefinition): string {
+  if (def.unit) return def.unit;
+  if (def.isUsdcAmount) return "usdc_amount";
+  return def.type;
+}
+
+function resolveUnscopedFieldDef(field: string): FieldDefinition | undefined {
+  if (BUILTIN_EVENT_FIELDS[field]) {
+    return BUILTIN_EVENT_FIELDS[field];
+  }
+  let found: FieldDefinition | undefined;
+  for (const schema of Object.values(EVENT_PAYLOAD_SCHEMAS)) {
+    const def = schema[field];
+    if (!def) continue;
+    if (!found) {
+      found = def;
+    } else if (found.type !== def.type || effectiveUnit(found) !== effectiveUnit(def)) {
+      return undefined;
+    }
+  }
+  return found;
+}
+
+function validateSingleComparison(
+  node: Extract<ExprNode, { type: "comparison" }>,
+  leftDef: FieldDefinition,
+  resolveRightField: (name: string) => FieldDefinition | undefined,
+  eventName?: string,
+): void {
+  const leftUnit = effectiveUnit(leftDef);
+
+  if (node.value.kind === "field") {
+    const rightDef = resolveRightField(node.value.field);
+    if (!rightDef) {
+      if (eventName) {
+        throw new FilterParseError(
+          `Unknown field "${node.value.field}" for event "${eventName}"`,
+          node.valuePos,
+        );
+      }
+      return;
+    }
+    const rightUnit = effectiveUnit(rightDef);
+    if (leftUnit !== rightUnit || leftDef.type !== rightDef.type) {
+      throw new MixedUnitFilterError(
+        `Mixed-unit comparison: cannot compare ${leftUnit} field "${node.field}" with ${rightUnit} field "${node.value.field}"`,
+        node.valuePos,
+        leftUnit,
+        rightUnit,
+      );
+    }
+    if ((leftDef.type === "string" || leftDef.type === "boolean") && node.op !== "==" && node.op !== "!=") {
+      throw new FilterParseError(
+        `Operator "${node.op}" cannot be used on ${leftDef.type} field "${node.field}"`,
+        node.fieldPos,
+      );
+    }
+    return;
+  }
+
+  // Reject mixed-unit comparisons against explicit USDC atomic amount literals
+  if (node.value.kind === "usdc" && leftUnit !== "usdc_amount") {
+    throw new MixedUnitFilterError(
+      `Mixed-unit comparison on field "${node.field}" (${leftUnit}): cannot compare ${leftUnit} with USDC atomic amount "${node.value.rawDecimal}"`,
+      node.valuePos,
+      leftUnit,
+      "usdc_amount",
+    );
+  }
+
+  // Reject mixed-unit comparisons against explicit ledger sequence literals
+  if (node.value.kind === "ledger" && leftUnit !== "ledger") {
+    throw new MixedUnitFilterError(
+      `Mixed-unit comparison on field "${node.field}" (${leftUnit}): cannot compare ${leftUnit} with ledger number "${node.value.rawText}"`,
+      node.valuePos,
+      leftUnit,
+      "ledger",
+    );
+  }
+
+  // Reject mixed-unit comparisons against explicit identifier literals (#42)
+  if (node.value.kind === "identifier" && leftUnit !== "identifier") {
+    throw new MixedUnitFilterError(
+      `Mixed-unit comparison on field "${node.field}" (${leftUnit}): cannot compare ${leftUnit} with identifier "${node.value.rawText}"`,
+      node.valuePos,
+      leftUnit,
+      "identifier",
+    );
+  }
+
+  // Reject fractional decimal comparisons on integer identifiers, ledger numbers, or shares
+  if (
+    node.value.kind === "number" &&
+    (leftUnit === "identifier" || leftUnit === "ledger" || leftUnit === "shares") &&
+    !Number.isInteger(node.value.value)
+  ) {
+    throw new MixedUnitFilterError(
+      `Mixed-unit comparison on field "${node.field}" (${leftUnit}): ${leftUnit} requires an integer value, got "${node.value.rawText ?? node.value.value}"`,
+      node.valuePos,
+      leftUnit,
+      "decimal",
+    );
+  }
+
+  if (
+    node.value.kind === "number" &&
+    leftUnit === "usdc_amount" &&
+    node.value.rawText?.includes(".")
+  ) {
+    parseUsdcStringToUnits(node.value.rawText, node.valuePos);
+  }
+
+  // Check type compatibility
+  switch (leftDef.type) {
+    case "string":
+      if (node.value.kind !== "string") {
+        throw new FilterParseError(
+          `Field "${node.field}" is a string, but got ${node.value.kind} literal`,
+          node.valuePos,
+        );
+      }
+      if (node.op !== "==" && node.op !== "!=") {
+        throw new FilterParseError(
+          `Operator "${node.op}" cannot be used on string field "${node.field}" (only == and != are supported)`,
+          node.fieldPos,
+        );
+      }
+      break;
+
+    case "boolean":
+      if (node.value.kind !== "boolean") {
+        throw new FilterParseError(
+          `Field "${node.field}" is a boolean, but got ${node.value.kind} literal`,
+          node.valuePos,
+        );
+      }
+      if (node.op !== "==" && node.op !== "!=") {
+        throw new FilterParseError(
+          `Operator "${node.op}" cannot be used on boolean field "${node.field}"`,
+          node.fieldPos,
+        );
+      }
+      break;
+
+    case "bigint":
+      if (node.value.kind !== "usdc" && node.value.kind !== "number") {
+        throw new FilterParseError(
+          `Field "${node.field}" is a numeric/USDC amount, but got ${node.value.kind} literal`,
+          node.valuePos,
+        );
+      }
+      break;
+
+    case "number":
+      if (
+        node.value.kind !== "number" &&
+        !(leftUnit === "ledger" && node.value.kind === "ledger") &&
+        !(leftUnit === "identifier" && node.value.kind === "identifier")
+      ) {
+        throw new FilterParseError(
+          `Field "${node.field}" is a number, but got ${node.value.kind} literal`,
+          node.valuePos,
+        );
+      }
+      break;
+  }
+}
+
+function validateUnscopedConditionUnits(condition: ExprNode): void {
+  if (condition.type === "logical") {
+    validateUnscopedConditionUnits(condition.left);
+    validateUnscopedConditionUnits(condition.right);
+    return;
+  }
+  const leftDef = resolveUnscopedFieldDef(condition.field);
+  if (!leftDef) return;
+  validateSingleComparison(condition, leftDef, resolveUnscopedFieldDef);
+}
+
+/** Validate fields, types, and semantic units in condition against the given event payload schema. */
 export function validateConditionAgainstSchema(condition: ExprNode, eventName: string): void {
   const schema = EVENT_PAYLOAD_SCHEMAS[eventName];
   if (!schema) return;
   const currentSchema = schema;
+  const resolveScopedField = (name: string): FieldDefinition | undefined =>
+    BUILTIN_EVENT_FIELDS[name] ?? currentSchema[name];
 
   function traverse(node: ExprNode): void {
     if (node.type === "logical") {
@@ -642,7 +920,7 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
       return;
     }
 
-    const fieldDef = currentSchema[node.field];
+    const fieldDef = resolveScopedField(node.field);
     if (!fieldDef) {
       throw new FilterParseError(
         `Unknown field "${node.field}" for event "${eventName}"`,
@@ -650,57 +928,7 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
       );
     }
 
-    // Check type compatibility
-    switch (fieldDef.type) {
-      case "string":
-        if (node.value.kind !== "string") {
-          throw new FilterParseError(
-            `Field "${node.field}" is a string, but got ${node.value.kind} literal`,
-            node.valuePos,
-          );
-        }
-        if (node.op !== "==" && node.op !== "!=") {
-          throw new FilterParseError(
-            `Operator "${node.op}" cannot be used on string field "${node.field}" (only == and != are supported)`,
-            node.fieldPos,
-          );
-        }
-        break;
-
-      case "boolean":
-        if (node.value.kind !== "boolean") {
-          throw new FilterParseError(
-            `Field "${node.field}" is a boolean, but got ${node.value.kind} literal`,
-            node.valuePos,
-          );
-        }
-        if (node.op !== "==" && node.op !== "!=") {
-          throw new FilterParseError(
-            `Operator "${node.op}" cannot be used on boolean field "${node.field}"`,
-            node.fieldPos,
-          );
-        }
-        break;
-
-      case "bigint":
-        // Bigint fields (like stake, amount) can be compared to usdc literals or numbers
-        if (node.value.kind !== "usdc" && node.value.kind !== "number") {
-          throw new FilterParseError(
-            `Field "${node.field}" is a numeric/USDC amount, but got ${node.value.kind} literal`,
-            node.valuePos,
-          );
-        }
-        break;
-
-      case "number":
-        if (node.value.kind !== "number") {
-          throw new FilterParseError(
-            `Field "${node.field}" is a number, but got ${node.value.kind} literal`,
-            node.valuePos,
-          );
-        }
-        break;
-    }
+    validateSingleComparison(node, fieldDef, resolveScopedField, eventName);
   }
 
   traverse(condition);
@@ -713,7 +941,8 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
 /**
  * Parses a filter expression string into a structured {@link FilterRule}.
  *
- * @throws {@link FilterParseError} on invalid syntax, unknown fields, or type mismatches.
+ * @throws {@link FilterParseError} on invalid syntax, unknown fields, type mismatches,
+ * or mixed-unit comparisons ({@link MixedUnitFilterError}).
  */
 export function parseFilterExpression(input: string): FilterRule {
   const parser = new FilterParser(input.trim());
@@ -723,6 +952,20 @@ export function parseFilterExpression(input: string): FilterRule {
 // ----------------------------------------------------
 // Evaluator
 // ----------------------------------------------------
+
+function readEventFieldValue(
+  event: DecodedEvent,
+  payload: Record<string, unknown>,
+  field: string,
+): unknown {
+  if (Object.prototype.hasOwnProperty.call(payload, field)) {
+    return payload[field];
+  }
+  if (field === "ledger") {
+    return event.ledger;
+  }
+  return undefined;
+}
 
 /**
  * Evaluates a parsed FilterRule against a DecodedEvent purely (no eval, no side effects).
@@ -744,28 +987,99 @@ export function evaluateFilterRule(rule: FilterRule, event: DecodedEvent): boole
     return true;
   }
 
-  return evaluateNode(rule.condition, payload);
+  return evaluateNode(rule.condition, event, payload);
 }
 
-function evaluateNode(node: ExprNode, payload: Record<string, unknown>): boolean {
+function evaluateNode(
+  node: ExprNode,
+  event: DecodedEvent,
+  payload: Record<string, unknown>,
+): boolean {
   if (node.type === "logical") {
     if (node.op === "and") {
-      return evaluateNode(node.left, payload) && evaluateNode(node.right, payload);
+      return evaluateNode(node.left, event, payload) && evaluateNode(node.right, event, payload);
     }
     if (node.op === "or") {
-      return evaluateNode(node.left, payload) || evaluateNode(node.right, payload);
+      return evaluateNode(node.left, event, payload) || evaluateNode(node.right, event, payload);
     }
   }
 
   if (node.type === "comparison") {
-    const rawVal = payload[node.field];
+    const rawVal = readEventFieldValue(event, payload, node.field);
     if (rawVal === undefined || rawVal === null) {
       return false;
     }
 
-    return compareValues(rawVal, node.op, node.value);
+    if (node.value.kind === "field") {
+      const rightVal = readEventFieldValue(event, payload, node.value.field);
+      if (rightVal === undefined || rightVal === null || typeof rawVal !== typeof rightVal) {
+        return false;
+      }
+      return compareSameTypeValues(rawVal, node.op, rightVal);
+    }
+
+    const fieldDef = ruleFieldDefForRuntime(node.field, payload);
+    return compareValues(rawVal, node.op, node.value, fieldDef);
   }
 
+  return false;
+}
+
+function ruleFieldDefForRuntime(
+  field: string,
+  payload: Record<string, unknown>,
+): FieldDefinition | undefined {
+  if (BUILTIN_EVENT_FIELDS[field]) return BUILTIN_EVENT_FIELDS[field];
+  const eventName = typeof payload.name === "string" ? payload.name : undefined;
+  if (eventName && EVENT_PAYLOAD_SCHEMAS[eventName]?.[field]) {
+    return EVENT_PAYLOAD_SCHEMAS[eventName]![field];
+  }
+  return resolveUnscopedFieldDef(field);
+}
+
+function compareSameTypeValues(left: unknown, op: ComparisonOp, right: unknown): boolean {
+  if (typeof left === "bigint" && typeof right === "bigint") {
+    switch (op) {
+      case "==":
+        return left === right;
+      case "!=":
+        return left !== right;
+      case "<":
+        return left < right;
+      case "<=":
+        return left <= right;
+      case ">":
+        return left > right;
+      case ">=":
+        return left >= right;
+    }
+  }
+  if (typeof left === "number" && typeof right === "number") {
+    switch (op) {
+      case "==":
+        return left === right;
+      case "!=":
+        return left !== right;
+      case "<":
+        return left < right;
+      case "<=":
+        return left <= right;
+      case ">":
+        return left > right;
+      case ">=":
+        return left >= right;
+    }
+  }
+  if ((typeof left === "string" && typeof right === "string") || (typeof left === "boolean" && typeof right === "boolean")) {
+    switch (op) {
+      case "==":
+        return left === right;
+      case "!=":
+        return left !== right;
+      default:
+        return false;
+    }
+  }
   return false;
 }
 
@@ -773,14 +1087,25 @@ function compareValues(
   actual: unknown,
   op: ComparisonOp,
   literal: LiteralValue,
+  fieldDef?: FieldDefinition,
 ): boolean {
+  const unit = fieldDef ? effectiveUnit(fieldDef) : undefined;
+
   // BigInt actual value comparison (e.g. stake, amount in DecodedEvent)
   if (typeof actual === "bigint") {
     let targetBigInt: bigint;
     if (literal.kind === "usdc") {
+      if (unit && unit !== "usdc_amount") return false;
       targetBigInt = literal.atomic;
     } else if (literal.kind === "number") {
-      targetBigInt = BigInt(Math.floor(literal.value)) * USDC_SCALE;
+      if (unit === "shares") {
+        if (!Number.isInteger(literal.value)) return false;
+        targetBigInt = BigInt(literal.value);
+      } else if (literal.rawText) {
+        targetBigInt = parseUsdcStringToUnits(literal.rawText);
+      } else {
+        targetBigInt = BigInt(Math.floor(literal.value)) * USDC_SCALE;
+      }
     } else {
       return false;
     }
@@ -801,14 +1126,19 @@ function compareValues(
     }
   }
 
-  // Number actual value comparison (e.g. claimId, confidence, side)
+  // Number actual value comparison (e.g. claimId, marketId, ledger, confidence, side)
   if (typeof actual === "number") {
     let targetNum: number;
     if (literal.kind === "number") {
       targetNum = literal.value;
-    } else if (literal.kind === "usdc") {
-      targetNum = Number(literal.atomic) / Number(USDC_SCALE);
+    } else if (literal.kind === "ledger") {
+      if (unit !== "ledger") return false;
+      targetNum = literal.value;
+    } else if (literal.kind === "identifier") {
+      if (unit !== "identifier") return false;
+      targetNum = literal.value;
     } else {
+      // Never coerce USDC atomic amounts onto numeric identifiers or ledger numbers
       return false;
     }
 

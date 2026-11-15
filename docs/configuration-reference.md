@@ -33,6 +33,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 
 ### Notification Filtering
 - `NOTIFY_ENABLED`, `NOTIFY_MARKET`, `NOTIFY_SQUAD`: Coarse boolean kill switches for global or per-contract notifications (all default to `true`).
+- `NOTIFY_FILTER`: Optional typed filter expression (`[<eventName>] [where <condition>]`) compiled and validated synchronously at startup before live polling begins. Mixed-unit comparisons between 7-decimal USDC atomic amounts (`$100`, `100 USDC`, `stake`, `amount`, etc.), numeric identifiers (`claimId`, `marketId`, `#42`), ledger sequence numbers (`ledger`, `5000 ledger`), and `shares` are rejected before polling starts.
 - `SILENT_EVENTS`: Comma-separated event names sent without sound. Defaults to deposits, withdrawals, and fee claims; unknown names fail configuration validation.
 - `NOTIFY_CATEGORIES` (along with aliases `NOTIFICATION_CATEGORIES`, `NOTIFY_EVENT_CATEGORIES`, `EVENT_CATEGORIES`, and `CLAIM_CATEGORIES`): Optional allowlist restricting `mimir-market` `claim_created` notifications by category.
 - For full details on defaults, evaluation precedence, and worked examples, see [Notification Filters](notification-filters.md).
