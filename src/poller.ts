@@ -363,6 +363,32 @@ export interface PollerStatus {
   };
 }
 
+/** Canonical target names owned by the Mimir Telegram notifier. */
+export const KNOWN_CURSOR_TARGETS = ["market", "squad"] as const;
+
+export interface CursorOwnership {
+  contracts: Record<string, string>;
+  networkPassphrase?: string;
+}
+
+export type CursorOwnershipMismatchReason =
+  | "empty_targets"
+  | "unrecognized_target"
+  | "disjoint_targets"
+  | "contract_mismatch"
+  | "network_mismatch";
+
+export class CursorOwnershipMismatchError extends Error {
+  readonly code = "CURSOR_OWNERSHIP_MISMATCH" as const;
+  readonly reason: CursorOwnershipMismatchReason;
+
+  constructor(reason: CursorOwnershipMismatchReason, detail: string) {
+    super(`cursor backup ownership validation failed (${reason}): ${detail}`);
+    this.name = "CursorOwnershipMismatchError";
+    this.reason = reason;
+  }
+}
+
 /** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
 export const CURSOR_SCHEMA_VERSION = 1 as const;
 
@@ -375,12 +401,19 @@ export interface CursorFile {
    * it, so the on-disk format stays version 1 either way.
    */
   chainClockAt?: number | null;
+  /**
+   * Additive ownership metadata tying persisted cursor targets to contract IDs
+   * and optional network passphrase so unrelated backups are rejected on restore.
+   */
+  ownership?: CursorOwnership;
   targets: Record<string, CursorTarget>;
 }
 
 interface CursorTarget {
   cursor: string | null;
   lastEventLedger: number | null;
+  /** Optional contract identifier when recorded directly on a target entry. */
+  contractId?: string;
   /**
    * Recently processed event ids, oldest first. Additive and bounded: older
    * cursor files without it load as an empty window, and new files stay small
@@ -755,6 +788,126 @@ export function isValidCursorFile(value: unknown): value is CursorFile {
   return true;
 }
 
+export function parseCursorOwnership(value: unknown): CursorOwnership | undefined {
+  if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const obj = value as Record<string, unknown>;
+  const contracts: Record<string, string> = {};
+  if (obj.contracts !== null && typeof obj.contracts === "object" && !Array.isArray(obj.contracts)) {
+    for (const [source, contractId] of Object.entries(obj.contracts as Record<string, unknown>)) {
+      if (typeof contractId === "string" && contractId.trim().length > 0) {
+        contracts[source] = contractId.trim();
+      }
+    }
+  }
+  const networkPassphrase =
+    typeof obj.networkPassphrase === "string" && obj.networkPassphrase.trim().length > 0
+      ? obj.networkPassphrase.trim()
+      : undefined;
+  if (Object.keys(contracts).length === 0 && networkPassphrase === undefined) {
+    return undefined;
+  }
+  return {
+    contracts,
+    ...(networkPassphrase !== undefined ? { networkPassphrase } : {}),
+  };
+}
+
+/**
+ * Validate that a parsed backup cursor file belongs to the expected bot target
+ * set, contract IDs, and network before replacing a live cursor file.
+ */
+export function validateCursorBackupOwnership(params: {
+  backupFile: CursorFile;
+  liveFile?: CursorFile | null;
+  expectedContracts?: Record<string, string>;
+  expectedNetworkPassphrase?: string;
+  allowedTargets?: readonly string[];
+}): void {
+  const backupTargets = Object.keys(params.backupFile.targets);
+  if (backupTargets.length === 0) {
+    throw new CursorOwnershipMismatchError(
+      "empty_targets",
+      "backup contains no cursor targets",
+    );
+  }
+
+  const allowedSet = new Set<string>([
+    ...(params.allowedTargets ?? KNOWN_CURSOR_TARGETS),
+    ...Object.keys(params.expectedContracts ?? {}),
+    ...Object.keys(params.liveFile?.targets ?? {}),
+  ]);
+
+  const unrecognized = backupTargets.filter((target) => !allowedSet.has(target));
+  if (unrecognized.length > 0) {
+    throw new CursorOwnershipMismatchError(
+      "unrecognized_target",
+      `backup defines unrecognized target(s): ${unrecognized.map((t) => `"${t}"`).join(", ")}`,
+    );
+  }
+
+  const liveTargets = Object.keys(params.liveFile?.targets ?? {});
+  if (liveTargets.length > 0) {
+    const overlap = backupTargets.filter((target) => liveTargets.includes(target));
+    if (overlap.length === 0) {
+      throw new CursorOwnershipMismatchError(
+        "disjoint_targets",
+        `backup targets [${backupTargets.join(", ")}] do not overlap live cursor targets [${liveTargets.join(", ")}]`,
+      );
+    }
+  }
+
+  const referenceNetwork =
+    params.expectedNetworkPassphrase?.trim() ||
+    params.liveFile?.ownership?.networkPassphrase?.trim() ||
+    undefined;
+  const backupNetwork = params.backupFile.ownership?.networkPassphrase?.trim() || undefined;
+  if (
+    referenceNetwork !== undefined &&
+    backupNetwork !== undefined &&
+    referenceNetwork !== backupNetwork
+  ) {
+    throw new CursorOwnershipMismatchError(
+      "network_mismatch",
+      `backup network "${backupNetwork}" does not match expected network "${referenceNetwork}"`,
+    );
+  }
+
+  const referenceContracts: Record<string, string> = {
+    ...(params.liveFile?.ownership?.contracts ?? {}),
+  };
+  for (const [source, saved] of Object.entries(params.liveFile?.targets ?? {})) {
+    if (typeof saved.contractId === "string" && saved.contractId.trim().length > 0) {
+      referenceContracts[source] = saved.contractId.trim();
+    }
+  }
+  for (const [source, contractId] of Object.entries(params.expectedContracts ?? {})) {
+    if (typeof contractId === "string" && contractId.trim().length > 0) {
+      referenceContracts[source] = contractId.trim();
+    }
+  }
+
+  const backupContracts: Record<string, string> = {
+    ...(params.backupFile.ownership?.contracts ?? {}),
+  };
+  for (const [source, saved] of Object.entries(params.backupFile.targets)) {
+    if (typeof saved.contractId === "string" && saved.contractId.trim().length > 0) {
+      backupContracts[source] = saved.contractId.trim();
+    }
+  }
+
+  for (const [source, backupContract] of Object.entries(backupContracts)) {
+    const expectedContract = referenceContracts[source];
+    if (expectedContract !== undefined && expectedContract !== backupContract) {
+      throw new CursorOwnershipMismatchError(
+        "contract_mismatch",
+        `target "${source}" contract "${backupContract}" does not match expected "${expectedContract}"`,
+      );
+    }
+  }
+}
+
 /** Parse + validate a cursor file body; throws on JSON or schema failure. */
 export function parseCursorFile(raw: string): CursorFile {
   let parsed: unknown;
@@ -784,6 +937,9 @@ export function parseCursorFile(raw: string): CursorFile {
     targets[source] = {
       cursor: target.cursor,
       lastEventLedger: target.lastEventLedger,
+      ...(typeof target.contractId === "string" && target.contractId.trim().length > 0
+        ? { contractId: target.contractId.trim() }
+        : {}),
       // The dedup window is part of the cursor file: a restart must not
       // re-notify the boundary event the inclusive cursor hands back.
       // Additive field: only present when the file carried it.
@@ -797,11 +953,14 @@ export function parseCursorFile(raw: string): CursorFile {
     };
   }
 
+  const ownership = parseCursorOwnership((parsed as unknown as Record<string, unknown>).ownership);
+
   return {
     version: 1,
     updatedAt: parsed.updatedAt ?? "",
     // Additive field: only present when the file carried it.
     ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
+    ...(ownership !== undefined ? { ownership } : {}),
     targets,
   };
 }
@@ -880,9 +1039,14 @@ function normalizeTargetEntry(value: unknown, label: string): CursorTargetEntry 
   // only when the file had them.
   const recent = value.recentEventIds;
   const rewindFromLedger = parseRewindFromLedger(value.rewindFromLedger);
+  const contractId =
+    typeof value.contractId === "string" && value.contractId.trim().length > 0
+      ? value.contractId.trim()
+      : undefined;
   return {
     cursor,
     lastEventLedger,
+    ...(contractId !== undefined ? { contractId } : {}),
     ...(Array.isArray(recent)
       ? { recentEventIds: recent.filter((id): id is string => typeof id === "string") }
       : {}),
@@ -911,7 +1075,7 @@ function looksLikeFlatLegacyTargets(parsed: Record<string, unknown>): boolean {
   const keys = Object.keys(parsed);
   if (keys.length === 0) return false;
   // Ignore purely metadata-looking keys if somehow present alone.
-  const dataKeys = keys.filter((k) => k !== "updatedAt");
+  const dataKeys = keys.filter((k) => k !== "updatedAt" && k !== "ownership");
   if (dataKeys.length === 0) return false;
   return dataKeys.every((key) => {
     const value = parsed[key];
@@ -934,6 +1098,7 @@ export function parseAndMigrateCursorFile(
   }
   const parsed = parsedUnknown;
   const nowIso = (options.now ?? (() => new Date()))().toISOString();
+  const ownership = parseCursorOwnership(parsed.ownership);
 
   // ── Current versioned schema ───────────────────────────────────────────────
   if (parsed.version === CURSOR_SCHEMA_VERSION) {
@@ -947,6 +1112,7 @@ export function parseAndMigrateCursorFile(
         : nowIso;
     const file: CursorFile = { version: CURSOR_SCHEMA_VERSION, updatedAt, targets };
     if (parsed.chainClockAt !== undefined) file.chainClockAt = parseChainClock(parsed.chainClockAt);
+    if (ownership !== undefined) file.ownership = ownership;
     return {
       file,
       migrated: typeof parsed.updatedAt !== "string" || parsed.updatedAt.length === 0,
@@ -966,7 +1132,12 @@ export function parseAndMigrateCursorFile(
   if (isPlainObject(parsed.targets)) {
     const targets = normalizeTargets(parsed.targets, "legacy-unversioned");
     return {
-      file: { version: CURSOR_SCHEMA_VERSION, updatedAt: nowIso, targets },
+      file: {
+        version: CURSOR_SCHEMA_VERSION,
+        updatedAt: nowIso,
+        ...(ownership !== undefined ? { ownership } : {}),
+        targets,
+      },
       migrated: true,
       source: "legacy-unversioned",
     };
@@ -974,11 +1145,16 @@ export function parseAndMigrateCursorFile(
 
   // ── Legacy: flat map of target → entry or cursor string ────────────────────
   if (looksLikeFlatLegacyTargets(parsed)) {
-    const { updatedAt: _ignored, ...flat } = parsed;
+    const { updatedAt: _ignored, ownership: _ignoredOwnership, ...flat } = parsed;
     const allStrings = Object.values(flat).every((v) => typeof v === "string");
     const targets = normalizeTargets(flat, allStrings ? "legacy-string-map" : "legacy-flat");
     return {
-      file: { version: CURSOR_SCHEMA_VERSION, updatedAt: nowIso, targets },
+      file: {
+        version: CURSOR_SCHEMA_VERSION,
+        updatedAt: nowIso,
+        ...(ownership !== undefined ? { ownership } : {}),
+        targets,
+      },
       migrated: true,
       source: allStrings ? "legacy-string-map" : "legacy-flat",
     };
@@ -993,22 +1169,29 @@ export function buildCursorFile(
     source: string;
     cursor: string | null;
     lastEventLedger: number | null;
+    contractId?: string;
     recentEventIds?: string[];
     rewindFromLedger?: number | null;
   }>,
   updatedAt: string,
   chainClockAt?: number | null,
+  ownership?: CursorOwnership,
 ): CursorFile {
+  const parsedOwnership = parseCursorOwnership(ownership);
   return {
     version: CURSOR_SCHEMA_VERSION,
     updatedAt,
     ...(chainClockAt !== undefined ? { chainClockAt } : {}),
+    ...(parsedOwnership !== undefined ? { ownership: parsedOwnership } : {}),
     targets: Object.fromEntries(
       [...targets].map((t) => [
         t.source,
         {
           cursor: t.cursor,
           lastEventLedger: t.lastEventLedger,
+          ...(typeof t.contractId === "string" && t.contractId.trim().length > 0
+            ? { contractId: t.contractId.trim() }
+            : {}),
           ...(t.recentEventIds !== undefined ? { recentEventIds: t.recentEventIds } : {}),
           // Only a live rewind is persisted; a finished target drops the field
           // so an ordinary cursor file is byte-for-byte unchanged.
@@ -1798,6 +1981,12 @@ export function createPoller(deps: PollerDeps) {
   }
 
   async function saveCursors(reason: "cycle" | "shutdown" | "migration"): Promise<boolean> {
+    const ownership: CursorOwnership = {
+      contracts: Object.fromEntries(targets.map((t) => [t.source, t.contractId])),
+      ...(typeof config.networkPassphrase === "string" && config.networkPassphrase.trim().length > 0
+        ? { networkPassphrase: config.networkPassphrase.trim() }
+        : {}),
+    };
     const payload = buildCursorFile(
       [...state.values()].map((t) => ({
         source: t.source,
@@ -1808,6 +1997,7 @@ export function createPoller(deps: PollerDeps) {
       })),
       new Date(now()).toISOString(),
       status.chainClockAt,
+      ownership,
     );
 
     try {

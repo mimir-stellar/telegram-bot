@@ -26,9 +26,10 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Corrupt**: If JSON is invalid or fails schema validation (or references an unsupported future schema version), `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>` and starts cold.
 
 ### 2. Cursor Backup Copy
-- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`)
+- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`) and [`src/cursor-cli.ts`](../src/cursor-cli.ts) (`restoreCursor`)
 - **Default Path**: `${cursorFile}.bak` (typically `./data/cursor.json.bak`)
 - **Write Pattern**: Non-atomic `copyFile` immediately following atomic commit of primary cursor file.
+- **Ownership Validation**: `saveCursors` stamps additive `ownership` metadata (`contracts` and `networkPassphrase`) onto persisted cursor files. Before replacing the live cursor file, `restoreCursor` validates both backup schema and target ownership (`market`/`squad` target identity, overlap with live targets, contract IDs via live ownership or `--market-contract` / `--squad-contract`, and `--network-passphrase`), rejecting unrelated backups with `CursorOwnershipMismatchError` before writing.
 - **Recovery Role**: Acts as an offline recovery snapshot one generation older than the live cursor.
 
 ### 3. Cursor Quarantine Copy

@@ -10,7 +10,25 @@ import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import {
+  type CursorFile,
+  type CursorOwnership,
+  CursorOwnershipMismatchError,
+  type CursorOwnershipMismatchReason,
+  KNOWN_CURSOR_TARGETS,
+  parseAndMigrateCursorFile,
+  parseCursorOwnership,
+  validateCursorBackupOwnership,
+} from "./poller.js";
+
+export {
+  type CursorOwnership,
+  CursorOwnershipMismatchError,
+  type CursorOwnershipMismatchReason,
+  KNOWN_CURSOR_TARGETS,
+  parseCursorOwnership,
+  validateCursorBackupOwnership,
+};
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -20,6 +38,9 @@ export interface BackupCursorOptions {
 
 export interface RestoreCursorOptions extends BackupCursorOptions {
   lockFile: string;
+  expectedContracts?: Record<string, string>;
+  expectedNetworkPassphrase?: string;
+  allowedTargets?: readonly string[];
 }
 
 async function exists(filePath: string): Promise<boolean> {
@@ -83,9 +104,44 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
   try {
     const raw = await readFile(options.backupFile, "utf8");
     const parsed = validateCursor(raw);
-    if (!options.force && (await exists(options.cursorFile))) {
+    const liveExists = await exists(options.cursorFile);
+    if (!options.force && liveExists) {
       throw new Error(`cursor already exists at ${options.cursorFile}; pass --force to replace it`);
     }
+
+    let liveFile: CursorFile | null = null;
+    if (liveExists) {
+      try {
+        const liveRaw = await readFile(options.cursorFile, "utf8");
+        liveFile = parseAndMigrateCursorFile(liveRaw).file;
+      } catch {
+        // Corrupt/unreadable live cursor can still be recovered by an owned valid backup.
+        liveFile = null;
+      }
+    }
+
+    validateCursorBackupOwnership({
+      backupFile: parsed.file,
+      liveFile,
+      expectedContracts: options.expectedContracts,
+      expectedNetworkPassphrase: options.expectedNetworkPassphrase,
+      allowedTargets: options.allowedTargets,
+    });
+
+    if (parsed.file.ownership === undefined) {
+      const inheritedOwnership = parseCursorOwnership({
+        contracts: {
+          ...(liveFile?.ownership?.contracts ?? {}),
+          ...(options.expectedContracts ?? {}),
+        },
+        networkPassphrase:
+          options.expectedNetworkPassphrase ?? liveFile?.ownership?.networkPassphrase,
+      });
+      if (inheritedOwnership !== undefined) {
+        parsed.file.ownership = inheritedOwnership;
+      }
+    }
+
     const normalized = `${JSON.stringify(parsed.file, null, 2)}\n`;
     await writeAtomic(options.cursorFile, normalized, options.force === true);
     console.log(
@@ -101,6 +157,9 @@ interface CliOptions {
   file?: string;
   out?: string;
   from?: string;
+  marketContract?: string;
+  squadContract?: string;
+  networkPassphrase?: string;
   force: boolean;
 }
 
@@ -116,14 +175,26 @@ function parseOptions(args: string[]): CliOptions {
       options.force = true;
       continue;
     }
-    if (arg !== "--file" && arg !== "--out" && arg !== "--from") {
+    if (
+      arg !== "--file" &&
+      arg !== "--out" &&
+      arg !== "--from" &&
+      arg !== "--market-contract" &&
+      arg !== "--squad-contract" &&
+      arg !== "--network-passphrase"
+    ) {
       throw new Error(`unknown option: ${arg}`);
     }
     if (seen.has(arg)) throw new Error(`duplicate ${arg} option`);
     seen.add(arg);
     const value = args[index + 1];
-    if (value === undefined || value.startsWith("--")) throw new Error(`${arg} requires a path`);
-    options[arg.slice(2) as "file" | "out" | "from"] = value;
+    if (value === undefined || value.startsWith("--")) {
+      throw new Error(`${arg} requires a value`);
+    }
+    if (arg === "--market-contract") options.marketContract = value;
+    else if (arg === "--squad-contract") options.squadContract = value;
+    else if (arg === "--network-passphrase") options.networkPassphrase = value;
+    else options[arg.slice(2) as "file" | "out" | "from"] = value;
     index += 1;
   }
 
@@ -146,7 +217,10 @@ async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
   if (action !== "backup" && action !== "restore") {
-    throw new Error("usage: npm run cursor -- <backup|restore> [--file PATH] [--out PATH|--from PATH] [--force]");
+    throw new Error(
+      "usage: npm run cursor -- <backup|restore> [--file PATH] [--out PATH|--from PATH] " +
+        "[--market-contract ID] [--squad-contract ID] [--network-passphrase PASS] [--force]",
+    );
   }
 
   const options = parseOptions(args);
@@ -164,11 +238,21 @@ async function main(): Promise<void> {
   const backupFile = resolvePath(options.from);
   assertDifferentPaths(cursorFile, backupFile);
   const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
+  const expectedContracts: Record<string, string> = {};
+  const marketContract = options.marketContract ?? process.env.MARKET_CONTRACT_ID;
+  const squadContract = options.squadContract ?? process.env.SQUAD_CONTRACT_ID;
+  if (marketContract) expectedContracts.market = marketContract;
+  if (squadContract) expectedContracts.squad = squadContract;
+  const expectedNetworkPassphrase =
+    options.networkPassphrase ?? process.env.STELLAR_NETWORK_PASSPHRASE;
+
   await restoreCursor({
     cursorFile,
     backupFile,
     lockFile,
     force: options.force,
+    ...(Object.keys(expectedContracts).length > 0 ? { expectedContracts } : {}),
+    ...(expectedNetworkPassphrase ? { expectedNetworkPassphrase } : {}),
   });
 }
 
