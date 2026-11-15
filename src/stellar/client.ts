@@ -15,6 +15,31 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  clampRpcRetryAfterMs,
+  DEFAULT_RPC_MAX_BACKOFF_MS,
+  evaluateRpcRetryAfter,
+  MAX_RPC_RETRY_HEADER_CHARS,
+  resolveRpcRetryDelayMs,
+  RpcRetryConfigError,
+  type ClampRpcRetryDelayOptions,
+  type ResolveRpcRetryDelayOptions,
+  type RpcRetryDelayEvaluation,
+  type RpcRetryDelayRejectionReason,
+} from "./rpc-guard.js";
+
+export {
+  clampRpcRetryAfterMs,
+  DEFAULT_RPC_MAX_BACKOFF_MS,
+  evaluateRpcRetryAfter,
+  MAX_RPC_RETRY_HEADER_CHARS,
+  resolveRpcRetryDelayMs,
+  RpcRetryConfigError,
+  type ClampRpcRetryDelayOptions,
+  type ResolveRpcRetryDelayOptions,
+  type RpcRetryDelayEvaluation,
+  type RpcRetryDelayRejectionReason,
+};
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {

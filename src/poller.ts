@@ -94,7 +94,12 @@ import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
-import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
+import {
+  clampRpcRetryAfterMs,
+  resolveRpcRetryDelayMs,
+  validateLedgerWindow,
+  type LedgerWindow,
+} from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
 import {
   eventCursorLedger,
@@ -623,34 +628,31 @@ const DEFAULT_MAX_BACKOFF_MS = 10_000;
 /** Maximum time to back off based on Retry-After (1 hour). */
 const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 
-export function extractRetryAfterMs(err: unknown): number | null {
+export function extractRetryAfterMs(
+  err: unknown,
+  maxBackoffMs: number = MAX_RETRY_AFTER_MS,
+  nowMs: number = Date.now(),
+): number | null {
   if (!err || typeof err !== "object") return null;
-  const e = err as any;
+  const e = err as Record<string, unknown>;
 
-  let seconds: number | null = null;
-
-  if (typeof e.parameters?.retry_after === "number") {
-    seconds = e.parameters.retry_after;
-  } else {
-    const headers = e.response?.headers || e.headers;
-    if (headers) {
-      let val: any;
-      if (typeof headers.get === "function") {
-        val = headers.get("retry-after") || headers.get("Retry-After");
-      } else {
-        val = headers["retry-after"] || headers["Retry-After"];
-      }
-      if (typeof val === "string" || typeof val === "number") {
-        const parsed = parseInt(String(val), 10);
-        if (!Number.isNaN(parsed)) seconds = parsed;
+  const params = e.parameters as Record<string, unknown> | undefined;
+  if (params && "retry_after" in params) {
+    const rawRetryAfter = params.retry_after;
+    if (
+      typeof rawRetryAfter === "number" &&
+      Number.isFinite(rawRetryAfter) &&
+      rawRetryAfter > 0
+    ) {
+      const ms = Math.ceil(rawRetryAfter * 1000);
+      if (Number.isFinite(ms) && ms <= Number.MAX_SAFE_INTEGER) {
+        return Math.min(ms, maxBackoffMs);
       }
     }
+    return null;
   }
 
-  if (seconds !== null && seconds > 0) {
-    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
-  }
-  return null;
+  return clampRpcRetryAfterMs(err, { maxBackoffMs, nowMs });
 }
 /**
  * Consecutive automatic floor rewinds allowed for one target before the poller
@@ -2739,10 +2741,15 @@ export function createPoller(deps: PollerDeps) {
           cycleFailures++;
           metrics?.rpcErrors.inc();
           current.consecutiveFailures += 1;
-          const delayMs = Math.min(
+          const computedDelayMs = Math.min(
             targetInitialBackoff * Math.pow(targetBackoffFactor, current.consecutiveFailures - 1),
             targetMaxBackoff,
           );
+          const delayMs = resolveRpcRetryDelayMs(err, {
+            computedBackoffMs: computedDelayMs,
+            maxBackoffMs: targetMaxBackoff,
+            nowMs: currentTime,
+          });
           current.nextEligibleAt = currentTime + delayMs;
           const message = errorMessage(err);
           const staleCursor = isStaleCursorError(message);
@@ -2779,10 +2786,13 @@ export function createPoller(deps: PollerDeps) {
             ? eventCursorLedger(current.cursor)
             : null;
 
-          const retryAfterMs = extractRetryAfterMs(err);
+          const retryAfterMs = clampRpcRetryAfterMs(err, {
+            maxBackoffMs: targetMaxBackoff,
+            nowMs: currentTime,
+          });
           if (retryAfterMs !== null) {
             console.warn(`[poller] RPC requested backoff for ${retryAfterMs}ms`);
-            explicitBackoff = retryAfterMs;
+            explicitBackoff = delayMs;
             break; // Stop scanning other targets, they will likely hit the same limit
           }
         } finally {
