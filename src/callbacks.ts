@@ -16,6 +16,7 @@
 
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
+import { confirmationAuditEntry } from "./audit.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { handleBroadcastCallback } from "./commands/broadcast.js";
 import {
@@ -241,6 +242,13 @@ export async function handleCallbackQuery(
       console.warn(
         `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
       );
+      deps.audit?.record(
+        confirmationAuditEntry({
+          action: action.type,
+          outcome: "rejected",
+          reason: "unauthorized",
+        }),
+      );
       await safeAnswerCallback(ctx, config, {
         text: CALLBACK_UNAUTHORIZED_FEEDBACK,
         show_alert: true,
@@ -295,6 +303,13 @@ export async function handleCallbackQuery(
 
       case "pause": {
         const result = pause();
+        deps.audit?.record(
+          confirmationAuditEntry({
+            action: "pause",
+            outcome: "accepted",
+            result,
+          }),
+        );
         const text = pauseMessage(result, config.locale);
         if (ctx.callbackQuery?.message) {
           await updateOrReplyMessage(ctx, text, operatorKeyboard());
@@ -309,6 +324,13 @@ export async function handleCallbackQuery(
 
       case "resume": {
         const result = resume();
+        deps.audit?.record(
+          confirmationAuditEntry({
+            action: "resume",
+            outcome: "accepted",
+            result,
+          }),
+        );
         const text = resumeMessage(result, config.locale);
         if (ctx.callbackQuery?.message) {
           await updateOrReplyMessage(ctx, text, operatorKeyboard());
@@ -369,16 +391,24 @@ export function validatePauseConfirmData(
  */
 export async function handlePauseConfirmCallback(
   ctx: Context,
-  deps: Pick<CommandDeps, "config" | "pause">,
+  deps: Pick<CommandDeps, "config" | "pause"> & Pick<Partial<CommandDeps>, "audit">,
   nowMs: number = Date.now(),
 ): Promise<void> {
-  const { config, pause } = deps;
+  const { config, pause, audit } = deps;
 
   const action = validatePauseConfirmData(ctx.callbackQuery?.data);
   if (action === null) return; // unknown payload — silently ignore
 
   // Only the operator may act on these buttons.
   if (!isOperator(ctx, config)) {
+    audit?.record(
+      confirmationAuditEntry({
+        action: "pause",
+        outcome: "rejected",
+        reason: "unauthorized",
+        at: nowMs,
+      }),
+    );
     await ctx.answerCallbackQuery({ text: "Only the operator can do that.", show_alert: true });
     return;
   }
@@ -387,6 +417,14 @@ export async function handlePauseConfirmCallback(
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
   const ageMs = nowMs - messageDate * 1000;
   if (ageMs > PAUSE_CONFIRM_TTL_MS) {
+    audit?.record(
+      confirmationAuditEntry({
+        action: "pause",
+        outcome: "expired",
+        reason: "ttl_exceeded",
+        at: nowMs,
+      }),
+    );
     await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
     await ctx.editMessageText(
       "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
@@ -397,11 +435,26 @@ export async function handlePauseConfirmCallback(
 
   if (action === CALLBACK_PAUSE_CONFIRM) {
     const result = pause();
+    audit?.record(
+      confirmationAuditEntry({
+        action: "pause",
+        outcome: "accepted",
+        result,
+        at: nowMs,
+      }),
+    );
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
     return;
   }
 
+  audit?.record(
+    confirmationAuditEntry({
+      action: "pause",
+      outcome: "cancelled",
+      at: nowMs,
+    }),
+  );
   await ctx.answerCallbackQuery({ text: "Cancelled." });
   await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
 }

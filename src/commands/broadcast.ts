@@ -9,6 +9,7 @@
  */
 
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
+import { confirmationAuditEntry } from "../audit.js";
 import type { BotConfig } from "../config.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
@@ -90,13 +91,35 @@ export interface PendingBroadcast {
   confirmed: boolean;
 }
 
+interface ExpiredBroadcastMeta {
+  readonly targetCount: number;
+  readonly messageBytes: number;
+}
+
+const MAX_EXPIRED_META_ENTRIES = 256;
+
 export class BroadcastStore {
   private readonly items = new Map<string, PendingBroadcast>();
+  private readonly expiredMeta = new Map<string, ExpiredBroadcastMeta>();
   private readonly defaultTtlMs: number;
   private counter = 0;
 
   constructor(defaultTtlMs: number = DEFAULT_BROADCAST_EXPIRY_MS) {
     this.defaultTtlMs = defaultTtlMs;
+  }
+
+  private rememberExpired(id: string, item: PendingBroadcast): void {
+    if (item.confirmed) return;
+    if (this.expiredMeta.size >= MAX_EXPIRED_META_ENTRIES) {
+      const oldestKey = this.expiredMeta.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.expiredMeta.delete(oldestKey);
+      }
+    }
+    this.expiredMeta.set(id, {
+      targetCount: item.chats.length,
+      messageBytes: Buffer.byteLength(item.message, "utf8"),
+    });
   }
 
   create(
@@ -122,18 +145,34 @@ export class BroadcastStore {
     return item;
   }
 
+  /** Inspect an entry without running TTL eviction. */
+  peek(id: string): PendingBroadcast | undefined {
+    return this.items.get(id);
+  }
+
+  /** Consume bounded metadata recorded when an unconfirmed broadcast expired. */
+  consumeExpiredMeta(id: string): ExpiredBroadcastMeta | undefined {
+    const meta = this.expiredMeta.get(id);
+    if (meta !== undefined) {
+      this.expiredMeta.delete(id);
+    }
+    return meta;
+  }
+
   get(id: string, now: number = Date.now()): PendingBroadcast | undefined {
     this.cleanup(now);
     return this.items.get(id);
   }
 
   delete(id: string): boolean {
+    this.expiredMeta.delete(id);
     return this.items.delete(id);
   }
 
   cleanup(now: number = Date.now()): void {
     for (const [id, item] of this.items.entries()) {
       if (item.expiresAt <= now) {
+        this.rememberExpired(id, item);
         this.items.delete(id);
       }
     }
@@ -141,6 +180,7 @@ export class BroadcastStore {
 
   clear(): void {
     this.items.clear();
+    this.expiredMeta.clear();
   }
 
   size(): number {
@@ -288,19 +328,30 @@ export async function handleBroadcastCommand(
  */
 export async function handleBroadcastCallback(
   ctx: Context,
-  deps: BotDeps & {
-    broadcastStore?: BroadcastStore;
-    sleep?: (ms: number) => Promise<void>;
-  },
+  deps: Pick<BotDeps, "config"> &
+    Partial<BotDeps> & {
+      broadcastStore?: BroadcastStore;
+      sleep?: (ms: number) => Promise<void>;
+    },
   rawAction: string,
+  nowMs: number = Date.now(),
 ): Promise<void> {
-  const { config } = deps;
+  const { config, audit } = deps;
   const chatType = ctx.chat?.type ?? (ctx.callbackQuery?.message as any)?.chat?.type;
   const isPrivate = chatType === "private";
+  const authorizedOperator = isOperator(ctx, config);
 
-  if (!isOperator(ctx, config) || !isPrivate) {
+  if (!authorizedOperator || !isPrivate) {
     console.warn(
       `[bot] ignored unauthorized broadcast callback on update ${ctx.update?.update_id}`,
+    );
+    audit?.record(
+      confirmationAuditEntry({
+        action: "broadcast",
+        outcome: "rejected",
+        reason: authorizedOperator ? "non_private_chat" : "unauthorized",
+        at: nowMs,
+      }),
     );
     await safeAnswerCallback(ctx, config, {
       text: "Unauthorized: operator in private chat only",
@@ -314,30 +365,35 @@ export async function handleBroadcastCallback(
   const broadcastId = parts[2];
 
   if (!broadcastId || (subAction !== "confirm" && subAction !== "cancel")) {
+    audit?.record(
+      confirmationAuditEntry({
+        action: "broadcast",
+        outcome: "rejected",
+        reason: "invalid_payload",
+        at: nowMs,
+      }),
+    );
     await safeAnswerCallback(ctx, config, { text: "Invalid broadcast action" });
     return;
   }
 
   const store = deps.broadcastStore ?? defaultBroadcastStore;
-  const pending = store.get(broadcastId);
+  const rawPending = store.peek(broadcastId);
 
-  if (!pending) {
-    await safeAnswerCallback(ctx, config, {
-      text: "Broadcast expired or already processed",
-      show_alert: true,
-    });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("⚠️ Broadcast confirmation expired or already processed.");
-      } catch {
-        // ignore edit failure
-      }
-    }
-    return;
-  }
-
-  if (Date.now() > pending.expiresAt) {
+  if (rawPending && nowMs >= rawPending.expiresAt) {
+    const targetCount = rawPending.chats.length;
+    const messageBytes = Buffer.byteLength(rawPending.message, "utf8");
     store.delete(broadcastId);
+    audit?.record(
+      confirmationAuditEntry({
+        action: "broadcast",
+        outcome: "expired",
+        reason: "ttl_exceeded",
+        targetCount,
+        messageBytes,
+        at: nowMs,
+      }),
+    );
     await safeAnswerCallback(ctx, config, {
       text: "Broadcast confirmation expired",
       show_alert: true,
@@ -352,8 +408,71 @@ export async function handleBroadcastCallback(
     return;
   }
 
+  const pending = store.get(broadcastId, nowMs);
+
+  if (!pending) {
+    const expiredMeta = store.consumeExpiredMeta(broadcastId);
+    if (expiredMeta) {
+      audit?.record(
+        confirmationAuditEntry({
+          action: "broadcast",
+          outcome: "expired",
+          reason: "ttl_exceeded",
+          targetCount: expiredMeta.targetCount,
+          messageBytes: expiredMeta.messageBytes,
+          at: nowMs,
+        }),
+      );
+      await safeAnswerCallback(ctx, config, {
+        text: "Broadcast confirmation expired",
+        show_alert: true,
+      });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText("⚠️ Broadcast confirmation expired.");
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
+
+    audit?.record(
+      confirmationAuditEntry({
+        action: "broadcast",
+        outcome: "rejected",
+        reason: "unknown_or_processed",
+        at: nowMs,
+      }),
+    );
+    await safeAnswerCallback(ctx, config, {
+      text: "Broadcast expired or already processed",
+      show_alert: true,
+    });
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText("⚠️ Broadcast confirmation expired or already processed.");
+      } catch {
+        // ignore edit failure
+      }
+    }
+    return;
+  }
+
+  const targetCount = pending.chats.length;
+  const messageBytes = Buffer.byteLength(pending.message, "utf8");
+
   if (subAction === "cancel") {
     store.delete(broadcastId);
+    audit?.record(
+      confirmationAuditEntry({
+        action: "broadcast",
+        outcome: "cancelled",
+        targetCount,
+        messageBytes,
+        at: nowMs,
+      }),
+    );
     await safeAnswerCallback(ctx, config, { text: "Broadcast cancelled" });
     if (ctx.callbackQuery?.message) {
       try {
@@ -368,6 +487,16 @@ export async function handleBroadcastCallback(
   // subAction === "confirm"
   // Each chat receives the message at most once per confirmation.
   if (pending.confirmed) {
+    audit?.record(
+      confirmationAuditEntry({
+        action: "broadcast",
+        outcome: "rejected",
+        reason: "already_confirmed",
+        targetCount,
+        messageBytes,
+        at: nowMs,
+      }),
+    );
     await safeAnswerCallback(ctx, config, {
       text: "Broadcast already in progress or sent",
       show_alert: true,
@@ -395,6 +524,18 @@ export async function handleBroadcastCallback(
     interSendDelayMs,
     sleep: deps.sleep,
   });
+
+  const succeeded = results.filter((r) => r.ok).length;
+  audit?.record(
+    confirmationAuditEntry({
+      action: "broadcast",
+      outcome: "accepted",
+      targetCount,
+      messageBytes,
+      sentCount: succeeded,
+      at: nowMs,
+    }),
+  );
 
   const report = formatBroadcastReport(results);
   if (ctx.callbackQuery?.message) {

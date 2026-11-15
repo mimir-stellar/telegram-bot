@@ -251,6 +251,7 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
       handlePauseConfirmCallback(ctx, {
         config: deps.config,
         pause: deps.pause ?? (() => "stopped"),
+        audit: deps.audit,
       }),
   );
 

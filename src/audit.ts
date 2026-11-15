@@ -46,9 +46,34 @@ export const AUDIT_KINDS = [
   "event_skipped",
   "cap_reached",
   "send_failed",
+  "operator_confirmation",
 ] as const;
 
 export type AuditKind = (typeof AUDIT_KINDS)[number];
+
+/** Canonical outcomes recorded for state-changing operator confirmations. */
+export const CONFIRMATION_OUTCOMES = [
+  "accepted",
+  "rejected",
+  "expired",
+  "cancelled",
+] as const;
+
+export type ConfirmationOutcome = (typeof CONFIRMATION_OUTCOMES)[number];
+
+/** Operator actions that produce confirmation outcomes. */
+export type ConfirmationAction = "pause" | "resume" | "broadcast";
+
+export interface ConfirmationAuditOptions {
+  action: ConfirmationAction;
+  outcome: ConfirmationOutcome;
+  reason?: string | undefined;
+  result?: string | undefined;
+  targetCount?: number | undefined;
+  messageBytes?: number | undefined;
+  sentCount?: number | undefined;
+  at?: number | undefined;
+}
 
 /** Kinds that mean "an operator may need to look at this". */
 export const AUDIT_ERROR_KINDS: readonly AuditKind[] = [
@@ -215,6 +240,46 @@ export function auditFromError(
   return auditEntry(kind, {
     ...opts,
     detail: opts.detail ? `${opts.detail}: ${message}` : message,
+  });
+}
+
+function sanitizeAuditToken(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 48);
+}
+
+/**
+ * Build a privacy-safe audit entry for an operator confirmation callback.
+ *
+ * Intentionally accepts only bounded metadata tokens and numeric counts so
+ * callers can never pass complete broadcast bodies, destination chat IDs, or
+ * private Telegram user/profile fields (`id`, `username`, `first_name`, etc.).
+ */
+export function confirmationAuditEntry(opts: ConfirmationAuditOptions): AuditEntry {
+  if (!(CONFIRMATION_OUTCOMES as readonly string[]).includes(opts.outcome)) {
+    throw new TypeError(`unknown confirmation outcome: ${String(opts.outcome)}`);
+  }
+  const fields: string[] = [
+    `action=${sanitizeAuditToken(opts.action)}`,
+    `outcome=${sanitizeAuditToken(opts.outcome)}`,
+  ];
+  if (opts.reason) {
+    fields.push(`reason=${sanitizeAuditToken(opts.reason)}`);
+  }
+  if (opts.result) {
+    fields.push(`result=${sanitizeAuditToken(opts.result)}`);
+  }
+  if (typeof opts.targetCount === "number" && Number.isFinite(opts.targetCount) && opts.targetCount >= 0) {
+    fields.push(`targets=${Math.floor(opts.targetCount)}`);
+  }
+  if (typeof opts.messageBytes === "number" && Number.isFinite(opts.messageBytes) && opts.messageBytes >= 0) {
+    fields.push(`bytes=${Math.floor(opts.messageBytes)}`);
+  }
+  if (typeof opts.sentCount === "number" && Number.isFinite(opts.sentCount) && opts.sentCount >= 0) {
+    fields.push(`sent=${Math.floor(opts.sentCount)}`);
+  }
+  return auditEntry("operator_confirmation", {
+    detail: fields.join(" "),
+    at: opts.at,
   });
 }
 

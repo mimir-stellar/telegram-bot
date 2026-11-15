@@ -32,12 +32,13 @@ The bot reads only public chain data. It does not hold signing keys or any crede
 #### Audit file (`AUDIT_FILE`, default `./data/audit.jsonl`)
 
 - **What it contains**: Append-only JSONL audit trail of operational events:
-  - Event kinds (boot, shutdown, scan failures, send failures, etc.)
+  - Event kinds (boot, shutdown, scan failures, send failures, `operator_confirmation`, etc.)
+  - Operator confirmation outcomes (`accepted`, `rejected`, `expired`, `cancelled`) with bounded metadata (`action`, `outcome`, optional `reason`/`result`, destination count, and UTF-8 byte length)
   - Timestamps
   - Contract sources (`market` or `squad`)
   - Redacted detail strings (clamped to 240 characters)
 - **Retention**: Append-only; grows indefinitely with each event. Manual cleanup is required to prune old entries
-- **Redaction**: All detail strings pass through redaction rules that remove:
+- **Redaction**: Complete broadcast message bodies, destination chat IDs, and private Telegram user profiles (`id`, `username`, `first_name`, `last_name`) are never recorded in confirmation audit entries. All detail strings pass through redaction rules that remove:
   - Telegram bot tokens
   - Secret/seed strkeys (S…, D…, B…, T…)
   - URLs (which may embed tokens in query strings)
