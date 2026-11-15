@@ -141,6 +141,7 @@ The bot uses grammy for Telegram integration with a thin command layer and a sin
 - `/contracts`: Contract IDs and explorer links
 - `/preview`: Preview notification formatting
 - `/pause`, `/resume`: Operator-only controls (requires `OPERATOR_TELEGRAM_USER_ID`)
+- `/broadcast`, `/confirmations`: Private-chat operator maintenance announcements and bounded pending-confirmation inspection/cancellation (`MAX_PENDING_CONFIRMATIONS = 25`, `MAX_PENDING_CONFIRMATION_LIST = 10`), showing only the current operator's unexpired actions with expiry without exposing other chat identifiers
 
 **Send path:**
 - Single function: `bot.api.sendMessage(config.chatId, text, options)`

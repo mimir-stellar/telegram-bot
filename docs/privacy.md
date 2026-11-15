@@ -86,6 +86,13 @@ The bot reads only public chain data. It does not hold signing keys or any crede
   - Full-precision Stellar strkeys (G…/C…, 56 characters) are shortened to first 4 + `…` + last 4 (e.g., `GDV6…PKZI`)
 - **How to delete**: Set `LOG_BUFFER_LINES=0` to disable capture, or restart the process to clear the buffer
 
+#### Pending confirmation buffer (`MAX_PENDING_CONFIRMATIONS`, fixed cap 25)
+
+- **What it contains**: Unconfirmed operator confirmation entries for `/broadcast` and `/pause`, keyed by opaque confirmation ID and scoped to the initiating operator's Telegram user ID, creation/expiry timestamps, target count, and message text
+- **Retention**: In-memory only; automatically pruned on TTL expiry (`5` minutes for `/broadcast`, `60` seconds for `/pause`), capped at `25` total entries (`MAX_PENDING_CONFIRMATION_LIST = 10` shown per query), and cleared on explicit cancellation or process restart
+- **Redaction**: `/confirmations` (and `/broadcast list` / `/broadcast cancel <id>`) returns only the requesting operator's own unexpired actions with expiry countdowns and target chat counts, never exposing destination or other chat IDs
+- **How to delete**: Run `/confirmations cancel all` from the operator's private chat, or restart the process
+
 ## What the bot does NOT store
 
 - **No signing keys**: The bot holds no private keys and signs nothing

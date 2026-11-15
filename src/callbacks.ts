@@ -17,7 +17,7 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
 import { safeErrorMessage } from "./notifications/format.js";
-import { handleBroadcastCallback } from "./commands/broadcast.js";
+import { defaultBroadcastStore, handleBroadcastCallback } from "./commands/broadcast.js";
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
@@ -369,10 +369,11 @@ export function validatePauseConfirmData(
  */
 export async function handlePauseConfirmCallback(
   ctx: Context,
-  deps: Pick<CommandDeps, "config" | "pause">,
-  nowMs: number = Date.now(),
+  deps: Pick<CommandDeps, "config" | "pause"> & Pick<CommandDeps, "broadcastStore" | "now">,
+  nowMs?: number,
 ): Promise<void> {
   const { config, pause } = deps;
+  const currentMs = nowMs ?? (deps.now ? deps.now() : Date.now());
 
   const action = validatePauseConfirmData(ctx.callbackQuery?.data);
   if (action === null) return; // unknown payload — silently ignore
@@ -385,7 +386,7 @@ export async function handlePauseConfirmCallback(
 
   // Reject stale confirmations so an old message cannot stop the poller later.
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
-  const ageMs = nowMs - messageDate * 1000;
+  const ageMs = currentMs - messageDate * 1000;
   if (ageMs > PAUSE_CONFIRM_TTL_MS) {
     await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
     await ctx.editMessageText(
@@ -393,6 +394,24 @@ export async function handlePauseConfirmCallback(
       TELEGRAM_OPTIONS,
     );
     return;
+  }
+
+  const store = deps.broadcastStore ?? defaultBroadcastStore;
+  const actorId = ctx.from?.id !== undefined ? String(ctx.from.id) : "";
+  if (
+    actorId &&
+    store.isPauseCancelled(actorId, messageDate * 1000, currentMs, PAUSE_CONFIRM_TTL_MS)
+  ) {
+    await ctx.answerCallbackQuery({ text: "Confirmation cancelled.", show_alert: true });
+    await ctx.editMessageText(
+      "❌ *Pause confirmation was cancelled\\.* Polling continues\\.",
+      TELEGRAM_OPTIONS,
+    );
+    return;
+  }
+
+  if (actorId) {
+    store.clearOperatorKind(actorId, "pause");
   }
 
   if (action === CALLBACK_PAUSE_CONFIRM) {

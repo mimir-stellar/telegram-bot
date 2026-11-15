@@ -10,6 +10,7 @@
 
 import { messagesFor, type Locale } from "../i18n.js";
 import type { PollerPauseResult } from "../poller.js";
+import { DEFAULT_PAUSE_CONFIRM_EXPIRY_MS, defaultBroadcastStore } from "./broadcast.js";
 import { pauseConfirmKeyboard } from "./keyboards.js";
 import { defineCommand } from "./registry.js";
 import { TELEGRAM_OPTIONS } from "./runtime.js";
@@ -34,7 +35,12 @@ export function pauseMessage(result: PollerPauseResult, locale?: Locale): string
 export const pauseCommand = defineCommand({
   command: "pause",
   operatorOnly: true,
-  handler: async (ctx) => {
+  handler: async (ctx, deps) => {
+    if (ctx.from?.id !== undefined) {
+      const store = deps?.broadcastStore ?? defaultBroadcastStore;
+      const now = deps?.now ? deps.now() : Date.now();
+      store.createPause(String(ctx.from.id), DEFAULT_PAUSE_CONFIRM_EXPIRY_MS, now);
+    }
     await ctx.reply(PAUSE_PROMPT, {
       ...TELEGRAM_OPTIONS,
       reply_markup: pauseConfirmKeyboard(),

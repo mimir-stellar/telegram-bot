@@ -45,6 +45,8 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /** Injected clock (epoch ms) for deterministic tests. */
+  now?: (() => number) | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */

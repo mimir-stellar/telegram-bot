@@ -95,9 +95,21 @@ export {
   handleBroadcastCallback,
   registerBroadcastHandlers,
   handleBroadcastCommand,
+  handleConfirmationsCommand,
   getConfiguredBroadcastChats,
   BroadcastStore,
   sendBroadcast,
+  formatPendingConfirmationsList,
+  pendingConfirmationsKeyboard,
+  sanitizeConfirmationSnippet,
+  MAX_PENDING_CONFIRMATIONS,
+  MAX_PENDING_CONFIRMATION_LIST,
+  MAX_PENDING_SNIPPET_CHARS,
+  CONFIRMATIONS_USAGE_MESSAGE,
+  type PendingConfirmationKind,
+  type PendingConfirmationSummary,
+  type PendingConfirmationListResult,
+  type CancelConfirmationResult,
 } from "./commands/broadcast.js";
 export { clearHintState } from "./commands/unknown.js";
 
@@ -251,6 +263,8 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
       handlePauseConfirmCallback(ctx, {
         config: deps.config,
         pause: deps.pause ?? (() => "stopped"),
+        broadcastStore: deps.broadcastStore,
+        now: deps.now,
       }),
   );
 
@@ -348,9 +362,9 @@ export function createBot(deps: BotDeps): Bot {
       ? { botInfo: deps.botInfo, ...clientOptions }
       : clientOptions,
   );
+  registerBroadcastHandlers(bot, deps);
   registerCommandHandlers(bot, deps);
   registerCallbackHandlers(bot, deps);
-  registerBroadcastHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.
