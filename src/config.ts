@@ -211,6 +211,8 @@ export interface BotConfig extends StellarConfig {
   cursorFile: string;
   /** Persisted poller counters across restarts. */
   countersFile?: string;
+  /** Optional persisted ledger for one-time callback confirmation identities. */
+  confirmationStateFile?: string;
   /** Exclusive lock so only one process owns the cursor. */
   lockFile: string;
   statusFile: string;
@@ -906,6 +908,14 @@ export function loadConfig(): BotConfig {
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
     cursorFile: path.resolve(process.cwd(), c.get("CURSOR_FILE") ?? DEFAULTS.cursorFile),
     countersFile: path.resolve(process.cwd(), c.get("COUNTERS_FILE") ?? DEFAULTS.countersFile),
+    ...(read("CONFIRMATION_STATE_FILE") !== undefined
+      ? {
+          confirmationStateFile: path.resolve(
+            process.cwd(),
+            read("CONFIRMATION_STATE_FILE")!,
+          ),
+        }
+      : {}),
     lockFile: path.resolve(process.cwd(), read("INSTANCE_LOCK_FILE") ?? DEFAULTS.lockFile),
     statusFile: path.resolve(process.cwd(), c.get("STATUS_FILE") ?? DEFAULTS.statusFile),
     maxNotificationsPerCycle: c.int(

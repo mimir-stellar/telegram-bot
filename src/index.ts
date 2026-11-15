@@ -9,6 +9,7 @@
 
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 import { webhookCallback } from "grammy";
 
@@ -271,6 +272,9 @@ async function main(): Promise<void> {
     pause: () => poller.pause(),
     resume: () => poller.resume(),
     logs: logCapture,
+    confirmationStateFile:
+      config.confirmationStateFile ??
+      path.join(path.dirname(config.cursorFile), "confirmations.json"),
   });
   notify = createNotifier(bot, config);
 

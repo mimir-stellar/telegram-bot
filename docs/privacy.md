@@ -45,6 +45,16 @@ The bot reads only public chain data. It does not hold signing keys or any crede
   - Chat ids and Telegram user ids (when they appear in error text)
 - **How to delete**: Stop the bot, delete the file, and restart (historical audit data is lost)
 
+#### Confirmation state file (`CONFIRMATION_STATE_FILE`, default `./data/confirmations.json`)
+
+- **What it contains**: Bounded one-time callback confirmation ledger for operator `/pause` and `/broadcast` prompts:
+  - Opaque confirmation prompt IDs and action kinds (`pause` or `broadcast`)
+  - Salted SHA-256 digests (`actorHash`, `chatHash`, `bindingHash`) binding each confirmation to `(actor, chat, action)` without storing raw Telegram user IDs or chat IDs
+  - Creation, expiry, and settlement timestamps plus status (`pending`, `consumed`, `cancelled`, `expired`)
+- **Retention**: Bounded to at most 500 records and 24-hour tombstone retention so replayed or expired callbacks remain rejected across restarts
+- **Redaction**: Raw Telegram user IDs, chat IDs, and broadcast announcement bodies are never persisted to disk
+- **How to delete**: Stop the bot, delete the file, and restart (any unconfirmed prompts from the previous process must be re-created)
+
 #### Status file (`STATUS_FILE`, default `./data/status.json`)
 
 - **What it contains**: Machine-readable status snapshot written after each poll cycle:

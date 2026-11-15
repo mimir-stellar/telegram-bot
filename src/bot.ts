@@ -35,11 +35,12 @@ import {
   type CommandModule,
 } from "./commands/index.js";
 import {
+  ConfirmationIdentityStore,
   handlePauseConfirmCallback,
   registerCallbackHandlers,
   validatePauseConfirmData,
 } from "./callbacks.js";
-import { registerBroadcastHandlers } from "./commands/broadcast.js";
+import { BroadcastStore, registerBroadcastHandlers } from "./commands/broadcast.js";
 import { pauseConfirmKeyboard } from "./commands/keyboards.js";
 import { CommandRateLimiter } from "./commands/rate-limit.js";
 import {
@@ -79,16 +80,26 @@ export {
   CALLBACK_FALLBACK_PAYLOAD,
   CALLBACK_UNAUTHORIZED_FEEDBACK,
   CALLBACK_UNAUTHORIZED_PAYLOAD,
+  ConfirmationIdentityStore,
   PAUSE_CONFIRM_TTL_MS,
   TELEGRAM_CALLBACK_DATA_MAX_BYTES,
+  computeConfirmationBindingHash,
   handleCallbackQuery,
   handlePauseConfirmCallback,
+  hashConfirmationField,
+  pauseConfirmationId,
   registerCallbackHandlers,
   updateOrReplyMessage,
   validateCallbackData,
   validatePauseConfirmData,
   type CallbackActionType,
   type CallbackValidationResult,
+  type ConfirmationAction,
+  type ConfirmationIdentityInput,
+  type ConfirmationIdentityStoreOptions,
+  type ConfirmationRecord,
+  type ConfirmationRecordStatus,
+  type ConfirmationSettlementResult,
   type ValidCallbackAction,
 } from "./callbacks.js";
 export {
@@ -235,11 +246,22 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
     return false;
   };
 
+  const confirmationStore =
+    deps.confirmationStore ??
+    new ConfirmationIdentityStore({
+      filePath: deps.confirmationStateFile ?? deps.config.confirmationStateFile ?? null,
+      ...(deps.now ? { now: deps.now } : {}),
+    });
+  const effectiveDeps: BotDeps = {
+    ...deps,
+    confirmationStore,
+  };
+
   const modules = registeredCommands();
   for (const module of modules) {
     registrar.command(module.command, async (ctx) => {
       if (!withinRateLimit(ctx, module.command)) return;
-      await dispatch(module, ctx, deps);
+      await dispatch(module, ctx, effectiveDeps);
     });
   }
 
@@ -248,10 +270,15 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
   registrar.callbackQuery?.(
     [CALLBACK_PAUSE_CONFIRM, CALLBACK_PAUSE_CANCEL],
     async (ctx: Context) =>
-      handlePauseConfirmCallback(ctx, {
-        config: deps.config,
-        pause: deps.pause ?? (() => "stopped"),
-      }),
+      handlePauseConfirmCallback(
+        ctx,
+        {
+          config: effectiveDeps.config,
+          pause: effectiveDeps.pause ?? (() => "stopped"),
+          confirmationStore,
+        },
+        effectiveDeps.now ? effectiveDeps.now() : undefined,
+      ),
   );
 
   if (typeof registrar.on === "function") {
@@ -348,9 +375,28 @@ export function createBot(deps: BotDeps): Bot {
       ? { botInfo: deps.botInfo, ...clientOptions }
       : clientOptions,
   );
-  registerCommandHandlers(bot, deps);
-  registerCallbackHandlers(bot, deps);
-  registerBroadcastHandlers(bot, deps);
+  const stateFile = deps.confirmationStateFile ?? deps.config.confirmationStateFile ?? null;
+  const confirmationStore =
+    deps.confirmationStore ??
+    deps.broadcastStore?.confirmationStore ??
+    new ConfirmationIdentityStore({
+      filePath: stateFile,
+      ...(deps.now ? { now: deps.now } : {}),
+    });
+  const broadcastStore =
+    deps.broadcastStore ??
+    new BroadcastStore({
+      confirmationStore,
+      ...(deps.now ? { now: deps.now } : {}),
+    });
+  const wiredDeps: BotDeps = {
+    ...deps,
+    confirmationStore,
+    broadcastStore,
+  };
+  registerBroadcastHandlers(bot, wiredDeps);
+  registerCommandHandlers(bot, wiredDeps);
+  registerCallbackHandlers(bot, wiredDeps);
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.

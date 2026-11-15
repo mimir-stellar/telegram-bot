@@ -10,6 +10,10 @@
 
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { BotConfig } from "../config.js";
+import {
+  ConfirmationIdentityStore,
+  type ConfirmationIdentityStoreOptions,
+} from "../confirmation-store.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
@@ -83,6 +87,7 @@ export function getConfiguredBroadcastChats(
 export interface PendingBroadcast {
   id: string;
   operatorId: string;
+  originChatId: string;
   message: string;
   createdAt: number;
   expiresAt: number;
@@ -90,13 +95,35 @@ export interface PendingBroadcast {
   confirmed: boolean;
 }
 
+export interface BroadcastStoreOptions {
+  defaultTtlMs?: number | undefined;
+  confirmationStore?: ConfirmationIdentityStore | undefined;
+  stateFile?: ConfirmationIdentityStoreOptions["filePath"];
+  now?: (() => number) | undefined;
+}
+
 export class BroadcastStore {
   private readonly items = new Map<string, PendingBroadcast>();
   private readonly defaultTtlMs: number;
+  private readonly clock: () => number;
+  readonly confirmationStore: ConfirmationIdentityStore;
   private counter = 0;
 
-  constructor(defaultTtlMs: number = DEFAULT_BROADCAST_EXPIRY_MS) {
-    this.defaultTtlMs = defaultTtlMs;
+  constructor(optionsOrTtlMs: number | BroadcastStoreOptions = DEFAULT_BROADCAST_EXPIRY_MS) {
+    if (typeof optionsOrTtlMs === "number") {
+      this.defaultTtlMs = optionsOrTtlMs;
+      this.clock = Date.now;
+      this.confirmationStore = new ConfirmationIdentityStore();
+    } else {
+      this.defaultTtlMs = optionsOrTtlMs.defaultTtlMs ?? DEFAULT_BROADCAST_EXPIRY_MS;
+      this.clock = optionsOrTtlMs.now ?? Date.now;
+      this.confirmationStore =
+        optionsOrTtlMs.confirmationStore ??
+        new ConfirmationIdentityStore({
+          filePath: optionsOrTtlMs.stateFile ?? null,
+          now: this.clock,
+        });
+    }
   }
 
   create(
@@ -104,25 +131,50 @@ export class BroadcastStore {
     message: string,
     chats: readonly string[],
     ttlMs?: number,
+    originChatId?: string,
+    externalLedger?: ConfirmationIdentityStore,
   ): PendingBroadcast {
-    this.cleanup();
+    const now = this.clock();
+    this.cleanup(now);
     this.counter = (this.counter + 1) % 1_000_000;
-    const id = `${Date.now().toString(36)}_${this.counter}_${Math.random().toString(36).slice(2, 6)}`;
-    const now = Date.now();
+    const id = `${now.toString(36)}_${this.counter}_${Math.random().toString(36).slice(2, 6)}`;
+    const resolvedOriginChatId = String(originChatId ?? operatorId).trim();
+    const effectiveTtl = ttlMs ?? this.defaultTtlMs;
     const item: PendingBroadcast = {
       id,
       operatorId,
+      originChatId: resolvedOriginChatId,
       message,
       createdAt: now,
-      expiresAt: now + (ttlMs ?? this.defaultTtlMs),
+      expiresAt: now + effectiveTtl,
       chats,
       confirmed: false,
     };
     this.items.set(id, item);
+
+    this.confirmationStore.issue({
+      id,
+      actorId: operatorId,
+      chatId: resolvedOriginChatId,
+      action: "broadcast",
+      ttlMs: effectiveTtl,
+      now,
+    });
+    if (externalLedger && externalLedger !== this.confirmationStore) {
+      externalLedger.issue({
+        id,
+        actorId: operatorId,
+        chatId: resolvedOriginChatId,
+        action: "broadcast",
+        ttlMs: effectiveTtl,
+        now,
+      });
+    }
+
     return item;
   }
 
-  get(id: string, now: number = Date.now()): PendingBroadcast | undefined {
+  get(id: string, now: number = this.clock()): PendingBroadcast | undefined {
     this.cleanup(now);
     return this.items.get(id);
   }
@@ -131,7 +183,7 @@ export class BroadcastStore {
     return this.items.delete(id);
   }
 
-  cleanup(now: number = Date.now()): void {
+  cleanup(now: number = this.clock()): void {
     for (const [id, item] of this.items.entries()) {
       if (item.expiresAt <= now) {
         this.items.delete(id);
@@ -141,6 +193,7 @@ export class BroadcastStore {
 
   clear(): void {
     this.items.clear();
+    this.confirmationStore.clear();
   }
 
   size(): number {
@@ -227,13 +280,26 @@ export interface BroadcastDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
+function resolveCallbackChatId(ctx: Context): string {
+  const rawCtx = ctx.chat?.id;
+  const rawMsg = (
+    ctx.callbackQuery?.message as { chat?: { id?: number | string } } | undefined
+  )?.chat?.id;
+  const ctxId = rawCtx !== undefined && rawCtx !== null ? String(rawCtx).trim() : "";
+  const msgId = rawMsg !== undefined && rawMsg !== null ? String(rawMsg).trim() : "";
+  if (ctxId.length > 0 && msgId.length > 0 && ctxId !== msgId) {
+    return "";
+  }
+  return msgId || ctxId;
+}
+
 /**
  * Handle /broadcast <message> command.
  * Restricted to operator in private chats only.
  */
 export async function handleBroadcastCommand(
   ctx: CommandContext<Context>,
-  deps: Pick<BotDeps, "config"> & {
+  deps: Pick<BotDeps, "config" | "confirmationStore"> & {
     broadcastStore?: BroadcastStore;
     broadcastExpiryMs?: number;
   },
@@ -272,6 +338,8 @@ export async function handleBroadcastCommand(
     text,
     chats,
     deps.broadcastExpiryMs,
+    String(ctx.chat?.id ?? ctx.from?.id ?? ""),
+    deps.confirmationStore,
   );
 
   const previewText = formatBroadcastPreview(text, chats);
@@ -298,7 +366,7 @@ export async function handleBroadcastCallback(
   const chatType = ctx.chat?.type ?? (ctx.callbackQuery?.message as any)?.chat?.type;
   const isPrivate = chatType === "private";
 
-  if (!isOperator(ctx, config) || !isPrivate) {
+  if (!isOperator(ctx, config)) {
     console.warn(
       `[bot] ignored unauthorized broadcast callback on update ${ctx.update?.update_id}`,
     );
@@ -314,14 +382,84 @@ export async function handleBroadcastCallback(
   const broadcastId = parts[2];
 
   if (!broadcastId || (subAction !== "confirm" && subAction !== "cancel")) {
+    if (!isPrivate) {
+      await safeAnswerCallback(ctx, config, {
+        text: "Unauthorized: operator in private chat only",
+        show_alert: true,
+      });
+      return;
+    }
     await safeAnswerCallback(ctx, config, { text: "Invalid broadcast action" });
     return;
   }
 
   const store = deps.broadcastStore ?? defaultBroadcastStore;
-  const pending = store.get(broadcastId);
+  const ledger = deps.confirmationStore ?? store.confirmationStore;
+  const nowMs = deps.now ? deps.now() : undefined;
+  const actorId = String(ctx.from?.id ?? "").trim();
+  const chatId = resolveCallbackChatId(ctx);
 
-  if (!pending) {
+  const settlement = ledger.verifyAndSettle({
+    id: broadcastId,
+    actorId,
+    chatId,
+    action: "broadcast",
+    targetStatus: subAction === "confirm" ? "consumed" : "cancelled",
+    now: nowMs,
+  });
+
+  if (!settlement.ok) {
+    if (settlement.reason === "binding-mismatch") {
+      console.warn(
+        `[bot] rejected broadcast confirmation with mismatched binding on update ${ctx.update?.update_id}`,
+      );
+      await safeAnswerCallback(ctx, config, {
+        text: "Confirmation binding mismatch: wrong actor, chat, or action",
+        show_alert: true,
+      });
+      return;
+    }
+
+    if (!isPrivate) {
+      await safeAnswerCallback(ctx, config, {
+        text: "Unauthorized: operator in private chat only",
+        show_alert: true,
+      });
+      return;
+    }
+
+    store.delete(broadcastId);
+
+    if (settlement.reason === "replayed") {
+      await safeAnswerCallback(ctx, config, {
+        text: "Broadcast confirmation already processed",
+        show_alert: true,
+      });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText("⚠️ Broadcast confirmation already processed.");
+        } catch {
+          // ignore edit failure
+        }
+      }
+      return;
+    }
+
+    if (settlement.reason === "expired") {
+      await safeAnswerCallback(ctx, config, {
+        text: "Broadcast confirmation expired",
+        show_alert: true,
+      });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText("⚠️ Broadcast confirmation expired.");
+        } catch {
+          // ignore edit failure
+        }
+      }
+      return;
+    }
+
     await safeAnswerCallback(ctx, config, {
       text: "Broadcast expired or already processed",
       show_alert: true,
@@ -336,21 +474,15 @@ export async function handleBroadcastCallback(
     return;
   }
 
-  if (Date.now() > pending.expiresAt) {
-    store.delete(broadcastId);
+  if (!isPrivate) {
     await safeAnswerCallback(ctx, config, {
-      text: "Broadcast confirmation expired",
+      text: "Unauthorized: operator in private chat only",
       show_alert: true,
     });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("⚠️ Broadcast confirmation expired.");
-      } catch {
-        // ignore
-      }
-    }
     return;
   }
+
+  const pending = store.get(broadcastId, nowMs);
 
   if (subAction === "cancel") {
     store.delete(broadcastId);
@@ -358,6 +490,24 @@ export async function handleBroadcastCallback(
     if (ctx.callbackQuery?.message) {
       try {
         await ctx.editMessageText("❌ Broadcast cancelled.");
+      } catch {
+        // ignore
+      }
+    }
+    return;
+  }
+
+  if (!pending) {
+    ledger.markExpired(broadcastId, nowMs);
+    await safeAnswerCallback(ctx, config, {
+      text: "Broadcast session reset after restart; run /broadcast again",
+      show_alert: true,
+    });
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText(
+          "⚠️ Broadcast session reset after restart. Run /broadcast again.",
+        );
       } catch {
         // ignore
       }

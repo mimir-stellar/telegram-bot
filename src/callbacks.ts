@@ -17,7 +17,34 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
 import { safeErrorMessage } from "./notifications/format.js";
+import {
+  ConfirmationIdentityStore,
+  PAUSE_CONFIRM_TTL_MS,
+  computeConfirmationBindingHash,
+  hashConfirmationField,
+  pauseConfirmationId,
+  type ConfirmationAction,
+  type ConfirmationIdentityInput,
+  type ConfirmationIdentityStoreOptions,
+  type ConfirmationRecord,
+  type ConfirmationRecordStatus,
+  type ConfirmationSettlementResult,
+} from "./confirmation-store.js";
 import { handleBroadcastCallback } from "./commands/broadcast.js";
+
+export {
+  ConfirmationIdentityStore,
+  PAUSE_CONFIRM_TTL_MS,
+  computeConfirmationBindingHash,
+  hashConfirmationField,
+  pauseConfirmationId,
+  type ConfirmationAction,
+  type ConfirmationIdentityInput,
+  type ConfirmationIdentityStoreOptions,
+  type ConfirmationRecord,
+  type ConfirmationRecordStatus,
+  type ConfirmationSettlementResult,
+};
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
@@ -331,12 +358,6 @@ export async function handleCallbackQuery(
 
 // ── Pause confirmation callbacks ─────────────────────────────────────────────
 
-/**
- * How long a pause-confirmation message stays valid.
- * Callbacks arriving after this window are rejected as stale.
- */
-export const PAUSE_CONFIRM_TTL_MS = 60_000;
-
 const VALID_CALLBACK_DATA = new Set<string>([
   CALLBACK_PAUSE_CONFIRM,
   CALLBACK_PAUSE_CANCEL,
@@ -356,6 +377,23 @@ export function validatePauseConfirmData(
   return null;
 }
 
+function resolvePauseCallbackChatId(ctx: Context): { ok: true; chatId: string } | { ok: false } {
+  const rawCtx = ctx.chat?.id;
+  const rawMsg = (
+    ctx.callbackQuery?.message as { chat?: { id?: number | string } } | undefined
+  )?.chat?.id;
+  const ctxId = rawCtx !== undefined && rawCtx !== null ? String(rawCtx).trim() : "";
+  const msgId = rawMsg !== undefined && rawMsg !== null ? String(rawMsg).trim() : "";
+  if (ctxId.length > 0 && msgId.length > 0 && ctxId !== msgId) {
+    return { ok: false };
+  }
+  const resolved = msgId || ctxId;
+  if (!resolved) {
+    return { ok: false };
+  }
+  return { ok: true, chatId: resolved };
+}
+
 /**
  * Shared handler for pause inline-keyboard callbacks.
  *
@@ -369,10 +407,10 @@ export function validatePauseConfirmData(
  */
 export async function handlePauseConfirmCallback(
   ctx: Context,
-  deps: Pick<CommandDeps, "config" | "pause">,
+  deps: Pick<CommandDeps, "config" | "pause" | "confirmationStore">,
   nowMs: number = Date.now(),
 ): Promise<void> {
-  const { config, pause } = deps;
+  const { config, pause, confirmationStore } = deps;
 
   const action = validatePauseConfirmData(ctx.callbackQuery?.data);
   if (action === null) return; // unknown payload — silently ignore
@@ -383,10 +421,72 @@ export async function handlePauseConfirmCallback(
     return;
   }
 
-  // Reject stale confirmations so an old message cannot stop the poller later.
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
   const ageMs = nowMs - messageDate * 1000;
-  if (ageMs > PAUSE_CONFIRM_TTL_MS) {
+
+  if (confirmationStore) {
+    const chatRes = resolvePauseCallbackChatId(ctx);
+    if (!chatRes.ok) {
+      await ctx.answerCallbackQuery({
+        text: "Confirmation binding mismatch.",
+        show_alert: true,
+      });
+      return;
+    }
+
+    const confirmId = pauseConfirmationId(
+      ctx.callbackQuery?.message as { message_id?: number; date?: number } | undefined,
+    );
+    const settlement = confirmationStore.verifyAndSettle({
+      id: confirmId,
+      actorId: String(ctx.from?.id ?? ""),
+      chatId: chatRes.chatId,
+      action: "pause",
+      targetStatus: action === CALLBACK_PAUSE_CONFIRM ? "consumed" : "cancelled",
+      now: nowMs,
+      implicitCreatedAtMs: messageDate * 1000,
+      implicitTtlMs: PAUSE_CONFIRM_TTL_MS,
+    });
+
+    if (!settlement.ok) {
+      if (settlement.reason === "binding-mismatch") {
+        await ctx.answerCallbackQuery({
+          text: "Confirmation binding mismatch.",
+          show_alert: true,
+        });
+        return;
+      }
+      if (settlement.reason === "replayed") {
+        await ctx.answerCallbackQuery({
+          text: "Confirmation already used.",
+          show_alert: true,
+        });
+        await ctx.editMessageText(
+          "⚠️ *Pause confirmation already processed\\.*",
+          TELEGRAM_OPTIONS,
+        );
+        return;
+      }
+      // expired or unknown
+      await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
+      await ctx.editMessageText(
+        "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
+        TELEGRAM_OPTIONS,
+      );
+      return;
+    }
+
+    if (ageMs > PAUSE_CONFIRM_TTL_MS) {
+      confirmationStore.markExpired(confirmId, nowMs);
+      await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
+      await ctx.editMessageText(
+        "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
+        TELEGRAM_OPTIONS,
+      );
+      return;
+    }
+  } else if (ageMs > PAUSE_CONFIRM_TTL_MS) {
+    // Stateless unit-test fallback when no confirmationStore is supplied.
     await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
     await ctx.editMessageText(
       "⏱ *Pause confirmation expired\\.* Run /pause again\\.",

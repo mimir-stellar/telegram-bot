@@ -29,6 +29,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - `POLL_INTERVAL_MS`: How often to query the RPC for new events. Minimum is 5000ms. Testnet ledgers close roughly every 5 seconds.
 - `START_LOOKBACK_LEDGERS`: On a cold start (no cursor file), the number of recent ledgers to check for events. Defaults to 60. Limits unbounded backfilling.
 - `CURSOR_FILE`: Path to a persistent JSON file where the bot stores its last-seen ledger cursor. 
+- `CONFIRMATION_STATE_FILE`: Optional path to a bounded JSON ledger (defaults next to `CURSOR_FILE` as `confirmations.json` in the main daemon) that binds one-time `/pause` and `/broadcast` callback confirmations to `(actor, chat, action)` using SHA-256 hashes and rejects replayed or expired confirmations across restarts.
 - `MAX_NOTIFICATIONS_PER_CYCLE`: Operational safeguard. The maximum number of notifications to dispatch in a single poll cycle. Defaults to 20. Prevents Telegram rate limiting if a massive burst of events occurs on-chain. Additional events are skipped (logged), but the cursor advances.
 
 ### Notification Filtering

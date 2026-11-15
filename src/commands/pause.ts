@@ -8,6 +8,7 @@
  * Cursors are never touched; the current scan may still finish.
  */
 
+import { PAUSE_CONFIRM_TTL_MS, pauseConfirmationId } from "../confirmation-store.js";
 import { messagesFor, type Locale } from "../i18n.js";
 import type { PollerPauseResult } from "../poller.js";
 import { pauseConfirmKeyboard } from "./keyboards.js";
@@ -34,10 +35,24 @@ export function pauseMessage(result: PollerPauseResult, locale?: Locale): string
 export const pauseCommand = defineCommand({
   command: "pause",
   operatorOnly: true,
-  handler: async (ctx) => {
-    await ctx.reply(PAUSE_PROMPT, {
+  handler: async (ctx, deps) => {
+    const sent = await ctx.reply(PAUSE_PROMPT, {
       ...TELEGRAM_OPTIONS,
       reply_markup: pauseConfirmKeyboard(),
     });
+    if (ctx.from?.id !== undefined && ctx.chat?.id !== undefined && deps.confirmationStore) {
+      const sentMsg = sent as { message_id?: number; date?: number } | undefined;
+      if (typeof sentMsg?.message_id === "number" || typeof sentMsg?.date === "number") {
+        const now = deps.now ? deps.now() : Date.now();
+        deps.confirmationStore.issue({
+          id: pauseConfirmationId(sentMsg),
+          actorId: String(ctx.from.id),
+          chatId: String(ctx.chat.id),
+          action: "pause",
+          ttlMs: PAUSE_CONFIRM_TTL_MS,
+          now,
+        });
+      }
+    }
   },
 });

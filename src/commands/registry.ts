@@ -19,6 +19,7 @@ import type { UserFromGetMe } from "grammy/types";
 
 import type { AuditLog } from "../audit.js";
 import type { BotConfig } from "../config.js";
+import type { ConfirmationIdentityStore } from "../confirmation-store.js";
 import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
@@ -45,6 +46,10 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /** Durable one-time confirmation identity ledger. */
+  confirmationStore?: ConfirmationIdentityStore | undefined;
+  /** Optional path to persist one-time confirmation identities across restarts. */
+  confirmationStateFile?: string | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */
