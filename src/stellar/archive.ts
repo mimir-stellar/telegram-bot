@@ -2,6 +2,25 @@ import { open, mkdir, readdir, unlink, chmod } from "node:fs/promises";
 import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  DEFAULT_MAX_JSONL_LINE_BYTES,
+  DEFAULT_STREAM_CHUNK_BYTES,
+  OversizedArchiveRecordError,
+  normalizeChunkBytes,
+  normalizeMaxLineBytes,
+  streamBoundedJsonlLines,
+  streamScanJsonlEvents,
+  type BoundedLineStreamOptions,
+} from "./scan-jsonl.js";
+
+export {
+  DEFAULT_MAX_JSONL_LINE_BYTES,
+  DEFAULT_STREAM_CHUNK_BYTES,
+  OversizedArchiveRecordError,
+  streamBoundedJsonlLines,
+  streamScanJsonlEvents,
+  type BoundedLineStreamOptions,
+};
 
 export interface EventArchiveOptions {
   dir: string;
@@ -12,6 +31,17 @@ export interface EventArchiveOptions {
 export interface EventArchive {
   append(events: readonly DecodedEvent[]): Promise<void>;
   close(): Promise<void>;
+}
+
+export interface ReadArchiveStreamOptions {
+  /** Maximum UTF-8 byte length permitted for a single JSONL record (default: 256 KiB). */
+  maxLineBytes?: number | undefined;
+  /** File read chunk size in bytes (default: 64 KiB). */
+  chunkBytes?: number | undefined;
+}
+
+export interface StreamArchiveImportOptions extends EventArchiveOptions, ReadArchiveStreamOptions {
+  sourceName?: string | undefined;
 }
 
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
@@ -116,12 +146,14 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
 
   return {
     async append(events: readonly DecodedEvent[]): Promise<void> {
-      queue = queue.then(() => doAppend(events));
-      return queue;
+      const op = queue.then(() => doAppend(events));
+      queue = op.catch(() => {});
+      return op;
     },
     async close(): Promise<void> {
-      queue = queue.then(() => doClose());
-      return queue;
+      const op = queue.then(() => doClose());
+      queue = op.catch(() => {});
+      return op;
     },
   };
 }
@@ -137,22 +169,85 @@ async function listArchiveFiles(dir: string): Promise<string[]> {
   }
 }
 
-export async function* readArchive(dir: string): AsyncGenerator<DecodedEvent, void, unknown> {
+async function* readFileInFixedChunks(
+  filePath: string,
+  chunkBytes: number,
+): AsyncGenerator<Uint8Array, void, unknown> {
+  const handle = await open(filePath, "r");
+  const reusableBuffer = Buffer.allocUnsafe(chunkBytes);
+  try {
+    for (;;) {
+      const { bytesRead } = await handle.read(reusableBuffer, 0, chunkBytes, null);
+      if (bytesRead <= 0) {
+        break;
+      }
+      yield reusableBuffer.subarray(0, bytesRead);
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function* readArchive(
+  dir: string,
+  options: ReadArchiveStreamOptions = {},
+): AsyncGenerator<DecodedEvent, void, unknown> {
+  const maxLineBytes = normalizeMaxLineBytes(options.maxLineBytes);
+  const chunkBytes = normalizeChunkBytes(options.chunkBytes);
   const files = await listArchiveFiles(dir);
+
   for (const file of files) {
     const filePath = path.join(dir, file);
-    const handle = await open(filePath, "r");
-    try {
-      const content = await handle.readFile({ encoding: "utf8" });
-      const lines = content.split("\n");
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        const parsed = JSON.parse(trimmed);
-        yield parsed as DecodedEvent;
-      }
-    } finally {
-      await handle.close();
+    const chunks = readFileInFixedChunks(filePath, chunkBytes);
+    for await (const event of streamScanJsonlEvents(chunks, {
+      maxLineBytes,
+      sourceName: file,
+    })) {
+      yield event;
     }
   }
+}
+
+/**
+ * Stream a large JSONL chunk iterable into an `EventArchive` with a bounded
+ * per-line buffer so memory stays independent of total archive size and
+ * oversized lines fail before `JSON.parse`.
+ */
+export async function importArchiveFromStream(
+  chunks: AsyncIterable<Uint8Array | string> | Iterable<Uint8Array | string>,
+  options: StreamArchiveImportOptions,
+): Promise<{ importedCount: number }> {
+  const maxLineBytes = normalizeMaxLineBytes(options.maxLineBytes);
+  const archive = createEventArchive(options);
+  let importedCount = 0;
+
+  try {
+    for await (const event of streamScanJsonlEvents(chunks, {
+      maxLineBytes,
+      sourceName: options.sourceName ?? "<stream>",
+    })) {
+      await archive.append([event]);
+      importedCount += 1;
+    }
+  } finally {
+    await archive.close();
+  }
+
+  return { importedCount };
+}
+
+/**
+ * Stream a large JSONL file from disk into an `EventArchive` in fixed-size
+ * byte chunks without loading the whole source file into memory.
+ */
+export async function importArchiveFromFile(
+  sourceFilePath: string,
+  options: StreamArchiveImportOptions,
+): Promise<{ importedCount: number }> {
+  const chunkBytes = normalizeChunkBytes(options.chunkBytes);
+  const chunks = readFileInFixedChunks(sourceFilePath, chunkBytes);
+  return importArchiveFromStream(chunks, {
+    ...options,
+    sourceName: options.sourceName ?? path.basename(sourceFilePath),
+  });
 }

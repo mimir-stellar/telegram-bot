@@ -223,3 +223,12 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Bounded Streaming Archive Reads & Imports
+
+Large offline event archives (`src/stellar/archive.ts`) and JSONL streams (`src/stellar/scan-jsonl.ts`) are read and imported incrementally with fixed-size byte chunks (`DEFAULT_STREAM_CHUNK_BYTES`, 64 KiB) and a bounded per-line accumulator (`DEFAULT_MAX_JSONL_LINE_BYTES`, 256 KiB):
+
+* **Pre-Parse Oversized Record Rejection:** `streamBoundedJsonlLines`, `streamScanJsonlEvents`, `readArchive`, `importArchiveFromStream`, and `importArchiveFromFile` enforce `maxLineBytes` on raw UTF-8 byte length as chunks arrive, raising `OversizedArchiveRecordError` before buffering unbounded payloads or invoking `JSON.parse`.
+* **Constant-Space Memory Footprint:** Segments are read through a single reusable chunk buffer (`chunkBytes`) rather than whole-file `readFile()`, preserving multi-byte UTF-8 characters and CRLF sequences split across chunk boundaries while keeping heap usage independent of total archive size.
