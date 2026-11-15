@@ -27,9 +27,20 @@ export interface JournalEntry {
   source: string;
   ledger: number;
   eventName: string;
+  /** Optional canonical message-index reference (`market:<id>` / `squad:<id>`). */
+  ref?: string;
+  /** Optional confirmed Telegram `message_id` recorded on `done`. */
+  messageId?: number;
   /** Bounded hash of the message body; the body itself is never persisted. */
   textHash?: string;
   at: number;
+}
+
+export interface SendJournalSnapshot {
+  status: "ok" | "missing";
+  entries: JournalEntry[];
+  corruptLines: number;
+  bytes: number;
 }
 
 export interface SendJournalOptions {
@@ -50,12 +61,15 @@ export interface SendJournal {
     source: string;
     ledger: number;
     eventName: string;
+    ref?: string;
     textHash?: string;
     at: number;
   }): Promise<void>;
-  recordDone(id: string): Promise<void>;
+  recordDone(id: string, details?: { messageId?: number }): Promise<void>;
   /** Intents with no matching done: notifications that may have been sent. */
   loadPending(): Promise<JournalEntry[]>;
+  /** Read all valid entries and corrupt-line count without mutating disk state. */
+  readAll(): Promise<SendJournalSnapshot>;
   compact(): Promise<void>;
   stats(): Promise<SendJournalStats>;
 }
@@ -66,6 +80,61 @@ function line(entry: JournalEntry): string {
 
 function isDoneError(err: unknown): boolean {
   return (err as NodeJS.ErrnoException)?.code === "ENOENT";
+}
+
+function isValidJournalEntry(candidate: unknown): candidate is JournalEntry {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return false;
+  }
+  const rec = candidate as Record<string, unknown>;
+  if (rec.kind !== "intent" && rec.kind !== "done") return false;
+  if (typeof rec.id !== "string" || rec.id.trim() === "") return false;
+  if (typeof rec.source !== "string") return false;
+  if (typeof rec.ledger !== "number" || !Number.isFinite(rec.ledger)) return false;
+  if (typeof rec.eventName !== "string") return false;
+  if (typeof rec.at !== "number" || !Number.isFinite(rec.at)) return false;
+  return true;
+}
+
+/**
+ * Read a send-journal JSONL file offline without mutating or compacting it.
+ */
+export async function readSendJournalSnapshot(
+  filePath: string,
+): Promise<SendJournalSnapshot> {
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (err) {
+    if (isDoneError(err)) {
+      return { status: "missing", entries: [], corruptLines: 0, bytes: 0 };
+    }
+    throw err;
+  }
+
+  const entries: JournalEntry[] = [];
+  let corruptLines = 0;
+  for (const ln of raw.split("\n")) {
+    const trimmed = ln.trim();
+    if (trimmed === "") continue;
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (isValidJournalEntry(parsed)) {
+        entries.push(parsed);
+      } else {
+        corruptLines += 1;
+      }
+    } catch {
+      corruptLines += 1;
+    }
+  }
+
+  return {
+    status: "ok",
+    entries,
+    corruptLines,
+    bytes: Buffer.byteLength(raw, "utf8"),
+  };
 }
 
 export function createSendJournal(options: SendJournalOptions): SendJournal {
@@ -92,24 +161,8 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
   }
 
   async function readLines(): Promise<JournalEntry[]> {
-    let raw: string;
-    try {
-      raw = await readFile(filePath, "utf8");
-    } catch (err) {
-      if (isDoneError(err)) return [];
-      throw err;
-    }
-    const out: JournalEntry[] = [];
-    for (const ln of raw.split("\n")) {
-      const trimmed = ln.trim();
-      if (trimmed === "") continue;
-      try {
-        out.push(JSON.parse(trimmed) as JournalEntry);
-      } catch {
-        // A torn or corrupt line is skipped rather than failing the journal.
-      }
-    }
-    return out;
+    const snapshot = await readSendJournalSnapshot(filePath);
+    return snapshot.entries;
   }
 
   /** Atomically rewrite the journal with the given entries and fsync. */
@@ -143,18 +196,30 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     source: string;
     ledger: number;
     eventName: string;
+    ref?: string;
     textHash?: string;
     at: number;
   }): Promise<void> {
     await append({ kind: "intent", ...entry });
   }
 
-  async function recordDone(id: string): Promise<void> {
-    await append({ kind: "done", id, source: "", ledger: 0, eventName: "", at: now() });
+  async function recordDone(
+    id: string,
+    details?: { messageId?: number },
+  ): Promise<void> {
+    await append({
+      kind: "done",
+      id,
+      source: "",
+      ledger: 0,
+      eventName: "",
+      ...(details?.messageId !== undefined ? { messageId: details.messageId } : {}),
+      at: now(),
+    });
     // Once a send is accounted for, compact resolved pairs away when the file
     // has grown past its budget so the journal stays bounded.
-    const stats = await journalStats();
-    if (stats.entries > maxEntries || stats.bytes > maxBytes) {
+    const currentStats = await journalStats();
+    if (currentStats.entries > maxEntries || currentStats.bytes > maxBytes) {
       await compact();
     }
   }
@@ -166,6 +231,10 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
       if (entry.kind === "done") done.add(entry.id);
     }
     return entries.filter((e) => e.kind === "intent" && !done.has(e.id));
+  }
+
+  async function readAll(): Promise<SendJournalSnapshot> {
+    return readSendJournalSnapshot(filePath);
   }
 
   async function compact(): Promise<void> {
@@ -199,5 +268,5 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     return journalStats();
   }
 
-  return { recordIntent, recordDone, loadPending, compact, stats };
+  return { recordIntent, recordDone, loadPending, readAll, compact, stats };
 }

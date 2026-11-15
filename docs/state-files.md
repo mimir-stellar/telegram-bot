@@ -64,3 +64,15 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Offline Delivery Reconciliation (`SEND_JOURNAL_FILE` vs. `MessageIndex`)
+- **Inspection Module**: [`src/notifications/notifier.ts`](../src/notifications/notifier.ts) (`reconcileDeliveryState`, `formatDeliveryReconciliationReport`, `readMessageIndexSnapshot`) and [`src/notifications/send-journal.ts`](../src/notifications/send-journal.ts) (`readSendJournalSnapshot`)
+- **Access Pattern**: Strictly read-only (`readFile` only); performs zero Telegram Bot API requests and never compacts, renames, or quarantines either file on disk.
+- **Detected Drift Categories**:
+  - `pending_with_index_record`: Unresolved journal `intent` that already has a persisted `message-index` `messageId`.
+  - `pending_without_index_record`: Unresolved journal `intent` with no `message-index` record.
+  - `done_missing_index_record`: Settled journal `done` entry absent from `message-index`.
+  - `orphan_done_without_intent`: `done` entry with no preceding `intent`.
+  - `message_id_mismatch`: `done.messageId` differs from `message-index` `messageId`.
+  - `route_chat_mismatch`: `message-index` record exists under a different chat destination than the configured route.
+  - `index_without_journal_record`: `message-index` record with no matching journal entry (e.g. post-compaction).
