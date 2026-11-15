@@ -183,6 +183,20 @@ export function redactText(input: string, options: RedactOptions = {}): string {
   return clamp(out, options.maxLen);
 }
 
+/** Default maximum character length for structured log category / sample keys. */
+export const DEFAULT_MAX_LABEL_LEN = 80;
+
+/**
+ * Normalize and redact a structured log category or sampling key so caller
+ * labels stay single-line, bounded, and free of secret values.
+ */
+export function sanitizeLogLabel(label: string, options: RedactOptions = {}): string {
+  const maxLen = options.maxLen ?? DEFAULT_MAX_LABEL_LEN;
+  const compact = typeof label === "string" ? label.replace(/\s+/g, " ").trim() : "";
+  if (!compact) return "unknown";
+  return redactText(compact, { ...options, maxLen });
+}
+
 /** Redacted, bounded text for anything thrown at us. */
 export function redactError(err: unknown, options: RedactOptions = {}): string {
   let raw: string;

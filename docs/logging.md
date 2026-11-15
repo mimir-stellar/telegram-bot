@@ -142,6 +142,20 @@ Repetitive RPC errors or network disconnects can flood aggregators. The poller p
 3. When the window expires, the first new occurrence prints with a notice indicating how many repeats were held back (e.g. `[+N identical lines suppressed in the last 300s]`).
 4. In JSON mode, sampled errors still emit structured logs with canonical `level: "error"` and scope `component: "poller"`.
 
+### Sampled Repeats vs. Suppressed Error Categories
+
+Structured logging distinguishes windowed **sampled repeats** from policy-**suppressed error categories** so log aggregators and operators never conflate rate-limited duplicate messages with muted error classes:
+
+| Kind (`suppressionKind`) | Trigger | Key / Label Field | Count Field | Text Suffix |
+|---|---|---|---|---|
+| `"sampled_repeat"` | `sampleKey` passed via `Logger.sampled(...)` or `fields.sampleKey` | `sampleKey` | `sampledRepeats` | `[sampled_repeat: +N identical repeat(s) in Ws (M total)]` on rollover / flush |
+| `"suppressed_category"` | `fields.errorCategory` matches `Logger.configure({ suppressedCategories })` | `errorCategory` | `suppressedCount` | `[suppressed_category=<cat>: first occurrence (1 total), repeats muted]` on first occurrence, then `+<N> suppressed (<M> total)` on rollover / flush |
+
+Coherence and reset invariants:
+- **First occurrence & aggregate coherence**: The initial occurrence of a sampled key or suppressed error category always emits immediately with `firstOccurrence: true`, a zero repeat/suppressed counter, and `aggregateCount: 1`. Every subsequent occurrence increments `aggregateCount` so `aggregateCount` always matches total observed occurrences (`emitted + withheld`) without double-counting or omitting the initial event.
+- **Non-negative reset boundaries**: `Logger.reset()`, `Logger.resetSuppression()`, and `LogSampler.reset()` advance an internal monotonic `epoch`. Computing deltas across a reset boundary (`Logger.diffSuppressionSnapshot(...)` or `sampler.deltaSince(...)`) or across backward clock steps re-anchors counters at zero instead of reporting negative deltas.
+- **Label sanitization**: Both `sampleKey` and `errorCategory` pass through `sanitizeLogLabel` (`src/redact.ts`) so registered secrets, token shapes, URL credentials, newlines, and oversized labels are scrubbed before emission.
+
 ---
 
 ## Aggregator Ingestion & `jq` Examples
