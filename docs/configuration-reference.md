@@ -64,6 +64,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Logs
 - Operational outputs are structured and actionable.
 - **Redaction**: Bot tokens and private payloads are never logged.
+- **Slash-command argument bounds**: Registered slash commands enforce a shared `256`-byte UTF-8 argument limit (`MAX_COMMAND_ARGUMENT_BYTES`) prior to handler execution, logging only byte counts and update IDs rather than raw user input.
 
 ## Deployment & Rollback
 

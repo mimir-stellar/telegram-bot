@@ -111,6 +111,61 @@ export async function safeAnswerCallback(
   }
 }
 
+/** Default maximum UTF-8 byte length accepted for slash-command arguments. */
+export const MAX_COMMAND_ARGUMENT_BYTES = 256;
+
+export interface CommandArgumentBoundsResult {
+  readonly ok: boolean;
+  readonly byteLength: number;
+  readonly maxBytes: number;
+}
+
+/**
+ * Extract the raw argument substring after the slash-command token and its
+ * single separator character, preserving trailing/embedded payload bytes so
+ * whitespace-padded inputs are still measured accurately.
+ */
+export function rawCommandArgument(ctx: {
+  match?: unknown;
+  message?: { text?: string | undefined } | undefined;
+}): string {
+  if (typeof ctx.match === "string" && ctx.match.length > 0) {
+    return ctx.match;
+  }
+  const text = ctx.message?.text ?? "";
+  const wsIndex = text.search(/\s/);
+  return wsIndex === -1 ? "" : text.slice(wsIndex + 1);
+}
+
+/**
+ * Check whether a slash command's UTF-8 argument byte length stays within
+ * `maxBytes` (default {@link MAX_COMMAND_ARGUMENT_BYTES}).
+ */
+export function validateCommandArgumentBytes(
+  ctx: {
+    match?: unknown;
+    message?: { text?: string | undefined } | undefined;
+  },
+  maxBytes: number = MAX_COMMAND_ARGUMENT_BYTES,
+): CommandArgumentBoundsResult {
+  const raw = rawCommandArgument(ctx);
+  const byteLength = Buffer.byteLength(raw, "utf8");
+  return {
+    ok: byteLength <= maxBytes,
+    byteLength,
+    maxBytes,
+  };
+}
+
+/** Bounded user-facing rejection text that never echoes untrusted input. */
+export function commandArgumentTooLongMessage(
+  command: string,
+  maxBytes: number = MAX_COMMAND_ARGUMENT_BYTES,
+): string {
+  const safeCommand = command.replace(/[^a-z0-9_-]/gi, "").slice(0, 32) || "command";
+  return `Command arguments for /${safeCommand} exceed the ${maxBytes}-byte limit.`;
+}
+
 /**
  * Argument text following the command, without the command or its leading
  * space. grammy's `ctx.match` is used when present; hand-built contexts in

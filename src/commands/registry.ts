@@ -77,6 +77,11 @@ export interface CommandModule {
    * `/help` (e.g. `/export`, an operator recovery tool).
    */
   readonly hidden?: boolean;
+  /**
+   * Optional per-command UTF-8 byte ceiling for trailing slash-command
+   * arguments; defaults to `MAX_COMMAND_ARGUMENT_BYTES` (`256` bytes).
+   */
+  readonly maxArgumentBytes?: number;
   readonly handler: CommandHandler;
 }
 

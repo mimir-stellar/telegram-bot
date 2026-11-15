@@ -25,11 +25,14 @@ import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
+  MAX_COMMAND_ARGUMENT_BYTES,
   chatAllowed,
+  commandArgumentTooLongMessage,
   commandMetadata,
   isOperator,
   operatorAllowed,
   registeredCommands,
+  validateCommandArgumentBytes,
   visibleCommandMetadata,
   type CommandDeps,
   type CommandModule,
@@ -63,7 +66,16 @@ export {
   pauseConfirmKeyboard,
   statusKeyboard,
 } from "./commands/keyboards.js";
-export { TELEGRAM_OPTIONS, isChatAllowed, isOperator } from "./commands/runtime.js";
+export {
+  MAX_COMMAND_ARGUMENT_BYTES,
+  TELEGRAM_OPTIONS,
+  commandArgumentTooLongMessage,
+  isChatAllowed,
+  isOperator,
+  rawCommandArgument,
+  validateCommandArgumentBytes,
+  type CommandArgumentBoundsResult,
+} from "./commands/runtime.js";
 export {
   aboutMessage,
   helpMessage,
@@ -278,6 +290,18 @@ function dispatch(
   }
   if (module.chatAllowlist === true && !chatAllowed(ctx, deps.config, module.command)) {
     return Promise.resolve();
+  }
+  const argLimit = module.maxArgumentBytes ?? MAX_COMMAND_ARGUMENT_BYTES;
+  const bounds = validateCommandArgumentBytes(ctx, argLimit);
+  if (!bounds.ok) {
+    console.warn(
+      `[bot] rejected oversized /${module.command} arguments (${bounds.byteLength} bytes > ${bounds.maxBytes} bytes) on update ${ctx.update?.update_id ?? "unknown"}`,
+    );
+    return ctx
+      .reply(commandArgumentTooLongMessage(module.command, bounds.maxBytes), {
+        link_preview_options: { is_disabled: true },
+      })
+      .then(() => undefined);
   }
   return module.handler(ctx, deps);
 }
