@@ -53,6 +53,8 @@ Each entry in `entries` mirrors the `DeadLetterEntry` TypeScript interface defin
 * `text` (`string`): The formatted Telegram `MarkdownV2` message body. Bounded and truncated to at most 4,000 characters (`TEXT_TRUNCATE`).
 * `attempts` (`number`): The number of delivery attempts made so far (starts at `1` upon initial enqueue and increments on each failed replay).
 * `lastError` (`string | null`): Scrubbed, redacted error message from the most recent send failure, truncated to at most 200 characters (`ERROR_TRUNCATE`). Sensitive secrets like `BOT_TOKEN` are scrubbed via `safeErrorMessage`.
+* `network` (`string`, optional): Canonical Stellar network label (`testnet`, `mainnet`, `futurenet`, or `custom`) recorded when the entry was parked.
+* `networkPassphrase` (`string`, optional): Stellar network passphrase recorded when the entry was parked.
 
 ---
 
@@ -79,6 +81,7 @@ Format:
 * Parked messages are replayed during the poll cycle before processing newly scanned events, allowing the channel to catch up in chronological order.
 * Flushes are rate-budgeted: at most `MAX_NOTIFICATIONS_PER_CYCLE` (default `20`) messages are replayed per cycle. This prevents recovery bursts from flooding Telegram channels or triggering Telegram rate limits.
 * Replays use `sendWithRetry` with exponential backoff and redaction.
+* **Cross-network replay guard (`isEntryNetworkCompatible`)**: Before replaying any parked entry, `flush` and `replayEntry` compare the entry's stored `network` and `networkPassphrase` against the active configuration (`STELLAR_NETWORK` / `STELLAR_NETWORK_PASSPHRASE`). Entries parked under a different network are rejected/skipped without contacting Telegram, do not increment `attempts` or get dropped as poison, and remain completely unchanged on disk. Legacy entries without stored network fields remain compatible. Operators can inspect cross-network compatibility offline via `npm run dlq -- check-network [--network <name>] [--network-passphrase <passphrase>] [--file PATH] [--json]`.
 
 ### Bounds and Poison Entry Drops
 

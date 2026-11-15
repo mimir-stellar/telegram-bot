@@ -1449,6 +1449,8 @@ export function createPoller(deps: PollerDeps) {
     filePath: deadLetterEnabled ? (config.deadLetterFile as string) : null,
     maxEntries: config.deadLetterMax ?? DEAD_LETTER_MAX_ENTRIES,
     maxAttempts: config.deadLetterMaxAttempts ?? DEAD_LETTER_MAX_ATTEMPTS,
+    network: config.network,
+    networkPassphrase: config.networkPassphrase,
     // A Telegram error embeds the token in its request URL, and the queue is
     // the last place it belongs.
     secrets: [config.botToken],

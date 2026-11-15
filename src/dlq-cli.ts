@@ -27,13 +27,15 @@ import {
   createDeadLetterQueue,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
+  isEntryNetworkCompatible,
   type DeadLetterEntry,
+  type DeadLetterNetworkIdentity,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
 export const USAGE =
-  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
+  "usage: npm run dlq -- <list|show <id>|check-network|purge [--older-than <dur>] [--yes]> [--network <name>] [--network-passphrase <passphrase>] [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
   readonly exitCode = 2;
@@ -46,6 +48,8 @@ export class DlqUsageError extends Error {
 
 export interface DlqEntryView extends DeadLetterEntry {
   chatId: string;
+  networkCompatible?: boolean;
+  networkMismatchReason?: string | null;
 }
 
 export interface ListDlqOptions {
@@ -54,7 +58,21 @@ export interface ListDlqOptions {
   secrets?: readonly string[];
   maxEntries?: number;
   maxAttempts?: number;
+  network?: string;
+  networkPassphrase?: string;
   now?: () => number;
+}
+
+export interface CheckNetworkDlqResult {
+  compatible: number;
+  incompatible: number;
+  total: number;
+  incompatibleEntries: Array<{
+    id: string;
+    storedNetwork: string;
+    reason: string;
+  }>;
+  chatId: string;
 }
 
 export interface ShowDlqOptions extends ListDlqOptions {
@@ -217,9 +235,30 @@ function resolveChatIdForSource(source: string, explicitChatId?: string): string
   return redactChatId(primary);
 }
 
+function resolveActiveNetwork(options: {
+  network?: string;
+  networkPassphrase?: string;
+}): DeadLetterNetworkIdentity {
+  const network = (options.network ?? process.env.STELLAR_NETWORK ?? "").trim();
+  const networkPassphrase = (
+    options.networkPassphrase ??
+    process.env.STELLAR_NETWORK_PASSPHRASE ??
+    ""
+  ).trim();
+  return {
+    ...(network.length > 0 ? { network } : {}),
+    ...(networkPassphrase.length > 0 ? { networkPassphrase } : {}),
+  };
+}
+
 function toEntryView(
   entry: DeadLetterEntry,
-  options: { chatId?: string; secrets?: readonly string[] },
+  options: {
+    chatId?: string;
+    secrets?: readonly string[];
+    network?: string;
+    networkPassphrase?: string;
+  },
 ): DlqEntryView {
   const chatIds = configuredChatIds(options.chatId);
   const secrets = configuredSecrets(options.secrets);
@@ -232,6 +271,13 @@ function toEntryView(
       ? redactChatId(rawEntry.chatId.trim())
       : resolveChatIdForSource(entry.source, options.chatId);
 
+  const activeNetwork = resolveActiveNetwork(options);
+  const hasActiveNetwork =
+    activeNetwork.network !== undefined || activeNetwork.networkPassphrase !== undefined;
+  const compatibility = hasActiveNetwork
+    ? isEntryNetworkCompatible(entry, activeNetwork)
+    : undefined;
+
   return {
     id: sanitizeDlqText(entry.id, chatIds, secrets),
     enqueuedAt: entry.enqueuedAt,
@@ -242,6 +288,16 @@ function toEntryView(
     attempts: entry.attempts,
     lastError:
       entry.lastError === null ? null : sanitizeDlqText(entry.lastError, chatIds, secrets),
+    ...(entry.network !== undefined ? { network: entry.network } : {}),
+    ...(entry.networkPassphrase !== undefined
+      ? { networkPassphrase: sanitizeDlqText(entry.networkPassphrase, chatIds, secrets) }
+      : {}),
+    ...(compatibility !== undefined
+      ? {
+          networkCompatible: compatibility.compatible,
+          networkMismatchReason: compatibility.reason,
+        }
+      : {}),
     chatId: entryChat,
   };
 }
@@ -259,14 +315,57 @@ function openQueue(options: ListDlqOptions) {
     Number(process.env.DEAD_LETTER_MAX_ATTEMPTS) >= 1
       ? Number(process.env.DEAD_LETTER_MAX_ATTEMPTS)
       : DEAD_LETTER_MAX_ATTEMPTS);
+  const activeNetwork = resolveActiveNetwork(options);
 
   return createDeadLetterQueue({
     filePath: options.filePath,
     maxEntries,
     maxAttempts,
+    network: activeNetwork.network,
+    networkPassphrase: activeNetwork.networkPassphrase,
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
+}
+
+/**
+ * Inspect dead-letter entries against the active network configuration without
+ * modifying the file or contacting Telegram.
+ */
+export async function checkNetworkCompatibility(
+  options: ListDlqOptions,
+): Promise<CheckNetworkDlqResult> {
+  const chatIds = configuredChatIds(options.chatId);
+  const secrets = configuredSecrets(options.secrets);
+  const activeNetwork = resolveActiveNetwork(options);
+  const queue = openQueue(options);
+  await queue.load();
+
+  let compatible = 0;
+  const incompatibleEntries: CheckNetworkDlqResult["incompatibleEntries"] = [];
+
+  for (const entry of queue.snapshot()) {
+    const check = isEntryNetworkCompatible(entry, activeNetwork);
+    if (check.compatible) {
+      compatible += 1;
+    } else {
+      const storedNetwork = entry.network ?? entry.networkPassphrase ?? "unknown";
+      incompatibleEntries.push({
+        id: sanitizeDlqText(entry.id, chatIds, secrets),
+        storedNetwork: sanitizeDlqText(storedNetwork, chatIds, secrets),
+        reason: sanitizeDlqText(check.reason ?? "network mismatch", chatIds, secrets),
+      });
+    }
+  }
+
+  return {
+    compatible,
+    incompatible: incompatibleEntries.length,
+    total: compatible + incompatibleEntries.length,
+    incompatibleEntries,
+    chatId: resolveChatIdForSource("default", options.chatId),
+  };
 }
 
 /** Load and return all dead-letter entries with redacted chat ids. */
@@ -372,6 +471,7 @@ async function persistPurgedQueue(
     ),
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
 
   await queue.load();
@@ -392,18 +492,25 @@ async function persistPurgedQueue(
 }
 
 interface ParsedCliArgs {
-  subcommand: "list" | "show" | "purge";
+  subcommand: "list" | "show" | "purge" | "check-network";
   file?: string;
   id?: string;
   olderThan?: string;
   yes: boolean;
   json: boolean;
   chatId?: string;
+  network?: string;
+  networkPassphrase?: string;
 }
 
 export function parseDlqArgs(argv: string[]): ParsedCliArgs {
   const [subcommand, ...rest] = argv;
-  if (subcommand !== "list" && subcommand !== "show" && subcommand !== "purge") {
+  if (
+    subcommand !== "list" &&
+    subcommand !== "show" &&
+    subcommand !== "purge" &&
+    subcommand !== "check-network"
+  ) {
     throw new DlqUsageError(USAGE);
   }
 
@@ -434,7 +541,13 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
-    if (arg === "--file" || arg === "--older-than" || arg === "--chat-id") {
+    if (
+      arg === "--file" ||
+      arg === "--older-than" ||
+      arg === "--chat-id" ||
+      arg === "--network" ||
+      arg === "--network-passphrase"
+    ) {
       if (arg === "--older-than" && subcommand !== "purge") {
         throw new DlqUsageError(`--older-than is only valid with purge\n${USAGE}`);
       }
@@ -447,6 +560,8 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       if (arg === "--file") parsed.file = value;
       else if (arg === "--older-than") parsed.olderThan = value;
       else if (arg === "--chat-id") parsed.chatId = value;
+      else if (arg === "--network") parsed.network = value;
+      else if (arg === "--network-passphrase") parsed.networkPassphrase = value;
       i += 1;
       continue;
     }
@@ -539,6 +654,30 @@ function formatPurgeOutput(
   );
 }
 
+function formatCheckNetworkOutput(
+  result: CheckNetworkDlqResult,
+  filePath: string,
+  asJson: boolean,
+): string {
+  if (asJson) {
+    return `${JSON.stringify({ file: filePath, ...result }, null, 2)}\n`;
+  }
+  if (result.incompatible === 0) {
+    return (
+      `[dlq] ${result.compatible}/${result.total} entry(s) compatible with active network ` +
+      `(chat=${result.chatId}) in ${filePath}`
+    );
+  }
+  const lines = [
+    `[dlq] ${result.incompatible}/${result.total} entry(s) incompatible with active network ` +
+      `(${result.compatible} compatible, chat=${result.chatId}) in ${filePath}`,
+    ...result.incompatibleEntries.map(
+      (item) => `  ${item.id}  storedNetwork=${item.storedNetwork}  reason=${boundText(item.reason, 160)}`,
+    ),
+  ];
+  return lines.join("\n");
+}
+
 export interface RunDlqCliOptions {
   argv?: string[];
   now?: () => number;
@@ -568,6 +707,8 @@ export async function runDlqCli(
   const commonOptions: ListDlqOptions = {
     filePath,
     chatId: parsed.chatId,
+    network: parsed.network,
+    networkPassphrase: parsed.networkPassphrase,
     now: options.now,
   };
 
@@ -583,6 +724,12 @@ export async function runDlqCli(
       const entry = await showDeadLetter({ ...commonOptions, id: parsed.id! });
       out(formatShowOutput(entry, parsed.json).trimEnd());
       return { exitCode: 0 };
+    }
+
+    if (parsed.subcommand === "check-network") {
+      const report = await checkNetworkCompatibility(commonOptions);
+      out(formatCheckNetworkOutput(report, filePath, parsed.json).trimEnd());
+      return { exitCode: report.incompatible > 0 ? 1 : 0 };
     }
 
     const result = await purgeDeadLetters({
@@ -604,7 +751,7 @@ export async function runDlqCli(
 }
 
 async function main(): Promise<void> {
-  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
+  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env", quiet: true });
   const { exitCode } = await runDlqCli();
   if (exitCode !== 0) {
     process.exit(exitCode);
