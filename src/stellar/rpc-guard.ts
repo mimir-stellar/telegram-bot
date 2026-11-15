@@ -11,10 +11,17 @@ import type { rpc } from "@stellar/stellar-sdk";
 /** Default ceiling on the number of events permitted in a single RPC response. */
 export const DEFAULT_MAX_EVENTS_PER_RESPONSE = 1_000;
 
+/** Default ceiling on raw HTTP response payload bytes permitted per RPC call (5 MiB). */
+export const DEFAULT_RPC_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+
+/** Minimum configurable response-byte ceiling accepted for STELLAR_RPC_MAX_RESPONSE_BYTES. */
+export const MIN_RPC_MAX_RESPONSE_BYTES = 1_024;
+
 export type RpcGuardProblem =
   | "not-an-object"
   | "events-not-an-array"
   | "events-oversized"
+  | "response-bytes-oversized"
   | "cursor-invalid"
   | "latest-ledger-invalid"
   | "event-not-an-object"
@@ -33,6 +40,119 @@ export class RpcResponseShapeError extends Error {
     super(message);
     this.name = "RpcResponseShapeError";
     this.problem = problem;
+  }
+}
+
+export type RpcByteLimitSource = "content-length" | "stream";
+
+/**
+ * Error thrown when an HTTP RPC response exceeds the configured byte limit.
+ * Raised before `JSON.parse` runs and never echoes response payload content.
+ */
+export class RpcResponseByteLimitError extends RpcResponseShapeError {
+  readonly maxResponseBytes: number;
+  readonly observedBytes: number;
+  readonly limitSource: RpcByteLimitSource;
+
+  constructor(
+    maxResponseBytes: number,
+    observedBytes: number,
+    limitSource: RpcByteLimitSource,
+  ) {
+    const detail =
+      limitSource === "content-length"
+        ? `RPC response Content-Length (${observedBytes} bytes) exceeds configured limit of ${maxResponseBytes} bytes`
+        : `RPC response stream (${observedBytes} bytes read) exceeds configured limit of ${maxResponseBytes} bytes`;
+    super("response-bytes-oversized", detail);
+    this.name = "RpcResponseByteLimitError";
+    this.maxResponseBytes = maxResponseBytes;
+    this.observedBytes = observedBytes;
+    this.limitSource = limitSource;
+  }
+}
+
+export interface ReadBoundedRpcJsonOptions {
+  /** Maximum permitted response payload size in bytes. Defaults to {@link DEFAULT_RPC_MAX_RESPONSE_BYTES}. */
+  maxResponseBytes?: number | undefined;
+  /** Optional controller aborted immediately when the response exceeds `maxResponseBytes`. */
+  abortController?: AbortController | undefined;
+  /** Injectable JSON parser (used in tests to verify `JSON.parse` is never reached). */
+  parseJson?: ((text: string) => unknown) | undefined;
+}
+
+function validateMaxResponseBytes(value: number | undefined): number {
+  const resolved = value ?? DEFAULT_RPC_MAX_RESPONSE_BYTES;
+  if (typeof resolved !== "number" || !Number.isSafeInteger(resolved) || resolved < 1) {
+    throw new RangeError(
+      `maxResponseBytes must be a positive safe integer; got ${String(value)}`,
+    );
+  }
+  return resolved;
+}
+
+/**
+ * Read a Fetch `Response` body up to `maxResponseBytes` and parse it as JSON.
+ *
+ * - Rejects oversized `Content-Length` headers up front before reading body chunks.
+ * - Cancels the stream and aborts `abortController` on the first chunk that pushes
+ *   cumulative bytes past `maxResponseBytes`, BEFORE `TextDecoder` or `JSON.parse` runs.
+ */
+export async function readBoundedRpcJson(
+  response: Response,
+  options: ReadBoundedRpcJsonOptions = {},
+): Promise<unknown> {
+  const maxBytes = validateMaxResponseBytes(options.maxResponseBytes);
+  const parseJson = options.parseJson ?? JSON.parse;
+
+  const contentLengthHeader = response.headers.get("content-length");
+  if (contentLengthHeader !== null && contentLengthHeader.trim() !== "") {
+    const declared = Number(contentLengthHeader.trim());
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      const err = new RpcResponseByteLimitError(maxBytes, Math.floor(declared), "content-length");
+      options.abortController?.abort(err);
+      if (response.body) {
+        await response.body.cancel(err).catch(() => {});
+      }
+      throw err;
+    }
+  }
+
+  if (!response.body) {
+    return "";
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value && value.byteLength > 0) {
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        const err = new RpcResponseByteLimitError(maxBytes, totalBytes, "stream");
+        options.abortController?.abort(err);
+        await reader.cancel(err).catch(() => {});
+        throw err;
+      }
+      chunks.push(value);
+    }
+  }
+
+  const combined = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  const text = new TextDecoder().decode(combined);
+  if (text.length === 0) return "";
+  try {
+    return parseJson(text);
+  } catch {
+    return text;
   }
 }
 

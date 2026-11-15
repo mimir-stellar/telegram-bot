@@ -34,6 +34,7 @@ Called with JSON-RPC parameters matching Soroban RPC specs:
 - **Filters**: Topic/contract filters (e.g. `[{ type: "contract", contractIds: [...] }]`).
 - **Paging bounds**: Accepts either `startLedger` or `cursor` (mutually exclusive).
 - **Responses**: Returns `events` array along with `latestLedger` and a pagination `cursor`.
+- **Response byte ceiling (`STELLAR_RPC_MAX_RESPONSE_BYTES`)**: Each RPC response is bounded to `STELLAR_RPC_MAX_RESPONSE_BYTES` (default `5242880` bytes / 5 MiB, minimum `1024`). If `Content-Length` or the streamed body exceeds the ceiling, `createRpcServer` aborts the HTTP stream with `RpcResponseByteLimitError` (`problem: "response-bytes-oversized"`) before `JSON.parse` runs, leaving the target cursor unchanged.
 - **Note on pagination**: In Soroban RPC, an empty `events` list does not necessarily indicate the end of events—it indicates no events were found in the inspected slice of ledgers. The bot continues walking via `cursor` until the cursor reaches the tip.
 
 #### `getNetwork`

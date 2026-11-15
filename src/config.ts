@@ -183,6 +183,8 @@ export interface StellarConfig {
   networkPassphrase: string;
   /** Optional override for stellar.expert (or compatible) explorer origin. */
   explorerBaseUrl: string;
+  /** Maximum raw HTTP response bytes permitted per Soroban RPC response. */
+  rpcMaxResponseBytes?: number;
 }
 
 export interface TelegramRoute {
@@ -334,6 +336,8 @@ const DEFAULTS = {
   rpcUrl: NETWORK_RPC_URLS.testnet,
   horizonUrl: NETWORK_HORIZON_URLS.testnet,
   networkPassphrase: NETWORK_PASSPHRASES.testnet,
+  rpcMaxResponseBytes: 5 * 1024 * 1024,
+  minRpcMaxResponseBytes: 1_024,
   pollIntervalMs: 30_000,
   minPollIntervalMs: 5_000,
   startLookbackLedgers: 60,
@@ -850,6 +854,11 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
       "STELLAR_EXPLORER_BASE_URL",
       "https://stellar.expert/explorer",
     ),
+    rpcMaxResponseBytes: c.int(
+      "STELLAR_RPC_MAX_RESPONSE_BYTES",
+      DEFAULTS.rpcMaxResponseBytes,
+      DEFAULTS.minRpcMaxResponseBytes,
+    ),
   };
 }
 
@@ -1102,6 +1111,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "STELLAR_HORIZON_URL", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK_PASSPHRASE", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_EXPLORER_BASE_URL", secret: false, hasBuiltInDefault: true },
+  { key: "STELLAR_RPC_MAX_RESPONSE_BYTES", secret: false, hasBuiltInDefault: true },
   // Credentials and destinations: identifiers for a Telegram account, so they
   // are treated as secrets here even though a contract id is public.
   { key: "BOT_TOKEN", secret: true },

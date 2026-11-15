@@ -24,6 +24,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - `STELLAR_RPC_URL`: The Soroban RPC endpoint used to poll for events. (e.g., `https://soroban-testnet.stellar.org`).
 - `STELLAR_HORIZON_URL`: Used for generating transaction links.
 - `STELLAR_NETWORK_PASSPHRASE`: Must match the RPC network's passphrase.
+- `STELLAR_RPC_MAX_RESPONSE_BYTES`: Maximum raw HTTP response bytes permitted per Soroban RPC call (default `5242880` bytes / 5 MiB, minimum `1024`). Responses exceeding this limit are aborted at the HTTP stream boundary before `JSON.parse` executes, leaving the watched target's cursor unchanged.
 
 ### Poller Tuning & Safeguards
 - `POLL_INTERVAL_MS`: How often to query the RPC for new events. Minimum is 5000ms. Testnet ledgers close roughly every 5 seconds.

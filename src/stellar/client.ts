@@ -15,6 +15,23 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  DEFAULT_RPC_MAX_RESPONSE_BYTES,
+  MIN_RPC_MAX_RESPONSE_BYTES,
+  RpcResponseByteLimitError,
+  readBoundedRpcJson,
+  type ReadBoundedRpcJsonOptions,
+  type RpcByteLimitSource,
+} from "./rpc-guard.js";
+
+export {
+  DEFAULT_RPC_MAX_RESPONSE_BYTES,
+  MIN_RPC_MAX_RESPONSE_BYTES,
+  RpcResponseByteLimitError,
+  readBoundedRpcJson,
+  type ReadBoundedRpcJsonOptions,
+  type RpcByteLimitSource,
+};
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -26,16 +43,183 @@ export class RpcPassphraseError extends Error {
   }
 }
 
+export interface BoundedRpcServerOptions {
+  /** Override response-byte ceiling (defaults to `config.rpcMaxResponseBytes ?? DEFAULT_RPC_MAX_RESPONSE_BYTES`). */
+  maxResponseBytes?: number | undefined;
+  /** Injectable fetch implementation for hermetic tests. */
+  fetchImpl?: typeof globalThis.fetch | undefined;
+  /** Injectable JSON parser (used in tests to verify `JSON.parse` is skipped on oversize). */
+  parseJson?: ((text: string) => unknown) | undefined;
+}
+
+interface SdkHttpAdapterConfig {
+  url?: string;
+  baseURL?: string;
+  method?: string;
+  headers?: RequestInit["headers"];
+  params?: Record<string, string>;
+  data?: unknown;
+  timeout?: number;
+  signal?: AbortSignal;
+  fetchOptions?: RequestInit;
+}
+
+interface SdkHttpAdapterResponse {
+  data: unknown;
+  headers: Headers;
+  config: SdkHttpAdapterConfig;
+  status: number;
+  statusText: string;
+}
+
+function buildAdapterUrl(config: SdkHttpAdapterConfig, fallbackUrl: string): string {
+  let url = config.url || fallbackUrl;
+  if (config.baseURL && url && !/^https?:\/\//i.test(url)) {
+    url = url.replace(/^\/?/, `${config.baseURL.replace(/\/$/, "")}/`);
+  }
+  if (config.params && Object.keys(config.params).length > 0) {
+    const qs = new URLSearchParams(config.params).toString();
+    url += (url.includes("?") ? "&" : "?") + qs;
+  }
+  return url;
+}
+
+function encodeAdapterBody(data: unknown, headers: Headers): RequestInit["body"] {
+  if (data === undefined || data === null) return undefined;
+  if (typeof data === "string") return data;
+  if (data instanceof URLSearchParams) {
+    if (!headers.has("content-type")) {
+      headers.set("content-type", "application/x-www-form-urlencoded");
+    }
+    return data;
+  }
+  if (!headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  return JSON.stringify(data);
+}
+
+/**
+ * Build a `@stellar/stellar-sdk` HTTP client adapter that aborts and rejects
+ * any HTTP response exceeding `maxResponseBytes` before `JSON.parse` executes.
+ */
+export function createBoundedRpcFetchAdapter(options: {
+  rpcUrl: string;
+  maxResponseBytes: number;
+  defaultTimeoutMs?: number | undefined;
+  fetchImpl?: typeof globalThis.fetch | undefined;
+  parseJson?: ((text: string) => unknown) | undefined;
+}): (reqConfig: SdkHttpAdapterConfig) => Promise<SdkHttpAdapterResponse> {
+  const fetchFn = options.fetchImpl ?? globalThis.fetch;
+  const defaultTimeoutMs = options.defaultTimeoutMs ?? 15_000;
+
+  return async (reqConfig: SdkHttpAdapterConfig): Promise<SdkHttpAdapterResponse> => {
+    const url = buildAdapterUrl(reqConfig, options.rpcUrl);
+    const headers = new Headers(reqConfig.headers ?? {});
+    const body = encodeAdapterBody(reqConfig.data, headers);
+    const abortController = new AbortController();
+
+    const signals: AbortSignal[] = [abortController.signal];
+    const effectiveTimeout = reqConfig.timeout ?? defaultTimeoutMs;
+    if (effectiveTimeout > 0) {
+      signals.push(AbortSignal.timeout(effectiveTimeout));
+    }
+    if (reqConfig.signal) {
+      signals.push(reqConfig.signal);
+    }
+    const signal = signals.length === 1 ? signals[0]! : AbortSignal.any(signals);
+
+    let response: Response;
+    try {
+      response = await fetchFn(url, {
+        ...reqConfig.fetchOptions,
+        method: (reqConfig.method ?? "POST").toUpperCase(),
+        headers,
+        body,
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof RpcResponseByteLimitError) throw err;
+      if ((err as { name?: string } | null)?.name === "TimeoutError") {
+        throw new Error(`timeout of ${effectiveTimeout}ms exceeded`);
+      }
+      throw err;
+    }
+
+    const data = await readBoundedRpcJson(response, {
+      maxResponseBytes: options.maxResponseBytes,
+      abortController,
+      parseJson: options.parseJson,
+    });
+
+    if (!response.ok) {
+      const httpErr = new Error(`Request failed with status code ${response.status}`) as Error & {
+        response?: SdkHttpAdapterResponse;
+      };
+      httpErr.response = {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+        data,
+        config: reqConfig,
+      };
+      throw httpErr;
+    }
+
+    return {
+      data,
+      headers: response.headers,
+      config: reqConfig,
+      status: response.status,
+      statusText: response.statusText,
+    };
+  };
+}
+
 /**
  * Create an RPC server. Construction is offline; the network passphrase is
  * verified separately at boot by {@link validateNetworkPassphrase}.
  */
-export function createRpcServer(config: StellarConfig): rpc.Server {
-  return new rpc.Server(config.rpcUrl, {
+export function createRpcServer(
+  config: StellarConfig,
+  options: BoundedRpcServerOptions = {},
+): rpc.Server {
+  const maxResponseBytes =
+    options.maxResponseBytes ?? config.rpcMaxResponseBytes ?? DEFAULT_RPC_MAX_RESPONSE_BYTES;
+  if (
+    typeof maxResponseBytes !== "number" ||
+    !Number.isSafeInteger(maxResponseBytes) ||
+    maxResponseBytes < 1
+  ) {
+    throw new RangeError(
+      `rpcMaxResponseBytes must be a positive safe integer; got ${String(maxResponseBytes)}`,
+    );
+  }
+
+  const server = new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
     timeout: 15000,
   });
+
+  const clientDefaults = (
+    server as unknown as {
+      httpClient?: { defaults?: { adapter?: unknown; timeout?: number } };
+    }
+  ).httpClient?.defaults;
+
+  if (clientDefaults) {
+    clientDefaults.timeout = 15_000;
+    clientDefaults.adapter = createBoundedRpcFetchAdapter({
+      rpcUrl: config.rpcUrl,
+      maxResponseBytes,
+      defaultTimeoutMs: 15_000,
+      fetchImpl: options.fetchImpl,
+      parseJson: options.parseJson,
+    });
+  }
+
+  return server;
 }
 
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */

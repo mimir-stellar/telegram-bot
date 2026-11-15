@@ -35,6 +35,7 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "STELLAR_HORIZON_URL",
   "STELLAR_NETWORK_PASSPHRASE",
   "STELLAR_EXPLORER_BASE_URL",
+  "STELLAR_RPC_MAX_RESPONSE_BYTES",
   "BOT_TOKEN",
   "TELEGRAM_CHAT_ID",
   "TELEGRAM_MARKET_CHAT_ID",
@@ -186,6 +187,8 @@ function resolveSettingValue(
       return config.networkPassphrase;
     case "STELLAR_EXPLORER_BASE_URL":
       return config.explorerBaseUrl;
+    case "STELLAR_RPC_MAX_RESPONSE_BYTES":
+      return String(config.rpcMaxResponseBytes ?? 5 * 1024 * 1024);
     case "POLL_INTERVAL_MS":
       return String(config.pollIntervalMs);
     case "START_LOOKBACK_LEDGERS":
