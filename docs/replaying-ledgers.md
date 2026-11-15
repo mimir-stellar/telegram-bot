@@ -223,3 +223,12 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Atomic Archive Compaction by Ledger Range
+
+Long-lived event archives and JSONL captures can be compacted to a reviewed inclusive `[fromLedger, toLedger]` window using `compactArchiveByLedgerRange` (`src/stellar/archive.ts`) or `compactScanJsonlByLedgerRange` (`src/stellar/scan-jsonl.ts`):
+
+* **Bounded Retention & Metadata Rebuild:** Rejects negative, non-integer, or inverted ledger bounds (`INVALID_RANGE`), retains only deduplicated, deterministically sorted events inside `[fromLedger, toLedger]`, and rebuilds `archive-metadata.json` (`eventCount`, `retainedLedgerRange`, `droppedOutOfRangeCount`, `duplicateCount`, `segmentFiles`, `contracts`, and `histogram`).
+* **Verify-Before-Replace Atomicity:** Compaction writes to an isolated sibling staging directory and runs `verifyCompactedArchive` (plus any caller `verifyStaging` hook) against disk before swapping directories. If source parsing, retention capacity (`maxFiles`), or verification fails, the staging directory is removed and the source archive remains untouched.
