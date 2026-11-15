@@ -75,6 +75,30 @@ export interface DeadLetterQueueOptions {
   secrets?: readonly string[];
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /** Suppress informational console output (used by machine-readable CLI modes). */
+  quiet?: boolean;
+}
+
+export class DuplicateDeadLetterIdError extends Error {
+  readonly duplicateIds: readonly string[];
+  readonly filePath: string | null;
+
+  constructor(
+    duplicateIds: readonly string[],
+    filePath: string | null = null,
+    secrets: readonly string[] = [],
+  ) {
+    const safeIds = duplicateIds.map((id) =>
+      truncate(safeErrorMessage(id, secrets), 120),
+    );
+    const location = filePath ? ` in ${filePath}` : "";
+    super(
+      `duplicate dead-letter entry id(s)${location}: ${safeIds.join(", ")}`,
+    );
+    this.name = "DuplicateDeadLetterIdError";
+    this.duplicateIds = safeIds;
+    this.filePath = filePath;
+  }
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
@@ -108,10 +132,86 @@ export function makeEntryId(
   return `${source}:${ledger}:${eventName}:${shortHash(text)}`;
 }
 
+export interface ValidateDeadLetterOptions {
+  filePath?: string | null;
+  secrets?: readonly string[];
+  now?: () => number;
+}
+
+/**
+ * Validate a serialized `DeadLetterFile` payload, rejecting unknown versions,
+ * non-array `entries`, and duplicate entry identifiers.
+ */
+export function validateDeadLetterFile(
+  raw: string,
+  options: ValidateDeadLetterOptions = {},
+): DeadLetterEntry[] {
+  const now = options.now ?? Date.now;
+  const parsed = JSON.parse(raw) as Partial<DeadLetterFile> | null;
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    parsed.version !== 1 ||
+    !Array.isArray(parsed.entries)
+  ) {
+    throw new Error("unknown or corrupt dead-letter schema");
+  }
+
+  const seenIds = new Set<string>();
+  const duplicateIds: string[] = [];
+
+  for (const candidate of parsed.entries) {
+    if (
+      candidate !== null &&
+      typeof candidate === "object" &&
+      typeof (candidate as { id?: unknown }).id === "string"
+    ) {
+      const id = (candidate as { id: string }).id;
+      if (seenIds.has(id)) {
+        if (!duplicateIds.includes(id)) {
+          duplicateIds.push(id);
+        }
+      } else {
+        seenIds.add(id);
+      }
+    }
+  }
+
+  if (duplicateIds.length > 0) {
+    throw new DuplicateDeadLetterIdError(
+      duplicateIds,
+      options.filePath ?? null,
+      options.secrets ?? [],
+    );
+  }
+
+  return parsed.entries
+    .filter(
+      (e): e is DeadLetterEntry =>
+        Boolean(e) &&
+        typeof e.id === "string" &&
+        typeof e.text === "string" &&
+        typeof e.ledger === "number",
+    )
+    .map((e) => ({
+      id: e.id,
+      enqueuedAt:
+        typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
+      source: typeof e.source === "string" ? e.source : "unknown",
+      ledger: e.ledger,
+      eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
+      text: truncate(e.text, TEXT_TRUNCATE),
+      attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
+      lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
+    }));
+}
+
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
+  const quiet = options.quiet === true;
   let entries: DeadLetterEntry[] = [];
+  let preservedConflict: DuplicateDeadLetterIdError | null = null;
   const stats: DeadLetterStats = {
     depth: 0,
     enqueued: 0,
@@ -129,6 +229,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   }
 
   async function load(): Promise<void> {
+    preservedConflict = null;
     if (filePath === null) {
       entries = [];
       syncDepth();
@@ -146,52 +247,61 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     }
 
     try {
-      const parsed = JSON.parse(raw) as DeadLetterFile;
-      if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
-        console.warn(
-          `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
-        );
-        entries = [];
-      } else {
-        entries = parsed.entries
-          .filter(
-            (e) =>
-              e &&
-              typeof e.id === "string" &&
-              typeof e.text === "string" &&
-              typeof e.ledger === "number",
-          )
-          .map((e) => ({
-            id: e.id,
-            enqueuedAt:
-              typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
-            source: typeof e.source === "string" ? e.source : "unknown",
-            ledger: e.ledger,
-            eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
-            text: truncate(e.text, TEXT_TRUNCATE),
-            attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
-            lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
-          }));
-        // Bound on load too: the file may have been edited by hand.
-        while (entries.length > options.maxEntries) {
-          entries.shift();
-          stats.dropped += 1;
-        }
+      entries = validateDeadLetterFile(raw, {
+        filePath,
+        secrets: options.secrets,
+        now,
+      });
+      // Bound on load too: the file may have been edited by hand.
+      while (entries.length > options.maxEntries) {
+        entries.shift();
+        stats.dropped += 1;
       }
     } catch (err) {
-      console.warn(
-        `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
-      );
-      entries = [];
+      if (err instanceof DuplicateDeadLetterIdError) {
+        preservedConflict = err;
+        if (!quiet) {
+          console.warn(
+            `[dead-letter] ${err.message}; preserving source file for inspection`,
+          );
+        }
+        entries = [];
+      } else if (
+        err instanceof Error &&
+        err.message === "unknown or corrupt dead-letter schema"
+      ) {
+        if (!quiet) {
+          console.warn(
+            `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
+          );
+        }
+        entries = [];
+      } else {
+        if (!quiet) {
+          console.warn(
+            `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
+          );
+        }
+        entries = [];
+      }
     }
     syncDepth();
-    if (entries.length > 0) {
+    if (entries.length > 0 && !quiet) {
       console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
   }
 
   async function persist(): Promise<void> {
     if (filePath === null) {
+      syncDepth();
+      return;
+    }
+    if (preservedConflict !== null) {
+      if (!quiet) {
+        console.warn(
+          `[dead-letter] preserving conflicting source file at ${filePath}; skipping disk overwrite`,
+        );
+      }
       syncDepth();
       return;
     }
@@ -323,6 +433,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     load,
     enqueue,
     flush,
+    validationConflict(): DuplicateDeadLetterIdError | null {
+      return preservedConflict;
+    },
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
     },
