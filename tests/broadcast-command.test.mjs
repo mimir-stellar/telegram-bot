@@ -250,7 +250,12 @@ test("Confirmation: on confirm, send plain text to each unique chat with inter-s
 });
 
 test("Each chat receives the message at most once per confirmation (duplicate confirm prevention)", async () => {
-  const config = fakeConfig({ interSendDelayMs: 0 });
+  const config = fakeConfig({
+    interSendDelayMs: 0,
+    chatIds: ["-100111", "-100222"],
+    marketChatId: "",
+    squadChatId: "",
+  });
   const store = new BroadcastStore();
   const pending = store.create("42", "Unique message", ["-100111", "-100222"]);
 
@@ -354,7 +359,12 @@ test("Cancellation: clicking cancel removes broadcast and sends nothing", async 
 });
 
 test("Partial failure: reports per-chat success when some chats fail", async () => {
-  const config = fakeConfig({ interSendDelayMs: 0 });
+  const config = fakeConfig({
+    interSendDelayMs: 0,
+    chatIds: ["-100111", "-100FAIL", "-100333"],
+    marketChatId: "",
+    squadChatId: "",
+  });
   const store = new BroadcastStore();
   const pending = store.create("42", "Notice with partial failure", ["-100111", "-100FAIL", "-100333"]);
 

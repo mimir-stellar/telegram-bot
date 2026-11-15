@@ -8,6 +8,7 @@
  * inter-send delay while reporting per-chat success.
  */
 
+import { createHash } from "node:crypto";
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { BotConfig } from "../config.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
@@ -24,6 +25,10 @@ export const BROADCAST_USAGE_MESSAGE = "Usage: /broadcast <message>";
 export const BROADCAST_TOO_LONG_MESSAGE =
   "Broadcast message exceeds the maximum length of 4096 characters.";
 export const BROADCAST_NO_CHATS_MESSAGE = "No notification chats configured.";
+export const BROADCAST_ROUTE_CHANGED_ALERT =
+  "Broadcast cancelled: target chats changed. Run /broadcast again to preview.";
+export const BROADCAST_ROUTE_CHANGED_MESSAGE =
+  "⚠️ Broadcast cancelled because notification route configuration changed. Run /broadcast <message> again to review the updated target chats.";
 
 /**
  * Extracts and deduplicates all unique configured notification chats from config.
@@ -80,6 +85,29 @@ export function getConfiguredBroadcastChats(
   return unique;
 }
 
+/**
+ * Canonical, order-independent representation of a destination chat set.
+ */
+export function normalizeBroadcastDestinations(chats: readonly string[]): string[] {
+  const seen = new Set<string>();
+  for (const raw of chats) {
+    const trimmed = typeof raw === "string" ? raw.trim() : String(raw ?? "").trim();
+    if (trimmed.length > 0) {
+      seen.add(trimmed);
+    }
+  }
+  return [...seen].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/**
+ * Deterministic SHA-256 fingerprint of a reviewed destination chat set.
+ */
+export function fingerprintBroadcastDestinations(chats: readonly string[]): string {
+  const canonical = normalizeBroadcastDestinations(chats);
+  const digest = createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
+  return `sha256:${digest}`;
+}
+
 export interface PendingBroadcast {
   id: string;
   operatorId: string;
@@ -87,6 +115,7 @@ export interface PendingBroadcast {
   createdAt: number;
   expiresAt: number;
   chats: readonly string[];
+  destinationFingerprint: string;
   confirmed: boolean;
 }
 
@@ -104,22 +133,47 @@ export class BroadcastStore {
     message: string,
     chats: readonly string[],
     ttlMs?: number,
+    destinationFingerprint?: string,
   ): PendingBroadcast {
     this.cleanup();
     this.counter = (this.counter + 1) % 1_000_000;
     const id = `${Date.now().toString(36)}_${this.counter}_${Math.random().toString(36).slice(2, 6)}`;
     const now = Date.now();
+    const normalizedChats = [...chats];
     const item: PendingBroadcast = {
       id,
       operatorId,
       message,
       createdAt: now,
       expiresAt: now + (ttlMs ?? this.defaultTtlMs),
-      chats,
+      chats: normalizedChats,
+      destinationFingerprint:
+        destinationFingerprint ?? fingerprintBroadcastDestinations(normalizedChats),
       confirmed: false,
     };
     this.items.set(id, item);
     return item;
+  }
+
+  /**
+   * Cancel and remove all pending confirmations whose fingerprinted destination
+   * set no longer matches the active route configuration. Returns cancelled count.
+   */
+  cancelMismatchedRoutes(
+    config: Pick<BotConfig, "chatId"> &
+      Partial<Pick<BotConfig, "chatIds" | "marketChatId" | "squadChatId">>,
+  ): number {
+    const activeFingerprint = fingerprintBroadcastDestinations(
+      getConfiguredBroadcastChats(config),
+    );
+    let cancelled = 0;
+    for (const [id, item] of this.items.entries()) {
+      if (item.destinationFingerprint !== activeFingerprint) {
+        this.items.delete(id);
+        cancelled += 1;
+      }
+    }
+    return cancelled;
   }
 
   get(id: string, now: number = Date.now()): PendingBroadcast | undefined {
@@ -267,11 +321,13 @@ export async function handleBroadcastCommand(
   }
 
   const store = deps.broadcastStore ?? defaultBroadcastStore;
+  const destinationFingerprint = fingerprintBroadcastDestinations(chats);
   const pending = store.create(
     String(ctx.from?.id),
     text,
     chats,
     deps.broadcastExpiryMs,
+    destinationFingerprint,
   );
 
   const previewText = formatBroadcastPreview(text, chats);
@@ -366,6 +422,28 @@ export async function handleBroadcastCallback(
   }
 
   // subAction === "confirm"
+  const activeChats = getConfiguredBroadcastChats(config);
+  const activeFingerprint = fingerprintBroadcastDestinations(activeChats);
+  if (activeFingerprint !== pending.destinationFingerprint) {
+    store.delete(broadcastId);
+    await safeAnswerCallback(ctx, config, {
+      text: BROADCAST_ROUTE_CHANGED_ALERT,
+      show_alert: true,
+    });
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText(BROADCAST_ROUTE_CHANGED_MESSAGE);
+        return;
+      } catch {
+        // fallback to reply
+      }
+    }
+    if (typeof ctx.reply === "function") {
+      await ctx.reply(BROADCAST_ROUTE_CHANGED_MESSAGE);
+    }
+    return;
+  }
+
   // Each chat receives the message at most once per confirmation.
   if (pending.confirmed) {
     await safeAnswerCallback(ctx, config, {

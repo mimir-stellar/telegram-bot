@@ -92,10 +92,14 @@ export {
   type ValidCallbackAction,
 } from "./callbacks.js";
 export {
+  BROADCAST_ROUTE_CHANGED_ALERT,
+  BROADCAST_ROUTE_CHANGED_MESSAGE,
   handleBroadcastCallback,
   registerBroadcastHandlers,
   handleBroadcastCommand,
   getConfiguredBroadcastChats,
+  fingerprintBroadcastDestinations,
+  normalizeBroadcastDestinations,
   BroadcastStore,
   sendBroadcast,
 } from "./commands/broadcast.js";
@@ -348,9 +352,9 @@ export function createBot(deps: BotDeps): Bot {
       ? { botInfo: deps.botInfo, ...clientOptions }
       : clientOptions,
   );
+  registerBroadcastHandlers(bot, deps);
   registerCommandHandlers(bot, deps);
   registerCallbackHandlers(bot, deps);
-  registerBroadcastHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.
