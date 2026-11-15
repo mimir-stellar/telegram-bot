@@ -75,10 +75,36 @@ export interface DeadLetterQueueOptions {
   secrets?: readonly string[];
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /** Suppress informational console output (used by machine-readable CLI modes). */
+  quiet?: boolean;
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
+/** Maximum explicit entry IDs accepted in a single bulk acknowledgement. */
+export const DEAD_LETTER_MAX_ACK_IDS = 100;
+
+export class DeadLetterAckLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeadLetterAckLimitError";
+  }
+}
+
+export interface DeadLetterAckOptions {
+  /** Override maximum unique IDs accepted per call (defaults to {@link DEAD_LETTER_MAX_ACK_IDS}). */
+  maxIds?: number;
+  /** Preview matched and unmatched IDs without modifying memory or disk. */
+  dryRun?: boolean;
+}
+
+export interface DeadLetterAckResult {
+  dryRun: boolean;
+  acknowledged: number;
+  acknowledgedIds: string[];
+  notFoundIds: string[];
+  remaining: number;
+}
 
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
@@ -111,6 +137,7 @@ export function makeEntryId(
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
+  const quiet = options.quiet === true;
   let entries: DeadLetterEntry[] = [];
   const stats: DeadLetterStats = {
     depth: 0,
@@ -185,9 +212,26 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       entries = [];
     }
     syncDepth();
-    if (entries.length > 0) {
+    if (entries.length > 0 && !quiet) {
       console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
+  }
+
+  async function writeAtomicSnapshot(nextEntries: DeadLetterEntry[]): Promise<void> {
+    if (filePath === null) {
+      return;
+    }
+    const payload: DeadLetterFile = {
+      version: 1,
+      updatedAt: new Date(now()).toISOString(),
+      entries: nextEntries,
+    };
+    await mkdir(path.dirname(filePath), { recursive: true });
+    // Write-then-rename, like the cursor and status files: a reader never sees
+    // a half-written queue, and a crash leaves the previous one intact.
+    const tmp = `${filePath}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    await rename(tmp, filePath);
   }
 
   async function persist(): Promise<void> {
@@ -195,18 +239,8 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       syncDepth();
       return;
     }
-    const payload: DeadLetterFile = {
-      version: 1,
-      updatedAt: new Date(now()).toISOString(),
-      entries,
-    };
     try {
-      await mkdir(path.dirname(filePath), { recursive: true });
-      // Write-then-rename, like the cursor and status files: a reader never sees
-      // a half-written queue, and a crash leaves the previous one intact.
-      const tmp = `${filePath}.tmp`;
-      await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-      await rename(tmp, filePath);
+      await writeAtomicSnapshot(entries);
     } catch (err) {
       // An unwritable queue is degraded observability, never a reason to stop
       // notifying or to throw into the poll loop.
@@ -319,10 +353,80 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     return { sent, remaining: entries.length };
   }
 
+  /**
+   * Atomically acknowledge an explicit, bounded list of inspected entry IDs.
+   *
+   * Valid matched entries are removed in a single atomic write-then-rename step;
+   * unmatched entries in the queue are preserved with their original attempts,
+   * timestamps, and ordering intact. Unknown requested IDs are reported in
+   * `notFoundIds` without aborting valid acknowledgements. If persistence fails,
+   * neither disk nor in-memory state is mutated.
+   */
+  async function acknowledge(
+    ids: readonly string[],
+    ackOptions: DeadLetterAckOptions = {},
+  ): Promise<DeadLetterAckResult> {
+    const maxIds = Math.max(1, ackOptions.maxIds ?? DEAD_LETTER_MAX_ACK_IDS);
+    const normalized: string[] = [];
+    const seen = new Set<string>();
+
+    for (const rawId of ids) {
+      if (typeof rawId !== "string") continue;
+      const trimmed = rawId.trim();
+      if (trimmed.length === 0) continue;
+      if (!seen.has(trimmed)) {
+        seen.add(trimmed);
+        normalized.push(trimmed);
+      }
+    }
+
+    if (normalized.length === 0) {
+      throw new DeadLetterAckLimitError(
+        "acknowledge requires at least one non-empty entry id",
+      );
+    }
+    if (normalized.length > maxIds) {
+      throw new DeadLetterAckLimitError(
+        `acknowledge accepts at most ${maxIds} unique entry ids; got ${normalized.length}`,
+      );
+    }
+
+    const dryRun = ackOptions.dryRun === true;
+    const presentById = new Set(entries.map((entry) => entry.id));
+    const acknowledgedIds: string[] = [];
+    const notFoundIds: string[] = [];
+
+    for (const id of normalized) {
+      if (presentById.has(id)) {
+        acknowledgedIds.push(id);
+      } else {
+        notFoundIds.push(id);
+      }
+    }
+
+    const ackSet = new Set(acknowledgedIds);
+    const nextEntries = entries.filter((entry) => !ackSet.has(entry.id));
+
+    if (!dryRun && acknowledgedIds.length > 0) {
+      await writeAtomicSnapshot(nextEntries);
+      entries = nextEntries;
+      syncDepth();
+    }
+
+    return {
+      dryRun,
+      acknowledged: acknowledgedIds.length,
+      acknowledgedIds,
+      notFoundIds,
+      remaining: nextEntries.length,
+    };
+  }
+
   return {
     load,
     enqueue,
     flush,
+    acknowledge,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
     },

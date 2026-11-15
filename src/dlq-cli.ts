@@ -25,15 +25,18 @@ import { pathToFileURL } from "node:url";
 
 import {
   createDeadLetterQueue,
+  DEAD_LETTER_MAX_ACK_IDS,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
+  DeadLetterAckLimitError,
+  type DeadLetterAckResult,
   type DeadLetterEntry,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
 export const USAGE =
-  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
+  "usage: npm run dlq -- <list|show <id>|ack <id...> [--dry-run] [--yes]|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
   readonly exitCode = 2;
@@ -73,6 +76,16 @@ export interface PurgeDlqResult {
   remaining: number;
   purgedIds: string[];
   entries: DlqEntryView[];
+  chatId: string;
+}
+
+export interface AckDlqOptions extends ListDlqOptions {
+  ids: readonly string[];
+  maxIds?: number;
+  dryRun?: boolean;
+}
+
+export interface AckDlqResult extends DeadLetterAckResult {
   chatId: string;
 }
 
@@ -266,7 +279,43 @@ function openQueue(options: ListDlqOptions) {
     maxAttempts,
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
+}
+
+/**
+ * Atomically acknowledge an explicit, bounded list of dead-letter entry IDs,
+ * preserving all unmatched entries and their metadata on disk.
+ */
+export async function acknowledgeDeadLetters(
+  options: AckDlqOptions,
+): Promise<AckDlqResult> {
+  const chatIds = configuredChatIds(options.chatId);
+  const secrets = configuredSecrets(options.secrets);
+  const queue = openQueue(options);
+  await queue.load();
+
+  let ack: DeadLetterAckResult;
+  try {
+    ack = await queue.acknowledge(options.ids, {
+      maxIds: options.maxIds,
+      dryRun: options.dryRun,
+    });
+  } catch (err) {
+    if (err instanceof DeadLetterAckLimitError) {
+      throw new DlqUsageError(err.message);
+    }
+    throw err;
+  }
+
+  return {
+    dryRun: ack.dryRun,
+    acknowledged: ack.acknowledged,
+    acknowledgedIds: ack.acknowledgedIds.map((id) => sanitizeDlqText(id, chatIds, secrets)),
+    notFoundIds: ack.notFoundIds.map((id) => sanitizeDlqText(id, chatIds, secrets)),
+    remaining: ack.remaining,
+    chatId: resolveChatIdForSource("default", options.chatId),
+  };
 }
 
 /** Load and return all dead-letter entries with redacted chat ids. */
@@ -372,6 +421,7 @@ async function persistPurgedQueue(
     ),
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
 
   await queue.load();
@@ -392,25 +442,34 @@ async function persistPurgedQueue(
 }
 
 interface ParsedCliArgs {
-  subcommand: "list" | "show" | "purge";
+  subcommand: "list" | "show" | "purge" | "ack";
   file?: string;
   id?: string;
+  ids?: string[];
   olderThan?: string;
   yes: boolean;
+  dryRun: boolean;
   json: boolean;
   chatId?: string;
 }
 
 export function parseDlqArgs(argv: string[]): ParsedCliArgs {
   const [subcommand, ...rest] = argv;
-  if (subcommand !== "list" && subcommand !== "show" && subcommand !== "purge") {
+  if (
+    subcommand !== "list" &&
+    subcommand !== "show" &&
+    subcommand !== "purge" &&
+    subcommand !== "ack"
+  ) {
     throw new DlqUsageError(USAGE);
   }
 
   const parsed: ParsedCliArgs = {
     subcommand,
     yes: false,
+    dryRun: false,
     json: false,
+    ...(subcommand === "ack" ? { ids: [] } : {}),
   };
   const seen = new Set<string>();
 
@@ -418,12 +477,22 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
     const arg = rest[i]!;
 
     if (arg === "--yes") {
-      if (subcommand !== "purge") {
-        throw new DlqUsageError(`--yes is only valid with purge\n${USAGE}`);
+      if (subcommand !== "purge" && subcommand !== "ack") {
+        throw new DlqUsageError(`--yes is only valid with purge or ack\n${USAGE}`);
       }
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
       parsed.yes = true;
+      continue;
+    }
+
+    if (arg === "--dry-run") {
+      if (subcommand !== "ack") {
+        throw new DlqUsageError(`--dry-run is only valid with ack\n${USAGE}`);
+      }
+      if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
+      seen.add(arg);
+      parsed.dryRun = true;
       continue;
     }
 
@@ -460,11 +529,33 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
+    if (subcommand === "ack") {
+      parsed.ids!.push(arg);
+      continue;
+    }
+
     throw new DlqUsageError(`unexpected argument: ${arg}\n${USAGE}`);
   }
 
   if (subcommand === "show" && (!parsed.id || parsed.id.trim() === "")) {
     throw new DlqUsageError(`show requires an entry <id>\n${USAGE}`);
+  }
+
+  if (subcommand === "ack") {
+    if (parsed.dryRun && parsed.yes) {
+      throw new DlqUsageError(`cannot combine --dry-run and --yes\n${USAGE}`);
+    }
+    const uniqueIds = new Set(
+      (parsed.ids ?? []).map((id) => id.trim()).filter((id) => id.length > 0),
+    );
+    if (uniqueIds.size === 0) {
+      throw new DlqUsageError(`ack requires at least one entry <id>\n${USAGE}`);
+    }
+    if (uniqueIds.size > DEAD_LETTER_MAX_ACK_IDS) {
+      throw new DlqUsageError(
+        `ack accepts at most ${DEAD_LETTER_MAX_ACK_IDS} unique entry ids; got ${uniqueIds.size}\n${USAGE}`,
+      );
+    }
   }
 
   if (parsed.olderThan !== undefined) {
@@ -517,6 +608,28 @@ function formatShowOutput(entry: DlqEntryView, asJson: boolean): string {
     `lastError:  ${entry.lastError ?? "none"}`,
     `text:\n${entry.text}`,
   ].join("\n");
+}
+
+function formatAckOutput(
+  result: AckDlqResult,
+  filePath: string,
+  asJson: boolean,
+): string {
+  if (asJson) {
+    return `${JSON.stringify({ file: filePath, ...result }, null, 2)}\n`;
+  }
+  const missingSuffix =
+    result.notFoundIds.length > 0 ? `, ${result.notFoundIds.length} unmatched` : "";
+  if (result.dryRun) {
+    return (
+      `[dlq] dry-run: would acknowledge ${result.acknowledged} entry(s)${missingSuffix}, ` +
+      `${result.remaining} remaining (chat=${result.chatId}) in ${filePath}`
+    );
+  }
+  return (
+    `[dlq] acknowledged ${result.acknowledged} entry(s)${missingSuffix}, ` +
+    `${result.remaining} remaining (chat=${result.chatId}) in ${filePath}`
+  );
 }
 
 function formatPurgeOutput(
@@ -585,6 +698,16 @@ export async function runDlqCli(
       return { exitCode: 0 };
     }
 
+    if (parsed.subcommand === "ack") {
+      const ackResult = await acknowledgeDeadLetters({
+        ...commonOptions,
+        ids: parsed.ids ?? [],
+        dryRun: parsed.dryRun,
+      });
+      out(formatAckOutput(ackResult, filePath, parsed.json).trimEnd());
+      return { exitCode: 0 };
+    }
+
     const result = await purgeDeadLetters({
       ...commonOptions,
       olderThan: parsed.olderThan,
@@ -604,7 +727,7 @@ export async function runDlqCli(
 }
 
 async function main(): Promise<void> {
-  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
+  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env", quiet: true });
   const { exitCode } = await runDlqCli();
   if (exitCode !== 0) {
     process.exit(exitCode);

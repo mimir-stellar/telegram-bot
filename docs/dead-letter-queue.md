@@ -127,6 +127,23 @@ jq -r '.entries[] | select(.id == "market:123456:MarketCreated:a1b2c3d4") | .tex
 
 ---
 
+## Atomic Bulk Acknowledgement (`ack`)
+
+Once specific parked entries have been inspected (`npm run dlq -- list` / `npm run dlq -- show <id>`), operators can acknowledge and remove an explicit, bounded batch of entry IDs without disturbing other parked items:
+
+```bash
+# Preview matched and unmatched IDs without modifying disk
+npm run dlq -- ack <id-1> <id-2> --dry-run [--file data/dead-letter.json] [--json]
+
+# Atomically acknowledge matched IDs and preserve all unmatched entries
+npm run dlq -- ack <id-1> <id-2> [--file data/dead-letter.json] [--json]
+```
+
+* **Explicit bounded ID list**: `ack` requires at least `1` non-empty ID and accepts at most `DEAD_LETTER_MAX_ACK_IDS` (`100`) unique IDs per invocation (duplicate IDs in the same request are deduplicated before validation). Empty or oversized ID lists fail fast with `DeadLetterAckLimitError` (CLI exit code `2`) before touching disk.
+* **Atomic persistence & unmatched preservation**: Valid matched entries are removed in a single temporary-file write and atomic `rename` (`writeAtomicSnapshot` in [`src/deadLetter.ts`](../src/deadLetter.ts)). Unmatched entries in the queue retain their exact `enqueuedAt`, `attempts`, `lastError`, and chronological order; unknown requested IDs are reported in `notFoundIds` without aborting valid acknowledgements. If the atomic write fails, neither disk nor in-memory queue state is modified.
+
+---
+
 ## When to Delete or Clear the File
 
 Under normal operation, **operators should not need to manually delete the file**. The dead-letter queue will drain automatically once Telegram connectivity is restored, and poison or overflow messages are dropped gracefully per the limits.
