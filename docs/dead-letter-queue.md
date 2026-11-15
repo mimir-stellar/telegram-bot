@@ -125,6 +125,21 @@ jq -r '.entries[].lastError' data/dead-letter.json | sort | uniq -c
 jq -r '.entries[] | select(.id == "market:123456:MarketCreated:a1b2c3d4") | .text' data/dead-letter.json
 ```
 
+### 6. Export a Redacted Incident Bundle (`npm run dlq -- bundle`)
+
+When sharing dead-letter diagnostics in an issue ticket or incident channel, export a redacted JSON bundle instead of copying `data/dead-letter.json` directly:
+
+```bash
+npm run dlq -- bundle --output ./dlq-incident.json
+# or stream JSON directly to stdout:
+npm run dlq -- bundle --json
+```
+
+The incident bundle (`schemaVersion: 1`) includes:
+* Queue metadata (`depth`, `maxEntries`, `maxAttempts`, `fileUpdatedAt`, `oldestEnqueuedAt`, `newestEnqueuedAt`, `bySource`, `byReasonCode`).
+* Stable reason codes (`RATE_LIMITED`, `TIMEOUT`, `AUTH_OR_PERMISSION`, `BAD_REQUEST`, `UPSTREAM_UNAVAILABLE`, `NETWORK_ERROR`, `UNKNOWN`).
+* Per-entry metadata with scrubbed errors while **omitting** raw message bodies (`text`), host file paths, bot credentials (`BOT_TOKEN`), and private destination identifiers (chat IDs and `@channel` handles).
+
 ---
 
 ## When to Delete or Clear the File

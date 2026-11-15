@@ -75,6 +75,60 @@ export interface DeadLetterQueueOptions {
   secrets?: readonly string[];
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /** Suppress informational console output (used by machine-readable CLI modes). */
+  quiet?: boolean;
+}
+
+export const INCIDENT_BUNDLE_SCHEMA_VERSION = 1 as const;
+
+export const DEAD_LETTER_REASON_CODES = [
+  "RATE_LIMITED",
+  "TIMEOUT",
+  "AUTH_OR_PERMISSION",
+  "BAD_REQUEST",
+  "UPSTREAM_UNAVAILABLE",
+  "NETWORK_ERROR",
+  "UNKNOWN",
+] as const;
+
+export type DeadLetterReasonCode = (typeof DEAD_LETTER_REASON_CODES)[number];
+
+export interface DeadLetterIncidentItem {
+  id: string;
+  enqueuedAt: string;
+  source: string;
+  ledger: number;
+  eventName: string;
+  attempts: number;
+  reasonCode: DeadLetterReasonCode;
+  redactedError: string | null;
+}
+
+export interface DeadLetterIncidentBundle {
+  schemaVersion: typeof INCIDENT_BUNDLE_SCHEMA_VERSION;
+  generatedAt: string;
+  queue: {
+    schemaVersion: 1;
+    fileUpdatedAt: string | null;
+    depth: number;
+    maxEntries: number;
+    maxAttempts: number;
+    oldestEnqueuedAt: string | null;
+    newestEnqueuedAt: string | null;
+    bySource: Record<string, number>;
+    byReasonCode: Record<DeadLetterReasonCode, number>;
+  };
+  entries: DeadLetterIncidentItem[];
+}
+
+export interface IncidentBundleOptions {
+  entries: readonly DeadLetterEntry[];
+  fileUpdatedAt?: string | null;
+  maxEntries?: number;
+  maxAttempts?: number;
+  secrets?: readonly string[];
+  privateDestinations?: readonly string[];
+  now?: () => number;
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
@@ -108,10 +162,208 @@ export function makeEntryId(
   return `${source}:${ledger}:${eventName}:${shortHash(text)}`;
 }
 
+const PUBLIC_SOURCES = new Set(["market", "squad", "default", "unknown"]);
+
+/** Map a recorded failure string to a stable operator triage reason code. */
+export function classifyDeadLetterReasonCode(
+  lastError: string | null | undefined,
+): DeadLetterReasonCode {
+  if (!lastError || lastError.trim() === "") return "UNKNOWN";
+  const lower = lastError.toLowerCase();
+
+  if (
+    /\b429\b/.test(lower) ||
+    lower.includes("too many requests") ||
+    lower.includes("rate limit") ||
+    lower.includes("retry after")
+  ) {
+    return "RATE_LIMITED";
+  }
+  if (
+    lower.includes("timed out") ||
+    lower.includes("timeout") ||
+    lower.includes("etimedout") ||
+    lower.includes("aborted") ||
+    lower.includes("deadline")
+  ) {
+    return "TIMEOUT";
+  }
+  if (
+    /\b(401|403)\b/.test(lower) ||
+    lower.includes("unauthorized") ||
+    lower.includes("forbidden") ||
+    lower.includes("bot was blocked") ||
+    lower.includes("chat not found") ||
+    lower.includes("not enough rights")
+  ) {
+    return "AUTH_OR_PERMISSION";
+  }
+  if (
+    /\b400\b/.test(lower) ||
+    lower.includes("bad request") ||
+    lower.includes("can't parse entities") ||
+    lower.includes("message is too long")
+  ) {
+    return "BAD_REQUEST";
+  }
+  if (
+    /\b(500|502|503|504)\b/.test(lower) ||
+    lower.includes("bad gateway") ||
+    lower.includes("service unavailable") ||
+    lower.includes("gateway timeout")
+  ) {
+    return "UPSTREAM_UNAVAILABLE";
+  }
+  if (
+    lower.includes("econnreset") ||
+    lower.includes("econnrefused") ||
+    lower.includes("enotfound") ||
+    lower.includes("fetch failed") ||
+    lower.includes("socket hang up") ||
+    lower.includes("network")
+  ) {
+    return "NETWORK_ERROR";
+  }
+  return "UNKNOWN";
+}
+
+function scrubIncidentText(
+  input: string,
+  secrets: readonly string[],
+  privateDestinations: readonly string[],
+): string {
+  let out = safeErrorMessage(input, secrets);
+  out = out.replace(/https?:\/\/api\.telegram\.org\/bot[^/\s]+/gi, "https://api.telegram.org/bot[REDACTED]");
+  out = out.replace(/\b\d{6,}:[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]");
+
+  for (const dest of privateDestinations) {
+    const trimmed = dest.trim();
+    if (trimmed.length >= 2 && out.includes(trimmed)) {
+      out = out.split(trimmed).join("[OMITTED_DESTINATION]");
+    }
+  }
+
+  out = out.replace(
+    /\b(chat(?:_id|Id)?(?:\s*[:=]|\s+))(-?\d{4,}|@[A-Za-z0-9_]{3,})/gi,
+    (_full, prefix: string) => `${prefix}[OMITTED_DESTINATION]`,
+  );
+  out = out.replace(/(?<![A-Za-z0-9_-])-\d{6,}\b/g, "[OMITTED_DESTINATION]");
+  out = out.replace(/@[A-Za-z0-9_]{4,}\b/g, "[OMITTED_DESTINATION]");
+
+  return truncate(out, 160);
+}
+
+function sanitizeIncidentSource(source: string): string {
+  const normalized = source.trim();
+  return PUBLIC_SOURCES.has(normalized) ? normalized : "custom_route";
+}
+
+function sanitizeIncidentEntryId(
+  entry: DeadLetterEntry,
+  secrets: readonly string[],
+  privateDestinations: readonly string[],
+): string {
+  const safeSource = sanitizeIncidentSource(entry.source);
+  const parts = entry.id.split(":");
+  if (parts.length >= 4) {
+    const rest = parts.slice(1).join(":");
+    return scrubIncidentText(`${safeSource}:${rest}`, secrets, privateDestinations);
+  }
+  return scrubIncidentText(entry.id, secrets, privateDestinations);
+}
+
+/**
+ * Build a shareable, redacted incident bundle with queue metadata and stable
+ * reason codes while omitting message bodies, bot credentials, and private
+ * destination identifiers.
+ */
+export function buildDeadLetterIncidentBundle(
+  options: IncidentBundleOptions,
+): DeadLetterIncidentBundle {
+  const now = options.now ?? Date.now;
+  const secrets = options.secrets ?? [];
+  const privateDestinations = [...(options.privateDestinations ?? [])];
+
+  for (const entry of options.entries) {
+    const maybeChatId = (entry as DeadLetterEntry & { chatId?: unknown }).chatId;
+    if (typeof maybeChatId === "string" && maybeChatId.trim().length > 0) {
+      privateDestinations.push(maybeChatId.trim());
+    }
+  }
+
+  const bySource: Record<string, number> = {};
+  const byReasonCode: Record<DeadLetterReasonCode, number> = {
+    RATE_LIMITED: 0,
+    TIMEOUT: 0,
+    AUTH_OR_PERMISSION: 0,
+    BAD_REQUEST: 0,
+    UPSTREAM_UNAVAILABLE: 0,
+    NETWORK_ERROR: 0,
+    UNKNOWN: 0,
+  };
+
+  let oldestMs = Number.POSITIVE_INFINITY;
+  let newestMs = Number.NEGATIVE_INFINITY;
+  let oldestEnqueuedAt: string | null = null;
+  let newestEnqueuedAt: string | null = null;
+
+  const items: DeadLetterIncidentItem[] = options.entries.map((entry) => {
+    const safeSource = sanitizeIncidentSource(entry.source);
+    const reasonCode = classifyDeadLetterReasonCode(entry.lastError);
+    bySource[safeSource] = (bySource[safeSource] ?? 0) + 1;
+    byReasonCode[reasonCode] += 1;
+
+    const ts = Date.parse(entry.enqueuedAt);
+    if (Number.isFinite(ts)) {
+      if (ts < oldestMs) {
+        oldestMs = ts;
+        oldestEnqueuedAt = entry.enqueuedAt;
+      }
+      if (ts > newestMs) {
+        newestMs = ts;
+        newestEnqueuedAt = entry.enqueuedAt;
+      }
+    }
+
+    return {
+      id: sanitizeIncidentEntryId(entry, secrets, privateDestinations),
+      enqueuedAt: entry.enqueuedAt,
+      source: safeSource,
+      ledger: entry.ledger,
+      eventName: scrubIncidentText(entry.eventName, secrets, privateDestinations),
+      attempts: entry.attempts,
+      reasonCode,
+      redactedError:
+        entry.lastError === null
+          ? null
+          : scrubIncidentText(entry.lastError, secrets, privateDestinations),
+    };
+  });
+
+  return {
+    schemaVersion: INCIDENT_BUNDLE_SCHEMA_VERSION,
+    generatedAt: new Date(now()).toISOString(),
+    queue: {
+      schemaVersion: 1,
+      fileUpdatedAt: options.fileUpdatedAt ?? null,
+      depth: items.length,
+      maxEntries: options.maxEntries ?? DEAD_LETTER_MAX_ENTRIES,
+      maxAttempts: options.maxAttempts ?? DEAD_LETTER_MAX_ATTEMPTS,
+      oldestEnqueuedAt,
+      newestEnqueuedAt,
+      bySource,
+      byReasonCode,
+    },
+    entries: items,
+  };
+}
+
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
+  const quiet = options.quiet === true;
   let entries: DeadLetterEntry[] = [];
+  let fileUpdatedAt: string | null = null;
   const stats: DeadLetterStats = {
     depth: 0,
     enqueued: 0,
@@ -148,11 +400,15 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     try {
       const parsed = JSON.parse(raw) as DeadLetterFile;
       if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
-        console.warn(
-          `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
-        );
+        if (!quiet) {
+          console.warn(
+            `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
+          );
+        }
         entries = [];
+        fileUpdatedAt = null;
       } else {
+        fileUpdatedAt = typeof parsed.updatedAt === "string" ? parsed.updatedAt : null;
         entries = parsed.entries
           .filter(
             (e) =>
@@ -179,13 +435,16 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         }
       }
     } catch (err) {
-      console.warn(
-        `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
-      );
+      if (!quiet) {
+        console.warn(
+          `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
+        );
+      }
       entries = [];
+      fileUpdatedAt = null;
     }
     syncDepth();
-    if (entries.length > 0) {
+    if (entries.length > 0 && !quiet) {
       console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
   }
@@ -195,9 +454,10 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       syncDepth();
       return;
     }
+    const updatedAt = new Date(now()).toISOString();
     const payload: DeadLetterFile = {
       version: 1,
-      updatedAt: new Date(now()).toISOString(),
+      updatedAt,
       entries,
     };
     try {
@@ -207,6 +467,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       const tmp = `${filePath}.tmp`;
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, filePath);
+      fileUpdatedAt = updatedAt;
     } catch (err) {
       // An unwritable queue is degraded observability, never a reason to stop
       // notifying or to throw into the poll loop.
@@ -323,6 +584,19 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     load,
     enqueue,
     flush,
+    incidentBundle(
+      extra?: { privateDestinations?: readonly string[] },
+    ): DeadLetterIncidentBundle {
+      return buildDeadLetterIncidentBundle({
+        entries,
+        fileUpdatedAt,
+        maxEntries: options.maxEntries,
+        maxAttempts: options.maxAttempts,
+        secrets: options.secrets,
+        privateDestinations: extra?.privateDestinations,
+        now,
+      });
+    },
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
     },

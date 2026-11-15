@@ -19,6 +19,7 @@
  *   - Unknown subcommands or bad arguments print usage and exit 2.
  */
 
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
@@ -28,12 +29,13 @@ import {
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
   type DeadLetterEntry,
+  type DeadLetterIncidentBundle,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
 export const USAGE =
-  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
+  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]|bundle [--output PATH]> [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
   readonly exitCode = 2;
@@ -65,6 +67,10 @@ export interface PurgeDlqOptions extends ListDlqOptions {
   olderThan?: string | number;
   olderThanMs?: number;
   yes?: boolean;
+}
+
+export interface ExportBundleDlqOptions extends ListDlqOptions {
+  outputPath?: string;
 }
 
 export interface PurgeDlqResult {
@@ -198,11 +204,30 @@ function configuredChatIds(explicitChatId?: string): string[] {
 
 function configuredSecrets(extraSecrets?: readonly string[]): string[] {
   const secrets = [...(extraSecrets ?? [])];
-  const botToken = process.env.BOT_TOKEN?.trim();
-  if (botToken && botToken.length > 0 && !secrets.includes(botToken)) {
-    secrets.push(botToken);
+  for (const raw of [process.env.BOT_TOKEN, process.env.HEALTH_AUTH_TOKEN]) {
+    const trimmed = raw?.trim();
+    if (trimmed && trimmed.length > 0 && !secrets.includes(trimmed)) {
+      secrets.push(trimmed);
+    }
   }
   return secrets;
+}
+
+function configuredPrivateDestinations(explicitChatId?: string): string[] {
+  const ids = configuredChatIds(explicitChatId);
+  for (const raw of [
+    process.env.ALLOWED_CHAT_IDS,
+    process.env.OPERATOR_TELEGRAM_USER_ID,
+  ]) {
+    if (!raw) continue;
+    for (const part of raw.split(",")) {
+      const trimmed = part.trim();
+      if (trimmed.length > 0 && !ids.includes(trimmed)) {
+        ids.push(trimmed);
+      }
+    }
+  }
+  return ids;
 }
 
 function resolveChatIdForSource(source: string, explicitChatId?: string): string {
@@ -266,7 +291,33 @@ function openQueue(options: ListDlqOptions) {
     maxAttempts,
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
+}
+
+/**
+ * Export a redacted dead-letter incident bundle containing queue metadata and
+ * stable reason codes while omitting bot credentials, raw message bodies, and
+ * private destination identifiers.
+ */
+export async function exportDeadLetterBundle(
+  options: ExportBundleDlqOptions,
+): Promise<DeadLetterIncidentBundle> {
+  const queue = openQueue(options);
+  await queue.load();
+  const bundle = queue.incidentBundle({
+    privateDestinations: configuredPrivateDestinations(options.chatId),
+  });
+
+  if (options.outputPath) {
+    const target = resolvePath(options.outputPath);
+    await mkdir(path.dirname(target), { recursive: true });
+    const tmp = `${target}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(bundle, null, 2)}\n`, "utf8");
+    await rename(tmp, target);
+  }
+
+  return bundle;
 }
 
 /** Load and return all dead-letter entries with redacted chat ids. */
@@ -372,6 +423,7 @@ async function persistPurgedQueue(
     ),
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
 
   await queue.load();
@@ -392,10 +444,11 @@ async function persistPurgedQueue(
 }
 
 interface ParsedCliArgs {
-  subcommand: "list" | "show" | "purge";
+  subcommand: "list" | "show" | "purge" | "bundle";
   file?: string;
   id?: string;
   olderThan?: string;
+  output?: string;
   yes: boolean;
   json: boolean;
   chatId?: string;
@@ -403,7 +456,12 @@ interface ParsedCliArgs {
 
 export function parseDlqArgs(argv: string[]): ParsedCliArgs {
   const [subcommand, ...rest] = argv;
-  if (subcommand !== "list" && subcommand !== "show" && subcommand !== "purge") {
+  if (
+    subcommand !== "list" &&
+    subcommand !== "show" &&
+    subcommand !== "purge" &&
+    subcommand !== "bundle"
+  ) {
     throw new DlqUsageError(USAGE);
   }
 
@@ -434,9 +492,17 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
-    if (arg === "--file" || arg === "--older-than" || arg === "--chat-id") {
+    if (
+      arg === "--file" ||
+      arg === "--older-than" ||
+      arg === "--output" ||
+      arg === "--chat-id"
+    ) {
       if (arg === "--older-than" && subcommand !== "purge") {
         throw new DlqUsageError(`--older-than is only valid with purge\n${USAGE}`);
+      }
+      if (arg === "--output" && subcommand !== "bundle") {
+        throw new DlqUsageError(`--output is only valid with bundle\n${USAGE}`);
       }
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
@@ -446,6 +512,7 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       }
       if (arg === "--file") parsed.file = value;
       else if (arg === "--older-than") parsed.olderThan = value;
+      else if (arg === "--output") parsed.output = value;
       else if (arg === "--chat-id") parsed.chatId = value;
       i += 1;
       continue;
@@ -585,6 +652,26 @@ export async function runDlqCli(
       return { exitCode: 0 };
     }
 
+    if (parsed.subcommand === "bundle") {
+      const bundle = await exportDeadLetterBundle({
+        ...commonOptions,
+        outputPath: parsed.output,
+      });
+      if (parsed.json || !parsed.output) {
+        out(JSON.stringify(bundle, null, 2));
+      } else {
+        const activeReasons = Object.entries(bundle.queue.byReasonCode)
+          .filter(([, count]) => count > 0)
+          .map(([code, count]) => `${code}=${count}`)
+          .join(", ");
+        out(
+          `[dlq] wrote redacted incident bundle (${bundle.queue.depth} entry(s)` +
+            `${activeReasons ? `; ${activeReasons}` : ""}) to ${resolvePath(parsed.output)}`,
+        );
+      }
+      return { exitCode: 0 };
+    }
+
     const result = await purgeDeadLetters({
       ...commonOptions,
       olderThan: parsed.olderThan,
@@ -604,7 +691,7 @@ export async function runDlqCli(
 }
 
 async function main(): Promise<void> {
-  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
+  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env", quiet: true });
   const { exitCode } = await runDlqCli();
   if (exitCode !== 0) {
     process.exit(exitCode);
