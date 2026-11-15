@@ -27,20 +27,54 @@ import {
   createDeadLetterQueue,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
+  DlqAccessError,
+  DlqMalformedFileError,
+  inspectDeadLetterFile,
   type DeadLetterEntry,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
+export { DlqAccessError, DlqMalformedFileError };
+
+/**
+ * Stable process exit codes returned by the dead-letter inspection CLI:
+ * - `0` (`OK`): Command succeeded.
+ * - `1` (`UNKNOWN_ENTRY`): Requested entry ID was not found (`show <id>`).
+ * - `2` (`USAGE_ERROR`): Invalid subcommand, flag, or duration argument.
+ * - `3` (`MALFORMED_FILE`): Dead-letter file contains invalid JSON, wrong schema version, or malformed entry shape.
+ * - `4` (`ACCESS_FAILURE`): Filesystem read/permission/directory failure on `--file`.
+ */
+export const DLQ_EXIT_CODES = {
+  OK: 0,
+  UNKNOWN_ENTRY: 1,
+  USAGE_ERROR: 2,
+  MALFORMED_FILE: 3,
+  ACCESS_FAILURE: 4,
+} as const;
+
+export type DlqExitCode = (typeof DLQ_EXIT_CODES)[keyof typeof DLQ_EXIT_CODES];
+
 export const USAGE =
   "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
-  readonly exitCode = 2;
+  readonly code = "USAGE_ERROR" as const;
+  readonly exitCode = DLQ_EXIT_CODES.USAGE_ERROR;
 
   constructor(message: string) {
     super(message.includes(USAGE) ? message : `${message}\n${USAGE}`);
     this.name = "DlqUsageError";
+  }
+}
+
+export class DlqUnknownEntryError extends Error {
+  readonly code = "UNKNOWN_ENTRY" as const;
+  readonly exitCode = DLQ_EXIT_CODES.UNKNOWN_ENTRY;
+
+  constructor(entryId: string) {
+    super(`dead-letter entry not found: ${boundText(entryId, 120)}`);
+    this.name = "DlqUnknownEntryError";
   }
 }
 
@@ -246,47 +280,38 @@ function toEntryView(
   };
 }
 
-function openQueue(options: ListDlqOptions) {
-  const maxEntries =
-    options.maxEntries ??
-    (Number.isInteger(Number(process.env.DEAD_LETTER_MAX)) &&
+function resolveMaxEntries(explicit?: number): number {
+  if (explicit !== undefined) return explicit;
+  return Number.isInteger(Number(process.env.DEAD_LETTER_MAX)) &&
     Number(process.env.DEAD_LETTER_MAX) >= 1
-      ? Number(process.env.DEAD_LETTER_MAX)
-      : DEAD_LETTER_MAX_ENTRIES);
-  const maxAttempts =
-    options.maxAttempts ??
-    (Number.isInteger(Number(process.env.DEAD_LETTER_MAX_ATTEMPTS)) &&
-    Number(process.env.DEAD_LETTER_MAX_ATTEMPTS) >= 1
-      ? Number(process.env.DEAD_LETTER_MAX_ATTEMPTS)
-      : DEAD_LETTER_MAX_ATTEMPTS);
-
-  return createDeadLetterQueue({
-    filePath: options.filePath,
-    maxEntries,
-    maxAttempts,
-    secrets: configuredSecrets(options.secrets),
-    now: options.now,
-  });
+    ? Number(process.env.DEAD_LETTER_MAX)
+    : DEAD_LETTER_MAX_ENTRIES;
 }
 
 /** Load and return all dead-letter entries with redacted chat ids. */
 export async function listDeadLetters(options: ListDlqOptions): Promise<DlqEntryView[]> {
-  const queue = openQueue(options);
-  await queue.load();
-  return queue.snapshot().map((entry) => toEntryView(entry, options));
+  const inspected = await inspectDeadLetterFile(options.filePath, {
+    now: options.now,
+    secrets: configuredSecrets(options.secrets),
+    maxEntries: resolveMaxEntries(options.maxEntries),
+  });
+  return inspected.entries.map((entry) => toEntryView(entry, options));
 }
 
-/** Load and return a single dead-letter entry by id, or throw if not found. */
+/** Load and return a single dead-letter entry by id, or throw {@link DlqUnknownEntryError} if not found. */
 export async function showDeadLetter(options: ShowDlqOptions): Promise<DlqEntryView> {
   const targetId = options.id.trim();
   if (!targetId) {
     throw new DlqUsageError(`show requires an entry <id>\n${USAGE}`);
   }
-  const queue = openQueue(options);
-  await queue.load();
-  const match = queue.snapshot().find((entry) => entry.id === targetId);
+  const inspected = await inspectDeadLetterFile(options.filePath, {
+    now: options.now,
+    secrets: configuredSecrets(options.secrets),
+    maxEntries: resolveMaxEntries(options.maxEntries),
+  });
+  const match = inspected.entries.find((entry) => entry.id === targetId);
   if (!match) {
-    throw new Error(`dead-letter entry not found: ${boundText(targetId, 120)}`);
+    throw new DlqUnknownEntryError(targetId);
   }
   return toEntryView(match, options);
 }
@@ -318,9 +343,12 @@ export async function purgeDeadLetters(options: PurgeDlqOptions): Promise<PurgeD
   const cutoffMs = ageMs === null ? null : now() - ageMs;
   const dryRun = options.yes !== true;
 
-  const queue = openQueue(options);
-  await queue.load();
-  const before = queue.snapshot();
+  const inspected = await inspectDeadLetterFile(options.filePath, {
+    now,
+    secrets: configuredSecrets(options.secrets),
+    maxEntries: resolveMaxEntries(options.maxEntries),
+  });
+  const before = inspected.entries;
   const matched = before.filter((entry) => shouldPurgeEntry(entry, cutoffMs));
   const purgedIds = matched.map((entry) => entry.id);
   const purgedSet = new Set(purgedIds);
@@ -372,6 +400,7 @@ async function persistPurgedQueue(
     ),
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
 
   await queue.load();
@@ -552,14 +581,41 @@ export async function runDlqCli(
   const argv = options.argv ?? process.argv.slice(2);
   const out = options.stdout ?? ((line: string) => console.log(line));
   const errOut = options.stderr ?? ((line: string) => console.error(line));
+  const wantsJson = argv.includes("--json");
+
+  const emitFailure = (
+    exitCode: DlqExitCode,
+    code: string,
+    message: string,
+    preserveNewlines = false,
+  ): { exitCode: number } => {
+    const formattedMsg = preserveNewlines ? message : boundText(message, 300);
+    errOut(`[dlq] ${formattedMsg}`);
+    if (wantsJson) {
+      out(
+        JSON.stringify(
+          {
+            ok: false,
+            error: {
+              code,
+              exitCode,
+              message: boundText(message, 300),
+            },
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    return { exitCode };
+  };
 
   let parsed: ParsedCliArgs;
   try {
     parsed = parseDlqArgs(argv);
   } catch (err) {
     const message = err instanceof Error ? err.message : USAGE;
-    errOut(`[dlq] ${message}`);
-    return { exitCode: 2 };
+    return emitFailure(DLQ_EXIT_CODES.USAGE_ERROR, "USAGE_ERROR", message, true);
   }
 
   const filePath = resolvePath(
@@ -576,13 +632,13 @@ export async function runDlqCli(
       const entries = await listDeadLetters(commonOptions);
       const chatId = resolveChatIdForSource("default", parsed.chatId);
       out(formatListOutput(entries, filePath, chatId, parsed.json).trimEnd());
-      return { exitCode: 0 };
+      return { exitCode: DLQ_EXIT_CODES.OK };
     }
 
     if (parsed.subcommand === "show") {
       const entry = await showDeadLetter({ ...commonOptions, id: parsed.id! });
       out(formatShowOutput(entry, parsed.json).trimEnd());
-      return { exitCode: 0 };
+      return { exitCode: DLQ_EXIT_CODES.OK };
     }
 
     const result = await purgeDeadLetters({
@@ -591,20 +647,27 @@ export async function runDlqCli(
       yes: parsed.yes,
     });
     out(formatPurgeOutput(result, filePath, parsed.json).trimEnd());
-    return { exitCode: 0 };
+    return { exitCode: DLQ_EXIT_CODES.OK };
   } catch (err) {
     if (err instanceof DlqUsageError) {
-      errOut(`[dlq] ${err.message}`);
-      return { exitCode: 2 };
+      return emitFailure(err.exitCode, err.code, err.message, true);
+    }
+    if (err instanceof DlqUnknownEntryError) {
+      return emitFailure(err.exitCode, err.code, err.message);
+    }
+    if (err instanceof DlqMalformedFileError) {
+      return emitFailure(err.exitCode, err.code, err.message);
+    }
+    if (err instanceof DlqAccessError) {
+      return emitFailure(err.exitCode, err.code, err.message);
     }
     const message = err instanceof Error ? err.message : "dlq command failed";
-    errOut(`[dlq] ${boundText(message, 300)}`);
-    return { exitCode: 1 };
+    return emitFailure(DLQ_EXIT_CODES.ACCESS_FAILURE, "ACCESS_FAILURE", message);
   }
 }
 
 async function main(): Promise<void> {
-  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
+  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env", quiet: true });
   const { exitCode } = await runDlqCli();
   if (exitCode !== 0) {
     process.exit(exitCode);

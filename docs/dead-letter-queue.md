@@ -96,6 +96,28 @@ The queue is strictly bounded across every dimension:
 
 ---
 
+## Offline CLI & Stable Exit Codes (`src/dlq-cli.ts`)
+
+Operators and automation scripts can inspect or purge `DEAD_LETTER_FILE` offline without contacting Stellar or Telegram:
+
+```bash
+node dist/dlq-cli.js list [--file PATH] [--json]
+node dist/dlq-cli.js show <id> [--file PATH] [--json]
+node dist/dlq-cli.js purge [--older-than <dur>] [--yes] [--file PATH] [--json]
+```
+
+With `--json`, `stdout` is strictly machine-readable JSON (never mixed with `[dead-letter]` or `dotenv` log banners); human diagnostics are written to `stderr`.
+
+| Exit Code | Constant | Meaning |
+| :---: | :--- | :--- |
+| `0` | `DLQ_EXIT_CODES.OK` | Command succeeded (`ENOENT` on `list` / `purge` reports `0` entries). |
+| `1` | `DLQ_EXIT_CODES.UNKNOWN_ENTRY` | Requested entry `<id>` does not exist (`show <id>`). |
+| `2` | `DLQ_EXIT_CODES.USAGE_ERROR` | Unknown subcommand, invalid option, or malformed `--older-than` duration. |
+| `3` | `DLQ_EXIT_CODES.MALFORMED_FILE` | Corrupt JSON, unsupported `version`, non-array `entries`, or malformed entry record. |
+| `4` | `DLQ_EXIT_CODES.ACCESS_FAILURE` | Filesystem access error (e.g. `EISDIR`, `EACCES`, `EPERM`) reading `--file`. |
+
+---
+
 ## Operator Inspection with `jq`
 
 Because the file contains standard JSON, operators can safely inspect queue status and contents on host or container storage using `jq`.

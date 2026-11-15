@@ -75,6 +75,28 @@ export interface DeadLetterQueueOptions {
   secrets?: readonly string[];
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /** Suppress informational console output (used by machine-readable CLI subcommands). */
+  quiet?: boolean;
+}
+
+export class DlqMalformedFileError extends Error {
+  readonly code = "MALFORMED_FILE" as const;
+  readonly exitCode = 3 as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "DlqMalformedFileError";
+  }
+}
+
+export class DlqAccessError extends Error {
+  readonly code = "ACCESS_FAILURE" as const;
+  readonly exitCode = 4 as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "DlqAccessError";
+  }
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
@@ -106,6 +128,103 @@ export function makeEntryId(
   text: string,
 ): string {
   return `${source}:${ledger}:${eventName}:${shortHash(text)}`;
+}
+
+/**
+ * Strictly read and validate a dead-letter file for offline inspection without
+ * writing log lines to stdout. Distinguishes missing (`ENOENT` -> empty),
+ * filesystem access failure ({@link DlqAccessError}), and malformed content
+ * ({@link DlqMalformedFileError}).
+ */
+export async function inspectDeadLetterFile(
+  filePath: string,
+  options: {
+    now?: () => number;
+    secrets?: readonly string[];
+    maxEntries?: number;
+  } = {},
+): Promise<{ exists: boolean; updatedAt: string | null; entries: DeadLetterEntry[] }> {
+  const now = options.now ?? Date.now;
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") {
+      return { exists: false, updatedAt: null, entries: [] };
+    }
+    const safeMsg = truncate(safeErrorMessage(err, options.secrets ?? []), ERROR_TRUNCATE);
+    throw new DlqAccessError(`cannot read dead-letter file ${filePath}: ${safeMsg}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const safeMsg = truncate(safeErrorMessage(err, options.secrets ?? []), ERROR_TRUNCATE);
+    throw new DlqMalformedFileError(`malformed JSON in dead-letter file ${filePath}: ${safeMsg}`);
+  }
+
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    (parsed as { version?: unknown }).version !== 1 ||
+    !Array.isArray((parsed as { entries?: unknown }).entries)
+  ) {
+    throw new DlqMalformedFileError(
+      `invalid dead-letter schema in ${filePath}: expected { version: 1, entries: [...] }`,
+    );
+  }
+
+  const rawEntries = (parsed as { entries: unknown[]; updatedAt?: unknown }).entries;
+  const validated: DeadLetterEntry[] = [];
+
+  for (let i = 0; i < rawEntries.length; i += 1) {
+    const item = rawEntries[i];
+    if (
+      !item ||
+      typeof item !== "object" ||
+      Array.isArray(item) ||
+      typeof (item as { id?: unknown }).id !== "string" ||
+      (item as { id: string }).id.trim() === "" ||
+      typeof (item as { text?: unknown }).text !== "string" ||
+      typeof (item as { ledger?: unknown }).ledger !== "number" ||
+      !Number.isFinite((item as { ledger: number }).ledger)
+    ) {
+      throw new DlqMalformedFileError(
+        `malformed dead-letter entry at index ${i} in ${filePath}`,
+      );
+    }
+    const rec = item as Partial<DeadLetterEntry> & { id: string; text: string; ledger: number };
+    validated.push({
+      id: rec.id,
+      enqueuedAt:
+        typeof rec.enqueuedAt === "string" ? rec.enqueuedAt : new Date(now()).toISOString(),
+      source: typeof rec.source === "string" ? rec.source : "unknown",
+      ledger: rec.ledger,
+      eventName: typeof rec.eventName === "string" ? rec.eventName : "unknown",
+      text: truncate(rec.text, TEXT_TRUNCATE),
+      attempts: typeof rec.attempts === "number" && rec.attempts >= 0 ? rec.attempts : 0,
+      lastError: typeof rec.lastError === "string" ? truncate(rec.lastError, ERROR_TRUNCATE) : null,
+    });
+  }
+
+  const maxEntries = options.maxEntries;
+  if (typeof maxEntries === "number" && maxEntries >= 1) {
+    while (validated.length > maxEntries) {
+      validated.shift();
+    }
+  }
+
+  return {
+    exists: true,
+    updatedAt:
+      typeof (parsed as { updatedAt?: unknown }).updatedAt === "string"
+        ? ((parsed as { updatedAt: string }).updatedAt)
+        : null,
+    entries: validated,
+  };
 }
 
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
@@ -185,7 +304,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       entries = [];
     }
     syncDepth();
-    if (entries.length > 0) {
+    if (entries.length > 0 && !options.quiet) {
       console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
   }
@@ -290,9 +409,11 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         await send(entry.text, entry);
         sent += 1;
         stats.replayed += 1;
-        console.log(
-          `[dead-letter] replayed ${entry.source} ${entry.eventName} @ ledger ${entry.ledger}`,
-        );
+        if (!options.quiet) {
+          console.log(
+            `[dead-letter] replayed ${entry.source} ${entry.eventName} @ ledger ${entry.ledger}`,
+          );
+        }
       } catch (err) {
         entry.attempts += 1;
         entry.lastError = safeError(err);
