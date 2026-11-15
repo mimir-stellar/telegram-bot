@@ -21,6 +21,11 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import {
+  EVENT_FILTER_REASONS,
+  emptyEventFilterCounts,
+  type EventFilterReason,
+} from "./stellar/metrics.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -81,7 +86,10 @@ export interface HealthReport {
     chainClockSkewMs: number | null;
     notificationsSent: number;
     notificationsFailed: number;
+    notificationsAttempted: number;
     eventsSkipped: number;
+    eventsFiltered: Record<EventFilterReason, number>;
+    deliveryFailureRate: number | null;
     /** Events suppressed as already-seen across overlapping pages / resumes. */
     eventsDeduplicated: number;
     /**
@@ -307,7 +315,21 @@ export function buildHealthReport(
       chainClockSkewMs: chainClockAt === null ? null : nowMs - chainClockAt,
       notificationsSent: poller.notificationsSent,
       notificationsFailed: poller.notificationsFailed,
+      notificationsAttempted:
+        poller.notificationsAttempted ??
+        poller.notificationsSent + poller.notificationsFailed,
       eventsSkipped: poller.eventsSkipped,
+      eventsFiltered: poller.eventsFiltered ?? emptyEventFilterCounts(),
+      deliveryFailureRate:
+        poller.deliveryFailureRate !== undefined
+          ? poller.deliveryFailureRate
+          : poller.notificationsSent + poller.notificationsFailed > 0
+            ? Math.round(
+                (poller.notificationsFailed /
+                  (poller.notificationsSent + poller.notificationsFailed)) *
+                  1_000_000,
+              ) / 1_000_000
+            : null,
       eventsDeduplicated: poller.eventsDeduplicated ?? 0,
       activity: poller.activityBaseline ?? emptyActivityBaseline(),
       notificationsDropped: poller.notificationsDropped ?? 0,
@@ -395,9 +417,20 @@ export function buildMetricsReport(
     `# TYPE mimir_telegram_notifications_failed_total counter`,
     `mimir_telegram_notifications_failed_total{network="${network}"} ${poller.notificationsFailed}`,
     ``,
+    `# HELP mimir_telegram_notifications_attempted_total Total notification deliveries attempted after intentional filtering (failure-rate denominator)`,
+    `# TYPE mimir_telegram_notifications_attempted_total counter`,
+    `mimir_telegram_notifications_attempted_total{network="${network}"} ${poller.notificationsAttempted ?? poller.notificationsSent + poller.notificationsFailed}`,
+    ``,
     `# HELP mimir_telegram_events_skipped_total Total number of events skipped (unrecognized, unformatted, or rate-limited)`,
     `# TYPE mimir_telegram_events_skipped_total counter`,
     `mimir_telegram_events_skipped_total{network="${network}"} ${poller.eventsSkipped}`,
+    ``,
+    `# HELP mimir_telegram_events_filtered_total Total number of events intentionally suppressed by bounded filter reason`,
+    `# TYPE mimir_telegram_events_filtered_total counter`,
+    ...EVENT_FILTER_REASONS.map(
+      (reason) =>
+        `mimir_telegram_events_filtered_total{network="${network}",reason="${reason}"} ${(poller.eventsFiltered ?? emptyEventFilterCounts())[reason]}`,
+    ),
     ``,
     `# HELP mimir_telegram_consecutive_failures Current number of consecutive failed poll cycles`,
     `# TYPE mimir_telegram_consecutive_failures gauge`,

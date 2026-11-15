@@ -313,6 +313,8 @@ The metrics registry tracks:
 | `mimir_bot_rpc_errors_total` | counter | Failed Soroban RPC calls |
 | `mimir_bot_events_decoded_total` | counter | Events returned by the RPC and passed to the decoder |
 | `mimir_bot_events_skipped_total` | counter | Events not notified (unknown type, no formatter, or cycle cap) |
+| `mimir_bot_events_filtered_total{reason}` | counter | Events intentionally suppressed before delivery (`feature_flag`, `category_filter`, `admin_event`, `unformatted`, `other`) |
+| `mimir_bot_notifications_attempted_total` | counter | Notification deliveries attempted after intentional filtering (exact failure-rate denominator) |
 | `mimir_bot_notifications_sent_total` | counter | Telegram messages successfully sent |
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |

@@ -25,6 +25,13 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import {
+  EVENT_FILTER_REASONS,
+  emptyEventFilterCounts,
+  normalizeEventFilterReason,
+  type EventFilterReason,
+} from "./stellar/metrics.js";
+
 // ── Metric types ──────────────────────────────────────────────────────────────
 
 export interface Counter {
@@ -39,6 +46,16 @@ export interface Gauge {
   set(value: number): void;
   /** Current value. */
   value(): number;
+}
+
+/** Reason-labeled counter for intentionally filtered on-chain events. */
+export interface ReasonCounter {
+  /** Increment the counter for `reason` (normalized to a bounded reason label). */
+  inc(reason: unknown, delta?: number): void;
+  /** Total filtered events across all reasons, or for one specific `reason`. */
+  value(reason?: unknown): number;
+  /** Snapshot of counts keyed by every bounded {@link EventFilterReason}. */
+  reasons(): Record<EventFilterReason, number>;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -72,10 +89,29 @@ export interface MetricsRegistry {
   /** Total events the decoder handed back with payload.name === "unknown", plus
    *  those dropped by the MAX_NOTIFICATIONS_PER_CYCLE cap. */
   eventsSkipped: Counter;
+  /**
+   * Total events intentionally suppressed by operator/contract filter rules,
+   * partitioned by bounded `reason` (`feature_flag`, `category_filter`,
+   * `admin_event`, `unformatted`, `other`). Never included in delivery
+   * failure-rate denominators.
+   */
+  eventsFiltered: ReasonCounter;
+  /**
+   * Total notification deliveries attempted after all intentional filters
+   * (`notificationsSent + notificationsFailed`). Serves as the exact
+   * denominator for delivery failure-rate calculations.
+   */
+  notificationsAttempted: Counter;
   /** Total Telegram messages successfully sent. */
   notificationsSent: Counter;
   /** Total Telegram sends that threw (the cursor still advances). */
   notificationsFailed: Counter;
+  /**
+   * Delivery failure rate `notificationsFailed / (notificationsSent + notificationsFailed)`,
+   * or `null` when zero deliveries have been attempted. Intentionally filtered
+   * events never enter this ratio.
+   */
+  deliveryFailureRate(): number | null;
   /** Number of times a stale-cursor warning was emitted this process lifetime. */
   staleCursorEvents: Counter;
   /** Current count of consecutive full-cycle failures (gauge: resets to 0 on
@@ -167,6 +203,29 @@ export function createMetrics(): MetricsRegistry {
     `${METRICS_PREFIX}events_skipped_total`,
     "Total events not notified: unknown type, no formatter, or MAX_NOTIFICATIONS_PER_CYCLE cap.",
   );
+  const filteredCounts = emptyEventFilterCounts();
+  const eventsFiltered: ReasonCounter = {
+    inc(reason: unknown, delta = 1): void {
+      if (!Number.isFinite(delta) || delta < 0) {
+        throw new RangeError(`ReasonCounter.inc delta must be >= 0; got ${delta}`);
+      }
+      const key = normalizeEventFilterReason(reason);
+      filteredCounts[key] += delta;
+    },
+    value(reason?: unknown): number {
+      if (reason === undefined) {
+        return EVENT_FILTER_REASONS.reduce((sum, k) => sum + filteredCounts[k], 0);
+      }
+      return filteredCounts[normalizeEventFilterReason(reason)];
+    },
+    reasons(): Record<EventFilterReason, number> {
+      return { ...filteredCounts };
+    },
+  };
+  const notificationsAttempted = makeCounter(
+    `${METRICS_PREFIX}notifications_attempted_total`,
+    "Total notification deliveries attempted after intentional filtering (failure-rate denominator).",
+  );
   const notificationsSent = makeCounter(
     `${METRICS_PREFIX}notifications_sent_total`,
     "Total Telegram messages successfully sent.",
@@ -202,12 +261,22 @@ export function createMetrics(): MetricsRegistry {
     rpcErrors,
     eventsDecoded,
     eventsSkipped,
+    notificationsAttempted,
     notificationsSent,
     notificationsFailed,
     staleCursorEvents,
     activityAnomalies,
   ];
   const gauges = [consecutiveFailures, lastCycleEvents, activityBaselineEvents];
+
+  function deliveryFailureRate(): number | null {
+    const denominator = Math.max(
+      notificationsAttempted.value(),
+      notificationsSent.value() + notificationsFailed.value(),
+    );
+    if (denominator === 0) return null;
+    return Math.round((notificationsFailed.value() / denominator) * 1_000_000) / 1_000_000;
+  }
 
   function render(): string {
     const lines: string[] = [];
@@ -216,6 +285,14 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`# HELP ${c._name} ${c._help}`);
       lines.push(`# TYPE ${c._name} counter`);
       lines.push(`${c._name} ${c.value()}`);
+    }
+
+    lines.push(
+      `# HELP ${METRICS_PREFIX}events_filtered_total Total on-chain events intentionally filtered before delivery by bounded reason.`,
+      `# TYPE ${METRICS_PREFIX}events_filtered_total counter`,
+    );
+    for (const reason of EVENT_FILTER_REASONS) {
+      lines.push(`${METRICS_PREFIX}events_filtered_total{reason="${reason}"} ${filteredCounts[reason]}`);
     }
 
     for (const g of gauges) {
@@ -299,8 +376,11 @@ export function createMetrics(): MetricsRegistry {
     rpcErrors,
     eventsDecoded,
     eventsSkipped,
+    eventsFiltered,
+    notificationsAttempted,
     notificationsSent,
     notificationsFailed,
+    deliveryFailureRate,
     staleCursorEvents,
     consecutiveFailures,
     lastCycleEvents,

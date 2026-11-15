@@ -98,6 +98,20 @@ Checking deploy/prometheus/alerts.yml
   2. Verify `BOT_TOKEN` and confirm the bot still has permission to post in `TELEGRAM_CHAT_ID`.
   3. Once fixed, queued messages in `DEAD_LETTER_FILE` (`data/dead-letter.json`) will replay automatically on subsequent cycles. See [Incident Runbook — Telegram failures](./incident-runbook.md#telegram-failures).
 
+> **Filtered events vs. failure-rate denominator:** Intentionally filtered
+> events (`NOTIFY_*` feature flags, `NOTIFICATION_CATEGORIES` allowlist,
+> audit-only admin events, and unformatted event types) increment
+> `mimir_telegram_events_filtered_total{reason="..."}` (and
+> `mimir_bot_events_filtered_total{reason="..."}`), **never**
+> `mimir_telegram_notifications_attempted_total`. When computing a delivery
+> failure ratio in PromQL, divide failed deliveries by attempted deliveries so
+> filtered chain activity cannot dilute or inflate the denominator:
+>
+> ```promql
+> increase(mimir_telegram_notifications_failed_total[15m])
+>   / clamp_min(increase(mimir_telegram_notifications_attempted_total[15m]), 1)
+> ```
+
 ### 3.4 `MimirTelegramBotStaleCursor` (Stale Cursor / Ledger Lag)
 
 * **Expression:**

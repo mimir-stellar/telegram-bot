@@ -85,6 +85,7 @@ import {
 } from "./instanceLock.js";
 import {
   clip,
+  eventAllowedByCategory,
   explorerKeyboard,
   formatEvent,
   formatPlainTextEvent,
@@ -102,6 +103,10 @@ import {
   resumeCursorProblem,
   type WatchTarget,
 } from "./stellar/events.js";
+import {
+  DeliveryOutcomeTracker,
+  type EventFilterReason,
+} from "./stellar/metrics.js";
 import {
   isAdminPayload,
   normalizeContractVersion,
@@ -292,8 +297,14 @@ export interface PollerStatus {
   oldestLedger: number | null;
   notificationsSent: number;
   notificationsFailed: number;
+  /** Total notification deliveries attempted after filtering (`sent + failed`). */
+  notificationsAttempted?: number;
   /** Never attempted (unknown, malformed or over the per-cycle cap). */
   eventsSkipped: number;
+  /** Intentionally suppressed events partitioned by bounded filter reason. */
+  eventsFiltered?: Record<EventFilterReason, number>;
+  /** Delivery failure rate `failed / attempted`, or `null` when zero attempted. */
+  deliveryFailureRate?: number | null;
   /** Counter values accumulated since this process started. */
   sinceStart?: PollerCounters;
   /** Cumulative counter values persisted across restarts for the current contract IDs. */
@@ -1348,6 +1359,7 @@ export function createPoller(deps: PollerDeps) {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? defaultSleep;
   const activityBaseline = new ActivityBaseline(deps.activityBaselineOptions);
+  const deliveryOutcomes = new DeliveryOutcomeTracker();
   const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
   const targetMaxBackoff = deps.targetBackoffOptions?.maxBackoffMs ?? DEFAULT_TARGET_MAX_BACKOFF_MS;
   const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
@@ -1495,7 +1507,10 @@ export function createPoller(deps: PollerDeps) {
     oldestLedger: null,
     notificationsSent: 0,
     notificationsFailed: 0,
+    notificationsAttempted: 0,
     eventsSkipped: 0,
+    eventsFiltered: deliveryOutcomes.filteredReasons(),
+    deliveryFailureRate: null,
     sinceStart: { ...sinceStartCounters },
     cumulative: {
       cycles: 0,
@@ -1907,6 +1922,19 @@ export function createPoller(deps: PollerDeps) {
     });
   }
 
+  function syncOutcomeSnapshots(): void {
+    const snap = deliveryOutcomes.snapshot();
+    status.eventsFiltered = snap.filteredByReason;
+    status.notificationsAttempted = snap.deliveryAttempts;
+    status.deliveryFailureRate = snap.failureRate;
+  }
+
+  function recordFilteredEvent(reason: EventFilterReason): void {
+    deliveryOutcomes.recordFiltered(reason);
+    metrics?.eventsFiltered.inc(reason);
+    syncOutcomeSnapshots();
+  }
+
   function recordCycleIncrement(): void {
     status.cycles += 1;
     sinceStartCounters.cycles += 1;
@@ -2010,6 +2038,7 @@ export function createPoller(deps: PollerDeps) {
       if (isAdminPayload(event.payload)) {
         recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
+        recordFilteredEvent("admin_event");
         skipped += 1;
         const adminAudit = toAdminAuditRecord(event, config);
         const adminPart = adminAudit?.admin ? ` admin=${boundedLabel(adminAudit.admin, 56)}` : "";
@@ -2046,10 +2075,25 @@ export function createPoller(deps: PollerDeps) {
       if (!isNotificationAllowed(config.featureFlags, event.source, event.payload.name)) {
         recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
+        recordFilteredEvent("feature_flag");
         skipped += 1;
         console.log(
           `[poller] feature-flag skipped ${event.source} event "${boundedLabel(event.payload.name, 80)}" ` +
             `at ledger ${event.ledger} (NOTIFY_* flags)`,
+        );
+        continue;
+      }
+
+      if (!eventAllowedByCategory(config, event)) {
+        recordSkippedIncrement();
+        metrics?.eventsSkipped.inc();
+        recordFilteredEvent("category_filter");
+        skipped += 1;
+        audit.record(
+          auditEntry("event_skipped", {
+            source: event.source,
+            detail: `${event.payload.name} at ledger ${event.ledger}: category filtered`,
+          }),
         );
         continue;
       }
@@ -2105,6 +2149,7 @@ export function createPoller(deps: PollerDeps) {
       if (text === null) {
         recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
+        recordFilteredEvent("unformatted");
         skipped += 1;
         audit.record(
           auditEntry("event_skipped", {
@@ -2202,6 +2247,9 @@ export function createPoller(deps: PollerDeps) {
           sleep,
         );
         recordSentIncrement();
+        deliveryOutcomes.recordDeliverySuccess();
+        syncOutcomeSnapshots();
+        metrics?.notificationsAttempted.inc();
         metrics?.notificationsSent.inc();
         sentThisCycle += 1;
         if (sendJournal) {
@@ -2218,6 +2266,9 @@ export function createPoller(deps: PollerDeps) {
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
         recordFailedIncrement();
+        deliveryOutcomes.recordDeliveryFailure();
+        syncOutcomeSnapshots();
+        metrics?.notificationsAttempted.inc();
         metrics?.notificationsFailed.inc();
         failed += 1;
         audit.recordError(err, "send_failed", {
