@@ -126,6 +126,7 @@ Every log record is redacted before it leaves the process:
 2. **Telegram Token Pattern**: Any substring matching Telegram bot token shape (`\b\d{5,}:[A-Za-z0-9_-]{20,}/g`) is automatically replaced with `[REDACTED]`, even if not explicitly registered in secrets configuration.
 3. **URL Redaction**: Internal helpers (`redactUrl`) mask HTTP basic auth or query credentials in URLs before logging.
 4. **All Fields Protected**: Redaction applies recursively to both the log `msg` and all string values in custom `fields`.
+5. **Terminal Escape Neutralization (`LOG_FORMAT=text` & `redactText`)**: `neutralizeTerminalEscapes` (`src/redact.ts`, re-exported from `src/logger.ts`) strips OSC (`ESC ]` / `0x9d` clipboard, title, and hyperlink injections), DCS/SOS/PM/APC command strings, ANSI CSI (`ESC [` / `0x9b` SGR colors, cursor moves, and screen/line erases), bare `ESC` sequences, standalone carriage returns (`\r`), and C0/C1 control characters before redaction while preserving ordinary Unicode text, tabs (`\t`), and newlines (`\n`).
 
 ---
 

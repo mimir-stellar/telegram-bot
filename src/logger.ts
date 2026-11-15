@@ -30,6 +30,9 @@
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import { neutralizeTerminalEscapes } from "./redact.js";
+
+export { neutralizeTerminalEscapes };
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -68,7 +71,7 @@ export interface LogCapture {
  * than it needs to be).
  */
 export function redactLine(text: string, secrets: string[]): string {
-  let out = text;
+  let out = neutralizeTerminalEscapes(text);
   for (const secret of secrets) {
     if (secret) out = out.split(secret).join(REDACTED);
   }
@@ -96,7 +99,12 @@ export function createLogCapture(capacity: number): LogCapture {
   return {
     add(level, text) {
       if (cap === 0) return;
-      const line: LogLine = { seq: nextSeq++, at: Date.now(), level, text };
+      const line: LogLine = {
+        seq: nextSeq++,
+        at: Date.now(),
+        level,
+        text: neutralizeTerminalEscapes(text),
+      };
       if (ring.length >= cap) ring.shift();
       ring.push(line);
     },
@@ -311,11 +319,11 @@ function sanitize(value: unknown, depth: number): unknown {
 
 function emit(level: LogLevel, component: string, message: string, fields?: LogFields): void {
   if (LEVEL_RANK[level] < LEVEL_RANK[state.level]) return;
-  const msg = redactLogText(message);
   if (state.format === "text") {
-    state.sink(level, msg);
+    state.sink(level, redactLogText(neutralizeTerminalEscapes(message)));
     return;
   }
+  const msg = redactLogText(message);
   let line: string;
   try {
     const safe: Record<string, unknown> = {};
@@ -326,7 +334,7 @@ function emit(level: LogLevel, component: string, message: string, fields?: LogF
     line = JSON.stringify({ ...safe, ts: state.now().toISOString(), level, component, msg });
   } catch {
     // Never let a hostile field take the log call (or the caller) down.
-    line = msg;
+    line = redactLogText(neutralizeTerminalEscapes(message));
   }
   state.sink(level, line);
 }

@@ -149,6 +149,32 @@ function clamp(input: string, maxLen: number = DEFAULT_MAX_LEN): string {
   return `${input.slice(0, Math.max(0, maxLen - 1))}…`;
 }
 
+const OSC_SEQUENCE = /(?:\u001B\]|\u009D)[^\u0007\u001B\u009C\r\n]*(?:\u0007|\u001B\\|\u009C)?/g;
+const STRING_CONTROL_SEQUENCE =
+  /(?:\u001B[PX^_]|[\u0090\u0098\u009E\u009F])[^\u0007\u001B\u009C\r\n]*(?:\u0007|\u001B\\|\u009C)?/g;
+const CSI_SEQUENCE = /(?:\u001B\[|\u009B)[\u0030-\u003F]*[\u0020-\u002F]*[\u0040-\u007E]?/g;
+const ESC_SEQUENCE = /\u001B[\u0020-\u002F]*[\u0030-\u007E]?/g;
+const ESC_OR_C1_INTRODUCER = /[\u001B\u0090\u0098\u009B\u009D-\u009F]/;
+const TERMINAL_CONTROLS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+
+/**
+ * Strip OSC, DCS/SOS/PM/APC, ANSI CSI, ESC sequences, standalone carriage
+ * returns, and C0/C1 control characters from untrusted log text while
+ * preserving ordinary Unicode content, tabs (`\t`), and newlines (`\n`).
+ */
+export function neutralizeTerminalEscapes(input: string): string {
+  if (!input) return "";
+  let out = input.replace(/\r\n/g, "\n");
+  for (let pass = 0; pass < 4 && ESC_OR_C1_INTRODUCER.test(out); pass += 1) {
+    out = out
+      .replace(OSC_SEQUENCE, "")
+      .replace(STRING_CONTROL_SEQUENCE, "")
+      .replace(CSI_SEQUENCE, "")
+      .replace(ESC_SEQUENCE, "");
+  }
+  return out.replace(TERMINAL_CONTROLS, "");
+}
+
 export interface RedactOptions {
   /** Extra secrets known only to this call site (config values, fixture ids). */
   secrets?: readonly string[];
@@ -159,13 +185,17 @@ export interface RedactOptions {
 /**
  * Replace registered/known secrets and credential-shaped substrings.
  *
- * Registered and caller-supplied secrets go first, because a secret can be any
+ * Terminal escape and control sequences are neutralized first so untrusted
+ * error text cannot spoof terminal output or wrap a credential in ANSI SGR
+ * bytes to evade token word-boundary matching.
+ *
+ * Registered and caller-supplied secrets go next, because a secret can be any
  * shape at all; the patterns then catch the cases where no value was ever
  * registered (a hand-pasted token in a test, a seed key in an upstream error).
  */
 export function redactText(input: string, options: RedactOptions = {}): string {
   if (!input) return "";
-  let out = input;
+  let out = neutralizeTerminalEscapes(input);
 
   const known = [...registeredSecrets(), ...(options.secrets ?? [])]
     .filter((secret) => typeof secret === "string" && secret.length > 0)
