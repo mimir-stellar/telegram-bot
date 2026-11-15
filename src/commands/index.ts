@@ -23,6 +23,7 @@ import "./audit.js";
 import "./contracts.js";
 import "./health.js";
 import "./preview.js";
+import "./categories.js";
 import "./pause.js";
 import "./resume.js";
 import "./log-export.js"; // hidden: operator log export
@@ -62,6 +63,19 @@ export { contractsCommand, contractsMessage } from "./contracts.js";
 export { healthCommand, healthMessage } from "./health.js";
 export { pauseCommand, pauseMessage, PAUSE_PROMPT } from "./pause.js";
 export { previewCommand } from "./preview.js";
+export {
+  CategoryCounter,
+  categoriesCommand,
+  categoriesMessage,
+  createCategoryCounter,
+  deriveCategoryCounts,
+  sanitizeCategory,
+  type CategoriesConfig,
+  type CategoriesMessageOptions,
+  type CategoryCounterInput,
+  type CategoryCounterOptions,
+  type CategoryEntry,
+} from "./categories.js";
 export { resumeCommand, resumeMessage } from "./resume.js";
 export { lastEventMessage, statusCommand, statusMessage } from "./status.js";
 export { logExportCommand } from "./log-export.js";

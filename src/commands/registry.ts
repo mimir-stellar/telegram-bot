@@ -22,6 +22,7 @@ import type { BotConfig } from "../config.js";
 import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
+import type { DecodedEvent } from "../stellar/decode.js";
 import type { BroadcastStore } from "./broadcast.js";
 
 /** Everything a command handler may need, supplied once by `createBot`. */
@@ -45,6 +46,8 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /** Bounded retained on-chain events observed by the poller, for derived summaries. */
+  observedEvents?: (() => Iterable<DecodedEvent>) | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */

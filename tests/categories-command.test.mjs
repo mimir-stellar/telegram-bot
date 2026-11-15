@@ -3,14 +3,20 @@ import test from "node:test";
 
 import {
   CategoryCounter,
+  categoriesCommand,
   categoriesMessage,
   createCategoryCounter,
+  deriveCategoryCounts,
   sanitizeCategory,
   DEFAULT_MAX_CATEGORIES,
   DEFAULT_MAX_LIST_LENGTH,
+  MAX_CATEGORIES_MESSAGE_CHARS,
   MAX_CATEGORY_NAME_LENGTH,
 } from "../dist/commands/categories.js";
+import { createBot, helpDetailMessage } from "../dist/bot.js";
+import { commandModule } from "../dist/commands/index.js";
 import { escapeMd } from "../dist/notifications/format.js";
+import { assertValidMarkdownV2 } from "./markdown-lint.test.mjs";
 
 // ── Empty counter ─────────────────────────────────────────────────────────────
 
@@ -348,4 +354,289 @@ test("categoriesMessage: pure across multiple calls with same inputs", () => {
   const second = categoriesMessage(counter, config);
 
   assert.equal(first, second);
+});
+
+// ── Registered /categories command & dynamic observed-event derivation ───────
+
+const BOT_INFO = {
+  id: 909000,
+  is_bot: true,
+  first_name: "MimirBot",
+  username: "mimir_test_bot",
+  can_join_groups: true,
+  can_read_all_group_messages: false,
+  supports_inline_queries: false,
+  can_connect_to_business: false,
+  has_main_web_app: false,
+};
+
+function makeBotHarness({ configOverrides = {}, observed = undefined, targets = [] } = {}) {
+  const botCredential = ["123456789:", "A".repeat(35)].join("");
+  const config = {
+    locale: "en",
+    version: "0.1.0",
+    marketContractId: "C" + "A".repeat(55),
+    squadContractId: "C" + "B".repeat(55),
+    marketContractVersion: "v1",
+    squadContractVersion: "v2",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
+    botToken: botCredential,
+    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
+    allowedChatIds: [],
+    operatorTelegramUserId: "42",
+    pollIntervalMs: 30_000,
+    startLookbackLedgers: 60,
+    cursorFile: "/tmp/unused-cursor.json",
+    lockFile: "/tmp/unused-poller.lock",
+    statusFile: "/tmp/unused-status.json",
+    maxNotificationsPerCycle: 20,
+    interSendDelayMs: 1_500,
+    metricsPort: null,
+    notificationCategories: [],
+    silentEvents: [],
+    csvOutputFile: "/tmp/unused-scanner.csv",
+    featureFlags: { enabled: true, market: true, squad: true },
+    auditFile: "/tmp/unused-audit.jsonl",
+    dedupWindow: 256,
+    deadLetterFile: "/tmp/unused-dead-letter.json",
+    deadLetterMax: 100,
+    deadLetterMaxAttempts: 10,
+    sendJournalFile: "/tmp/unused-send-journal.jsonl",
+    healthHost: "127.0.0.1",
+    healthPort: 0,
+    healthStaleMs: 90_000,
+    startupHealthDeadlineMs: 0,
+    startupHealthRetryMs: 0,
+    shutdownTimeoutMs: 1_000,
+    telegramSendTimeoutMs: 5_000,
+    channelPreviewMode: false,
+    linkPreviewMarket: false,
+    linkPreviewSquad: false,
+    logSampleMaxPerWindow: 3,
+    logSampleWindowMs: 300_000,
+    logBufferLines: 0,
+    telegramWebhookUrl: null,
+    telegramApiRoot: null,
+    mimirAppUrl: null,
+    healthAuthToken: null,
+    ...configOverrides,
+  };
+
+  const sent = [];
+  const bot = createBot({
+    config,
+    botInfo: BOT_INFO,
+    ...(observed !== undefined ? { observedEvents: observed } : {}),
+    status: () => ({
+      running: true,
+      paused: false,
+      startedAt: 1,
+      cycles: 1,
+      lastPollAt: 1,
+      lastSuccessAt: 1,
+      latestLedger: 100,
+      oldestLedger: 50,
+      notificationsSent: 0,
+      notificationsFailed: 0,
+      eventsSkipped: 0,
+      consecutiveFailures: 0,
+      lastError: null,
+      targets,
+    }),
+    pause: () => "paused",
+    resume: () => "resumed",
+  });
+
+  bot.api.config.use((prev, method, payload) => {
+    if (method === "sendMessage") {
+      sent.push(payload);
+      return Promise.resolve({
+        ok: true,
+        result: {
+          message_id: sent.length,
+          date: 1_700_000_000,
+          chat: { id: payload.chat_id, type: "supergroup" },
+          text: payload.text,
+        },
+      });
+    }
+    return Promise.resolve({ ok: true, result: true });
+  });
+
+  return { bot, config, sent };
+}
+
+function slashUpdate(text, { updateId = 1, chatId = -1001234567890, userId = 100 } = {}) {
+  const cmdLen = text.indexOf(" ") === -1 ? text.length : text.indexOf(" ");
+  return {
+    update_id: updateId,
+    message: {
+      message_id: updateId,
+      date: 1_700_000_000,
+      chat: { id: chatId, type: "supergroup", title: "Mimir Group" },
+      from: { id: userId, is_bot: false, first_name: "Member" },
+      text,
+      entities: [{ offset: 0, length: cmdLen, type: "bot_command" }],
+    },
+  };
+}
+
+test("/categories is registered in the command catalogue with allowlist gating and help detail", () => {
+  const registered = commandModule("categories");
+  assert.equal(registered, categoriesCommand);
+  assert.equal(registered?.chatAllowlist, true);
+  assert.notEqual(registered?.operatorOnly, true);
+
+  const detail = helpDetailMessage("categories");
+  assert.match(detail, /\*Command:\* \/categories/);
+  assertValidMarkdownV2(detail, "helpDetailMessage(categories)");
+});
+
+test("/categories derives categories dynamically from observed events rather than a separate mutable list", async () => {
+  let retainedEvents = [
+    {
+      source: "market",
+      contractId: "C" + "A".repeat(55),
+      ledger: 101,
+      txHash: "a".repeat(64),
+      at: 1_700_000_001,
+      eventId: "101-0",
+      payload: { name: "claim_created", claimId: 1, creator: "GAAA", category: "crypto" },
+    },
+    {
+      source: "market",
+      contractId: "C" + "A".repeat(55),
+      ledger: 102,
+      txHash: "b".repeat(64),
+      at: 1_700_000_002,
+      eventId: "102-0",
+      payload: { name: "claim_created", claimId: 2, creator: "GAAA", category: "crypto" },
+    },
+    {
+      source: "squad",
+      contractId: "C" + "B".repeat(55),
+      ledger: 103,
+      txHash: "c".repeat(64),
+      at: 1_700_000_003,
+      eventId: "103-0",
+      payload: {
+        name: "market_created",
+        marketId: 9,
+        captain: "GBBB",
+        deadline: 1_700_099_000,
+        feeBps: 100,
+        question: "Will X happen?",
+        category: "sports",
+      },
+    },
+    {
+      source: "market",
+      contractId: "C" + "A".repeat(55),
+      ledger: 104,
+      txHash: "d".repeat(64),
+      at: 1_700_000_004,
+      eventId: "104-0",
+      payload: { name: "claim_challenged", claimId: 1, stake: 100n, challenger: "GCCC" },
+    },
+  ];
+
+  const { bot, sent } = makeBotHarness({
+    configOverrides: {
+      allowedChatIds: ["-1001234567890"],
+      notificationCategories: ["crypto"],
+    },
+    observed: () => retainedEvents,
+  });
+
+  await bot.handleUpdate(slashUpdate("/categories", { updateId: 1, chatId: -1001234567890 }));
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].parse_mode, "MarkdownV2");
+  assertValidMarkdownV2(sent[0].text, "/categories initial");
+  assert.ok(sent[0].text.includes("• `crypto`: 2"));
+  assert.ok(sent[0].text.includes("• `sports`: 1 \\(filtered\\)"));
+
+  // When retained observed events roll over, /categories reflects the current observed window directly
+  retainedEvents = [
+    {
+      source: "market",
+      contractId: "C" + "A".repeat(55),
+      ledger: 200,
+      txHash: "e".repeat(64),
+      at: 1_700_000_100,
+      eventId: "200-0",
+      payload: { name: "claim_created", claimId: 10, creator: "GDDD", category: "macro" },
+    },
+  ];
+
+  await bot.handleUpdate(slashUpdate("/categories", { updateId: 2, chatId: -1001234567890 }));
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].text.includes("crypto"), false, "no stale mutable list retained");
+  assert.ok(sent[1].text.includes("• `macro`: 1 \\(filtered\\)"));
+  assertValidMarkdownV2(sent[1].text, "/categories updated window");
+});
+
+test("/categories enforces ALLOWED_CHAT_IDS, falls back to status target lastEvent, and bounds worst-case output", async () => {
+  // 1. Fallback to status().targets[].lastEvent + allowlist enforcement
+  const { bot: fallbackBot, sent: fallbackSent } = makeBotHarness({
+    configOverrides: { allowedChatIds: ["-1001234567890"] },
+    targets: [
+      {
+        source: "market",
+        contractId: "C" + "A".repeat(55),
+        lastEvent: {
+          source: "market",
+          contractId: "C" + "A".repeat(55),
+          ledger: 55,
+          txHash: "f".repeat(64),
+          at: 1_700_000_000,
+          eventId: "55-0",
+          payload: { name: "claim_created", claimId: 3, creator: "GEEE", category: "science" },
+        },
+      },
+    ],
+  });
+
+  const origWarn = console.warn;
+  console.warn = () => undefined;
+  try {
+    await fallbackBot.handleUpdate(
+      slashUpdate("/categories", { updateId: 1, chatId: -1009999999999 }),
+    );
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.equal(fallbackSent.length, 0, "unapproved chat must be ignored silently");
+
+  await fallbackBot.handleUpdate(
+    slashUpdate("/categories", { updateId: 2, chatId: -1001234567890 }),
+  );
+  assert.equal(fallbackSent.length, 1);
+  assert.ok(fallbackSent[0].text.includes("• `science`: 1"));
+
+  // 2. Worst-case 30 categories of 100 MarkdownV2 reserved characters stay strictly < 4096 chars
+  const adversarialEvents = Array.from({ length: 30 }, (_, idx) => ({
+    source: "market",
+    contractId: "C" + "A".repeat(55),
+    ledger: 300 + idx,
+    txHash: "1".repeat(64),
+    at: 1_700_000_300 + idx,
+    eventId: `${300 + idx}-0`,
+    payload: {
+      name: "claim_created",
+      claimId: idx + 1,
+      creator: "GFFF",
+      category: `${idx}_${"*.-!()[]{}".repeat(10)}`,
+    },
+  }));
+
+  const derived = deriveCategoryCounts(adversarialEvents);
+  const boundedText = categoriesMessage(derived, { notificationCategories: ["none"] });
+  assert.ok(boundedText.length <= MAX_CATEGORIES_MESSAGE_CHARS);
+  assert.ok(boundedText.length < 4096, "must fit within one Telegram message");
+  assert.match(boundedText, /_…and \d+ more_/);
+  assertValidMarkdownV2(boundedText, "worst-case bounded /categories output");
 });

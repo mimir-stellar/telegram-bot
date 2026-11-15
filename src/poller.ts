@@ -250,6 +250,9 @@ export interface CycleSummaryFields {
 /** Current on-disk counters schema version. */
 export const COUNTERS_SCHEMA_VERSION = 1 as const;
 
+/** Maximum observed DecodedEvents retained in memory for derived command summaries. */
+export const MAX_OBSERVED_EVENTS = 512 as const;
+
 export interface CountersFile {
   version: typeof COUNTERS_SCHEMA_VERSION;
   updatedAt: string;
@@ -1935,6 +1938,16 @@ export function createPoller(deps: PollerDeps) {
     syncCounterSnapshots();
   }
 
+  const observedEvents: DecodedEvent[] = [];
+  function recordObservedEvents(events: readonly DecodedEvent[]): void {
+    for (const event of events) {
+      observedEvents.push(event);
+    }
+    if (observedEvents.length > MAX_OBSERVED_EVENTS) {
+      observedEvents.splice(0, observedEvents.length - MAX_OBSERVED_EVENTS);
+    }
+  }
+
   /**
    * Track whether a target's cursor is making progress.
    *
@@ -2677,6 +2690,7 @@ export function createPoller(deps: PollerDeps) {
           // never be recorded.
           for (const id of scan.seenEventIds) dedupWindow.add(id);
           if (scan.events.length > 0) {
+            recordObservedEvents(scan.events);
             markDirty();
             delivery = await notify(scan.events, correlationId);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
@@ -3171,6 +3185,11 @@ export function createPoller(deps: PollerDeps) {
         suppressedLogs: errorSampler.suppressedTotal(),
         targets: [...state.values()].map((t) => ({ ...t })),
       };
+    },
+
+    /** Bounded snapshot of observed on-chain events for derived summaries. */
+    observedEvents(): readonly DecodedEvent[] {
+      return [...observedEvents];
     },
 
     /**

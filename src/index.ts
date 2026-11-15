@@ -267,6 +267,7 @@ async function main(): Promise<void> {
   const bot = createBot({
     config,
     status: () => poller.status(),
+    observedEvents: () => poller.observedEvents(),
     audit,
     pause: () => poller.pause(),
     resume: () => poller.resume(),

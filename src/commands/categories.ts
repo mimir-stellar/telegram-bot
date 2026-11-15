@@ -1,18 +1,20 @@
 /**
- * Claim categories message builder and bounded category counter.
+ * Claim categories message builder, bounded category counter, and `/categories` command.
  *
- * Tracks category values seen in delivered `claim_created` events and formats
- * them for Telegram in MarkdownV2:
+ * Derives category summaries from observed on-chain events (`claim_created`
+ * and `market_created`) and formats them for Telegram in MarkdownV2:
  * - Bounded memory: maximum distinct categories tracked with eviction.
  * - Sanitised and escaped category strings.
  * - Sorted by count (descending) then name (ascending).
- * - Capped list length.
+ * - Capped list length and single-Telegram-message byte/char ceiling.
  * - Marks categories filtered out by configuration.
  */
 
 import { escapeMd } from "../notifications/format.js";
 import type { BotConfig } from "../config.js";
 import type { DecodedEvent } from "../stellar/decode.js";
+import { defineCommand } from "./registry.js";
+import { TELEGRAM_OPTIONS } from "./runtime.js";
 
 /** Default ceiling on tracked distinct categories in memory. */
 export const DEFAULT_MAX_CATEGORIES = 256;
@@ -22,6 +24,9 @@ export const DEFAULT_MAX_LIST_LENGTH = 20;
 
 /** Maximum character length permitted for a category name. */
 export const MAX_CATEGORY_NAME_LENGTH = 100;
+
+/** Upper bound on rendered message characters so `/categories` stays in one Telegram message. */
+export const MAX_CATEGORIES_MESSAGE_CHARS = 3_900;
 
 /** Minimal configuration shape required to check category filters. */
 export type CategoriesConfig = Partial<Pick<BotConfig, "notificationCategories">>;
@@ -106,7 +111,11 @@ export class CategoryCounter {
     let rawCategory: unknown = categoryOrEvent;
 
     // Extract category if a DecodedEvent object was passed
-    if (typeof categoryOrEvent === "object" && categoryOrEvent !== null && "payload" in categoryOrEvent) {
+    if (
+      typeof categoryOrEvent === "object" &&
+      categoryOrEvent !== null &&
+      "payload" in categoryOrEvent
+    ) {
       const event = categoryOrEvent as DecodedEvent;
       if (event.payload.name === "claim_created") {
         rawCategory = event.payload.category;
@@ -240,6 +249,32 @@ export function createCategoryCounter(
   return new CategoryCounter(options);
 }
 
+/**
+ * Derives bounded category counts directly from observed on-chain events
+ * (`claim_created` and `market_created` carrying a category) instead of
+ * maintaining a separate mutable category list.
+ */
+export function deriveCategoryCounts(
+  events: Iterable<DecodedEvent>,
+  options?: CategoryCounterOptions,
+): CategoryCounter {
+  const counter = new CategoryCounter(options);
+  for (const event of events) {
+    if (!event || typeof event !== "object" || !("payload" in event) || !event.payload) {
+      continue;
+    }
+    if (event.payload.name === "claim_created") {
+      counter.record(event.payload.category);
+    } else if (
+      event.payload.name === "market_created" &&
+      typeof event.payload.category === "string"
+    ) {
+      counter.record(event.payload.category);
+    }
+  }
+  return counter;
+}
+
 /** Shape of inputs accepted by categoriesMessage. */
 export type CategoryCounterInput =
   | CategoryCounter
@@ -284,44 +319,14 @@ function extractEntries(counter: CategoryCounterInput): CategoryEntry[] {
   return entries;
 }
 
-/**
- * Builds a Telegram MarkdownV2 message listing seen claim categories.
- *
- * Requirements:
- * - Sorts by count then name.
- * - Caps the list length (default: 20).
- * - Marks categories currently filtered out by configuration.
- * - Sanitises and escapes all dynamic values with escapeMd.
- *
- * @param counter Bounded CategoryCounter, Map, Record, or iterable of entries
- * @param config Optional bot config with notificationCategories filter
- * @param options Display options such as maxListLength
- */
-export function categoriesMessage(
-  counter: CategoryCounterInput,
-  config?: CategoriesConfig,
-  options?: CategoriesMessageOptions,
+function renderCategoryLines(
+  entries: readonly CategoryEntry[],
+  displayCount: number,
+  filterActive: boolean,
+  allowedSet: ReadonlySet<string>,
 ): string {
-  const effectiveConfig =
-    config ?? (counter instanceof CategoryCounter ? counter.config : undefined);
-  const maxListLength = options?.maxListLength ?? DEFAULT_MAX_LIST_LENGTH;
-
-  const entries = extractEntries(counter);
   const lines: string[] = ["*Claim Categories*", ""];
-
-  if (entries.length === 0) {
-    lines.push("No claim categories recorded yet\\.");
-    return lines.join("\n");
-  }
-
-  // Determine active category allowlist if configured
-  const allowedCategories = effectiveConfig?.notificationCategories ?? [];
-  const filterActive = allowedCategories.length > 0;
-  const allowedSet = new Set(
-    allowedCategories.map((c) => c.trim().toLowerCase()),
-  );
-
-  const displayed = entries.slice(0, maxListLength);
+  const displayed = entries.slice(0, displayCount);
   const remaining = entries.length - displayed.length;
 
   for (const entry of displayed) {
@@ -338,3 +343,62 @@ export function categoriesMessage(
 
   return lines.join("\n");
 }
+
+/**
+ * Builds a Telegram MarkdownV2 message listing seen claim categories.
+ *
+ * Requirements:
+ * - Sorts by count then name.
+ * - Caps the list length (default: 20) and guarantees bounded `< 4096`-char output.
+ * - Marks categories currently filtered out by configuration.
+ * - Sanitises and escapes all dynamic values with escapeMd.
+ *
+ * @param counter Bounded CategoryCounter, Map, Record, or iterable of entries
+ * @param config Optional bot config with notificationCategories filter
+ * @param options Display options such as maxListLength
+ */
+export function categoriesMessage(
+  counter: CategoryCounterInput,
+  config?: CategoriesConfig,
+  options?: CategoriesMessageOptions,
+): string {
+  const effectiveConfig =
+    config ?? (counter instanceof CategoryCounter ? counter.config : undefined);
+  const maxListLength = Math.max(0, options?.maxListLength ?? DEFAULT_MAX_LIST_LENGTH);
+
+  const entries = extractEntries(counter);
+  if (entries.length === 0) {
+    return ["*Claim Categories*", "", "No claim categories recorded yet\\."].join("\n");
+  }
+
+  // Determine active category allowlist if configured
+  const allowedCategories = effectiveConfig?.notificationCategories ?? [];
+  const filterActive = allowedCategories.length > 0;
+  const allowedSet = new Set(
+    allowedCategories.map((c) => c.trim().toLowerCase()),
+  );
+
+  let displayCount = Math.min(entries.length, maxListLength);
+  let rendered = renderCategoryLines(entries, displayCount, filterActive, allowedSet);
+  while (rendered.length > MAX_CATEGORIES_MESSAGE_CHARS && displayCount > 1) {
+    displayCount -= 1;
+    rendered = renderCategoryLines(entries, displayCount, filterActive, allowedSet);
+  }
+
+  return rendered;
+}
+
+export const categoriesCommand = defineCommand({
+  command: "categories",
+  chatAllowlist: true,
+  handler: async (ctx, deps) => {
+    const events: Iterable<DecodedEvent> = deps.observedEvents
+      ? deps.observedEvents()
+      : (deps.status().targets ?? [])
+          .map((target) => target.lastEvent)
+          .filter((event): event is DecodedEvent => event !== null && event !== undefined);
+
+    const derived = deriveCategoryCounts(events, { config: deps.config });
+    await ctx.reply(categoriesMessage(derived, deps.config), TELEGRAM_OPTIONS);
+  },
+});
