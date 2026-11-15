@@ -15,6 +15,65 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  classifyRpcFailure,
+  formatClassifiedRpcFailure,
+  isRetryableRpcFailure,
+  type RpcFailureCategory,
+  type RpcFailureClassification,
+  type RpcFailureReasonCode,
+} from "./rpc-guard.js";
+
+export {
+  classifyRpcFailure,
+  formatClassifiedRpcFailure,
+  isRetryableRpcFailure,
+  type RpcFailureCategory,
+  type RpcFailureClassification,
+  type RpcFailureReasonCode,
+};
+
+/**
+ * Redacted RPC transport/protocol error annotated with its separated failure
+ * category (`"dns"`, `"tls"`, `"http"`, `"timeout"`, or `"transport"`), stable
+ * reason code, and preserved retryability flag.
+ */
+export class RpcClassifiedError extends Error {
+  readonly category: RpcFailureCategory;
+  readonly reasonCode: RpcFailureReasonCode;
+  readonly retryable: boolean;
+  readonly httpStatus: number | null;
+
+  constructor(classification: RpcFailureClassification, options?: ErrorOptions) {
+    super(classification.summary, options);
+    this.name = "RpcClassifiedError";
+    this.category = classification.category;
+    this.reasonCode = classification.reasonCode;
+    this.retryable = classification.retryable;
+    this.httpStatus = classification.httpStatus;
+  }
+
+  static from(err: unknown): RpcClassifiedError {
+    if (err instanceof RpcClassifiedError) return err;
+    return new RpcClassifiedError(
+      classifyRpcFailure(err),
+      err instanceof Error ? { cause: err } : undefined,
+    );
+  }
+}
+
+/**
+ * Execute an async Soroban RPC call and normalize any thrown failure into a
+ * redacted {@link RpcClassifiedError} while preserving `cause` for in-process
+ * callers.
+ */
+export async function withClassifiedRpcFailure<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    throw RpcClassifiedError.from(err);
+  }
+}
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
