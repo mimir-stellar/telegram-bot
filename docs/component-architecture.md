@@ -119,6 +119,12 @@ The decoder converts raw Soroban events into typed TypeScript objects. It handle
 - **Squad**: `market_created`, `deposited`, `withdrawn`, `resolved`, `claimed`, `fees_claimed`
 - **Admin**: Recognized but not notified (`oracle_changed`, `ownership_transferred`, `fee_policy_*`, etc.)
 
+### Analytical Reducers (`src/stellar/volume-series.ts`, `src/stellar/resolution-latency.ts`)
+
+Offline reducers derive analytical summaries from decoded event streams without mutating live poller state:
+- **`volumeSeries()`**: Aggregates challenge stakes and squad deposits into contiguous UTC `"hour"` or `"day"` buckets using integer `bigint` math.
+- **`resolutionLatency()`**: Pairs `claim_created` with terminal `claim_resolved` / `claim_cancelled` events per `(contractId, claimId)` identity using integer durations and nearest-rank percentiles (`p50`, `p90`, `max`). When contradictory terminal events are observed for the same claim identity (such as both `claim_resolved` and `claim_cancelled`, or multiple `claim_resolved` events with conflicting `winnerSide` or `evidenceHash`), the claim is excluded from `resolved`/`cancelled` latency groups, counted in `excludedCount`, and surfaced explicitly in `report.inconsistencies` rather than silently picking an arbitrary terminal event. Idempotent duplicate re-deliveries of an identical terminal outcome collapse deterministically.
+
 ### Notification Formatter (`src/notifications/format.ts`)
 
 Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's MarkdownV2 format (not legacy Markdown) for reliable rendering.
