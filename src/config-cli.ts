@@ -81,6 +81,9 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "LOG_SAMPLE_WINDOW_MS",
   "LOG_BUFFER_LINES",
   "TELEGRAM_WEBHOOK_URL",
+  "FEED_ENABLED",
+  "FEED_MAX_EVENTS",
+  "FEED_SELF_URL",
   "DOTENV_CONFIG_PATH",
   "DOTENV_CONFIG_ENCODING",
   "DOTENV_CONFIG_OVERRIDE",
@@ -103,6 +106,7 @@ export const KNOWN_PREFIXES: readonly string[] = [
   "SQUAD_",
   "BOT_",
   "CLAIM_",
+  "FEED_",
   "DOTENV_",
 ];
 
@@ -218,6 +222,12 @@ function resolveSettingValue(
       return String(config.linkPreviewMarket);
     case "LINK_PREVIEW_SQUAD":
       return String(config.linkPreviewSquad);
+    case "FEED_ENABLED":
+      return String(config.feedEnabled ?? false);
+    case "FEED_MAX_EVENTS":
+      return String(config.feedMaxEvents ?? 50);
+    case "FEED_SELF_URL":
+      return config.feedSelfUrl ?? null;
     case "PORT":
       return process.env.PORT ?? null;
     default:

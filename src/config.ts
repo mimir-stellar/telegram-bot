@@ -306,6 +306,12 @@ export interface BotConfig extends StellarConfig {
   mimirAppUrl: string | null;
   /** Optional bearer token for health endpoint authentication. Null disables auth. */
   healthAuthToken: string | null;
+  /** Opt-in switch for the read-only `GET /feed.atom` endpoint (`FEED_ENABLED`, default false). */
+  feedEnabled?: boolean;
+  /** Bounded retained-event ring capacity for `GET /feed.atom` (`FEED_MAX_EVENTS`, 1..500, default 50). */
+  feedMaxEvents?: number;
+  /** Optional canonical `https:` URL for `<feed><id>` and `<link rel="self">` (`FEED_SELF_URL`). */
+  feedSelfUrl?: string | null;
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
@@ -372,6 +378,9 @@ const DEFAULTS = {
   // an outage that lasts for hours.
   logSampleWindowMs: 300_000,
   logBufferLines: 500,
+  feedEnabled: false,
+  feedMaxEvents: 50,
+  maxFeedMaxEvents: 500,
 } as const;
 
 /**
@@ -628,7 +637,7 @@ function collector(profile: Record<string, string>) {
       return value;
     },
 
-    int(name: string, fallback: number, min: number): number {
+    int(name: string, fallback: number, min: number, max?: number): number {
       const raw = read(name);
       if (raw === undefined) return fallback;
       const parsed = Number(raw);
@@ -638,6 +647,10 @@ function collector(profile: Record<string, string>) {
       }
       if (parsed < min) {
         problems.push(`${name} must be >= ${min}; got ${parsed}`);
+        return fallback;
+      }
+      if (max !== undefined && parsed > max) {
+        problems.push(`${name} must be <= ${max}; got ${parsed}`);
         return fallback;
       }
       return parsed;
@@ -974,15 +987,24 @@ export function loadConfig(): BotConfig {
     telegramApiRoot: c.loopbackApiRoot("TELEGRAM_API_ROOT"),
     mimirAppUrl: c.optionalHttpsUrl("MIMIR_APP_URL"),
     healthAuthToken: c.optionalSecret("HEALTH_AUTH_TOKEN"),
+    feedEnabled: c.bool("FEED_ENABLED", DEFAULTS.feedEnabled),
+    feedMaxEvents: c.int(
+      "FEED_MAX_EVENTS",
+      DEFAULTS.feedMaxEvents,
+      1,
+      DEFAULTS.maxFeedMaxEvents,
+    ),
+    feedSelfUrl: c.optionalHttpsUrl("FEED_SELF_URL"),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
 
-  // Warn if health endpoint is exposed beyond loopback without authentication.
+  // Warn if health/feed listener is exposed beyond loopback without authentication.
   if (config.healthPort !== 0 && !isLoopback(config.healthHost) && config.healthAuthToken === null) {
+    const exposed = config.feedEnabled ? "Health, metrics, and Atom feed" : "Health and metrics";
     console.warn(
       `[config] HEALTH_HOST=${config.healthHost} is non-loopback but HEALTH_AUTH_TOKEN is not set. ` +
-        `Health and metrics will be accessible without authentication. ` +
+        `${exposed} will be accessible without authentication. ` +
         `Set HEALTH_AUTH_TOKEN to protect these endpoints.`,
     );
   }
@@ -1156,6 +1178,9 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "LOG_SAMPLE_WINDOW_MS", secret: false, hasBuiltInDefault: true },
   { key: "TELEGRAM_API_ROOT", secret: false },
   { key: "MIMIR_APP_URL", secret: false },
+  { key: "FEED_ENABLED", secret: false, hasBuiltInDefault: true },
+  { key: "FEED_MAX_EVENTS", secret: false, hasBuiltInDefault: true },
+  { key: "FEED_SELF_URL", secret: false },
   // Injected by a platform, never set by an operator: read only as the
   // HEALTH_PORT fallback, so it is reported for the same reason.
   { key: "PORT", secret: false },

@@ -249,6 +249,17 @@ curl -s http://127.0.0.1:8787/metrics
 
 ---
 
+### `GET /feed.atom` (alias: `GET /feed` — opt-in, disabled by default)
+
+Read-only Atom 1.0 syndication feed (`application/atom+xml; charset=utf-8`) built by `buildAtomFeed` (`src/stellar/feed.ts`) over a bounded in-memory ring buffer of recent decoded chain events (`FEED_MAX_EVENTS`, 1–500, default `50`).
+
+- **Disabled by default**: Returns `404` unless `FEED_ENABLED=true`.
+- **Bind authentication**: Served on the `HEALTH_HOST` / `HEALTH_PORT` listener behind `HEALTH_AUTH_TOKEN` bearer validation (unauthenticated requests return `401` when `HEALTH_AUTH_TOKEN` is set).
+- **Read-only**: Accepts `GET` and `HEAD` only; non-read methods (`POST`, `PUT`, `DELETE`, etc.) return `405` with `Allow: GET, HEAD`.
+- **Optional web-app links**: When `MIMIR_APP_URL` is configured, mappable events also include `<link rel="related" type="text/html" href="…"/>` deep links (`src/notifications/app-links.ts`). `FEED_SELF_URL` optionally sets the canonical `https:` `<feed><id>` and `<link rel="self">`.
+
+---
+
 ### `POST /telegram-webhook` (webhook mode only)
 
 Receives Telegram update payloads when `TELEGRAM_WEBHOOK_URL` is set. The
@@ -367,6 +378,7 @@ methods (`Allow: GET` header set).
 | Health | GET | `/health/live` | 200 | Liveness only (no poller state) |
 | Health | GET | `/livez` | 200 | Alias for `/health/live` |
 | Health | GET | `/metrics` | 200 | Prometheus text (poller-level) |
+| Health | GET, HEAD | `/feed.atom` (`/feed`) | 200, 401, 404, 405 | Opt-in read-only Atom 1.0 feed (`FEED_ENABLED=true`) |
 | Health | POST | `/telegram-webhook` | 200, 401, 404 | Webhook updates (webhook mode only) |
 | Health | GET | `<other>` | 404 | — |
 | Metrics | GET | `/metrics` | 200 | Prometheus text (registry-level) |

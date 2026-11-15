@@ -21,6 +21,13 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import type { DecodedEvent } from "./stellar/decode.js";
+import {
+  buildAtomFeed,
+  DEFAULT_FEED_MAX_EVENTS,
+  DEFAULT_FEED_SELF_URL,
+  MAX_FEED_MAX_EVENTS,
+} from "./stellar/feed.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -36,6 +43,11 @@ export interface HealthDeps {
    * {@link configProvenance}; either way only key names and origins are served.
    */
   provenance?: () => ConfigProvenance;
+  /**
+   * Bounded retained-event reader for the opt-in read-only `GET /feed.atom`
+   * endpoint. Inactive unless `config.feedEnabled === true`.
+   */
+  feedEvents?: () => readonly DecodedEvent[];
 }
 
 export interface HealthServer {
@@ -485,6 +497,12 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     return { url: null, port: 0, close: async () => undefined };
   }
 
+  const feedActive = config.feedEnabled === true && typeof deps.feedEvents === "function";
+  const boundedFeedLimit = Math.min(
+    MAX_FEED_MAX_EVENTS,
+    Math.max(1, Math.trunc(config.feedMaxEvents ?? DEFAULT_FEED_MAX_EVENTS)),
+  );
+
   const server = http.createServer((req, res) => {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
@@ -525,12 +543,44 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
+    if (feedActive && (url.pathname === "/feed.atom" || url.pathname === "/feed")) {
+      const upperMethod = method.toUpperCase();
+      if (upperMethod !== "GET" && upperMethod !== "HEAD") {
+        const errPayload = `${JSON.stringify({ ok: false, error: "method_not_allowed" })}\n`;
+        res.writeHead(405, {
+          allow: "GET, HEAD",
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+          "content-length": Buffer.byteLength(errPayload),
+        });
+        res.end(errPayload);
+        return;
+      }
+
+      const retained = deps.feedEvents!().slice(0, boundedFeedLimit);
+      const xml = buildAtomFeed(retained, {
+        title: "Mimir Events",
+        selfUrl: config.feedSelfUrl ?? DEFAULT_FEED_SELF_URL,
+        config,
+        mimirAppUrl: config.mimirAppUrl ?? null,
+        ...(retained.length === 0 ? { updatedAt: new Date(now()).toISOString() } : {}),
+      });
+      res.writeHead(200, {
+        "content-type": "application/atom+xml; charset=utf-8",
+        "cache-control": "no-store",
+        "content-length": Buffer.byteLength(xml, "utf8"),
+      });
+      res.end(upperMethod === "HEAD" ? "" : xml);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/") {
       sendJson(res, 200, {
         service: "mimir-telegram-bot",
         health: "/health",
         live: "/health/live",
         metrics: "/metrics",
+        ...(feedActive ? { feed: "/feed.atom" } : {}),
       });
       return;
     }
@@ -550,7 +600,8 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   const url = `http://${config.healthHost}:${port}`;
   console.log(
     `[health] listening on ${url} (GET /health, GET /health/live` +
-      `${logs && logs.capacity() > 0 ? ", GET /health/diag" : ""})`,
+      `${logs && logs.capacity() > 0 ? ", GET /health/diag" : ""}` +
+      `${feedActive ? ", GET /feed.atom" : ""})`,
   );
 
   return {

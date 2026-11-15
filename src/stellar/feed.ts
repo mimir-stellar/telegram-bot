@@ -11,12 +11,13 @@
  *   https://www.rfc-editor.org/rfc/rfc4287
  */
 
+import { appUrlFor } from "../notifications/app-links.js";
 import { formatPlainTextEvent, eventExplorerUrl } from "../notifications/format.js";
 import type { DecodedEvent } from "./decode.js";
 import type { StellarConfig } from "../config.js";
 
 // ---------------------------------------------------------------------------
-// XML escaping
+// XML escaping & feed bounds
 // ---------------------------------------------------------------------------
 
 /** Maximum byte length of a single feed-entry content block. */
@@ -24,6 +25,15 @@ export const FEED_CONTENT_MAX_CHARS = 2_000;
 
 /** Maximum byte length of a title or subtitle string. */
 export const FEED_TITLE_MAX_CHARS = 500;
+
+/** Default maximum number of decoded events retained in memory for GET /feed.atom. */
+export const DEFAULT_FEED_MAX_EVENTS = 50;
+
+/** Hard upper bound on retained feed events so memory stays strictly bounded. */
+export const MAX_FEED_MAX_EVENTS = 500;
+
+/** Fallback Atom feed `<id>` when `FEED_SELF_URL` is not configured. */
+export const DEFAULT_FEED_SELF_URL = "https://mimir.local/feed.atom";
 
 /**
  * Escape the five XML predefined entities so a string is safe inside any
@@ -80,6 +90,74 @@ export function safeHttpsUrl(url: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Bounded retained-event ring buffer
+// ---------------------------------------------------------------------------
+
+export interface RetainedEventBuffer {
+  /** Maximum number of events kept in memory (`0` disables retention). */
+  readonly capacity: number;
+  /** Current number of retained events (`0..capacity`). */
+  readonly size: number;
+  /** Append newly decoded events, deduplicating by `eventId` and evicting oldest-first. */
+  record(events: readonly DecodedEvent[]): void;
+  /** Snapshot of retained events ordered newest-first (`length <= capacity`). */
+  snapshot(): DecodedEvent[];
+  /** Clear all retained events. */
+  clear(): void;
+}
+
+/**
+ * Create an in-memory, capacity-bounded ring buffer for decoded chain events.
+ *
+ * - Clamps `capacity` into `[0, MAX_FEED_MAX_EVENTS]`.
+ * - Capacity `0` retains nothing (zero memory overhead when the feed endpoint is disabled).
+ * - Deduplicates repeated `eventId`s from overlapping pages and evicts oldest entries first.
+ */
+export function createRetainedEventBuffer(
+  capacity: number = DEFAULT_FEED_MAX_EVENTS,
+): RetainedEventBuffer {
+  const boundedCapacity = Number.isFinite(capacity)
+    ? Math.min(MAX_FEED_MAX_EVENTS, Math.max(0, Math.floor(capacity)))
+    : 0;
+  const items: DecodedEvent[] = [];
+  const seenIds = new Set<string>();
+
+  return {
+    get capacity(): number {
+      return boundedCapacity;
+    },
+    get size(): number {
+      return items.length;
+    },
+    record(events: readonly DecodedEvent[]): void {
+      if (boundedCapacity === 0 || events.length === 0) return;
+      for (const event of events) {
+        const key =
+          typeof event.eventId === "string" && event.eventId.trim().length > 0
+            ? `${event.source}:${event.contractId}:${event.eventId.trim()}`
+            : null;
+        if (key !== null && seenIds.has(key)) continue;
+        if (key !== null) seenIds.add(key);
+        items.push(event);
+        while (items.length > boundedCapacity) {
+          const evicted = items.shift();
+          if (evicted && typeof evicted.eventId === "string" && evicted.eventId.trim().length > 0) {
+            seenIds.delete(`${evicted.source}:${evicted.contractId}:${evicted.eventId.trim()}`);
+          }
+        }
+      }
+    },
+    snapshot(): DecodedEvent[] {
+      return [...items].reverse();
+    },
+    clear(): void {
+      items.length = 0;
+      seenIds.clear();
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Feed entry
 // ---------------------------------------------------------------------------
 
@@ -94,6 +172,8 @@ export interface AtomEntry {
   content: string | null;
   /** RFC 4287 §4.2.7: alternate link (explorer URL), or null when absent. */
   link: string | null;
+  /** Optional sanitized HTTPS Mimir web-app deep link when `MIMIR_APP_URL` is set. */
+  appLink?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +195,8 @@ export interface AtomFeedOptions {
   updatedAt?: string;
   /** Optional subtitle / description for the feed. */
   subtitle?: string;
+  /** Optional Mimir web-app base URL (`MIMIR_APP_URL`) for `rel="related"` deep links. */
+  mimirAppUrl?: string | null;
 }
 
 /**
@@ -127,7 +209,11 @@ export interface AtomFeedOptions {
  * The link is the explorer URL when one exists.
  * The updated timestamp comes from `event.at` (ledger close time).
  */
-export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): AtomEntry {
+export function buildAtomEntry(
+  event: DecodedEvent,
+  config: StellarConfig,
+  mimirAppUrl?: string | null,
+): AtomEntry {
   const eventName =
     event.payload.name === "unknown"
       ? (event.payload.eventName ?? "unknown")
@@ -152,13 +238,22 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
   const explorerUrl = eventExplorerUrl(config, event);
   const link = explorerUrl ? safeHttpsUrl(explorerUrl) : null;
 
-  return {
+  const resolvedAppBase =
+    mimirAppUrl ?? (config as { mimirAppUrl?: string | null }).mimirAppUrl ?? null;
+  const rawAppUrl = appUrlFor(event, resolvedAppBase);
+  const appLink = rawAppUrl ? safeHttpsUrl(rawAppUrl) : null;
+
+  const entry: AtomEntry = {
     id: `tag:mimir,event:${event.eventId}`,
     title,
     updated,
     content,
     link,
   };
+  if (appLink !== null) {
+    entry.appLink = appLink;
+  }
+  return entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +270,10 @@ function renderEntry(entry: AtomEntry): string {
       ? `    <link rel="alternate" type="text/html" href="${escapeXml(entry.link)}"/>`
       : "";
 
+  const appLinkEl = entry.appLink
+    ? `    <link rel="related" type="text/html" href="${escapeXml(entry.appLink)}"/>`
+    : "";
+
   const contentEl =
     entry.content !== null
       ? `    <content type="text">${xmlText(entry.content, FEED_CONTENT_MAX_CHARS)}</content>`
@@ -186,6 +285,7 @@ function renderEntry(entry: AtomEntry): string {
     idEl,
     updatedEl,
     linkEl,
+    appLinkEl,
     contentEl,
     "  </entry>",
   ]
@@ -246,7 +346,7 @@ export function buildAtomFeed(
   }
 
   for (const event of events) {
-    const entry = buildAtomEntry(event, config);
+    const entry = buildAtomEntry(event, config, options.mimirAppUrl);
     lines.push(renderEntry(entry));
   }
 

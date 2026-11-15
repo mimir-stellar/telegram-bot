@@ -109,6 +109,10 @@ import {
   type ContractSource,
   type DecodedEvent,
 } from "./stellar/decode.js";
+import {
+  createRetainedEventBuffer,
+  DEFAULT_FEED_MAX_EVENTS,
+} from "./stellar/feed.js";
 
 export interface TargetState {
   source: ContractSource;
@@ -1546,6 +1550,9 @@ export function createPoller(deps: PollerDeps) {
   // of each cycle means the tip is fetched exactly once per cycle however many
   // targets are watched, without a wall-clock expiry landing mid-cycle.
   const ledgerCache = new LedgerCache({ ttlMs: Number.POSITIVE_INFINITY });
+  const retainedFeedEvents = createRetainedEventBuffer(
+    config.feedEnabled === true ? (config.feedMaxEvents ?? DEFAULT_FEED_MAX_EVENTS) : 0,
+  );
 
   let timer: NodeJS.Timeout | null = null;
   let stopped = false;
@@ -2677,6 +2684,7 @@ export function createPoller(deps: PollerDeps) {
           // never be recorded.
           for (const id of scan.seenEventIds) dedupWindow.add(id);
           if (scan.events.length > 0) {
+            retainedFeedEvents.record(scan.events);
             markDirty();
             delivery = await notify(scan.events, correlationId);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
@@ -3196,6 +3204,11 @@ export function createPoller(deps: PollerDeps) {
     /** Machine-readable snapshot, same shape as the file on disk. */
     snapshot(): StatusSnapshot {
       return snapshot();
+    },
+
+    /** Bounded snapshot of recent decoded events retained for the opt-in Atom HTTP endpoint. */
+    retainedEvents(): readonly DecodedEvent[] {
+      return retainedFeedEvents.snapshot();
     },
 
     audit,

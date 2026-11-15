@@ -169,6 +169,13 @@ async function main(): Promise<void> {
     `[boot] preview mode  ${config.channelPreviewMode ? "enabled" : "disabled"}`,
     { channelPreviewMode: config.channelPreviewMode },
   );
+  Logger.info(
+    "boot",
+    `[boot] atom feed     ${
+      config.feedEnabled ? `enabled (max=${config.feedMaxEvents ?? 50})` : "disabled"
+    }`,
+    { feedEnabled: config.feedEnabled === true, feedMaxEvents: config.feedMaxEvents ?? 50 },
+  );
 
   // Which setting came from where, then anything an operator can act on. Names
   // and origins only: a value never reaches this log, so a boot log can be
@@ -284,6 +291,7 @@ async function main(): Promise<void> {
     config,
     status: () => poller.status(),
     logs: logCapture,
+    feedEvents: config.feedEnabled ? () => poller.retainedEvents() : undefined,
     webhookHandler:
       webhookSecret !== null
         ? webhookCallback(bot, "http", { secretToken: webhookSecret })

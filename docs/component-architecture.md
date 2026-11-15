@@ -60,7 +60,8 @@ Configuration is loaded from environment variables with support for profiles (`M
 - **Telegram**: `BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ALLOWED_CHAT_IDS`, `OPERATOR_TELEGRAM_USER_ID`
 - **Stellar**: `MARKET_CONTRACT_ID`, `SQUAD_CONTRACT_ID`, `STELLAR_RPC_URL`, `STELLAR_HORIZON_URL`, `STELLAR_NETWORK_PASSPHRASE`
 - **Poller**: `POLL_INTERVAL_MS`, `START_LOOKBACK_LEDGERS`, `CURSOR_FILE`, `MAX_NOTIFICATIONS_PER_CYCLE`, `EVENT_DEDUP_WINDOW`
-- **Health**: `HEALTH_HOST`, `HEALTH_PORT`, `HEALTH_STALE_MS`
+- **Health**: `HEALTH_HOST`, `HEALTH_PORT`, `HEALTH_STALE_MS`, `HEALTH_AUTH_TOKEN`
+- **Atom Feed (opt-in)**: `FEED_ENABLED` (default `false`), `FEED_MAX_EVENTS` (bounded `1..500`, default `50`), `FEED_SELF_URL`
 - **Display**: `CHANNEL_PREVIEW_MODE`
 
 ### Poller (`src/poller.ts`)
