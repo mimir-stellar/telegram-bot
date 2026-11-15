@@ -12,7 +12,13 @@
  *   - Static field validation and type compatibility checking against known payload types.
  */
 
+import { redactText } from "../redact.js";
 import type { DecodedEvent } from "../stellar/decode.js";
+import {
+  explainThreshold,
+  meetsThreshold,
+  type AmountThresholds,
+} from "./amount-threshold.js";
 
 /** USDC atomic unit divisor (7 decimal places). */
 export const USDC_SCALE = 10_000_000n;
@@ -856,4 +862,490 @@ function compareValues(
   }
 
   return false;
+}
+
+// ----------------------------------------------------
+// Deterministic Operator Filter Explanation Tree
+// ----------------------------------------------------
+
+/** Default per-reason character cap in filter explanation trees. */
+export const DEFAULT_MAX_EXPLANATION_REASON_LENGTH = 120;
+
+/** Default maximum number of AST/pipeline explanation nodes emitted per report. */
+export const DEFAULT_MAX_EXPLANATION_NODES = 64;
+
+export type FilterExplanationNodeKind =
+  | "pipeline"
+  | "rule"
+  | "event_gate"
+  | "logical"
+  | "comparison"
+  | "threshold";
+
+export type PublicRouteRole = "default" | "market" | "squad";
+
+export interface FilterExplanationNode {
+  /** Deterministic pre-order identifier (`"n0"`, `"n1"`, ...). */
+  id: string;
+  kind: FilterExplanationNodeKind;
+  matched: boolean;
+  /** Bounded, single-line, privacy-safe reason text. */
+  reason: string;
+  operator?: "and" | "or" | ComparisonOp;
+  field?: string;
+  children: FilterExplanationNode[];
+}
+
+export interface ExplainFilterOptions {
+  /** Optional parsed filter expression rule. */
+  rule?: FilterRule;
+  /** Optional USDC amount thresholds (`marketChallenge`, `squadDeposit`). */
+  thresholds?: AmountThresholds;
+  /** Coarse public routing role; private chat/user IDs are never emitted. */
+  routeRole?: PublicRouteRole;
+  /** Optional private route chat ID (accepted only to ensure it is scrubbed, never emitted). */
+  chatId?: string;
+  /** Optional private Telegram user ID (accepted only to ensure it is scrubbed, never emitted). */
+  userId?: string;
+  /** Optional rendered message text (accepted only to ensure it is omitted/scrubbed, never emitted). */
+  messageText?: string;
+  /** Additional caller-known secrets to scrub from explanation output. */
+  secrets?: readonly string[];
+  /** Per-reason character cap (default 120, clamped to 24..240). */
+  maxReasonLength?: number;
+  /** Maximum explanation tree nodes (default 64, minimum 4). */
+  maxNodes?: number;
+}
+
+export interface FilterExplanationReport {
+  allowed: boolean;
+  eventSource: "market" | "squad";
+  eventName: string;
+  eventId: string;
+  ledger: number;
+  routeRole?: PublicRouteRole;
+  truncated: boolean;
+  nodeCount: number;
+  matchedPredicates: string[];
+  failedPredicates: string[];
+  tree: FilterExplanationNode;
+}
+
+const CONTENT_BEARER_FIELDS = new Set([
+  "title",
+  "summary",
+  "question",
+  "description",
+  "metadata",
+  "message",
+  "messagetext",
+  "renderedmessage",
+  "text",
+  "body",
+]);
+
+function isContentField(field: string): boolean {
+  return CONTENT_BEARER_FIELDS.has(field.trim().toLowerCase());
+}
+
+function clampExplanationReason(
+  raw: string,
+  maxLen: number,
+  privateValues: readonly string[],
+): string {
+  const cap = Math.max(24, Math.min(240, maxLen));
+  let cleaned = raw.replace(/\s+/g, " ").trim();
+
+  for (const priv of privateValues) {
+    if (priv && priv.length > 0 && cleaned.includes(priv)) {
+      cleaned = cleaned.split(priv).join("[REDACTED]");
+    }
+  }
+
+  // Scrub private Telegram @handles and numeric group chat ids (-100...)
+  cleaned = cleaned
+    .replace(/@[A-Za-z0-9_]{3,}/g, "[REDACTED_ROUTE]")
+    .replace(/(?<![A-Za-z0-9])-\d{5,}(?![A-Za-z0-9])/g, "[REDACTED_ROUTE]");
+
+  // Scrub bot tokens, seeds, URL credentials, and registered secrets
+  const redacted = redactText(cleaned, {
+    secrets: privateValues.filter((v) => v.length >= 4),
+    maxLen: cap,
+  });
+
+  if (redacted.length <= cap) return redacted;
+  return `${redacted.slice(0, cap - 1)}…`;
+}
+
+function formatSafeUsdc(atomic: bigint): string {
+  const neg = atomic < 0n ? "-" : "";
+  const abs = atomic < 0n ? -atomic : atomic;
+  const whole = abs / USDC_SCALE;
+  const frac = abs % USDC_SCALE;
+  if (frac === 0n) {
+    return `${neg}${whole.toString()} USDC`;
+  }
+  const fracStr = frac.toString().padStart(7, "0").replace(/0+$/, "");
+  return `${neg}${whole.toString()}.${fracStr} USDC`;
+}
+
+function formatSafeExpected(field: string, literal: LiteralValue): string {
+  if (isContentField(field)) {
+    return "<omitted-content>";
+  }
+  switch (literal.kind) {
+    case "string": {
+      const snippet = literal.value.length > 32
+        ? `${literal.value.slice(0, 31)}…`
+        : literal.value;
+      return JSON.stringify(snippet);
+    }
+    case "number":
+      return String(literal.value);
+    case "boolean":
+      return String(literal.value);
+    case "usdc":
+      return formatSafeUsdc(literal.atomic);
+  }
+}
+
+function formatSafeActual(field: string, value: unknown): string {
+  if (isContentField(field)) {
+    return "<omitted-content>";
+  }
+  if (typeof value === "bigint") {
+    return formatSafeUsdc(value);
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (typeof value === "string") {
+    const snippet = value.length > 32 ? `${value.slice(0, 31)}…` : value;
+    return JSON.stringify(snippet);
+  }
+  return `<${typeof value}>`;
+}
+
+/**
+ * Builds a deterministic, bounded, privacy-safe explanation tree for a single {@link FilterRule}.
+ */
+export function explainFilterRule(
+  rule: FilterRule,
+  event: DecodedEvent,
+  options: Omit<ExplainFilterOptions, "rule"> = {},
+): FilterExplanationReport {
+  return explainFilterEvaluation(event, { ...options, rule });
+}
+
+/**
+ * Builds a deterministic, bounded operator explanation tree covering a {@link FilterRule}
+ * and/or {@link AmountThresholds} while keeping message contents and private route
+ * identities out of all output fields.
+ */
+export function explainFilterEvaluation(
+  event: DecodedEvent,
+  options: ExplainFilterOptions = {},
+): FilterExplanationReport {
+  const maxReasonLength = Math.max(
+    24,
+    Math.min(240, options.maxReasonLength ?? DEFAULT_MAX_EXPLANATION_REASON_LENGTH),
+  );
+  const maxNodes = Math.max(4, options.maxNodes ?? DEFAULT_MAX_EXPLANATION_NODES);
+
+  const privateValues: string[] = [];
+  if (typeof options.chatId === "string" && options.chatId.trim()) {
+    privateValues.push(options.chatId.trim());
+  }
+  if (typeof options.userId === "string" && options.userId.trim()) {
+    privateValues.push(options.userId.trim());
+  }
+  if (typeof options.messageText === "string" && options.messageText.trim()) {
+    privateValues.push(options.messageText.trim());
+  }
+  if (options.secrets) {
+    for (const s of options.secrets) {
+      if (typeof s === "string" && s.trim()) privateValues.push(s.trim());
+    }
+  }
+  privateValues.sort((a, b) => b.length - a.length);
+
+  const payload = event.payload as Record<string, unknown>;
+  const rawEventName = typeof payload.name === "string" && payload.name.length > 0
+    ? payload.name
+    : "unknown";
+  const safeEventName = clampExplanationReason(rawEventName, 48, privateValues);
+
+  let nextId = 0;
+  let truncated = false;
+  const matchedPredicates: string[] = [];
+  const failedPredicates: string[] = [];
+
+  const canAllocate = (): boolean => {
+    if (nextId >= maxNodes) {
+      truncated = true;
+      return false;
+    }
+    return true;
+  };
+
+  const makeNode = (
+    kind: FilterExplanationNodeKind,
+    matched: boolean,
+    rawReason: string,
+    extra: {
+      operator?: "and" | "or" | ComparisonOp;
+      field?: string;
+      children?: FilterExplanationNode[];
+    } = {},
+  ): FilterExplanationNode => {
+    const id = `n${nextId++}`;
+    return {
+      id,
+      kind,
+      matched,
+      reason: clampExplanationReason(rawReason, maxReasonLength, privateValues),
+      ...(extra.operator !== undefined ? { operator: extra.operator } : {}),
+      ...(extra.field !== undefined ? { field: extra.field } : {}),
+      children: extra.children ?? [],
+    };
+  };
+
+  const explainExpr = (node: ExprNode): FilterExplanationNode | null => {
+    if (!canAllocate()) return null;
+
+    if (node.type === "logical") {
+      // Reserve parent ID in strict pre-order before recursing into children
+      const parentId = `n${nextId++}`;
+      const leftBool = evaluateNode(node.left, payload);
+      const rightBool = evaluateNode(node.right, payload);
+      const matched = node.op === "and" ? leftBool && rightBool : leftBool || rightBool;
+
+      const children: FilterExplanationNode[] = [];
+      const leftNode = explainExpr(node.left);
+      if (leftNode) children.push(leftNode);
+      const rightNode = explainExpr(node.right);
+      if (rightNode) children.push(rightNode);
+
+      const summary = node.op === "and"
+        ? matched
+          ? "all AND branches matched"
+          : "one or more AND branches failed"
+        : matched
+          ? "at least one OR branch matched"
+          : "all OR branches failed";
+
+      return {
+        id: parentId,
+        kind: "logical",
+        matched,
+        operator: node.op,
+        reason: clampExplanationReason(summary, maxReasonLength, privateValues),
+        children,
+      };
+    }
+
+    const hasField = Object.prototype.hasOwnProperty.call(payload, node.field) &&
+      payload[node.field] !== undefined &&
+      payload[node.field] !== null;
+
+    const expectedStr = formatSafeExpected(node.field, node.value);
+    if (!hasField) {
+      const reason = clampExplanationReason(
+        `${node.field} ${node.op} ${expectedStr} -> failed (field missing)`,
+        maxReasonLength,
+        privateValues,
+      );
+      failedPredicates.push(reason);
+      return makeNode("comparison", false, reason, {
+        operator: node.op,
+        field: node.field,
+      });
+    }
+
+    const rawVal = payload[node.field];
+    const matched = compareValues(rawVal, node.op, node.value);
+    const actualStr = formatSafeActual(node.field, rawVal);
+    const reason = clampExplanationReason(
+      matched
+        ? `${node.field} ${node.op} ${expectedStr} -> matched (actual ${actualStr})`
+        : `${node.field} ${node.op} ${expectedStr} -> failed (actual ${actualStr})`,
+      maxReasonLength,
+      privateValues,
+    );
+
+    if (matched) {
+      matchedPredicates.push(reason);
+    } else {
+      failedPredicates.push(reason);
+    }
+
+    return makeNode("comparison", matched, reason, {
+      operator: node.op,
+      field: node.field,
+    });
+  };
+
+  const buildRuleTree = (rule: FilterRule): FilterExplanationNode | null => {
+    if (!canAllocate()) return null;
+    const ruleId = `n${nextId++}`;
+    const ruleMatched = evaluateFilterRule(rule, event);
+    const children: FilterExplanationNode[] = [];
+
+    if (rule.eventName) {
+      const gateMatched = rule.eventName === payload.name;
+      if (canAllocate()) {
+        const gateReason = gateMatched
+          ? `event name "${safeEventName}" == "${rule.eventName}"`
+          : `event name "${safeEventName}" != "${rule.eventName}"`;
+        const gateNode = makeNode("event_gate", gateMatched, gateReason, {
+          field: "name",
+          operator: "==",
+        });
+        if (gateMatched) {
+          matchedPredicates.push(gateNode.reason);
+        } else {
+          failedPredicates.push(gateNode.reason);
+        }
+        children.push(gateNode);
+      }
+      if (!gateMatched) {
+        return {
+          id: ruleId,
+          kind: "rule",
+          matched: false,
+          reason: clampExplanationReason(
+            `rule rejected event "${safeEventName}" (expected "${rule.eventName}")`,
+            maxReasonLength,
+            privateValues,
+          ),
+          children,
+        };
+      }
+    }
+
+    if (rule.condition) {
+      const condNode = explainExpr(rule.condition);
+      if (condNode) children.push(condNode);
+    }
+
+    const ruleSummary = !rule.condition
+      ? `rule matched event "${safeEventName}" (no where condition)`
+      : ruleMatched
+        ? `rule matched event "${safeEventName}"`
+        : `rule rejected event "${safeEventName}"`;
+
+    return {
+      id: ruleId,
+      kind: "rule",
+      matched: ruleMatched,
+      reason: clampExplanationReason(ruleSummary, maxReasonLength, privateValues),
+      children,
+    };
+  };
+
+  const buildThresholdNode = (thresholds: AmountThresholds): FilterExplanationNode | null => {
+    if (!canAllocate()) return null;
+    const explained = explainThreshold(event, thresholds, { maxReasonLength });
+    const reason = clampExplanationReason(explained.reason, maxReasonLength, privateValues);
+    if (explained.applicable) {
+      if (explained.matched) {
+        matchedPredicates.push(reason);
+      } else {
+        failedPredicates.push(reason);
+      }
+    }
+    return makeNode("threshold", explained.matched, reason, {
+      ...(explained.field !== undefined ? { field: explained.field, operator: ">=" } : {}),
+    });
+  };
+
+  const ruleAllowed = options.rule ? evaluateFilterRule(options.rule, event) : true;
+  const thresholdAllowed = options.thresholds
+    ? meetsThreshold(event, options.thresholds)
+    : true;
+  const allowed = ruleAllowed && thresholdAllowed;
+
+  let root: FilterExplanationNode;
+  if (options.rule && !options.thresholds) {
+    root = buildRuleTree(options.rule)!;
+  } else if (!options.rule && options.thresholds) {
+    root = buildThresholdNode(options.thresholds)!;
+  } else {
+    const rootId = `n${nextId++}`;
+    const children: FilterExplanationNode[] = [];
+    if (options.rule) {
+      const rNode = buildRuleTree(options.rule);
+      if (rNode) children.push(rNode);
+    }
+    if (options.thresholds) {
+      const tNode = buildThresholdNode(options.thresholds);
+      if (tNode) children.push(tNode);
+    }
+    const pipelineReason = !options.rule && !options.thresholds
+      ? `event "${safeEventName}" allowed (no filter rules or thresholds configured)`
+      : allowed
+        ? `pipeline allowed event "${safeEventName}"`
+        : `pipeline denied event "${safeEventName}"`;
+    root = {
+      id: rootId,
+      kind: "pipeline",
+      matched: allowed,
+      reason: clampExplanationReason(pipelineReason, maxReasonLength, privateValues),
+      children,
+    };
+  }
+
+  const validRole: PublicRouteRole | undefined =
+    options.routeRole === "default" || options.routeRole === "market" || options.routeRole === "squad"
+      ? options.routeRole
+      : undefined;
+
+  return {
+    allowed,
+    eventSource: event.source,
+    eventName: safeEventName,
+    eventId: clampExplanationReason(String(event.eventId ?? ""), 64, privateValues),
+    ledger: event.ledger,
+    ...(validRole !== undefined ? { routeRole: validRole } : {}),
+    truncated,
+    nodeCount: nextId,
+    matchedPredicates,
+    failedPredicates,
+    tree: root,
+  };
+}
+
+/**
+ * Formats a {@link FilterExplanationReport} into a deterministic multi-line ASCII tree
+ * suitable for operator logs or CLI diagnostics, free of message bodies and private route IDs.
+ */
+export function formatFilterExplanationTree(report: FilterExplanationReport): string {
+  const headerParts = [
+    `Filter Explanation: ${report.allowed ? "ALLOW" : "DENY"}`,
+    `source=${report.eventSource}`,
+    `event=${report.eventName}`,
+    `ledger=${report.ledger}`,
+    `id=${report.eventId}`,
+  ];
+  if (report.routeRole) {
+    headerParts.push(`route=${report.routeRole}`);
+  }
+  if (report.truncated) {
+    headerParts.push("truncated=true");
+  }
+
+  const lines: string[] = [headerParts.join(" ")];
+
+  const walk = (node: FilterExplanationNode, depth: number): void => {
+    const indent = "  ".repeat(depth);
+    const badge = node.matched ? "[PASS]" : "[FAIL]";
+    const opTag = node.operator && node.kind === "logical" ? ` (${node.operator})` : "";
+    lines.push(`${indent}${badge} ${node.id} ${node.kind}${opTag}: ${node.reason}`);
+    for (const child of node.children) {
+      walk(child, depth + 1);
+    }
+  };
+
+  walk(report.tree, 0);
+  return lines.join("\n");
 }

@@ -119,3 +119,126 @@ export function meetsThreshold(
 
   return true;
 }
+
+export interface ThresholdExplanation {
+  matched: boolean;
+  applicable: boolean;
+  field?: "stake" | "amount";
+  reason: string;
+}
+
+function formatUsdcUnits(units: bigint): string {
+  const scale = 10_000_000n;
+  const neg = units < 0n ? "-" : "";
+  const abs = units < 0n ? -units : units;
+  const whole = abs / scale;
+  const frac = abs % scale;
+  if (frac === 0n) {
+    return `${neg}${whole.toString()} USDC`;
+  }
+  const fracStr = frac.toString().padStart(7, "0").replace(/0+$/, "");
+  return `${neg}${whole.toString()}.${fracStr} USDC`;
+}
+
+function clampSingleLine(text: string, maxLen = 120): string {
+  const cap = Math.max(24, Math.min(240, maxLen));
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= cap) return collapsed;
+  return `${collapsed.slice(0, cap - 1)}…`;
+}
+
+/**
+ * Produces a deterministic, bounded, privacy-safe explanation for amount-threshold evaluation.
+ */
+export function explainThreshold(
+  event: DecodedEvent,
+  thresholds?: AmountThresholds,
+  options: { maxReasonLength?: number } = {},
+): ThresholdExplanation {
+  const maxLen = options.maxReasonLength ?? 120;
+  if (!thresholds) {
+    return {
+      matched: true,
+      applicable: false,
+      reason: clampSingleLine("threshold check skipped (no thresholds configured)", maxLen),
+    };
+  }
+
+  const payload = event.payload as Record<string, unknown>;
+  if (event.payload.name === "claim_challenged") {
+    const minStake = thresholds.marketChallenge;
+    if (minStake === undefined || minStake <= 0n) {
+      return {
+        matched: true,
+        applicable: false,
+        field: "stake",
+        reason: clampSingleLine("marketChallenge threshold inactive (0 or unset)", maxLen),
+      };
+    }
+    if (typeof payload.stake !== "bigint") {
+      return {
+        matched: false,
+        applicable: true,
+        field: "stake",
+        reason: clampSingleLine(
+          `stake >= ${formatUsdcUnits(minStake)} failed (field missing)`,
+          maxLen,
+        ),
+      };
+    }
+    const matched = payload.stake >= minStake;
+    return {
+      matched,
+      applicable: true,
+      field: "stake",
+      reason: clampSingleLine(
+        matched
+          ? `stake (${formatUsdcUnits(payload.stake)}) >= ${formatUsdcUnits(minStake)}`
+          : `stake (${formatUsdcUnits(payload.stake)}) < ${formatUsdcUnits(minStake)}`,
+        maxLen,
+      ),
+    };
+  }
+
+  if (event.payload.name === "deposited") {
+    const minAmount = thresholds.squadDeposit;
+    if (minAmount === undefined || minAmount <= 0n) {
+      return {
+        matched: true,
+        applicable: false,
+        field: "amount",
+        reason: clampSingleLine("squadDeposit threshold inactive (0 or unset)", maxLen),
+      };
+    }
+    if (typeof payload.amount !== "bigint") {
+      return {
+        matched: false,
+        applicable: true,
+        field: "amount",
+        reason: clampSingleLine(
+          `amount >= ${formatUsdcUnits(minAmount)} failed (field missing)`,
+          maxLen,
+        ),
+      };
+    }
+    const matched = payload.amount >= minAmount;
+    return {
+      matched,
+      applicable: true,
+      field: "amount",
+      reason: clampSingleLine(
+        matched
+          ? `amount (${formatUsdcUnits(payload.amount)}) >= ${formatUsdcUnits(minAmount)}`
+          : `amount (${formatUsdcUnits(payload.amount)}) < ${formatUsdcUnits(minAmount)}`,
+        maxLen,
+      ),
+    };
+  }
+
+  const eventLabel = typeof payload.name === "string" && payload.name ? payload.name : "unknown";
+  return {
+    matched: true,
+    applicable: false,
+    reason: clampSingleLine(`no amount threshold applies to event "${eventLabel}"`, maxLen),
+  };
+}

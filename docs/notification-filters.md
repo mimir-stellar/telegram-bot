@@ -153,3 +153,14 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_created` events**: Muted by `eventAllowedByCategory` because `config.notificationCategories` is non-empty (`["__none__"]`) and no real on-chain claim category matches `"__none__"`.
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
+
+---
+
+## 4. Deterministic Operator Filter Explanation Tree
+
+Operators and diagnostic tools can inspect why an event passed or failed notification filters via [`explainFilterRule`](../src/notifications/filter-expr.ts), [`explainFilterEvaluation`](../src/notifications/filter-expr.ts), [`formatFilterExplanationTree`](../src/notifications/filter-expr.ts), and [`explainThreshold`](../src/notifications/amount-threshold.ts):
+
+- **Deterministic AST & pipeline walk**: Assigns stable pre-order node identifiers (`n0`, `n1`, ...) across `pipeline`, `rule`, `event_gate`, `logical` (`and` / `or`), `comparison`, and `threshold` nodes while preserving exact live boolean `allowed` decisions.
+- **Bounded reasons and node counts**: Collapses whitespace and clamps every reason to `maxReasonLength` (default `120` chars) and caps total emitted nodes at `maxNodes` (default `64`, marking `truncated: true` if exceeded).
+- **Privacy guarantees**: Free-text/message-bearing fields (`title`, `summary`, `question`, `description`, `metadata`, `message`, `messageText`, `body`) render as `<omitted-content>`, and private route identities (`chatId`, `userId`, `-100...` group IDs, `@channel` handles, and bot tokens) are omitted or scrubbed from both structured reports and formatted trees.
+
