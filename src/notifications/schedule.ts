@@ -1,6 +1,12 @@
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
 
+import {
+  extractWindow,
+  isInQuietHours,
+  type QuietHoursPolicy,
+} from "./quiet-hours.js";
+
 export type ScheduleKind = "daily" | "weekly";
 
 export interface Schedule {
@@ -111,6 +117,52 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+/**
+ * Return `nowMs` when it already falls in an allowed delivery window, or the
+ * earliest UTC timestamp strictly after `nowMs` when `policy`'s quiet hours end.
+ */
+export function nextAllowedWindow(
+  policy: QuietHoursPolicy | undefined,
+  nowMs: number,
+): number {
+  if (!Number.isFinite(nowMs)) {
+    throw new ScheduleParseError("nowMs must be a finite number");
+  }
+  if (!policy || !isInQuietHours(policy, new Date(nowMs))) {
+    return nowMs;
+  }
+  const win = extractWindow(policy);
+  if (!win || win.startMinutes === win.endMinutes) {
+    return nowMs;
+  }
+
+  const dayStart = startOfUtcDay(nowMs);
+  const currentMinutes = (nowMs - dayStart) / 60_000;
+  const endOffsetMs = Math.ceil(win.endMinutes * 60_000);
+
+  if (win.startMinutes < win.endMinutes) {
+    return Math.max(nowMs + 1, dayStart + endOffsetMs);
+  }
+
+  // Midnight-crossing window (e.g. 22:00 -> 06:00 UTC).
+  if (currentMinutes >= win.startMinutes) {
+    return Math.max(nowMs + 1, dayStart + MS_PER_DAY + endOffsetMs);
+  }
+  return Math.max(nowMs + 1, dayStart + endOffsetMs);
+}
+
+/**
+ * Compute the next scheduled boundary after `nowMs`, deferred to the end of
+ * `quietHours` when the scheduled boundary falls inside the quiet window.
+ */
+export function nextAllowedRun(
+  schedule: Schedule,
+  nowMs: number,
+  quietHours?: QuietHoursPolicy,
+): number {
+  return nextAllowedWindow(quietHours, nextRun(schedule, nowMs));
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;
@@ -155,6 +207,8 @@ export interface SchedulerOptions {
   run: (atMs: number) => Promise<void> | void;
   clock?: SchedulerClock;
   lastRunStore: LastRunStore;
+  /** Optional UTC quiet-hours policy used to defer scheduled digests until the allowed window. */
+  quietHours?: QuietHoursPolicy;
 }
 
 export interface Scheduler {
@@ -168,15 +222,18 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       ? parseSchedule(options.schedule)
       : options.schedule;
   const clock = options.clock ?? systemClock;
-  const { run, lastRunStore } = options;
+  const { run, lastRunStore, quietHours } = options;
 
   let timer: unknown = null;
   let stopped = true;
+  let deferredPending = false;
   let chain = Promise.resolve();
 
   const scheduleNext = () => {
     const now = clock.now();
-    const next = nextRun(schedule, now);
+    const next = deferredPending
+      ? nextAllowedWindow(quietHours, now)
+      : nextRun(schedule, now);
     const delay = Math.max(0, next - now);
     timer = clock.setTimeout(() => {
       void tick(true);
@@ -194,10 +251,20 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       // Fire at most once for any missed runs since the last recorded run.
       // With no recorded run there is nothing missed: a first start waits for
       // the next boundary instead of firing early (and then again at it).
-      const shouldFire = last === null ? atBoundary : nextRun(schedule, last) <= now;
+      const shouldFire =
+        deferredPending || (last === null ? atBoundary : nextRun(schedule, last) <= now);
       if (shouldFire) {
-        await run(nextRun(schedule, last ?? now - 1));
-        await lastRunStore.write(now);
+        if (quietHours && isInQuietHours(quietHours, new Date(now))) {
+          deferredPending = true;
+        } else {
+          const scheduledAt = nextRun(schedule, last ?? now - 1);
+          const wasDeferredByQuietHours =
+            deferredPending ||
+            (quietHours !== undefined && isInQuietHours(quietHours, new Date(scheduledAt)));
+          deferredPending = false;
+          await run(wasDeferredByQuietHours ? now : scheduledAt);
+          await lastRunStore.write(now);
+        }
       }
     } catch (err) {
       console.error("[scheduler] run failed:", err);
@@ -217,6 +284,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     },
     async stop() {
       stopped = true;
+      deferredPending = false;
       if (timer !== null) {
         clock.clearTimeout(timer);
         timer = null;

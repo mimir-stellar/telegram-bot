@@ -130,6 +130,14 @@ Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's
 - **Explorer links**: Includes transaction links to stellar.expert
 - **Preview mode**: Optional `[PREVIEW MODE]` badge for testing
 
+### Digest Grouping & Quiet-Hours Deferral (`src/notifications/digest-grouping.ts` & `src/notifications/schedule.ts`)
+
+Scheduled digests group non-critical events by claim or squad market while honoring UTC quiet-hours policies:
+
+- **Quiet-hours deferral**: `createScheduler({ ..., quietHours })`, `nextAllowedWindow(policy, nowMs)`, and `nextAllowedRun(schedule, nowMs, quietHours)` defer eligible scheduled digest deliveries that land inside a UTC quiet window (including overnight windows such as `22:00`–`06:00` UTC) until the earliest allowed UTC boundary without losing missed-run state across restarts.
+- **Bounded accumulation**: `createQuietHoursDigestDeferral({ policy, maxEntries })` caps retained digest entries (default `200`), tracks `overflowCount`, and appends an escaped omission note when capped entries were dropped.
+- **Immediate critical alerts**: Critical events (`claim_resolved`, `market_settled`, `resolved`, or policy-configured `alwaysSend` overrides) return `{ decision: "immediate", reason: "critical" }` and bypass digest buffering even during quiet hours or when the digest buffer is full.
+
 ### Telegram Integration (`src/bot.ts`)
 
 The bot uses grammy for Telegram integration with a thin command layer and a single send path for the poller.
