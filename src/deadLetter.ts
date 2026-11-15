@@ -75,10 +75,63 @@ export interface DeadLetterQueueOptions {
   secrets?: readonly string[];
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /** Suppress informational console output (used by machine-readable CLI modes). */
+  quiet?: boolean;
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
+export const DEAD_LETTER_DEFAULT_REPLAY_BUDGET = 20;
+
+export type DeadLetterReplayReason =
+  | "eligible"
+  | "deferred_zero_budget"
+  | "deferred_over_budget"
+  | "max_attempts_exhausted"
+  | "empty_message_body"
+  | "filtered_source";
+
+export interface DeadLetterReplayPlanItem {
+  id: string;
+  source: string;
+  destination: string;
+  ledger: number;
+  eventName: string;
+  enqueuedAt: string;
+  attempts: number;
+  selected: boolean;
+  reason: DeadLetterReplayReason;
+}
+
+export interface DeadLetterDestinationReplayGroup {
+  destination: string;
+  sources: string[];
+  totalCount: number;
+  selectedCount: number;
+  excludedCount: number;
+  reasonCounts: Partial<Record<DeadLetterReplayReason, number>>;
+  items: DeadLetterReplayPlanItem[];
+}
+
+export interface DeadLetterReplayPlanOptions {
+  /** Maximum entries selected for replay in this cycle (default {@link DEAD_LETTER_DEFAULT_REPLAY_BUDGET}). */
+  budget?: number;
+  /** Optional source filter (e.g. `"market"` or `"squad"`). */
+  source?: string;
+  /** Maps an entry to its destination route label (defaults to `entry.source`). */
+  resolveDestination?: (entry: DeadLetterEntry) => string;
+}
+
+export interface DeadLetterReplayPlan {
+  dryRun: true;
+  budget: number;
+  maxAttempts: number;
+  totalEntries: number;
+  selectedCount: number;
+  excludedCount: number;
+  reasonCounts: Partial<Record<DeadLetterReplayReason, number>>;
+  destinations: DeadLetterDestinationReplayGroup[];
+}
 
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
@@ -108,9 +161,106 @@ export function makeEntryId(
   return `${source}:${ledger}:${eventName}:${shortHash(text)}`;
 }
 
+/**
+ * Compute a side-effect-free, dry-run replay plan grouped by destination route.
+ * Performs no network I/O and mutates neither the input entries nor disk state.
+ */
+export function buildDeadLetterReplayPlan(
+  entries: readonly DeadLetterEntry[],
+  options: DeadLetterReplayPlanOptions & { maxAttempts?: number } = {},
+): DeadLetterReplayPlan {
+  const budget = Math.max(0, Math.trunc(options.budget ?? DEAD_LETTER_DEFAULT_REPLAY_BUDGET));
+  const maxAttempts = Math.max(1, Math.trunc(options.maxAttempts ?? DEAD_LETTER_MAX_ATTEMPTS));
+  const sourceFilter = options.source?.trim();
+  const resolveDestination =
+    options.resolveDestination ??
+    ((entry: DeadLetterEntry) => {
+      const candidate = (entry as DeadLetterEntry & { chatId?: string }).chatId;
+      return typeof candidate === "string" && candidate.trim().length > 0
+        ? candidate.trim()
+        : entry.source;
+    });
+
+  let selectedCount = 0;
+  const reasonCounts: Partial<Record<DeadLetterReplayReason, number>> = {};
+  const groupMap = new Map<string, DeadLetterDestinationReplayGroup>();
+
+  for (const entry of entries) {
+    let selected = false;
+    let reason: DeadLetterReplayReason;
+
+    if (sourceFilter && entry.source !== sourceFilter) {
+      reason = "filtered_source";
+    } else if (entry.text.trim().length === 0) {
+      reason = "empty_message_body";
+    } else if (entry.attempts >= maxAttempts) {
+      reason = "max_attempts_exhausted";
+    } else if (budget <= 0) {
+      reason = "deferred_zero_budget";
+    } else if (selectedCount >= budget) {
+      reason = "deferred_over_budget";
+    } else {
+      selected = true;
+      reason = "eligible";
+      selectedCount += 1;
+    }
+
+    reasonCounts[reason] = (reasonCounts[reason] ?? 0) + 1;
+
+    const destination = resolveDestination(entry);
+    let group = groupMap.get(destination);
+    if (!group) {
+      group = {
+        destination,
+        sources: [],
+        totalCount: 0,
+        selectedCount: 0,
+        excludedCount: 0,
+        reasonCounts: {},
+        items: [],
+      };
+      groupMap.set(destination, group);
+    }
+
+    if (!group.sources.includes(entry.source)) {
+      group.sources.push(entry.source);
+    }
+    group.totalCount += 1;
+    if (selected) {
+      group.selectedCount += 1;
+    } else {
+      group.excludedCount += 1;
+    }
+    group.reasonCounts[reason] = (group.reasonCounts[reason] ?? 0) + 1;
+    group.items.push({
+      id: entry.id,
+      source: entry.source,
+      destination,
+      ledger: entry.ledger,
+      eventName: entry.eventName,
+      enqueuedAt: entry.enqueuedAt,
+      attempts: entry.attempts,
+      selected,
+      reason,
+    });
+  }
+
+  return {
+    dryRun: true,
+    budget,
+    maxAttempts,
+    totalEntries: entries.length,
+    selectedCount,
+    excludedCount: entries.length - selectedCount,
+    reasonCounts,
+    destinations: [...groupMap.values()],
+  };
+}
+
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
+  const quiet = options.quiet === true;
   let entries: DeadLetterEntry[] = [];
   const stats: DeadLetterStats = {
     depth: 0,
@@ -185,7 +335,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       entries = [];
     }
     syncDepth();
-    if (entries.length > 0) {
+    if (entries.length > 0 && !quiet) {
       console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
   }
@@ -319,10 +469,18 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     return { sent, remaining: entries.length };
   }
 
+  function planReplay(planOptions: DeadLetterReplayPlanOptions = {}): DeadLetterReplayPlan {
+    return buildDeadLetterReplayPlan(entries, {
+      ...planOptions,
+      maxAttempts: options.maxAttempts,
+    });
+  }
+
   return {
     load,
     enqueue,
     flush,
+    planReplay,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
     },

@@ -127,6 +127,24 @@ jq -r '.entries[] | select(.id == "market:123456:MarketCreated:a1b2c3d4") | .tex
 
 ---
 
+## Dry-Run Replay Plan (`plan`)
+
+Operators can preview how the next replay cycle will evaluate parked entries, grouped by redacted destination route, without contacting Telegram or mutating `dead-letter.json`:
+
+```bash
+# Preview default replay cycle (budget defaults to MAX_NOTIFICATIONS_PER_CYCLE or 20)
+npm run dlq -- plan [--file data/dead-letter.json] [--json]
+
+# Preview bounded replay budget or single source filter
+npm run dlq -- plan --budget 5 [--source market] [--file data/dead-letter.json] [--json]
+```
+
+* **Destination grouping**: Entries are grouped by redacted destination route (`redactChatId` applied to per-contract `TELEGRAM_MARKET_CHAT_ID`, `TELEGRAM_SQUAD_CHAT_ID`, or shared `TELEGRAM_CHAT_ID`).
+* **Explicit eligibility reasons**: Every parked entry receives a deterministic reason (`eligible`, `deferred_over_budget`, `deferred_zero_budget`, `max_attempts_exhausted`, `empty_message_body`, or `filtered_source`), and per-destination `selectedCount`, `excludedCount`, and `reasonCounts` are reported.
+* **Strictly read-only**: `plan` (`planDeadLetterReplay` in [`src/dlq-cli.ts`](../src/dlq-cli.ts) and `buildDeadLetterReplayPlan` / `queue.planReplay` in [`src/deadLetter.ts`](../src/deadLetter.ts)) performs zero Telegram API calls and zero queue mutations.
+
+---
+
 ## When to Delete or Clear the File
 
 Under normal operation, **operators should not need to manually delete the file**. The dead-letter queue will drain automatically once Telegram connectivity is restored, and poison or overflow messages are dropped gracefully per the limits.

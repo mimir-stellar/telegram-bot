@@ -25,15 +25,17 @@ import { pathToFileURL } from "node:url";
 
 import {
   createDeadLetterQueue,
+  DEAD_LETTER_DEFAULT_REPLAY_BUDGET,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
   type DeadLetterEntry,
+  type DeadLetterReplayPlan,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
 export const USAGE =
-  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
+  "usage: npm run dlq -- <list|show <id>|plan [--budget <n>] [--source <name>] [--dry-run]|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
   readonly exitCode = 2;
@@ -51,10 +53,21 @@ export interface DlqEntryView extends DeadLetterEntry {
 export interface ListDlqOptions {
   filePath: string;
   chatId?: string;
+  marketChatId?: string;
+  squadChatId?: string;
   secrets?: readonly string[];
   maxEntries?: number;
   maxAttempts?: number;
   now?: () => number;
+}
+
+export interface PlanDlqOptions extends ListDlqOptions {
+  budget?: number;
+  source?: string;
+}
+
+export interface PlanDlqResult extends DeadLetterReplayPlan {
+  chatId: string;
 }
 
 export interface ShowDlqOptions extends ListDlqOptions {
@@ -176,9 +189,15 @@ export function sanitizeDlqText(
   return redactText(out, { secrets, maxLen: 4_096 });
 }
 
-function configuredChatIds(explicitChatId?: string): string[] {
+function configuredChatIds(
+  explicitChatId?: string,
+  marketChatId?: string,
+  squadChatId?: string,
+): string[] {
   const candidates = [
     explicitChatId,
+    marketChatId,
+    squadChatId,
     process.env.TELEGRAM_CHAT_ID,
     process.env.TELEGRAM_MARKET_CHAT_ID,
     process.env.TELEGRAM_SQUAD_CHAT_ID,
@@ -205,7 +224,18 @@ function configuredSecrets(extraSecrets?: readonly string[]): string[] {
   return secrets;
 }
 
-function resolveChatIdForSource(source: string, explicitChatId?: string): string {
+function resolveChatIdForSource(
+  source: string,
+  explicitChatId?: string,
+  marketChatId?: string,
+  squadChatId?: string,
+): string {
+  if (source === "market" && marketChatId?.trim()) {
+    return redactChatId(marketChatId.trim());
+  }
+  if (source === "squad" && squadChatId?.trim()) {
+    return redactChatId(squadChatId.trim());
+  }
   if (explicitChatId !== undefined) return redactChatId(explicitChatId);
   if (source === "market" && process.env.TELEGRAM_MARKET_CHAT_ID?.trim()) {
     return redactChatId(process.env.TELEGRAM_MARKET_CHAT_ID.trim());
@@ -266,7 +296,73 @@ function openQueue(options: ListDlqOptions) {
     maxAttempts,
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
+}
+
+function resolveDestinationLabel(entry: DeadLetterEntry, options: ListDlqOptions): string {
+  const rawEntry = entry as DeadLetterEntry & { chatId?: string };
+  if (typeof rawEntry.chatId === "string" && rawEntry.chatId.trim().length > 0) {
+    return redactChatId(rawEntry.chatId.trim());
+  }
+  const resolved = resolveChatIdForSource(
+    entry.source,
+    options.chatId,
+    options.marketChatId,
+    options.squadChatId,
+  );
+  return resolved === "…" ? `${entry.source}:…` : resolved;
+}
+
+/**
+ * Build a dry-run replay plan grouped by destination route, showing selected
+ * entry counts and explicit eligibility reasons without contacting Telegram or
+ * mutating disk state.
+ */
+export async function planDeadLetterReplay(options: PlanDlqOptions): Promise<PlanDlqResult> {
+  const defaultBudget =
+    Number.isInteger(Number(process.env.MAX_NOTIFICATIONS_PER_CYCLE)) &&
+    Number(process.env.MAX_NOTIFICATIONS_PER_CYCLE) >= 0
+      ? Number(process.env.MAX_NOTIFICATIONS_PER_CYCLE)
+      : DEAD_LETTER_DEFAULT_REPLAY_BUDGET;
+  const budget = options.budget ?? defaultBudget;
+  if (!Number.isInteger(budget) || budget < 0) {
+    throw new DlqUsageError(`invalid --budget value: ${String(budget)}`);
+  }
+
+  const chatIds = configuredChatIds(
+    options.chatId,
+    options.marketChatId,
+    options.squadChatId,
+  );
+  const secrets = configuredSecrets(options.secrets);
+  const queue = openQueue(options);
+  await queue.load();
+
+  const rawPlan = queue.planReplay({
+    budget,
+    source: options.source,
+    resolveDestination: (entry) => resolveDestinationLabel(entry, options),
+  });
+
+  const sanitizedDestinations = rawPlan.destinations.map((group) => ({
+    ...group,
+    items: group.items.map((item) => ({
+      ...item,
+      id: sanitizeDlqText(item.id, chatIds, secrets),
+    })),
+  }));
+
+  return {
+    ...rawPlan,
+    destinations: sanitizedDestinations,
+    chatId: resolveChatIdForSource(
+      "default",
+      options.chatId,
+      options.marketChatId,
+      options.squadChatId,
+    ),
+  };
 }
 
 /** Load and return all dead-letter entries with redacted chat ids. */
@@ -372,6 +468,7 @@ async function persistPurgedQueue(
     ),
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
 
   await queue.load();
@@ -392,24 +489,35 @@ async function persistPurgedQueue(
 }
 
 interface ParsedCliArgs {
-  subcommand: "list" | "show" | "purge";
+  subcommand: "list" | "show" | "purge" | "plan";
   file?: string;
   id?: string;
   olderThan?: string;
+  budget?: number;
+  source?: string;
   yes: boolean;
+  dryRun: boolean;
   json: boolean;
   chatId?: string;
+  marketChatId?: string;
+  squadChatId?: string;
 }
 
 export function parseDlqArgs(argv: string[]): ParsedCliArgs {
   const [subcommand, ...rest] = argv;
-  if (subcommand !== "list" && subcommand !== "show" && subcommand !== "purge") {
+  if (
+    subcommand !== "list" &&
+    subcommand !== "show" &&
+    subcommand !== "purge" &&
+    subcommand !== "plan"
+  ) {
     throw new DlqUsageError(USAGE);
   }
 
   const parsed: ParsedCliArgs = {
     subcommand,
     yes: false,
+    dryRun: subcommand === "plan",
     json: false,
   };
   const seen = new Set<string>();
@@ -427,6 +535,16 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
+    if (arg === "--dry-run") {
+      if (subcommand !== "plan" && subcommand !== "purge") {
+        throw new DlqUsageError(`--dry-run is only valid with plan or purge\n${USAGE}`);
+      }
+      if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
+      seen.add(arg);
+      parsed.dryRun = true;
+      continue;
+    }
+
     if (arg === "--json") {
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
@@ -434,9 +552,20 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
-    if (arg === "--file" || arg === "--older-than" || arg === "--chat-id") {
+    if (
+      arg === "--file" ||
+      arg === "--older-than" ||
+      arg === "--chat-id" ||
+      arg === "--market-chat-id" ||
+      arg === "--squad-chat-id" ||
+      arg === "--budget" ||
+      arg === "--source"
+    ) {
       if (arg === "--older-than" && subcommand !== "purge") {
         throw new DlqUsageError(`--older-than is only valid with purge\n${USAGE}`);
+      }
+      if ((arg === "--budget" || arg === "--source") && subcommand !== "plan") {
+        throw new DlqUsageError(`${arg} is only valid with plan\n${USAGE}`);
       }
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
@@ -447,6 +576,15 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       if (arg === "--file") parsed.file = value;
       else if (arg === "--older-than") parsed.olderThan = value;
       else if (arg === "--chat-id") parsed.chatId = value;
+      else if (arg === "--market-chat-id") parsed.marketChatId = value;
+      else if (arg === "--squad-chat-id") parsed.squadChatId = value;
+      else if (arg === "--source") parsed.source = value;
+      else if (arg === "--budget") {
+        if (!/^\d+$/.test(value.trim())) {
+          throw new DlqUsageError(`invalid --budget value: "${value}"\n${USAGE}`);
+        }
+        parsed.budget = Number(value.trim());
+      }
       i += 1;
       continue;
     }
@@ -539,6 +677,39 @@ function formatPurgeOutput(
   );
 }
 
+function formatPlanOutput(
+  plan: PlanDlqResult,
+  filePath: string,
+  asJson: boolean,
+): string {
+  if (asJson) {
+    return `${JSON.stringify({ file: filePath, ...plan }, null, 2)}\n`;
+  }
+  const header =
+    `[dlq] dry-run replay plan: ${plan.selectedCount}/${plan.totalEntries} selected, ` +
+    `${plan.excludedCount} excluded (budget=${plan.budget}, maxAttempts=${plan.maxAttempts}) in ${filePath}`;
+  if (plan.destinations.length === 0) {
+    return header;
+  }
+  const lines = [header];
+  for (const group of plan.destinations) {
+    const reasons = Object.entries(group.reasonCounts)
+      .map(([reason, count]) => `${reason}=${count}`)
+      .join(", ");
+    lines.push(
+      `  destination=${group.destination}  sources=${group.sources.join(",")}  ` +
+        `selected=${group.selectedCount}/${group.totalCount}  reasons=[${reasons}]`,
+    );
+    for (const item of group.items) {
+      lines.push(
+        `    ${item.selected ? "SELECT" : "SKIP  "}  ${item.id}  ` +
+          `source=${item.source}  ledger=${item.ledger}  attempts=${item.attempts}  reason=${item.reason}`,
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
 export interface RunDlqCliOptions {
   argv?: string[];
   now?: () => number;
@@ -568,13 +739,20 @@ export async function runDlqCli(
   const commonOptions: ListDlqOptions = {
     filePath,
     chatId: parsed.chatId,
+    marketChatId: parsed.marketChatId,
+    squadChatId: parsed.squadChatId,
     now: options.now,
   };
 
   try {
     if (parsed.subcommand === "list") {
       const entries = await listDeadLetters(commonOptions);
-      const chatId = resolveChatIdForSource("default", parsed.chatId);
+      const chatId = resolveChatIdForSource(
+        "default",
+        parsed.chatId,
+        parsed.marketChatId,
+        parsed.squadChatId,
+      );
       out(formatListOutput(entries, filePath, chatId, parsed.json).trimEnd());
       return { exitCode: 0 };
     }
@@ -582,6 +760,16 @@ export async function runDlqCli(
     if (parsed.subcommand === "show") {
       const entry = await showDeadLetter({ ...commonOptions, id: parsed.id! });
       out(formatShowOutput(entry, parsed.json).trimEnd());
+      return { exitCode: 0 };
+    }
+
+    if (parsed.subcommand === "plan") {
+      const plan = await planDeadLetterReplay({
+        ...commonOptions,
+        budget: parsed.budget,
+        source: parsed.source,
+      });
+      out(formatPlanOutput(plan, filePath, parsed.json).trimEnd());
       return { exitCode: 0 };
     }
 
@@ -604,7 +792,7 @@ export async function runDlqCli(
 }
 
 async function main(): Promise<void> {
-  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
+  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env", quiet: true });
   const { exitCode } = await runDlqCli();
   if (exitCode !== 0) {
     process.exit(exitCode);
