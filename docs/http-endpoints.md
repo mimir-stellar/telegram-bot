@@ -278,7 +278,25 @@ curl -s -o /dev/null -w "%{http_code}" \
 
 ---
 
-### `GET <any other path>`
+### Non-GET methods on health routes
+
+All read-only health routes (`/`, `/health`, `/healthz`, `/health/live`,
+`/livez`, and `/metrics`) accept `GET` only. Any other HTTP method (`POST`,
+`PUT`, `PATCH`, `DELETE`, `OPTIONS`, `HEAD`) returns a bounded **405** response
+with `Allow: GET` without mutating poller state. When `HEALTH_AUTH_TOKEN` is
+configured, bearer authentication still runs first (unauthenticated requests
+receive **401**). When webhook mode is active, non-`POST` requests to
+`/telegram-webhook` return **405** with `Allow: POST`.
+
+**Response — 405**, `Allow: GET`
+
+```json
+{ "ok": false, "error": "method_not_allowed" }
+```
+
+---
+
+### `<any other path>`
 
 **Response — 404**
 
@@ -367,8 +385,10 @@ methods (`Allow: GET` header set).
 | Health | GET | `/health/live` | 200 | Liveness only (no poller state) |
 | Health | GET | `/livez` | 200 | Alias for `/health/live` |
 | Health | GET | `/metrics` | 200 | Prometheus text (poller-level) |
+| Health | non-GET | `/`, `/health`, `/healthz`, `/health/live`, `/livez`, `/metrics` | 401, 405 | Method rejected (`Allow: GET`) |
 | Health | POST | `/telegram-webhook` | 200, 401, 404 | Webhook updates (webhook mode only) |
-| Health | GET | `<other>` | 404 | — |
+| Health | non-POST | `/telegram-webhook` | 401, 404, 405 | Method rejected (`Allow: POST` in webhook mode; 404 otherwise) |
+| Health | `<any>` | `<other>` | 401, 404 | — |
 | Metrics | GET | `/metrics` | 200 | Prometheus text (registry-level) |
 | Metrics | GET | `/health` | 200 | Plain-text liveness |
 | Metrics | GET | `<other>` | 404 | — |

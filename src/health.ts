@@ -446,6 +446,15 @@ export function buildMetricsReport(
   return lines.join("\\n") + "\\n";
 }
 
+const HEALTH_GET_ROUTES = new Set([
+  "/",
+  "/health",
+  "/healthz",
+  "/health/live",
+  "/livez",
+  "/metrics",
+]);
+
 function sendJson(
   res: http.ServerResponse,
   statusCode: number,
@@ -455,6 +464,20 @@ function sendJson(
   res.writeHead(statusCode, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
+    "content-length": Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
+
+function sendMethodNotAllowed(
+  res: http.ServerResponse,
+  allow: string = "GET",
+): void {
+  const payload = `${JSON.stringify({ ok: false, error: "method_not_allowed" })}\n`;
+  res.writeHead(405, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    allow,
     "content-length": Buffer.byteLength(payload),
   });
   res.end(payload);
@@ -476,7 +499,7 @@ function sendUnauthorized(res: http.ServerResponse): void {
  * useful for unit tests and one-shot CLI runs that must not bind a port.
  */
 export function startHealthServer(deps: HealthDeps): HealthServer {
-  const { config, status, logs } = deps;
+  const { config, status, logs, webhookHandler } = deps;
   const now = deps.now ?? Date.now;
   const provenance = deps.provenance ?? configProvenance;
 
@@ -486,12 +509,33 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   }
 
   const server = http.createServer((req, res) => {
-    const method = req.method ?? "GET";
+    const method = (req.method ?? "GET").toUpperCase();
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
+
+    if (url.pathname === "/telegram-webhook" && webhookHandler !== undefined) {
+      if (method !== "POST") {
+        req.resume();
+        if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
+          sendUnauthorized(res);
+          return;
+        }
+        sendMethodNotAllowed(res, "POST");
+        return;
+      }
+      webhookHandler(req, res);
+      return;
+    }
 
     // Check authentication for all routes when token is configured
     if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
+      req.resume();
       sendUnauthorized(res);
+      return;
+    }
+
+    if (HEALTH_GET_ROUTES.has(url.pathname) && method !== "GET") {
+      req.resume();
+      sendMethodNotAllowed(res, "GET");
       return;
     }
 
@@ -535,6 +579,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
+    req.resume();
     sendJson(res, 404, { ok: false, error: "not_found" });
   });
 
