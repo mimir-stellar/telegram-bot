@@ -34,6 +34,13 @@ that restricts who can reach the port. The health response includes
 configuration provenance (which env var supplied each setting) and poller
 counters. It contains no secrets, but it does confirm what is running.
 
+When `HEALTH_AUTH_TOKEN` is set, every route on the health listener requires an
+`Authorization: Bearer <token>` header. Incoming `Authorization` headers
+exceeding `512` UTF-8 bytes (`MAX_HEALTH_AUTH_HEADER_BYTES`), missing a single
+bearer credential, or containing whitespace/control characters are rejected
+before constant-time token comparison with the same bounded `401` response
+(`Content-Length: 0`, empty body).
+
 ---
 
 ## Health server — `HEALTH_PORT` (default 8787)
@@ -383,6 +390,7 @@ methods (`Allow: GET` header set).
 | `HEALTH_HOST` | `127.0.0.1` | Bind address for the health server |
 | `HEALTH_PORT` | `8787` (or `PORT` if set by platform) | TCP port; `0` disables the listener |
 | `HEALTH_STALE_MS` | `90000` | `/health` returns 503 if no successful poll within this window |
+| `HEALTH_AUTH_TOKEN` | _(unset — loopback unauthenticated)_ | Require `Authorization: Bearer <token>` (max 512 UTF-8 header bytes) on all health routes |
 | `METRICS_PORT` | _(unset — disabled)_ | TCP port for the separate metrics server; omit to disable |
 
 See [configuration-reference.md](configuration-reference.md) for all

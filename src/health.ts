@@ -164,36 +164,78 @@ export interface HealthReport {
 
 const CURSOR_PREVIEW_LEN = 24;
 
+/**
+ * Fixed UTF-8 byte ceiling applied to incoming `Authorization` headers before
+ * scheme parsing or constant-time bearer token comparison.
+ */
+export const MAX_HEALTH_AUTH_HEADER_BYTES = 512;
+
 function iso(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString();
 }
 
+function hasControlOrWhitespace(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
+
 /**
  * Constant-time comparison for bearer token authentication.
- * Prevents timing attacks that could reveal the token.
+ * Compares UTF-8 byte lengths before `timingSafeEqual` so multi-byte inputs of
+ * equal UTF-16 length never throw a `RangeError`.
  */
 function constantTimeEquals(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  if (bufA.byteLength !== bufB.byteLength) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 /**
  * Extract and validate the bearer token from the Authorization header.
- * Returns true if the token matches the expected value (or if auth is disabled).
+ * Enforces {@link MAX_HEALTH_AUTH_HEADER_BYTES} before parsing and rejects
+ * malformed schemes, embedded whitespace, or control characters without regex
+ * backtracking.
  */
-function isValidAuth(
-  authHeader: string | undefined,
+export function isValidHealthAuth(
+  authHeader: string | string[] | undefined,
   expectedToken: string | null | undefined,
 ): boolean {
   // No token configured (null, or absent from a config built before #546):
   // the server is loopback-only, which config validation enforces.
   if (expectedToken === null || expectedToken === undefined) return true;
-  if (authHeader === undefined) return false;
+  if (typeof authHeader !== "string" || authHeader.length === 0) return false;
 
-  const match = authHeader.match(/^Bearer\s+(.+)$/i);
-  if (!match || match[1] === undefined) return false;
+  // Enforce fixed byte ceiling before any scheme parsing or buffer allocation.
+  if (
+    authHeader.length > MAX_HEALTH_AUTH_HEADER_BYTES ||
+    Buffer.byteLength(authHeader, "utf8") > MAX_HEALTH_AUTH_HEADER_BYTES
+  ) {
+    return false;
+  }
 
-  const providedToken = match[1];
+  // Require ASCII "Bearer" prefix followed by at least one space/tab.
+  if (authHeader.length < 8) return false;
+  const scheme = authHeader.slice(0, 6);
+  if (scheme.toLowerCase() !== "bearer") return false;
+
+  const firstSep = authHeader.charCodeAt(6);
+  if (firstSep !== 0x20 && firstSep !== 0x09) return false;
+
+  let tokenStart = 7;
+  while (tokenStart < authHeader.length) {
+    const ch = authHeader.charCodeAt(tokenStart);
+    if (ch !== 0x20 && ch !== 0x09) break;
+    tokenStart += 1;
+  }
+
+  if (tokenStart >= authHeader.length) return false;
+  const providedToken = authHeader.slice(tokenStart);
+  if (hasControlOrWhitespace(providedToken)) return false;
+
   return constantTimeEquals(providedToken, expectedToken);
 }
 
@@ -490,7 +532,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
     // Check authentication for all routes when token is configured
-    if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
+    if (!isValidHealthAuth(req.headers.authorization, config.healthAuthToken)) {
       sendUnauthorized(res);
       return;
     }
