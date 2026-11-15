@@ -39,6 +39,8 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures/cursor-valid.json` | Well-formed `data/cursor.json` shape for restart docs |
 | `tests/fixtures/cursor-stale.json` | Cursor that fell below the RPC's retained window (restart gap) |
 | `tests/fixtures/cursor-corrupt.txt` | Unreadable cursor sample (cold-start path) |
+| `tests/fixtures/health/*.json` | Deterministic versioned `HealthReport` compatibility fixtures (`v1` healthy, degraded, cold-start, additive forward-evolution, and `v2` breaking) |
+| `docs/schemas/health-report.v1.schema.json` | Frozen `v1` `HealthReport` consumer baseline schema compared against `docs/schemas/health-report.schema.json` |
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
 | `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
 | `tests/dedup.test.mjs` | Inline unit cases for the canonical key (`eventKey`: RPC id → `eventId` → `v2:` content-derived composite → `null`) and the bounded window (`src/dedup.ts`), including restart/mixed-format round-trips |

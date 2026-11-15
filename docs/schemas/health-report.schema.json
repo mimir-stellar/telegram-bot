@@ -4,8 +4,12 @@
   "description": "Body of GET /health and GET /healthz: the object buildHealthReport in src/health.ts returns, serialised with JSON.stringify. HTTP 200 when ok is true, 503 otherwise. Every object is closed (additionalProperties: false), so a field added to or renamed in the report must be changed here too; tests/health-schema.test.mjs fails until it is.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["ok", "status", "service", "version", "network", "uptimeMs", "checkedAt", "poller", "config"],
+  "required": ["schemaVersion", "ok", "status", "service", "version", "network", "uptimeMs", "checkedAt", "poller", "config"],
   "properties": {
+    "schemaVersion": {
+      "enum": [1],
+      "description": "Published major contract version of the GET /health response shape."
+    },
     "ok": { "type": "boolean", "description": "True exactly when status is \"ok\"." },
     "status": {
       "enum": ["ok", "degraded", "stopped"],

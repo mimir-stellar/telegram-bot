@@ -1,0 +1,133 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "status": "ok",
+  "service": "mimir-telegram-bot",
+  "version": "0.1.0",
+  "network": "testnet",
+  "uptimeMs": 2000,
+  "checkedAt": "2026-10-17T12:00:00.000Z",
+  "poller": {
+    "running": true,
+    "paused": false,
+    "stopping": false,
+    "channelPreviewMode": false,
+    "cycles": 0,
+    "lastCorrelationId": null,
+    "lastPollAt": null,
+    "lastSuccessAt": null,
+    "latestLedger": null,
+    "oldestLedger": null,
+    "chainClockAt": null,
+    "chainClockSkewMs": null,
+    "notificationsSent": 0,
+    "notificationsFailed": 0,
+    "eventsSkipped": 0,
+    "eventsDeduplicated": 0,
+    "activity": {
+      "windowSize": 20,
+      "minSamples": 10,
+      "zThreshold": 3,
+      "samples": 0,
+      "lastValue": null,
+      "baselineMean": null,
+      "baselineStdDev": null,
+      "zScore": null,
+      "deviation": "warming-up",
+      "anomalies": 0
+    },
+    "notificationsDropped": 0,
+    "cursorRewinds": 0,
+    "deadLetter": {
+      "depth": 0,
+      "enqueued": 0,
+      "replayed": 0,
+      "dropped": 0
+    },
+    "consecutiveFailures": 0,
+    "suppressedLogs": 0,
+    "lastError": null,
+    "restartGaps": 0,
+    "lastRestartGap": null,
+    "pendingFlush": false,
+    "lastFlushAt": null,
+    "targets": [
+      {
+        "source": "market",
+        "version": "v1",
+        "contractId": "CFIXTUREMARKET0000000000000000000000000000000000000000000000",
+        "lastCycleMs": 0,
+        "maxCycleMs": 0,
+        "lastEventLedger": null,
+        "cursorPreview": null,
+        "gapLedgers": 0,
+        "cursorResetAt": null,
+        "cursorUnreadable": false,
+        "rewindFromLedger": null,
+        "cursorStale": false,
+        "cursorStalled": false,
+        "cyclesWithoutAdvance": 0,
+        "hasError": false
+      },
+      {
+        "source": "squad",
+        "version": "v1",
+        "contractId": "CFIXTURESQUAD00000000000000000000000000000000000000000000000",
+        "lastCycleMs": 0,
+        "maxCycleMs": 0,
+        "lastEventLedger": null,
+        "cursorPreview": null,
+        "gapLedgers": 0,
+        "cursorResetAt": null,
+        "cursorUnreadable": false,
+        "rewindFromLedger": null,
+        "cursorStale": false,
+        "cursorStalled": false,
+        "cyclesWithoutAdvance": 0,
+        "hasError": false
+      }
+    ],
+    "persistentVolumeAvailable": true,
+    "persistentVolumeError": null
+  },
+  "config": {
+    "profile": "mock",
+    "envFile": {
+      "present": false,
+      "suppliedKeys": 0
+    },
+    "entries": [
+      {
+        "key": "BOT_TOKEN",
+        "source": "process-env",
+        "secret": true
+      },
+      {
+        "key": "CHAT_ID",
+        "source": "process-env",
+        "secret": true,
+        "derivedFrom": "TELEGRAM_CHAT_ID"
+      },
+      {
+        "key": "POLL_INTERVAL_MS",
+        "source": "built-in-default",
+        "secret": false,
+        "emptyDeclaration": true
+      },
+      {
+        "key": "SOROBAN_RPC_URL",
+        "source": "profile-default",
+        "secret": false
+      }
+    ],
+    "counts": {
+      "process-env": 2,
+      "env-file": 0,
+      "profile-default": 1,
+      "built-in-default": 1,
+      "derived": 0,
+      "unset": 0
+    },
+    "warnings": []
+  }
+}

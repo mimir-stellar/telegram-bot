@@ -17,6 +17,15 @@ import {
   type ActivityBaselineSnapshot,
 } from "./activity-baseline.js";
 import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
+import {
+  HEALTH_REPORT_SCHEMA_VERSION,
+  checkHealthPayloadCompatibility,
+  compareHealthSchemas,
+  type HealthContractCompatibility,
+  type HealthContractIssue,
+  type HealthContractIssueCode,
+  type HealthSchemaNode,
+} from "./health-schema-compat.js";
 import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
@@ -46,8 +55,20 @@ export interface HealthServer {
   close(): Promise<void>;
 }
 
+export {
+  HEALTH_REPORT_SCHEMA_VERSION,
+  checkHealthPayloadCompatibility,
+  compareHealthSchemas,
+  type HealthContractCompatibility,
+  type HealthContractIssue,
+  type HealthContractIssueCode,
+  type HealthSchemaNode,
+};
+
 /** Safe, redacted snapshot for HTTP clients. Never includes secrets. */
 export interface HealthReport {
+  /** Published major contract version for `GET /health` consumers. */
+  schemaVersion: typeof HEALTH_REPORT_SCHEMA_VERSION;
   ok: boolean;
   status: "ok" | "degraded" | "stopped";
   service: "mimir-telegram-bot";
@@ -285,6 +306,7 @@ export function buildHealthReport(
   }
 
   return {
+    schemaVersion: HEALTH_REPORT_SCHEMA_VERSION,
     ok: status === "ok",
     status,
     service: "mimir-telegram-bot",

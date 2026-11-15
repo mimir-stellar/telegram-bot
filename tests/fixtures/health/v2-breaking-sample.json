@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 2,
+  "ok": true,
+  "status": "warning",
+  "service": "mimir-telegram-bot",
+  "version": "0.1.0",
+  "network": "testnet",
+  "uptimeMs": 3600000,
+  "checkedAt": "2026-10-17T12:00:00.000Z",
+  "poller": {
+    "running": true,
+    "paused": false,
+    "stopping": false,
+    "channelPreviewMode": false,
+    "lastCorrelationId": "cycle-120",
+    "lastPollAt": "2026-10-17T11:59:50.000Z",
+    "lastSuccessAt": "2026-10-17T11:59:50.000Z",
+    "latestLedger": 5000,
+    "oldestLedger": 4000,
+    "chainClockAt": "2026-10-17T11:59:47.500Z",
+    "chainClockSkewMs": 12500,
+    "notificationsSent": 37,
+    "notificationsFailed": 0,
+    "eventsSkipped": 2,
+    "eventsDeduplicated": 3,
+    "activity": {
+      "windowSize": 20,
+      "minSamples": 10,
+      "zThreshold": 3,
+      "samples": 0,
+      "lastValue": null,
+      "baselineMean": null,
+      "baselineStdDev": null,
+      "zScore": null,
+      "deviation": "warming-up",
+      "anomalies": 0
+    },
+    "notificationsDropped": 0,
+    "cursorRewinds": 1,
+    "deadLetter": {
+      "depth": 1,
+      "enqueued": 2,
+      "replayed": 1,
+      "dropped": 0
+    },
+    "consecutiveFailures": 0,
+    "suppressedLogs": 0,
+    "lastError": null,
+    "restartGaps": 1,
+    "lastRestartGap": {
+      "at": "2026-10-17T11:00:10.000Z",
+      "source": "squad",
+      "cursorLedger": 3900,
+      "oldestLedger": 4000,
+      "missedLedgers": 100
+    },
+    "pendingFlush": false,
+    "lastFlushAt": "2026-10-17T11:59:50.000Z",
+    "targets": [
+      {
+        "source": "market",
+        "version": "v1",
+        "contractId": "CFIXTUREMARKET0000000000000000000000000000000000000000000000",
+        "lastCycleMs": 420,
+        "maxCycleMs": 1850,
+        "lastEventLedger": 4990,
+        "cursorPreview": "0018276211125911551-4294…",
+        "gapLedgers": 0,
+        "cursorResetAt": null,
+        "cursorUnreadable": false,
+        "rewindFromLedger": null,
+        "cursorStale": false,
+        "cursorStalled": false,
+        "cyclesWithoutAdvance": 0,
+        "hasError": false
+      },
+      {
+        "source": "squad",
+        "version": "v2",
+        "contractId": "CFIXTURESQUAD00000000000000000000000000000000000000000000000",
+        "lastCycleMs": 380,
+        "maxCycleMs": 2400,
+        "lastEventLedger": 4950,
+        "cursorPreview": "21474836480-1",
+        "gapLedgers": 100,
+        "cursorResetAt": "2026-10-17T11:00:10.000Z",
+        "cursorUnreadable": false,
+        "rewindFromLedger": null,
+        "cursorStale": false,
+        "cursorStalled": false,
+        "cyclesWithoutAdvance": 0,
+        "hasError": false
+      }
+    ],
+    "persistentVolumeAvailable": true,
+    "persistentVolumeError": null
+  },
+  "config": {
+    "profile": "mock",
+    "envFile": {
+      "present": false,
+      "suppliedKeys": 0
+    },
+    "entries": [
+      {
+        "key": "BOT_TOKEN",
+        "source": "process-env",
+        "secret": true
+      },
+      {
+        "key": "CHAT_ID",
+        "source": "process-env",
+        "secret": true,
+        "derivedFrom": "TELEGRAM_CHAT_ID"
+      },
+      {
+        "key": "POLL_INTERVAL_MS",
+        "source": "built-in-default",
+        "secret": false,
+        "emptyDeclaration": true
+      },
+      {
+        "key": "SOROBAN_RPC_URL",
+        "source": "profile-default",
+        "secret": false
+      }
+    ],
+    "counts": {
+      "process-env": 2,
+      "env-file": 0,
+      "profile-default": 1,
+      "built-in-default": 1,
+      "derived": 0,
+      "unset": 0
+    },
+    "warnings": []
+  }
+}

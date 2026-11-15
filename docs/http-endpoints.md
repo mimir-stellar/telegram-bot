@@ -78,6 +78,7 @@ is the machine-readable signal; the JSON body adds detail.
 
 ```jsonc
 {
+  "schemaVersion": 1,                  // published HealthReport major contract version
   "ok": true,                          // true only when status === "ok"
   "status": "ok",                      // "ok" | "degraded" | "stopped"
   "service": "mimir-telegram-bot",
@@ -158,6 +159,12 @@ curl -s http://127.0.0.1:8787/health | jq .status
 # Dead-letter queue depth
 curl -s http://127.0.0.1:8787/health | jq .poller.deadLetter.depth
 ```
+
+**Schema versioning and compatibility**
+
+- Current closed producer schema: [schemas/health-report.schema.json](schemas/health-report.schema.json)
+- Frozen `v1` baseline consumer schema: [schemas/health-report.v1.schema.json](schemas/health-report.v1.schema.json)
+- Adding new fields to response objects within `schemaVersion: 1` is classified as **additive** (backward-compatible for `v1` consumers), whereas removing or retyping baseline required fields, introducing unknown enum values, or bumping `schemaVersion` is classified as **breaking** (`compareHealthSchemas` / `checkHealthPayloadCompatibility`).
 
 ---
 

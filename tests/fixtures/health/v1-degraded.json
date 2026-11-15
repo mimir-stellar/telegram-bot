@@ -1,0 +1,136 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "status": "degraded",
+  "service": "mimir-telegram-bot",
+  "version": "0.1.0",
+  "network": "testnet",
+  "uptimeMs": 600000,
+  "checkedAt": "2026-10-17T12:00:00.000Z",
+  "poller": {
+    "running": true,
+    "paused": false,
+    "stopping": false,
+    "channelPreviewMode": false,
+    "cycles": 40,
+    "lastCorrelationId": "cycle-40",
+    "lastPollAt": "2026-10-17T11:59:55.000Z",
+    "lastSuccessAt": "2026-10-17T11:55:00.000Z",
+    "latestLedger": 5100,
+    "oldestLedger": 4100,
+    "chainClockAt": "2026-10-17T12:00:04.000Z",
+    "chainClockSkewMs": -4000,
+    "notificationsSent": 5,
+    "notificationsFailed": 4,
+    "eventsSkipped": 0,
+    "eventsDeduplicated": 0,
+    "activity": {
+      "windowSize": 20,
+      "minSamples": 10,
+      "zThreshold": 3,
+      "samples": 0,
+      "lastValue": null,
+      "baselineMean": null,
+      "baselineStdDev": null,
+      "zScore": null,
+      "deviation": "warming-up",
+      "anomalies": 0
+    },
+    "notificationsDropped": 1,
+    "cursorRewinds": 0,
+    "deadLetter": {
+      "depth": 0,
+      "enqueued": 0,
+      "replayed": 0,
+      "dropped": 0
+    },
+    "consecutiveFailures": 10,
+    "suppressedLogs": 6,
+    "lastError": {
+      "at": "2026-10-17T11:59:55.000Z",
+      "message": "getEvents failed: 503 Service Unavailable"
+    },
+    "restartGaps": 0,
+    "lastRestartGap": null,
+    "pendingFlush": true,
+    "lastFlushAt": "2026-10-17T11:55:00.000Z",
+    "targets": [
+      {
+        "source": "market",
+        "version": "v1",
+        "contractId": "CFIXTUREMARKET0000000000000000000000000000000000000000000000",
+        "lastCycleMs": 0,
+        "maxCycleMs": 0,
+        "lastEventLedger": 4990,
+        "cursorPreview": "0018276211125911551-4294…",
+        "gapLedgers": 0,
+        "cursorResetAt": null,
+        "cursorUnreadable": false,
+        "rewindFromLedger": 4100,
+        "cursorStale": true,
+        "cursorStalled": false,
+        "cyclesWithoutAdvance": 0,
+        "hasError": true
+      },
+      {
+        "source": "squad",
+        "version": "v1",
+        "contractId": "CFIXTURESQUAD00000000000000000000000000000000000000000000000",
+        "lastCycleMs": 0,
+        "maxCycleMs": 0,
+        "lastEventLedger": null,
+        "cursorPreview": "0017179869184000001-0",
+        "gapLedgers": 0,
+        "cursorResetAt": null,
+        "cursorUnreadable": true,
+        "rewindFromLedger": null,
+        "cursorStale": false,
+        "cursorStalled": true,
+        "cyclesWithoutAdvance": 7,
+        "hasError": false
+      }
+    ],
+    "persistentVolumeAvailable": false,
+    "persistentVolumeError": "EACCES: data directory is not writable"
+  },
+  "config": {
+    "profile": "mock",
+    "envFile": {
+      "present": false,
+      "suppliedKeys": 0
+    },
+    "entries": [
+      {
+        "key": "BOT_TOKEN",
+        "source": "process-env",
+        "secret": true
+      },
+      {
+        "key": "CHAT_ID",
+        "source": "process-env",
+        "secret": true,
+        "derivedFrom": "TELEGRAM_CHAT_ID"
+      },
+      {
+        "key": "POLL_INTERVAL_MS",
+        "source": "built-in-default",
+        "secret": false,
+        "emptyDeclaration": true
+      },
+      {
+        "key": "SOROBAN_RPC_URL",
+        "source": "profile-default",
+        "secret": false
+      }
+    ],
+    "counts": {
+      "process-env": 2,
+      "env-file": 0,
+      "profile-default": 1,
+      "built-in-default": 1,
+      "derived": 0,
+      "unset": 0
+    },
+    "warnings": []
+  }
+}
