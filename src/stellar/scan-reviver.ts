@@ -55,7 +55,7 @@ function parseBigInt(value: unknown): bigint | undefined {
 /**
  * Recursively revive bigint fields in an object based on its event name.
  */
-function revivePayload(payload: ScanJsonEvent["payload"]): ScanJsonEvent["payload"] {
+export function revivePayload(payload: ScanJsonEvent["payload"]): ScanJsonEvent["payload"] {
   if (!payload || typeof payload !== "object") return payload;
 
   const name = (payload as { name?: string }).name;

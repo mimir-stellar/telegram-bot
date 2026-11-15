@@ -64,8 +64,9 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 
 | Flag | Type / Values | Description | Default |
 | --- | --- | --- | --- |
-| `--from` | `<ledger \| cursor>` | Starting ledger sequence or opaque cursor token (`<TOID>-<index>`). **Required.** | None |
-| `--to` | `<ledger>` | Ending ledger sequence (inclusive upper bound). | Chain tip (`window.latestLedger`) |
+| `--from` | `<ledger \| cursor>` | Starting ledger sequence or opaque cursor token (`<TOID>-<index>`). **Required** unless `--archive` is provided (defaults to the archive's `ledgers.oldest`). | None |
+| `--to` | `<ledger>` | Ending ledger sequence (inclusive upper bound). | Chain tip (`window.latestLedger`) or archive `ledgers.latest` |
+| `--archive` | `<path>` | Replay offline from a validated scanner archive (`mimir-scan-archive-v1` or `mimir-scan-v1`) without making any RPC calls. Enforces schema version, network identity, passphrase alignment, and contract IDs before processing. | None |
 | `--contract` | `market \| squad` | Restrict replay to a single contract. | Both contracts (`market` and `squad`) |
 | `--send` | Boolean flag | Actually dispatch messages to Telegram. Requires valid Telegram credentials in `.env` or process environment. | `false` (dry-run mode is active by default) |
 | `--dry-run` | Boolean flag | Explicit dry-run flag accepted by CLI parser. Dry-run is active whenever `--send` is omitted. | `true` |
