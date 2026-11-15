@@ -225,3 +225,27 @@ export function volumeSeries(
     processedEvents,
   };
 }
+
+export {
+  AGGREGATE_CHECKPOINT_SCHEMA_VERSION,
+  AggregateCheckpointError,
+  DEFAULT_CHECKPOINT_DEDUP_WINDOW,
+  DEFAULT_MAX_COMPLETED_CLAIMS,
+  DEFAULT_MAX_OPEN_CLAIMS,
+  DEFAULT_MAX_VOLUME_BUCKETS,
+  IncrementalAggregator,
+  createIncrementalAggregator,
+  loadAggregateCheckpoint,
+  loadOrCreateIncrementalAggregator,
+  parseAggregateCheckpoint,
+  saveAggregateCheckpoint,
+  serializeAggregateCheckpoint,
+  type AggregateCheckpoint,
+  type IncrementalAggregatorBounds,
+  type IncrementalAggregatorOptions,
+  type IngestBatchStats,
+  type IngestOptions,
+  type LoadAggregatorOptions,
+  type SerializedOpenClaim,
+  type SerializedVolumeBucket,
+} from "./aggregate-checkpoint.js";
