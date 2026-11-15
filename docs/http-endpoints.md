@@ -318,6 +318,22 @@ The metrics registry tracks:
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
 
+#### Metric registration invariants
+
+`MetricsRegistry` (`src/metrics.ts`) exposes `registerCounter(name, help)` and
+`registerGauge(name, help)` (used by built-in metrics and helpers such as
+`registerStellarRpcMetrics` in `src/stellar/metrics.ts`):
+
+- **Idempotent identical registration:** Re-registering an existing metric name
+  with the exact same `type` (`counter` or `gauge`) and `help` string returns
+  the existing handle so shared callers accumulate into one series without
+  emitting duplicate `# HELP` or `# TYPE` blocks.
+- **Conflict rejection:** Re-registering an existing metric name with a
+  different `type` (`reason: "type-conflict"`) or `help` string
+  (`reason: "help-conflict"`), or supplying an invalid metric name / multiline
+  `help` string, throws `MetricRegistrationError` immediately and leaves the
+  registry's Prometheus exposition uncorrupted.
+
 ```bash
 METRICS_PORT=9090  # in .env or environment
 

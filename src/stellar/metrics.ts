@@ -13,6 +13,8 @@
  * log and to put in `/status`-style output.
  */
 
+import type { Counter, Gauge, MetricsRegistry } from "../metrics.js";
+
 export type RpcOperation = "health" | "events";
 
 /** Per-operation aggregate. Every quantity is a count or a duration in ms. */
@@ -135,4 +137,72 @@ export function formatRpcTiming(summary: RpcTimingSummary): string {
     `avg=${avgMs}ms max=${maxMs}ms ` +
     `health=${operations.health.requests} events=${operations.events.requests}`
   );
+}
+
+/** Handles registered in a {@link MetricsRegistry} for Stellar RPC timing. */
+export interface StellarRpcMetricHandles {
+  healthRequests: Counter;
+  healthFailures: Counter;
+  eventsRequests: Counter;
+  eventsFailures: Counter;
+  maxDurationMs: Gauge;
+  recordSummary(summary: RpcTimingSummary): void;
+}
+
+/**
+ * Idempotently register Stellar RPC timing metrics into a {@link MetricsRegistry}.
+ *
+ * Calling this helper multiple times against the same registry returns the
+ * existing metric handles without emitting duplicate `# HELP` or `# TYPE`
+ * blocks. If any target metric name was already registered with a conflicting
+ * `type` or `help` definition, the underlying `MetricRegistrationError` is
+ * propagated before exposition can be corrupted.
+ */
+export function registerStellarRpcMetrics(
+  registry: Pick<MetricsRegistry, "registerCounter" | "registerGauge">,
+  prefix = "mimir_bot_stellar_rpc_",
+): StellarRpcMetricHandles {
+  const healthRequests = registry.registerCounter(
+    `${prefix}health_requests_total`,
+    "Total Soroban RPC getHealth requests recorded.",
+  );
+  const healthFailures = registry.registerCounter(
+    `${prefix}health_failures_total`,
+    "Total failed Soroban RPC getHealth requests recorded.",
+  );
+  const eventsRequests = registry.registerCounter(
+    `${prefix}events_requests_total`,
+    "Total Soroban RPC getEvents page requests recorded.",
+  );
+  const eventsFailures = registry.registerCounter(
+    `${prefix}events_failures_total`,
+    "Total failed Soroban RPC getEvents page requests recorded.",
+  );
+  const maxDurationMs = registry.registerGauge(
+    `${prefix}max_duration_ms`,
+    "Maximum single Soroban RPC request duration in milliseconds.",
+  );
+
+  return {
+    healthRequests,
+    healthFailures,
+    eventsRequests,
+    eventsFailures,
+    maxDurationMs,
+    recordSummary(summary: RpcTimingSummary): void {
+      if (summary.operations.health.requests > 0) {
+        healthRequests.inc(summary.operations.health.requests);
+      }
+      if (summary.operations.health.failures > 0) {
+        healthFailures.inc(summary.operations.health.failures);
+      }
+      if (summary.operations.events.requests > 0) {
+        eventsRequests.inc(summary.operations.events.requests);
+      }
+      if (summary.operations.events.failures > 0) {
+        eventsFailures.inc(summary.operations.events.failures);
+      }
+      maxDurationMs.set(Math.max(maxDurationMs.value(), Math.round(summary.maxMs)));
+    },
+  };
 }

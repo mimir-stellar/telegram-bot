@@ -27,6 +27,33 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 
 // ── Metric types ──────────────────────────────────────────────────────────────
 
+export type MetricType = "counter" | "gauge";
+
+export type MetricRegistrationErrorReason =
+  | "invalid-name"
+  | "invalid-help"
+  | "type-conflict"
+  | "help-conflict";
+
+/**
+ * Thrown when a caller attempts to register an invalid metric definition or a
+ * duplicate metric name whose `type` or `help` conflicts with the existing
+ * registration. Rejecting at registration time prevents duplicate or
+ * contradictory `# HELP` / `# TYPE` headers from corrupting Prometheus text
+ * exposition.
+ */
+export class MetricRegistrationError extends Error {
+  readonly metricName: string;
+  readonly reason: MetricRegistrationErrorReason;
+
+  constructor(metricName: string, reason: MetricRegistrationErrorReason, message: string) {
+    super(message);
+    this.name = "MetricRegistrationError";
+    this.metricName = metricName;
+    this.reason = reason;
+  }
+}
+
 export interface Counter {
   /** Increment by 1 (default) or by `delta` (must be ≥ 0). */
   inc(delta?: number): void;
@@ -91,6 +118,22 @@ export interface MetricsRegistry {
   activityAnomalies: Counter;
 
   /**
+   * Register a counter metric in this registry, or return the existing handle
+   * when `name` is already registered as a counter with the exact same `help`.
+   * Throws {@link MetricRegistrationError} on invalid `name`/`help` or when an
+   * existing metric with `name` has a different `type` or `help`.
+   */
+  registerCounter(name: string, help: string): Counter;
+
+  /**
+   * Register a gauge metric in this registry, or return the existing handle
+   * when `name` is already registered as a gauge with the exact same `help`.
+   * Throws {@link MetricRegistrationError} on invalid `name`/`help` or when an
+   * existing metric with `name` has a different `type` or `help`.
+   */
+  registerGauge(name: string, help: string): Gauge;
+
+  /**
    * Render the registry as a Prometheus text exposition string.
    * Includes HELP and TYPE comment lines so Prometheus autodiscovery works.
    */
@@ -115,11 +158,36 @@ export interface MetricsRegistry {
 
 // ── Implementation ────────────────────────────────────────────────────────────
 
-function makeCounter(name: string, help: string): Counter & { _name: string; _help: string } {
+const METRIC_NAME_RE = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
+
+function validateMetricDefinition(name: string, help: string): void {
+  if (typeof name !== "string" || !METRIC_NAME_RE.test(name)) {
+    throw new MetricRegistrationError(
+      String(name),
+      "invalid-name",
+      `Invalid Prometheus metric name "${String(name)}": must match ${METRIC_NAME_RE}`,
+    );
+  }
+  if (typeof help !== "string" || help.trim().length === 0 || /[\r\n\0]/.test(help)) {
+    throw new MetricRegistrationError(
+      name,
+      "invalid-help",
+      `Invalid HELP string for metric "${name}": must be a non-empty single-line string`,
+    );
+  }
+}
+
+function escapeHelp(help: string): string {
+  return help.replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
+}
+
+type RegisteredEntry =
+  | { name: string; help: string; type: "counter"; handle: Counter }
+  | { name: string; help: string; type: "gauge"; handle: Gauge };
+
+function makeCounter(): Counter {
   let _value = 0;
   return {
-    _name: name,
-    _help: help,
     inc(delta = 1): void {
       if (delta < 0) throw new RangeError(`Counter.inc delta must be >= 0; got ${delta}`);
       _value += delta;
@@ -130,11 +198,9 @@ function makeCounter(name: string, help: string): Counter & { _name: string; _he
   };
 }
 
-function makeGauge(name: string, help: string): Gauge & { _name: string; _help: string } {
+function makeGauge(): Gauge {
   let _value = 0;
   return {
-    _name: name,
-    _help: help,
     set(value: number): void {
       _value = value;
     },
@@ -147,81 +213,114 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 const METRICS_PREFIX = "mimir_bot_";
 
 export function createMetrics(): MetricsRegistry {
-  const pollCycles = makeCounter(
+  const registered = new Map<string, RegisteredEntry>();
+
+  function registerCounter(name: string, help: string): Counter {
+    validateMetricDefinition(name, help);
+    const existing = registered.get(name);
+    if (existing !== undefined) {
+      if (existing.type !== "counter") {
+        throw new MetricRegistrationError(
+          name,
+          "type-conflict",
+          `Cannot register metric "${name}" as counter: already registered as ${existing.type}`,
+        );
+      }
+      if (existing.help !== help) {
+        throw new MetricRegistrationError(
+          name,
+          "help-conflict",
+          `Cannot register metric "${name}": HELP text conflicts with existing registration`,
+        );
+      }
+      return existing.handle;
+    }
+    const handle = makeCounter();
+    registered.set(name, { name, help, type: "counter", handle });
+    return handle;
+  }
+
+  function registerGauge(name: string, help: string): Gauge {
+    validateMetricDefinition(name, help);
+    const existing = registered.get(name);
+    if (existing !== undefined) {
+      if (existing.type !== "gauge") {
+        throw new MetricRegistrationError(
+          name,
+          "type-conflict",
+          `Cannot register metric "${name}" as gauge: already registered as ${existing.type}`,
+        );
+      }
+      if (existing.help !== help) {
+        throw new MetricRegistrationError(
+          name,
+          "help-conflict",
+          `Cannot register metric "${name}": HELP text conflicts with existing registration`,
+        );
+      }
+      return existing.handle;
+    }
+    const handle = makeGauge();
+    registered.set(name, { name, help, type: "gauge", handle });
+    return handle;
+  }
+
+  const pollCycles = registerCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
   );
-  const rpcRequests = makeCounter(
+  const rpcRequests = registerCounter(
     `${METRICS_PREFIX}rpc_requests_total`,
     "Total successful Soroban RPC getEvents calls.",
   );
-  const rpcErrors = makeCounter(
+  const rpcErrors = registerCounter(
     `${METRICS_PREFIX}rpc_errors_total`,
     "Total failed Soroban RPC getEvents calls.",
   );
-  const eventsDecoded = makeCounter(
+  const eventsDecoded = registerCounter(
     `${METRICS_PREFIX}events_decoded_total`,
     "Total on-chain events returned by the RPC and passed through the decoder.",
   );
-  const eventsSkipped = makeCounter(
+  const eventsSkipped = registerCounter(
     `${METRICS_PREFIX}events_skipped_total`,
     "Total events not notified: unknown type, no formatter, or MAX_NOTIFICATIONS_PER_CYCLE cap.",
   );
-  const notificationsSent = makeCounter(
+  const notificationsSent = registerCounter(
     `${METRICS_PREFIX}notifications_sent_total`,
     "Total Telegram messages successfully sent.",
   );
-  const notificationsFailed = makeCounter(
+  const notificationsFailed = registerCounter(
     `${METRICS_PREFIX}notifications_failed_total`,
     "Total Telegram sends that threw an error (cursor still advanced).",
   );
-  const staleCursorEvents = makeCounter(
+  const staleCursorEvents = registerCounter(
     `${METRICS_PREFIX}stale_cursor_events_total`,
     "Number of times a stale-cursor warning was emitted (events in the gap are lost).",
   );
-  const consecutiveFailures = makeGauge(
-    `${METRICS_PREFIX}consecutive_failures`,
-    "Current number of consecutive full-cycle RPC failures (resets to 0 on any success).",
-  );
-  const lastCycleEvents = makeGauge(
-    `${METRICS_PREFIX}last_cycle_events`,
-    "Events observed in the most recent complete poll cycle.",
-  );
-  const activityBaselineEvents = makeGauge(
-    `${METRICS_PREFIX}activity_baseline_events`,
-    "Rolling mean events per cycle at the most recent baseline comparison (rounded).",
-  );
-  const activityAnomalies = makeCounter(
+  const activityAnomalies = registerCounter(
     `${METRICS_PREFIX}activity_anomalies_total`,
     "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
   );
-
-  const counters = [
-    pollCycles,
-    rpcRequests,
-    rpcErrors,
-    eventsDecoded,
-    eventsSkipped,
-    notificationsSent,
-    notificationsFailed,
-    staleCursorEvents,
-    activityAnomalies,
-  ];
-  const gauges = [consecutiveFailures, lastCycleEvents, activityBaselineEvents];
+  const consecutiveFailures = registerGauge(
+    `${METRICS_PREFIX}consecutive_failures`,
+    "Current number of consecutive full-cycle RPC failures (resets to 0 on any success).",
+  );
+  const lastCycleEvents = registerGauge(
+    `${METRICS_PREFIX}last_cycle_events`,
+    "Events observed in the most recent complete poll cycle.",
+  );
+  const activityBaselineEvents = registerGauge(
+    `${METRICS_PREFIX}activity_baseline_events`,
+    "Rolling mean events per cycle at the most recent baseline comparison (rounded).",
+  );
 
   function render(): string {
     const lines: string[] = [];
 
-    for (const c of counters) {
-      lines.push(`# HELP ${c._name} ${c._help}`);
-      lines.push(`# TYPE ${c._name} counter`);
-      lines.push(`${c._name} ${c.value()}`);
-    }
-
-    for (const g of gauges) {
-      lines.push(`# HELP ${g._name} ${g._help}`);
-      lines.push(`# TYPE ${g._name} gauge`);
-      lines.push(`${g._name} ${g.value()}`);
+    for (const entry of registered.values()) {
+      lines.push(`# HELP ${entry.name} ${escapeHelp(entry.help)}`);
+      lines.push(`# TYPE ${entry.name} ${entry.type}`);
+      lines.push(`${entry.name} ${entry.handle.value()}`);
     }
 
     // Prometheus text format requires a trailing newline.
@@ -306,6 +405,8 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    registerCounter,
+    registerGauge,
     render,
     startServer,
   };
