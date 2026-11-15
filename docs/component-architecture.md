@@ -184,6 +184,13 @@ Thin wrapper around Stellar SDK's `rpc.Server` with explorer URL helpers.
 - **Unauthenticated**: Public Testnet RPC requires no keys
 - **HTTP-aware**: Allows HTTP for local quickstart containers
 
+### Atom Feed Publication Timestamps (`src/stellar/feed.ts`)
+
+Derives syndication publication times strictly from on-chain ledger close timestamps:
+
+- **Ledger-derived `<published>` and `<updated>`**: Historical events with valid `event.at` close times emit `<published>` and `<updated>` from that ledger timestamp, never process startup or wall-clock time.
+- **Explicit unknown event times**: Events missing a valid ledger timestamp (`0`, absent, non-finite, or out-of-range) omit `<published>`, set `eventTimeStatus: "unknown"`, emit `<category scheme="urn:mimir:event-time" term="unknown"/>`, and use `UNKNOWN_EVENT_UPDATED_AT` (`1970-01-01T00:00:00.000Z`) for RFC 4287 `<updated>`.
+
 ## Data Flow
 
 ### Event Processing Pipeline

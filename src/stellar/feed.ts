@@ -25,6 +25,56 @@ export const FEED_CONTENT_MAX_CHARS = 2_000;
 /** Maximum byte length of a title or subtitle string. */
 export const FEED_TITLE_MAX_CHARS = 500;
 
+/** Deterministic RFC 3339 sentinel for required Atom `<updated>` when ledger time is unknown. */
+export const UNKNOWN_EVENT_UPDATED_AT = "1970-01-01T00:00:00.000Z";
+
+/** Atom `<category>` scheme used to represent on-chain event timestamp availability. */
+export const EVENT_TIME_CATEGORY_SCHEME = "urn:mimir:event-time";
+
+/** Maximum Unix-seconds timestamp representable by ECMAScript `Date` (`8.64e15` ms). */
+const MAX_VALID_UNIX_SECONDS = 8_640_000_000_000;
+
+export type EventTimeStatus = "known" | "unknown";
+
+export interface LedgerPublicationTime {
+  /** Whether a valid positive on-chain ledger close timestamp was present. */
+  status: EventTimeStatus;
+  /** RFC 3339 ledger publication timestamp, or `null` when unknown. */
+  published: string | null;
+  /** RFC 3339 `<updated>` value (ledger timestamp when known, epoch sentinel when unknown). */
+  updated: string;
+}
+
+/**
+ * Derive Atom publication timestamps strictly from an on-chain ledger close
+ * timestamp (`at`, Unix seconds).
+ *
+ * Never falls back to `Date.now()` or process startup time: historical events
+ * keep their ledger close time, and missing/non-positive/out-of-range values
+ * are represented explicitly with `status: "unknown"` and `published: null`.
+ */
+export function resolveLedgerPublicationTime(at: unknown): LedgerPublicationTime {
+  if (
+    typeof at === "number" &&
+    Number.isFinite(at) &&
+    at > 0 &&
+    at <= MAX_VALID_UNIX_SECONDS
+  ) {
+    const iso = new Date(Math.floor(at * 1000)).toISOString();
+    return {
+      status: "known",
+      published: iso,
+      updated: iso,
+    };
+  }
+
+  return {
+    status: "unknown",
+    published: null,
+    updated: UNKNOWN_EVENT_UPDATED_AT,
+  };
+}
+
 /**
  * Escape the five XML predefined entities so a string is safe inside any
  * element text node or double-quoted attribute value.
@@ -88,6 +138,13 @@ export interface AtomEntry {
   id: string;
   /** RFC 4287 §4.2.14: human-readable title. */
   title: string;
+  /**
+   * RFC 4287 §4.2.9: on-chain ledger close timestamp in RFC 3339 when known,
+   * or `null` when the event has no valid ledger timestamp.
+   */
+  published: string | null;
+  /** Explicit indicator of whether the event's ledger close time is known. */
+  eventTimeStatus: EventTimeStatus;
   /** RFC 4287 §4.2.15: last-modified timestamp in RFC 3339. */
   updated: string;
   /** RFC 4287 §4.1.3.1: plain-text content, or null when not notifiable. */
@@ -134,14 +191,7 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
       : event.payload.name;
 
   const title = `mimir-${event.source}: ${eventName}`;
-
-  // Use ledger close time if available and looks reasonable (> Unix epoch start),
-  // otherwise fall back to a synthetic epoch-based value.
-  const updatedDate =
-    typeof event.at === "number" && event.at > 0
-      ? new Date(event.at * 1000)
-      : new Date(0);
-  const updated = updatedDate.toISOString();
+  const publication = resolveLedgerPublicationTime(event.at);
 
   const rawContent = formatPlainTextEvent(config, event);
   const content =
@@ -155,7 +205,9 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
   return {
     id: `tag:mimir,event:${event.eventId}`,
     title,
-    updated,
+    published: publication.published,
+    eventTimeStatus: publication.status,
+    updated: publication.updated,
     content,
     link,
   };
@@ -168,7 +220,15 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
 function renderEntry(entry: AtomEntry): string {
   const titleEl = `    <title type="text">${xmlText(entry.title, FEED_TITLE_MAX_CHARS)}</title>`;
   const idEl = `    <id>${escapeXml(entry.id)}</id>`;
+  const publishedEl =
+    entry.published !== null
+      ? `    <published>${escapeXml(entry.published)}</published>`
+      : "";
   const updatedEl = `    <updated>${escapeXml(entry.updated)}</updated>`;
+  const timeCategoryEl =
+    entry.eventTimeStatus === "unknown"
+      ? `    <category scheme="${EVENT_TIME_CATEGORY_SCHEME}" term="unknown" label="Unknown ledger timestamp"/>`
+      : "";
 
   const linkEl =
     entry.link !== null
@@ -184,7 +244,9 @@ function renderEntry(entry: AtomEntry): string {
     "  <entry>",
     titleEl,
     idEl,
+    publishedEl,
     updatedEl,
+    timeCategoryEl,
     linkEl,
     contentEl,
     "  </entry>",
@@ -210,16 +272,30 @@ export function buildAtomFeed(
   options: AtomFeedOptions,
 ): string {
   const { title, selfUrl, config, subtitle } = options;
+  const entries = events.map((event) => buildAtomEntry(event, config));
 
-  // Feed <updated>: caller override → latest event.at → now.
+  let latestKnownMs: number | null = null;
+  let unknownCount = 0;
+  for (const entry of entries) {
+    if (entry.eventTimeStatus === "known" && entry.published !== null) {
+      const ms = Date.parse(entry.published);
+      if (!Number.isNaN(ms) && (latestKnownMs === null || ms > latestKnownMs)) {
+        latestKnownMs = ms;
+      }
+    } else {
+      unknownCount += 1;
+    }
+  }
+
+  // Feed <updated>: caller override → latest known ledger close time → epoch sentinel.
+  // Never assign process startup time or Date.now() to historical or timeless events.
   let feedUpdated: string;
   if (options.updatedAt) {
     feedUpdated = options.updatedAt;
-  } else if (events.length > 0) {
-    const maxAt = events.reduce((best, e) => Math.max(best, e.at ?? 0), 0);
-    feedUpdated = new Date(maxAt > 0 ? maxAt * 1000 : Date.now()).toISOString();
+  } else if (latestKnownMs !== null) {
+    feedUpdated = new Date(latestKnownMs).toISOString();
   } else {
-    feedUpdated = new Date().toISOString();
+    feedUpdated = UNKNOWN_EVENT_UPDATED_AT;
   }
 
   const validSelfUrl = safeHttpsUrl(selfUrl) ?? "";
@@ -239,14 +315,23 @@ export function buildAtomFeed(
     `  <updated>${escapeXml(feedUpdated)}</updated>`,
   );
 
+  if (entries.length > 0 && unknownCount === entries.length) {
+    lines.push(
+      `  <category scheme="${EVENT_TIME_CATEGORY_SCHEME}" term="unknown" label="All entries have unknown ledger timestamps"/>`,
+    );
+  } else if (unknownCount > 0) {
+    lines.push(
+      `  <category scheme="${EVENT_TIME_CATEGORY_SCHEME}" term="partial" label="Some entries have unknown ledger timestamps"/>`,
+    );
+  }
+
   if (validSelfUrl) {
     lines.push(
       `  <link rel="self" type="application/atom+xml" href="${escapeXml(validSelfUrl)}"/>`,
     );
   }
 
-  for (const event of events) {
-    const entry = buildAtomEntry(event, config);
+  for (const entry of entries) {
     lines.push(renderEntry(entry));
   }
 
