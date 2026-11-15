@@ -71,7 +71,8 @@ Emitted by the poller loop during event ingestion, cursor management, cycle exec
 
 | Field | Type | Description |
 |---|---|---|
-| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"persistent_volume_unwritable"`. |
+| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_persist_failed"`, `"event_scanned"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"notification_delivered"`, `"notification_failed"`, `"dead_letter_replayed"`, `"persistent_volume_unwritable"`. |
+| `notificationCorrelationId` | `string` | Privacy-safe deterministic correlation ID (`ntf-<16-hex>`) derived from chain event metadata (`source`, `ledger`, `eventId`, `eventName`, `transactionIndex`, `operationIndex`), carried across scan, delivery, dead-letter persistence, and replay without raw message text or credentials. |
 | `marketContractId` | `string` | Mimir market contract address watched. |
 | `squadContractId` | `string` | Mimir squad contract address watched. |
 | `pollIntervalMs` | `number` | Polling interval in milliseconds. |

@@ -22,6 +22,8 @@
  * or a health response.
  */
 
+import { createHash } from "node:crypto";
+
 /** Placeholder, matching the wording the status/health surfaces already use. */
 export const REDACTED = "[REDACTED]";
 
@@ -202,4 +204,107 @@ export function redactError(err: unknown, options: RedactOptions = {}): string {
     }
   }
   return redactText(raw, options);
+}
+
+// ── Privacy-safe notification correlation identifier ─────────────────────────
+
+/** Prefix for deterministic, privacy-safe notification lifecycle correlation IDs. */
+export const NOTIFICATION_CORRELATION_PREFIX = "ntf-";
+
+const NOTIFICATION_CORRELATION_SHAPE = /^ntf-[0-9a-f]{16}$/;
+
+/**
+ * Public chain-event identity fields used to derive a stable notification
+ * correlation ID. Message bodies, recipient chat IDs, amounts, and credentials
+ * are intentionally excluded so correlating scan, delivery, and dead-letter
+ * records never leaks payload content or secrets.
+ */
+export interface NotificationCorrelationInput {
+  source: string;
+  ledger: number;
+  eventId?: string | null;
+  eventName?: string | null;
+  transactionIndex?: number | null;
+  operationIndex?: number | null;
+}
+
+/** True when `value` matches the canonical `ntf-<16-hex>` correlation shape. */
+export function isNotificationCorrelationId(value: unknown): value is string {
+  return typeof value === "string" && NOTIFICATION_CORRELATION_SHAPE.test(value);
+}
+
+/**
+ * Derive a deterministic 20-character (`ntf-<16-hex>`) correlation identifier
+ * from stable chain-event metadata.
+ *
+ * Every string input is scrubbed through {@link redactText} and hashed with
+ * SHA-256 using length-prefixed framing, so neither raw message text nor
+ * credentials can survive into the returned identifier even if untrusted
+ * values are passed.
+ */
+export function deriveNotificationCorrelationId(
+  input: NotificationCorrelationInput,
+): string {
+  const safeSource = redactText(
+    typeof input.source === "string" && input.source.trim().length > 0
+      ? input.source.trim().toLowerCase()
+      : "unknown",
+    { maxLen: 64 },
+  );
+  const safeLedger =
+    typeof input.ledger === "number" && Number.isFinite(input.ledger)
+      ? String(Math.trunc(input.ledger))
+      : "0";
+  const safeEventId =
+    typeof input.eventId === "string" && input.eventId.trim().length > 0
+      ? redactText(input.eventId.trim(), { maxLen: 128 })
+      : "";
+  const safeEventName =
+    typeof input.eventName === "string" && input.eventName.trim().length > 0
+      ? redactText(input.eventName.trim(), { maxLen: 128 })
+      : "";
+  const safeTxIdx =
+    typeof input.transactionIndex === "number" && Number.isFinite(input.transactionIndex)
+      ? String(Math.trunc(input.transactionIndex))
+      : "";
+  const safeOpIdx =
+    typeof input.operationIndex === "number" && Number.isFinite(input.operationIndex)
+      ? String(Math.trunc(input.operationIndex))
+      : "";
+
+  const parts = [
+    "v1",
+    safeSource,
+    safeLedger,
+    safeEventId,
+    safeEventName,
+    safeTxIdx,
+    safeOpIdx,
+  ];
+  const canonical = parts.map((part) => `${part.length}:${part}`).join("|");
+  const digest = createHash("sha256").update(canonical, "utf8").digest("hex").slice(0, 16);
+  return `${NOTIFICATION_CORRELATION_PREFIX}${digest}`;
+}
+
+/** Derive a notification correlation ID directly from a decoded chain event. */
+export function notificationCorrelationIdForEvent(event: {
+  source: string;
+  ledger: number;
+  eventId?: string | null;
+  transactionIndex?: number | null;
+  operationIndex?: number | null;
+  payload?: { name?: string; eventName?: string } | null;
+}): string {
+  const rawName =
+    event.payload?.name === "unknown" && typeof event.payload.eventName === "string"
+      ? event.payload.eventName
+      : (event.payload?.name ?? null);
+  return deriveNotificationCorrelationId({
+    source: event.source,
+    ledger: event.ledger,
+    eventId: event.eventId,
+    eventName: rawName,
+    transactionIndex: event.transactionIndex,
+    operationIndex: event.operationIndex,
+  });
 }

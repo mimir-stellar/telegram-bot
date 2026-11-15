@@ -30,6 +30,21 @@
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import {
+  NOTIFICATION_CORRELATION_PREFIX,
+  deriveNotificationCorrelationId,
+  isNotificationCorrelationId,
+  notificationCorrelationIdForEvent,
+  type NotificationCorrelationInput,
+} from "./redact.js";
+
+export {
+  NOTIFICATION_CORRELATION_PREFIX,
+  deriveNotificationCorrelationId,
+  isNotificationCorrelationId,
+  notificationCorrelationIdForEvent,
+  type NotificationCorrelationInput,
+};
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -331,6 +346,15 @@ function emit(level: LogLevel, component: string, message: string, fields?: LogF
   state.sink(level, line);
 }
 
+export interface ScopedLogger {
+  readonly notificationCorrelationId: string;
+  debug(component: string, message: string, fields?: LogFields): void;
+  info(component: string, message: string, fields?: LogFields): void;
+  warn(component: string, message: string, fields?: LogFields): void;
+  error(component: string, message: string, fields?: LogFields): void;
+  fatal(component: string, message: string, fields?: LogFields): void;
+}
+
 export const Logger = {
   configure(options: Partial<LoggerState>): void {
     state = { ...state, ...options };
@@ -350,6 +374,34 @@ export const Logger = {
   },
   getFormat(): LogFormat {
     return state.format;
+  },
+  withNotificationCorrelation(
+    correlationOrInput: string | NotificationCorrelationInput,
+  ): ScopedLogger {
+    const safeId =
+      typeof correlationOrInput === "string"
+        ? isNotificationCorrelationId(correlationOrInput)
+          ? correlationOrInput
+          : deriveNotificationCorrelationId({
+              source: "external",
+              ledger: 0,
+              eventId: correlationOrInput,
+            })
+        : deriveNotificationCorrelationId(correlationOrInput);
+
+    const mergeFields = (fields?: LogFields): LogFields => ({
+      ...fields,
+      notificationCorrelationId: safeId,
+    });
+
+    return {
+      notificationCorrelationId: safeId,
+      debug: (component, message, fields) => emit("debug", component, message, mergeFields(fields)),
+      info: (component, message, fields) => emit("info", component, message, mergeFields(fields)),
+      warn: (component, message, fields) => emit("warn", component, message, mergeFields(fields)),
+      error: (component, message, fields) => emit("error", component, message, mergeFields(fields)),
+      fatal: (component, message, fields) => emit("fatal", component, message, mergeFields(fields)),
+    };
   },
   debug(component: string, message: string, fields?: LogFields): void {
     emit("debug", component, message, fields);

@@ -37,7 +37,19 @@ export interface SendExtra {
   /**
    * Bounded identifiers for fallback logging only. Optional; never sent.
    */
-  eventRef?: { eventId?: string | undefined; ledger?: number | undefined; source?: string | undefined } | undefined;
+  eventRef?:
+    | {
+        eventId?: string | undefined;
+        ledger?: number | undefined;
+        source?: string | undefined;
+        notificationCorrelationId?: string | undefined;
+      }
+    | undefined;
+  /**
+   * Privacy-safe event-derived correlation identifier (`ntf-<16-hex>`) carried
+   * across scan, delivery, and dead-letter replay; never included in chat text.
+   */
+  notificationCorrelationId?: string | undefined;
   /**
    * Post the notification as a reply to this message, for chats that thread
    * their notifications. Optional: omitted from the payload entirely when
@@ -85,6 +97,12 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
     parts.push(`ledger ${eventRef.ledger}`);
   }
   if (typeof eventRef.eventId === "string" && eventRef.eventId) parts.push(eventRef.eventId);
+  if (
+    typeof eventRef.notificationCorrelationId === "string" &&
+    /^ntf-[0-9a-f]{16}$/.test(eventRef.notificationCorrelationId)
+  ) {
+    parts.push(eventRef.notificationCorrelationId);
+  }
   return parts.length > 0 ? ` (${parts.join(" ")})` : "";
 }
 

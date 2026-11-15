@@ -234,6 +234,7 @@ function toEntryView(
 
   return {
     id: sanitizeDlqText(entry.id, chatIds, secrets),
+    notificationCorrelationId: entry.notificationCorrelationId,
     enqueuedAt: entry.enqueuedAt,
     source: entry.source,
     ledger: entry.ledger,
@@ -508,6 +509,7 @@ function formatShowOutput(entry: DlqEntryView, asJson: boolean): string {
   }
   return [
     `id:         ${entry.id}`,
+    `correlation: ${entry.notificationCorrelationId}`,
     `enqueuedAt: ${entry.enqueuedAt}`,
     `source:     ${entry.source}`,
     `ledger:     ${entry.ledger}`,

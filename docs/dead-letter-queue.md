@@ -23,6 +23,7 @@ The dead-letter file is written atomically (via a write-to-temporary-file and re
   "entries": [
     {
       "id": "market:123456:MarketCreated:a1b2c3d4",
+      "notificationCorrelationId": "ntf-8f3a1b2c9d4e5f60",
       "enqueuedAt": "2026-10-18T14:59:50.000Z",
       "source": "market",
       "ledger": 123456,
@@ -46,6 +47,7 @@ The dead-letter file is written atomically (via a write-to-temporary-file and re
 Each entry in `entries` mirrors the `DeadLetterEntry` TypeScript interface defined in [`src/deadLetter.ts`](file:///c:/Users/HP/drips/work/telegram-bot/src/deadLetter.ts):
 
 * `id` (`string`): Stable unique identifier within the queue (see [Entry ID Generation](#entry-id-generation-makeentryid)).
+* `notificationCorrelationId` (`string`): Privacy-safe 20-character event correlation identifier (`ntf-<16-hex>`) carried unchanged from the poller scan through failed delivery, on-disk persistence, and later replay. Derived strictly from chain-event metadata (`deriveNotificationCorrelationId`), omitting message text, chat IDs, and credentials; legacy or malformed values on disk are deterministically regenerated on load.
 * `enqueuedAt` (`string`): ISO 8601 timestamp recording when the failure was first enqueued.
 * `source` (`string`): Originating contract source name (e.g. `market` or `squad`).
 * `ledger` (`number`): Stellar ledger sequence number where the event occurred.

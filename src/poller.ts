@@ -91,7 +91,7 @@ import {
   safeErrorMessage,
 } from "./notifications/format.js";
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
-import { Logger } from "./logger.js";
+import { Logger, notificationCorrelationIdForEvent } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
@@ -2006,6 +2006,7 @@ export function createPoller(deps: PollerDeps) {
 
     for (const event of events) {
       metrics?.eventsDecoded.inc();
+      const notificationCorrelationId = notificationCorrelationIdForEvent(event);
 
       if (isAdminPayload(event.payload)) {
         recordSkippedIncrement();
@@ -2038,7 +2039,7 @@ export function createPoller(deps: PollerDeps) {
           `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
             `at ledger ${event.ledger}` +
             (event.payload.reason ? ` (${boundedLabel(event.payload.reason, 160)})` : "") +
-            ` correlation=${correlationId}`,
+            ` correlation=${correlationId} notificationCorrelation=${notificationCorrelationId}`,
         );
         continue;
       }
@@ -2077,9 +2078,15 @@ export function createPoller(deps: PollerDeps) {
           // once, only when Telegram rejects the entities. Cursor accounting
           // below is unchanged: either path counts as sent, neither as skipped.
           const plainText = formatPlainTextEvent(config, event);
-          const eventRef = { eventId: event.eventId, ledger: event.ledger, source: event.source };
+          const eventRef = {
+            eventId: event.eventId,
+            ledger: event.ledger,
+            source: event.source,
+            notificationCorrelationId,
+          };
           extra = {
             eventName: event.payload.name,
+            notificationCorrelationId,
             ...(reply_markup ? { reply_markup } : {}),
             ...(plainText !== null ? { plainText, eventRef } : {}),
           };
@@ -2090,10 +2097,12 @@ export function createPoller(deps: PollerDeps) {
         skipped += 1;
         Logger.error(
           "poller",
-          `[poller] format failed for ${event.source} event at ledger ${event.ledger}: ` +
+          `[poller] format failed for ${event.source} event at ledger ${event.ledger} ` +
+            `notificationCorrelation=${notificationCorrelationId}: ` +
             errorMessage(err),
           {
             action: "format_failed",
+            notificationCorrelationId,
             eventId: event.eventId,
             source: event.source,
             ledger: event.ledger,
@@ -2140,9 +2149,11 @@ export function createPoller(deps: PollerDeps) {
         Logger.warn(
           "poller",
           `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
-            `dropping ${event.payload.name} at ledger ${event.ledger} correlation=${correlationId}`,
+            `dropping ${event.payload.name} at ledger ${event.ledger} ` +
+            `correlation=${correlationId} notificationCorrelation=${notificationCorrelationId}`,
           {
             action: "notification_cap_reached",
+            notificationCorrelationId,
             maxNotificationsPerCycle: config.maxNotificationsPerCycle,
             droppedEvent: event.payload.name,
             source: event.source,
@@ -2204,6 +2215,19 @@ export function createPoller(deps: PollerDeps) {
         recordSentIncrement();
         metrics?.notificationsSent.inc();
         sentThisCycle += 1;
+        Logger.debug(
+          "poller",
+          `[poller] delivered ${event.source} ${event.payload.name} at ledger ${event.ledger} ` +
+            `notificationCorrelation=${notificationCorrelationId}`,
+          {
+            action: "notification_delivered",
+            notificationCorrelationId,
+            cycleCorrelationId: correlationId,
+            source: event.source,
+            ledger: event.ledger,
+            eventName: event.payload.name,
+          },
+        );
         if (sendJournal) {
           try {
             await sendJournal.recordDone(event.eventId);
@@ -2232,13 +2256,30 @@ export function createPoller(deps: PollerDeps) {
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}` +
             `${chat ? ` to chat ${chat}` : ""} after retries: ` +
-            `${errorMessage(err)} correlation=${correlationId}`,
+            `${errorMessage(err)} correlation=${correlationId} ` +
+            `notificationCorrelation=${notificationCorrelationId}`,
+        );
+        Logger.debug(
+          "poller",
+          `[poller] send failed for ${event.source} ${event.payload.name} at ledger ${event.ledger} ` +
+            `notificationCorrelation=${notificationCorrelationId}`,
+          {
+            action: "notification_failed",
+            notificationCorrelationId,
+            cycleCorrelationId: correlationId,
+            source: event.source,
+            ledger: event.ledger,
+            eventName: event.payload.name,
+            error: errorMessage(err),
+          },
         );
         if (deadLetterEnabled) {
           await deadLetter.enqueue({
             source: event.source,
             ledger: event.ledger,
             eventName: event.payload.name,
+            eventId: event.eventId,
+            notificationCorrelationId,
             text,
             error: err,
           });
@@ -2272,12 +2313,33 @@ export function createPoller(deps: PollerDeps) {
     try {
       const flushed = await deadLetter.flush(async (text, entry) => {
         await sendWithRetry(
-          (message) => send(message, entry.source as ContractSource),
+          (message) =>
+            send(message, entry.source as ContractSource, {
+              eventName: entry.eventName,
+              notificationCorrelationId: entry.notificationCorrelationId,
+              eventRef: {
+                ledger: entry.ledger,
+                source: entry.source,
+                notificationCorrelationId: entry.notificationCorrelationId,
+              },
+            }),
           text,
           config.botToken,
           sendOptions,
           () => !status.stopping,
           sleep,
+        );
+        Logger.debug(
+          "poller",
+          `[poller] replayed dead-letter ${entry.source} ${entry.eventName} at ledger ${entry.ledger} ` +
+            `notificationCorrelation=${entry.notificationCorrelationId}`,
+          {
+            action: "dead_letter_replayed",
+            notificationCorrelationId: entry.notificationCorrelationId,
+            source: entry.source,
+            ledger: entry.ledger,
+            eventName: entry.eventName,
+          },
         );
       }, Math.max(0, config.maxNotificationsPerCycle));
       if (flushed.sent > 0) {
@@ -2677,6 +2739,26 @@ export function createPoller(deps: PollerDeps) {
           // never be recorded.
           for (const id of scan.seenEventIds) dedupWindow.add(id);
           if (scan.events.length > 0) {
+            for (const scannedEvent of scan.events) {
+              const notificationCorrelationId = notificationCorrelationIdForEvent(scannedEvent);
+              const scannedName =
+                scannedEvent.payload.name === "unknown"
+                  ? boundedLabel(scannedEvent.payload.eventName, 80)
+                  : boundedLabel(scannedEvent.payload.name, 80);
+              Logger.debug(
+                "poller",
+                `[poller] scanned ${target.source} ${scannedName} at ledger ${scannedEvent.ledger} ` +
+                  `notificationCorrelation=${notificationCorrelationId}`,
+                {
+                  action: "event_scanned",
+                  notificationCorrelationId,
+                  cycleCorrelationId: correlationId,
+                  source: target.source,
+                  ledger: scannedEvent.ledger,
+                  eventName: scannedName,
+                },
+              );
+            }
             markDirty();
             delivery = await notify(scan.events, correlationId);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";

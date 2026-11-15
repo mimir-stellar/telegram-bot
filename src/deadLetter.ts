@@ -28,10 +28,20 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { safeErrorMessage } from "./notifications/format.js";
+import {
+  deriveNotificationCorrelationId,
+  isNotificationCorrelationId,
+} from "./redact.js";
 
 export interface DeadLetterEntry {
   /** Stable id within the queue (source + ledger + event + short text hash). */
   id: string;
+  /**
+   * Privacy-safe event-derived correlation ID (`ntf-<16-hex>`) carried from
+   * scan through delivery failure, persistence, and replay. Never derived from
+   * message text or credentials.
+   */
+  notificationCorrelationId: string;
   enqueuedAt: string;
   source: string;
   ledger: number;
@@ -163,6 +173,15 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
           )
           .map((e) => ({
             id: e.id,
+            notificationCorrelationId: isNotificationCorrelationId(
+              (e as Partial<DeadLetterEntry>).notificationCorrelationId,
+            )
+              ? (e as DeadLetterEntry).notificationCorrelationId
+              : deriveNotificationCorrelationId({
+                  source: typeof e.source === "string" ? e.source : "unknown",
+                  ledger: e.ledger,
+                  eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
+                }),
             enqueuedAt:
               typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
             source: typeof e.source === "string" ? e.source : "unknown",
@@ -219,12 +238,25 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     source: string;
     ledger: number;
     eventName: string;
+    eventId?: string | null;
+    notificationCorrelationId?: string;
     text: string;
     error: unknown;
   }): Promise<DeadLetterEntry> {
+    const resolvedCorrelationId = isNotificationCorrelationId(input.notificationCorrelationId)
+      ? input.notificationCorrelationId
+      : deriveNotificationCorrelationId({
+          source: input.source,
+          ledger: input.ledger,
+          eventId: input.eventId,
+          eventName: input.eventName,
+        });
     const id = makeEntryId(input.source, input.ledger, input.eventName, input.text);
     const existing = entries.find((e) => e.id === id);
     if (existing) {
+      if (isNotificationCorrelationId(input.notificationCorrelationId)) {
+        existing.notificationCorrelationId = input.notificationCorrelationId;
+      }
       existing.attempts += 1;
       existing.lastError = safeError(input.error);
       await persist();
@@ -237,13 +269,15 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       if (dropped) {
         console.warn(
           `[dead-letter] queue full (max ${options.maxEntries}); dropped oldest ` +
-            `${dropped.source} ${dropped.eventName} @ ledger ${dropped.ledger}`,
+            `${dropped.source} ${dropped.eventName} @ ledger ${dropped.ledger} ` +
+            `notificationCorrelation=${dropped.notificationCorrelationId}`,
         );
       }
     }
 
     const entry: DeadLetterEntry = {
       id,
+      notificationCorrelationId: resolvedCorrelationId,
       enqueuedAt: new Date(now()).toISOString(),
       source: input.source,
       ledger: input.ledger,
@@ -257,6 +291,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     syncDepth();
     console.warn(
       `[dead-letter] parked ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
+        `notificationCorrelation=${entry.notificationCorrelationId} ` +
         `(depth ${entries.length}/${options.maxEntries}): ${entry.lastError}`,
     );
     await persist();
@@ -291,7 +326,8 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         sent += 1;
         stats.replayed += 1;
         console.log(
-          `[dead-letter] replayed ${entry.source} ${entry.eventName} @ ledger ${entry.ledger}`,
+          `[dead-letter] replayed ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
+            `notificationCorrelation=${entry.notificationCorrelationId}`,
         );
       } catch (err) {
         entry.attempts += 1;
@@ -300,13 +336,15 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
           stats.dropped += 1;
           console.error(
             `[dead-letter] dropping ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
+              `notificationCorrelation=${entry.notificationCorrelationId} ` +
               `after ${entry.attempts} attempts: ${entry.lastError}`,
           );
         } else {
           kept.push(entry);
           console.warn(
             `[dead-letter] replay failed for ${entry.source} ${entry.eventName} ` +
-              `@ ledger ${entry.ledger} (attempt ${entry.attempts}/${options.maxAttempts}): ` +
+              `@ ledger ${entry.ledger} notificationCorrelation=${entry.notificationCorrelationId} ` +
+              `(attempt ${entry.attempts}/${options.maxAttempts}): ` +
               entry.lastError,
           );
         }
