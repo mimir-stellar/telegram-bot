@@ -184,6 +184,13 @@ Thin wrapper around Stellar SDK's `rpc.Server` with explorer URL helpers.
 - **Unauthenticated**: Public Testnet RPC requires no keys
 - **HTTP-aware**: Allows HTTP for local quickstart containers
 
+### Atom Feed Filtering and Cache (`src/stellar/feed.ts`)
+
+Builds bounded Atom 1.0 feeds with per-contract filtering and isolated cache identities:
+
+- **Normalized filters**: `normalizeFeedFilter` and `parseFeedFilterParams` validate and canonicalize contract StrKeys (`C...`), logical sources (`market`, `squad`, `all`), and sorted event-name allowlists, rejecting malformed or unknown filter parameters with `FeedFilterError`.
+- **Stable cache isolation**: `buildFeedCacheKey` and `createFeedCache` incorporate the normalized filter and canonical feed metadata into each cache key so one contract's cached feed never leaks into another contract's or unfiltered subscriber's response.
+
 ## Data Flow
 
 ### Event Processing Pipeline

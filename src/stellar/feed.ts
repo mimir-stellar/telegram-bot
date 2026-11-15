@@ -11,9 +11,38 @@
  *   https://www.rfc-editor.org/rfc/rfc4287
  */
 
+import { createHash } from "node:crypto";
 import { formatPlainTextEvent, eventExplorerUrl } from "../notifications/format.js";
-import type { DecodedEvent } from "./decode.js";
+import { appUrlFor } from "../notifications/app-links.js";
+import type { ContractSource, DecodedEvent } from "./decode.js";
 import type { StellarConfig } from "../config.js";
+
+/** Soroban contract StrKey pattern (`C` + 55 base32 chars = 56 chars). */
+const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+const EVENT_NAME_RE = /^[a-z0-9_]{1,64}$/;
+
+/** Error raised when a feed filter contains malformed source, contract ID, or event names. */
+export class FeedFilterError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FeedFilterError";
+  }
+}
+
+export interface FeedFilter {
+  /** Filter by logical contract role (`"market"`, `"squad"`, or `"all"`). */
+  source?: ContractSource | "all" | string;
+  /** Filter by exact Stellar contract StrKey (`C...`, case-insensitive input). */
+  contractId?: string | null;
+  /** Optional allowlist of event names (`claim_created`, `resolved`, etc.). */
+  eventNames?: readonly string[];
+}
+
+export interface NormalizedFeedFilter {
+  readonly source: ContractSource | "all";
+  readonly contractId: string | null;
+  readonly eventNames: readonly string[];
+}
 
 // ---------------------------------------------------------------------------
 // XML escaping
@@ -94,10 +123,12 @@ export interface AtomEntry {
   content: string | null;
   /** RFC 4287 §4.2.7: alternate link (explorer URL), or null when absent. */
   link: string | null;
+  /** Optional Mimir web-app deep link when `mimirAppUrl` is configured. */
+  appLink?: string | null;
 }
 
 // ---------------------------------------------------------------------------
-// Feed document
+// Feed document & per-contract filtering
 // ---------------------------------------------------------------------------
 
 export interface AtomFeedOptions {
@@ -115,6 +146,198 @@ export interface AtomFeedOptions {
   updatedAt?: string;
   /** Optional subtitle / description for the feed. */
   subtitle?: string;
+  /** Optional per-contract / per-source / per-event-name feed filter. */
+  filter?: FeedFilter;
+  /** Optional Mimir web-app base URL (`MIMIR_APP_URL`) for deep links. */
+  mimirAppUrl?: string | null;
+}
+
+/**
+ * Validate and canonicalize a {@link FeedFilter} so equivalent filter inputs
+ * always normalize to an identical representation.
+ */
+export function normalizeFeedFilter(filter?: FeedFilter | null): NormalizedFeedFilter {
+  if (!filter) {
+    return { source: "all", contractId: null, eventNames: [] };
+  }
+
+  let source: ContractSource | "all" = "all";
+  if (filter.source !== undefined && filter.source !== null && filter.source.trim() !== "") {
+    const cleanedSource = filter.source.trim().toLowerCase();
+    if (cleanedSource !== "all" && cleanedSource !== "market" && cleanedSource !== "squad") {
+      throw new FeedFilterError(
+        `Invalid feed filter source "${filter.source}" (expected "market", "squad", or "all")`,
+      );
+    }
+    source = cleanedSource;
+  }
+
+  let contractId: string | null = null;
+  if (filter.contractId !== undefined && filter.contractId !== null && filter.contractId.trim() !== "") {
+    const upper = filter.contractId.trim().toUpperCase();
+    if (!CONTRACT_ID_RE.test(upper)) {
+      throw new FeedFilterError(
+        `Invalid feed filter contractId "${filter.contractId}" (expected 56-char Soroban C... address)`,
+      );
+    }
+    contractId = upper;
+  }
+
+  const nameSet = new Set<string>();
+  if (filter.eventNames !== undefined) {
+    if (!Array.isArray(filter.eventNames)) {
+      throw new FeedFilterError("Invalid feed filter eventNames (expected an array of event names)");
+    }
+    for (const rawName of filter.eventNames) {
+      if (typeof rawName !== "string") {
+        throw new FeedFilterError("Invalid feed filter event name (expected string)");
+      }
+      const normalized = rawName.trim().toLowerCase();
+      if (!normalized) continue;
+      if (!EVENT_NAME_RE.test(normalized)) {
+        throw new FeedFilterError(
+          `Invalid feed filter event name "${rawName}" (expected lowercase snake_case identifier)`,
+        );
+      }
+      nameSet.add(normalized);
+    }
+  }
+
+  const eventNames = [...nameSet].sort();
+  return { source, contractId, eventNames };
+}
+
+/**
+ * Parse URL query parameters (`?contract=...&source=...&event=...`) into a
+ * validated {@link NormalizedFeedFilter}. Rejects unknown query keys so typos
+ * cannot silently broaden a filtered feed into an unfiltered response.
+ */
+export function parseFeedFilterParams(
+  params: URLSearchParams | Readonly<Record<string, string | readonly string[] | undefined>>,
+): NormalizedFeedFilter {
+  const search =
+    params instanceof URLSearchParams
+      ? params
+      : (() => {
+          const built = new URLSearchParams();
+          for (const [k, v] of Object.entries(params)) {
+            if (v === undefined) continue;
+            if (Array.isArray(v)) {
+              for (const item of v) built.append(k, String(item));
+            } else {
+              built.append(k, String(v));
+            }
+          }
+          return built;
+        })();
+
+  const allowedKeys = new Set(["contract", "contractId", "source", "event"]);
+  for (const key of search.keys()) {
+    if (!allowedKeys.has(key)) {
+      throw new FeedFilterError(`Unsupported feed filter query parameter "${key}"`);
+    }
+  }
+
+  const contracts = [
+    ...search.getAll("contract"),
+    ...search.getAll("contractId"),
+  ]
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+  if (contracts.length > 1) {
+    const distinct = new Set(contracts.map((c) => c.toUpperCase()));
+    if (distinct.size > 1) {
+      throw new FeedFilterError("Conflicting contract filter parameters supplied");
+    }
+  }
+
+  const sources = search
+    .getAll("source")
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+  if (sources.length > 1) {
+    const distinct = new Set(sources.map((s) => s.toLowerCase()));
+    if (distinct.size > 1) {
+      throw new FeedFilterError("Conflicting source filter parameters supplied");
+    }
+  }
+
+  const eventNames: string[] = [];
+  for (const raw of search.getAll("event")) {
+    for (const part of raw.split(",")) {
+      if (part.trim().length > 0) eventNames.push(part);
+    }
+  }
+
+  return normalizeFeedFilter({
+    source: sources[0],
+    contractId: contracts[0] ?? null,
+    eventNames,
+  });
+}
+
+function effectiveEventName(event: DecodedEvent): string {
+  return (
+    event.payload.name === "unknown"
+      ? (event.payload.eventName ?? "unknown")
+      : event.payload.name
+  )
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Return only events matching `filter` without mutating the input array.
+ */
+export function filterFeedEvents(
+  events: readonly DecodedEvent[],
+  filter?: FeedFilter | NormalizedFeedFilter | null,
+): DecodedEvent[] {
+  const norm = normalizeFeedFilter(filter);
+  if (norm.source === "all" && norm.contractId === null && norm.eventNames.length === 0) {
+    return [...events];
+  }
+
+  const allowedNames = norm.eventNames.length > 0 ? new Set(norm.eventNames) : null;
+  return events.filter((event) => {
+    if (norm.source !== "all" && event.source !== norm.source) {
+      return false;
+    }
+    if (norm.contractId !== null && event.contractId.trim().toUpperCase() !== norm.contractId) {
+      return false;
+    }
+    if (allowedNames !== null && !allowedNames.has(effectiveEventName(event))) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function isDefaultFilter(filter: NormalizedFeedFilter): boolean {
+  return filter.source === "all" && filter.contractId === null && filter.eventNames.length === 0;
+}
+
+function canonicalFilteredSelfUrl(selfUrl: string, filter: NormalizedFeedFilter): string {
+  if (isDefaultFilter(filter)) return selfUrl;
+  const safe = safeHttpsUrl(selfUrl);
+  if (safe === null) return selfUrl;
+
+  const parsed = new URL(safe);
+  parsed.searchParams.delete("contract");
+  parsed.searchParams.delete("contractId");
+  parsed.searchParams.delete("source");
+  parsed.searchParams.delete("event");
+
+  if (filter.contractId !== null) {
+    parsed.searchParams.set("contract", filter.contractId);
+  }
+  if (filter.source !== "all") {
+    parsed.searchParams.set("source", filter.source);
+  }
+  if (filter.eventNames.length > 0) {
+    parsed.searchParams.set("event", filter.eventNames.join(","));
+  }
+  return parsed.toString();
 }
 
 /**
@@ -127,7 +350,11 @@ export interface AtomFeedOptions {
  * The link is the explorer URL when one exists.
  * The updated timestamp comes from `event.at` (ledger close time).
  */
-export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): AtomEntry {
+export function buildAtomEntry(
+  event: DecodedEvent,
+  config: StellarConfig,
+  mimirAppUrl?: string | null,
+): AtomEntry {
   const eventName =
     event.payload.name === "unknown"
       ? (event.payload.eventName ?? "unknown")
@@ -152,13 +379,22 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
   const explorerUrl = eventExplorerUrl(config, event);
   const link = explorerUrl ? safeHttpsUrl(explorerUrl) : null;
 
-  return {
+  const resolvedAppBase =
+    mimirAppUrl ?? (config as { mimirAppUrl?: string | null }).mimirAppUrl ?? null;
+  const rawAppUrl = appUrlFor(event, resolvedAppBase);
+  const appLink = rawAppUrl ? safeHttpsUrl(rawAppUrl) : null;
+
+  const entry: AtomEntry = {
     id: `tag:mimir,event:${event.eventId}`,
     title,
     updated,
     content,
     link,
   };
+  if (appLink !== null) {
+    entry.appLink = appLink;
+  }
+  return entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +411,11 @@ function renderEntry(entry: AtomEntry): string {
       ? `    <link rel="alternate" type="text/html" href="${escapeXml(entry.link)}"/>`
       : "";
 
+  const appLinkEl =
+    entry.appLink
+      ? `    <link rel="related" type="text/html" href="${escapeXml(entry.appLink)}"/>`
+      : "";
+
   const contentEl =
     entry.content !== null
       ? `    <content type="text">${xmlText(entry.content, FEED_CONTENT_MAX_CHARS)}</content>`
@@ -186,6 +427,7 @@ function renderEntry(entry: AtomEntry): string {
     idEl,
     updatedEl,
     linkEl,
+    appLinkEl,
     contentEl,
     "  </entry>",
   ]
@@ -210,19 +452,22 @@ export function buildAtomFeed(
   options: AtomFeedOptions,
 ): string {
   const { title, selfUrl, config, subtitle } = options;
+  const normalizedFilter = normalizeFeedFilter(options.filter);
+  const filteredEvents = filterFeedEvents(events, normalizedFilter);
+  const effectiveSelfUrl = canonicalFilteredSelfUrl(selfUrl, normalizedFilter);
 
-  // Feed <updated>: caller override → latest event.at → now.
+  // Feed <updated>: caller override → latest event.at → epoch (when filtered empty) or now.
   let feedUpdated: string;
   if (options.updatedAt) {
     feedUpdated = options.updatedAt;
-  } else if (events.length > 0) {
-    const maxAt = events.reduce((best, e) => Math.max(best, e.at ?? 0), 0);
+  } else if (filteredEvents.length > 0) {
+    const maxAt = filteredEvents.reduce((best, e) => Math.max(best, e.at ?? 0), 0);
     feedUpdated = new Date(maxAt > 0 ? maxAt * 1000 : Date.now()).toISOString();
   } else {
     feedUpdated = new Date().toISOString();
   }
 
-  const validSelfUrl = safeHttpsUrl(selfUrl) ?? "";
+  const validSelfUrl = safeHttpsUrl(effectiveSelfUrl) ?? "";
 
   const lines: string[] = [
     '<?xml version="1.0" encoding="UTF-8"?>',
@@ -235,7 +480,7 @@ export function buildAtomFeed(
   }
 
   lines.push(
-    `  <id>${escapeXml(validSelfUrl || selfUrl)}</id>`,
+    `  <id>${escapeXml(validSelfUrl || effectiveSelfUrl)}</id>`,
     `  <updated>${escapeXml(feedUpdated)}</updated>`,
   );
 
@@ -245,11 +490,190 @@ export function buildAtomFeed(
     );
   }
 
-  for (const event of events) {
-    const entry = buildAtomEntry(event, config);
+  for (const event of filteredEvents) {
+    const entry = buildAtomEntry(event, config, options.mimirAppUrl);
     lines.push(renderEntry(entry));
   }
 
   lines.push("</feed>");
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Stable cache identities & bounded per-filter feed cache
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute a deterministic cache identity for a feed configuration and its
+ * normalized per-contract filter.
+ *
+ * Uses JSON-tuple serialization inside SHA-256 so field boundaries cannot be
+ * spoofed and equivalent filters (regardless of casing, whitespace, or
+ * event-name order) always resolve to the exact same key, while distinct
+ * contracts or sources never collide.
+ */
+export function buildFeedCacheKey(options: AtomFeedOptions): string {
+  const norm = normalizeFeedFilter(options.filter);
+  const resolvedAppUrl =
+    options.mimirAppUrl ??
+    (options.config as { mimirAppUrl?: string | null }).mimirAppUrl ??
+    null;
+
+  const canonicalPayload = JSON.stringify({
+    v: 1,
+    filter: {
+      source: norm.source,
+      contractId: norm.contractId,
+      eventNames: norm.eventNames,
+    },
+    feed: {
+      title: options.title,
+      subtitle: options.subtitle ?? null,
+      selfUrl: canonicalFilteredSelfUrl(options.selfUrl, norm),
+      updatedAt: options.updatedAt ?? null,
+      locale: options.config.locale ?? "en",
+      networkPassphrase: options.config.networkPassphrase,
+      explorerBaseUrl: options.config.explorerBaseUrl,
+      mimirAppUrl: resolvedAppUrl,
+    },
+  });
+
+  const digest = createHash("sha256").update(canonicalPayload).digest("hex").slice(0, 32);
+  const scope = [
+    `src=${norm.source}`,
+    `cid=${norm.contractId ?? "*"}`,
+    `ev=${norm.eventNames.length > 0 ? norm.eventNames.join(",") : "*"}`,
+  ].join(";");
+  return `mimir-feed:v1:${scope}:${digest}`;
+}
+
+function computeEventsRevision(events: readonly DecodedEvent[]): string {
+  const hash = createHash("sha256");
+  hash.update(`n=${events.length}\n`);
+  for (const event of events) {
+    hash.update(
+      JSON.stringify([
+        event.source,
+        event.contractId,
+        event.ledger,
+        event.txHash,
+        event.eventId,
+        event.at ?? 0,
+        event.payload.name,
+      ]),
+    );
+    hash.update("\n");
+  }
+  return hash.digest("hex");
+}
+
+export interface FeedCacheLookupResult {
+  xml: string;
+  cacheKey: string;
+  revision: string;
+  filter: NormalizedFeedFilter;
+  entryCount: number;
+  fromCache: boolean;
+}
+
+export interface FeedCache {
+  getAtomFeed(events: readonly DecodedEvent[], options: AtomFeedOptions): FeedCacheLookupResult;
+  size(): number;
+  clear(): void;
+}
+
+export interface FeedCacheOptions {
+  /** Maximum distinct filter cache entries retained (LRU eviction, default 32). */
+  maxEntries?: number;
+}
+
+/**
+ * Create a bounded LRU feed cache isolated by {@link buildFeedCacheKey}.
+ *
+ * Each normalized filter caches its own rendered Atom XML alongside the
+ * filtered event revision, preventing one contract's feed response from ever
+ * leaking into another contract's or unfiltered subscriber's response.
+ */
+export function createFeedCache(cacheOptions: FeedCacheOptions = {}): FeedCache {
+  const maxEntries = Math.max(1, Math.trunc(cacheOptions.maxEntries ?? 32));
+  const store = new Map<
+    string,
+    { revision: string; xml: string; entryCount: number; filter: NormalizedFeedFilter }
+  >();
+
+  return {
+    getAtomFeed(
+      events: readonly DecodedEvent[],
+      options: AtomFeedOptions,
+    ): FeedCacheLookupResult {
+      const normalizedFilter = normalizeFeedFilter(options.filter);
+      const cacheKey = buildFeedCacheKey({ ...options, filter: normalizedFilter });
+      const matchingEvents = filterFeedEvents(events, normalizedFilter);
+      const revision = computeEventsRevision(matchingEvents);
+
+      const cached = store.get(cacheKey);
+      if (cached && cached.revision === revision) {
+        // Refresh LRU order
+        store.delete(cacheKey);
+        store.set(cacheKey, cached);
+        return {
+          xml: cached.xml,
+          cacheKey,
+          revision,
+          filter: cached.filter,
+          entryCount: cached.entryCount,
+          fromCache: true,
+        };
+      }
+
+      const deterministicUpdatedAt =
+        options.updatedAt ??
+        (matchingEvents.length > 0
+          ? (() => {
+              const maxAt = matchingEvents.reduce((best, e) => Math.max(best, e.at ?? 0), 0);
+              return new Date(maxAt > 0 ? maxAt * 1000 : 0).toISOString();
+            })()
+          : new Date(0).toISOString());
+
+      const xml = buildAtomFeed(matchingEvents, {
+        ...options,
+        filter: normalizedFilter,
+        updatedAt: deterministicUpdatedAt,
+      });
+
+      if (store.has(cacheKey)) {
+        store.delete(cacheKey);
+      } else if (store.size >= maxEntries) {
+        const oldestKey = store.keys().next().value;
+        if (oldestKey !== undefined) {
+          store.delete(oldestKey);
+        }
+      }
+
+      const entry = {
+        revision,
+        xml,
+        entryCount: matchingEvents.length,
+        filter: normalizedFilter,
+      };
+      store.set(cacheKey, entry);
+
+      return {
+        xml,
+        cacheKey,
+        revision,
+        filter: normalizedFilter,
+        entryCount: matchingEvents.length,
+        fromCache: false,
+      };
+    },
+
+    size(): number {
+      return store.size;
+    },
+
+    clear(): void {
+      store.clear();
+    },
+  };
 }
