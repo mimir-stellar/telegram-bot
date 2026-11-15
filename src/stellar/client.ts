@@ -15,6 +15,27 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  DEFAULT_PROVIDER_PROGRESS_WINDOW,
+  DEFAULT_PROVIDER_STALE_AFTER_MS,
+  ProviderProgressTracker,
+  type ProviderLivenessState,
+  type ProviderProgressAssessment,
+  type ProviderProgressObservation,
+  type ProviderProgressOptions,
+  type ProviderStaleReason,
+} from "./rpc-guard.js";
+
+export {
+  DEFAULT_PROVIDER_PROGRESS_WINDOW,
+  DEFAULT_PROVIDER_STALE_AFTER_MS,
+  ProviderProgressTracker,
+  type ProviderLivenessState,
+  type ProviderProgressAssessment,
+  type ProviderProgressObservation,
+  type ProviderProgressOptions,
+  type ProviderStaleReason,
+};
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -364,6 +385,45 @@ export function clampStartLedger(
     return { startLedger: window.oldestLedger, clamped: true };
   }
   return { startLedger: requested, clamped: false };
+}
+
+export interface WindowProgressSample {
+  /** Health window (`oldestLedger`, `latestLedger`) reported by `getHealth()`. */
+  window: {
+    oldestLedger?: unknown;
+    latestLedger?: unknown;
+  };
+  /** Timestamp (ms) at which the window was observed. */
+  observedAtMs: number;
+  /** Number of contract events observed in the same cycle/page (defaults to `0`). */
+  eventCount?: number | undefined;
+}
+
+/**
+ * Compare two `getHealth()` ledger windows across a bounded time interval so an
+ * up-to-date provider with zero contract events (`"idle-stream"`) is never
+ * mistaken for a stalled or regressing provider (`"stale-provider"`).
+ */
+export function assessProviderWindowProgress(
+  previous: WindowProgressSample,
+  current: WindowProgressSample,
+  options: Pick<ProviderProgressOptions, "staleAfterMs"> = {},
+): ProviderProgressAssessment {
+  const prevWindow = validateLedgerWindow(previous.window);
+  const currWindow = validateLedgerWindow(current.window);
+  const tracker = new ProviderProgressTracker({
+    staleAfterMs: options.staleAfterMs,
+  });
+  tracker.observe({
+    latestLedger: prevWindow.latestLedger,
+    eventCount: previous.eventCount,
+    observedAtMs: previous.observedAtMs,
+  });
+  return tracker.observe({
+    latestLedger: currWindow.latestLedger,
+    eventCount: current.eventCount,
+    observedAtMs: current.observedAtMs,
+  });
 }
 
 /**
