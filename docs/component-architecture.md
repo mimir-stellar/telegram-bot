@@ -119,6 +119,10 @@ The decoder converts raw Soroban events into typed TypeScript objects. It handle
 - **Squad**: `market_created`, `deposited`, `withdrawn`, `resolved`, `claimed`, `fees_claimed`
 - **Admin**: Recognized but not notified (`oracle_changed`, `ownership_transferred`, `fee_policy_*`, etc.)
 
+### Aggregate Capture Completeness (`src/stellar/capture-completeness.ts`, `src/stellar/volume-series.ts`, `src/stellar/resolution-latency.ts`)
+
+Analytical results from `volumeSeries()` (`annotatedVolumeSeries()`) and `resolutionLatency()` carry `CaptureCompletenessMetadata` (`result.capture`) recording ledger bounds (`genesisLedger`, `requestedStartLedger`, `requestedEndLedger`, `effectiveStartLedger`, `effectiveEndLedger`, `observedMinLedger`, `observedMaxLedger`, `oldestRetainedLedger`, `latestChainLedger`), explicit and synthesized `gaps` (clamped retention floor, page truncation, restart discontinuities), and `status` (`"complete_from_genesis"` | `"complete_window"` | `"partial"`). Because Soroban RPC retains only a rolling window, `isGlobalTotal` is `false` unless `genesisLedger` is covered continuously without clamping, truncation, gaps, or dropped records; `assertGlobalCapture`, `formatVolumeCaptureSummary`, and `formatLatencyCaptureSummary` refuse or clearly label partial/windowed captures so they cannot be mistaken for all-time market totals.
+
 ### Notification Formatter (`src/notifications/format.ts`)
 
 Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's MarkdownV2 format (not legacy Markdown) for reliable rendering.

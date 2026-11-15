@@ -1,4 +1,11 @@
 import type { DecodedEvent } from "./decode.js";
+import {
+  assertGlobalCapture,
+  evaluateCaptureCompleteness,
+  formatCaptureBanner,
+  type CaptureCompletenessMetadata,
+  type CaptureContextInput,
+} from "./capture-completeness.js";
 
 export interface LatencyDuration {
   seconds: number;
@@ -25,10 +32,15 @@ export interface LatencyGroup {
   summary: LatencySummary | null;
 }
 
+export interface ResolutionLatencyOptions {
+  capture?: CaptureContextInput;
+}
+
 export interface ResolutionLatencyReport {
   resolved: LatencyGroup;
   cancelled: LatencyGroup;
   excludedCount: number;
+  capture: CaptureCompletenessMetadata;
 }
 
 /**
@@ -78,7 +90,10 @@ function computeSummary(claims: ClaimLatency[]): LatencySummary | null {
  *
  * Uses integer math only.
  */
-export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLatencyReport {
+export function resolutionLatency(
+  events: readonly DecodedEvent[],
+  options: ResolutionLatencyOptions = {},
+): ResolutionLatencyReport {
   const creations = new Map<number, { at: number; ledger: number }>();
   const resolutions = new Map<number, { at: number; ledger: number }>();
   const cancellations = new Map<number, { at: number; ledger: number }>();
@@ -190,6 +205,11 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
   resolvedClaims.sort((a, b) => a.claimId - b.claimId);
   cancelledClaims.sort((a, b) => a.claimId - b.claimId);
 
+  const capture = evaluateCaptureCompleteness(events, options.capture, {
+    excludedClaims: excludedCount,
+    hasAnyEvents: Array.isArray(events) && events.length > 0,
+  });
+
   return {
     resolved: {
       claims: resolvedClaims,
@@ -200,5 +220,37 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
       summary: computeSummary(cancelledClaims),
     },
     excludedCount,
+    capture,
   };
 }
+
+export function formatLatencyCaptureSummary(
+  report: ResolutionLatencyReport,
+  options: { requireGlobalTotal?: boolean } = {},
+): string {
+  if (options.requireGlobalTotal) {
+    assertGlobalCapture(report.capture, "resolution latency report");
+  }
+  const prefix = report.capture.isGlobalTotal ? "global" : "captured";
+  return [
+    formatCaptureBanner(report.capture),
+    `${prefix}_resolved_claims=${report.resolved.claims.length} ${prefix}_cancelled_claims=${report.cancelled.claims.length} excluded=${report.excludedCount}`,
+  ].join("\n");
+}
+
+export {
+  PartialCaptureError,
+  assertGlobalCapture,
+  evaluateCaptureCompleteness,
+  formatCaptureBanner,
+  observeEventLedgerBounds,
+  type CaptureCompletenessMetadata,
+  type CaptureCompletenessStatus,
+  type CaptureContextInput,
+  type CaptureGapInput,
+  type CaptureGapReason,
+  type CaptureIncompletenessReason,
+  type CaptureLedgerGap,
+  type CaptureLedgerRange,
+  type CaptureScopeLabel,
+} from "./capture-completeness.js";

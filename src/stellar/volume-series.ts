@@ -1,9 +1,17 @@
 import type { DecodedEvent } from "./decode.js";
+import {
+  assertGlobalCapture,
+  evaluateCaptureCompleteness,
+  formatCaptureBanner,
+  type CaptureCompletenessMetadata,
+  type CaptureContextInput,
+} from "./capture-completeness.js";
 
 export type VolumeBucketUnit = "hour" | "day";
 
 export interface VolumeSeriesOptions {
   bucket: VolumeBucketUnit;
+  capture?: CaptureContextInput;
 }
 
 export interface VolumeBucket {
@@ -38,6 +46,12 @@ export interface VolumeSeriesResult {
   skippedWithoutAt: number;
   /** Total valid events processed. */
   processedEvents: number;
+  /** Ledger range, gap, and global-vs-partial completeness metadata for this series. */
+  capture?: CaptureCompletenessMetadata;
+}
+
+export interface AnnotatedVolumeSeriesResult extends VolumeSeriesResult {
+  capture: CaptureCompletenessMetadata;
 }
 
 const SECONDS_PER_HOUR = 3600;
@@ -74,13 +88,28 @@ export function volumeSeries(
   let processedEvents = 0;
 
   if (!events || !Array.isArray(events)) {
-    return {
+    const captureMeta = evaluateCaptureCompleteness(events, options?.capture, {
+      skippedWithoutAt: 0,
+      hasAnyEvents: false,
+    });
+    const emptyResult: VolumeSeriesResult = {
       buckets: [],
       totalChallengeStake: "0",
       totalSquadDeposit: "0",
       skippedWithoutAt: 0,
       processedEvents: 0,
     };
+    if (options?.capture !== undefined) {
+      emptyResult.capture = captureMeta;
+    } else {
+      Object.defineProperty(emptyResult, "capture", {
+        value: captureMeta,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return emptyResult;
   }
 
   interface IntermediateBucket {
@@ -184,13 +213,28 @@ export function volumeSeries(
   }
 
   if (minBucketStart === null || maxBucketStart === null) {
-    return {
+    const captureMeta = evaluateCaptureCompleteness(events, options?.capture, {
+      skippedWithoutAt,
+      hasAnyEvents: events.length > 0,
+    });
+    const emptyBucketsResult: VolumeSeriesResult = {
       buckets: [],
       totalChallengeStake: "0",
       totalSquadDeposit: "0",
       skippedWithoutAt,
       processedEvents,
     };
+    if (options?.capture !== undefined || skippedWithoutAt > 0 || processedEvents > 0) {
+      emptyBucketsResult.capture = captureMeta;
+    } else {
+      Object.defineProperty(emptyBucketsResult, "capture", {
+        value: captureMeta,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return emptyBucketsResult;
   }
 
   // Generate contiguous buckets from minBucketStart to maxBucketStart (zero-filled)
@@ -217,11 +261,76 @@ export function volumeSeries(
     });
   }
 
+  const captureMeta = evaluateCaptureCompleteness(events, options?.capture, {
+    skippedWithoutAt,
+    hasAnyEvents: true,
+  });
+
   return {
     buckets,
     totalChallengeStake: totalChallengeStakeBigInt.toString(),
     totalSquadDeposit: totalSquadDepositBigInt.toString(),
     skippedWithoutAt,
     processedEvents,
+    capture: captureMeta,
   };
 }
+
+/**
+ * Produce a volume series with `capture` completeness metadata always attached
+ * as an enumerable field, including on empty inputs.
+ */
+export function annotatedVolumeSeries(
+  events: readonly DecodedEvent[] | null | undefined,
+  options: VolumeSeriesOptions,
+): AnnotatedVolumeSeriesResult {
+  const res = volumeSeries(events, {
+    ...options,
+    capture: options.capture ?? {},
+  });
+  return res as AnnotatedVolumeSeriesResult;
+}
+
+/**
+ * Render a human-readable volume summary that labels partial/windowed captures
+ * explicitly and refuses `requireGlobalTotal: true` unless the capture is complete
+ * from contract genesis.
+ */
+export function formatVolumeCaptureSummary(
+  result: VolumeSeriesResult,
+  options: { requireGlobalTotal?: boolean } = {},
+): string {
+  const capture =
+    result.capture ??
+    evaluateCaptureCompleteness([], undefined, {
+      skippedWithoutAt: result.skippedWithoutAt,
+      hasAnyEvents: result.processedEvents > 0,
+    });
+
+  if (options.requireGlobalTotal) {
+    assertGlobalCapture(capture, "volume series");
+  }
+
+  const prefix = capture.isGlobalTotal ? "global_total" : "observed_capture_total";
+  return [
+    formatCaptureBanner(capture),
+    `${prefix}_challenge_stake=${result.totalChallengeStake} ${prefix}_squad_deposit=${result.totalSquadDeposit} buckets=${result.buckets.length}`,
+  ].join("\n");
+}
+
+export {
+  PartialCaptureError,
+  assertGlobalCapture,
+  evaluateCaptureCompleteness,
+  formatCaptureBanner,
+  observeEventLedgerBounds,
+  type CaptureCompletenessMetadata,
+  type CaptureCompletenessStatus,
+  type CaptureContextInput,
+  type CaptureGapInput,
+  type CaptureGapReason,
+  type CaptureIncompletenessReason,
+  type CaptureLedgerGap,
+  type CaptureLedgerRange,
+  type CaptureScopeLabel,
+} from "./capture-completeness.js";
