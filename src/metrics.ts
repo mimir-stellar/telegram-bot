@@ -25,6 +25,14 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import {
+  ServiceLevelWindow,
+  type CycleGapSampleInput,
+  type DeliverySampleInput,
+  type ServiceLevelWindowOptions,
+  type ServiceLevelWindowReport,
+} from "./stellar/metrics.js";
+
 // ── Metric types ──────────────────────────────────────────────────────────────
 
 export interface Counter {
@@ -39,6 +47,19 @@ export interface Gauge {
   set(value: number): void;
   /** Current value. */
   value(): number;
+}
+
+export interface CreateMetricsOptions {
+  /** Optional rolling service-level window configuration. */
+  serviceLevelWindow?: ServiceLevelWindowOptions;
+}
+
+/** Bounded service-level indicator window exposed by {@link MetricsRegistry}. */
+export interface ServiceLevelWindowMetrics {
+  recordDelivery(sample: DeliverySampleInput): void;
+  recordCycle(sample?: CycleGapSampleInput): void;
+  report(nowMs?: number): ServiceLevelWindowReport;
+  renderJson(nowMs?: number): string;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -89,6 +110,8 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** Bounded rolling service-level window for delivery success, lag, and data-gap indicators. */
+  serviceLevelWindow: ServiceLevelWindowMetrics;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -146,7 +169,8 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
-export function createMetrics(): MetricsRegistry {
+export function createMetrics(options: CreateMetricsOptions = {}): MetricsRegistry {
+  const sliWindow = new ServiceLevelWindow(options.serviceLevelWindow);
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -224,6 +248,13 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`${g._name} ${g.value()}`);
     }
 
+    const windowReport = sliWindow.report();
+    lines.push(
+      `# HELP ${METRICS_PREFIX}sli_window_complete Whether the rolling service-level window has full coverage (1) or is incomplete (0).`,
+      `# TYPE ${METRICS_PREFIX}sli_window_complete gauge`,
+      `${METRICS_PREFIX}sli_window_complete ${windowReport.complete ? 1 : 0}`,
+    );
+
     // Prometheus text format requires a trailing newline.
     return lines.join("\n") + "\n";
   }
@@ -248,6 +279,17 @@ export function createMetrics(): MetricsRegistry {
         "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
         "Content-Length": Buffer.byteLength(body),
         // Instruct proxies not to cache — stale metrics are misleading.
+        "Cache-Control": "no-store",
+      });
+      res.end(body);
+      return;
+    }
+
+    if (path === "/metrics/window") {
+      const body = sliWindow.renderJson();
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": Buffer.byteLength(body),
         "Cache-Control": "no-store",
       });
       res.end(body);
@@ -306,6 +348,12 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    serviceLevelWindow: {
+      recordDelivery: (sample) => sliWindow.recordDelivery(sample),
+      recordCycle: (sample) => sliWindow.recordCycle(sample),
+      report: (nowMs) => sliWindow.report(nowMs),
+      renderJson: (nowMs) => sliWindow.renderJson(nowMs),
+    },
     render,
     startServer,
   };

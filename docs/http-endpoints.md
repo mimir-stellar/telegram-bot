@@ -186,6 +186,64 @@ curl -sf http://127.0.0.1:8787/health/live
 
 ---
 
+### `GET /health/window`
+
+Machine-readable service-level window report (`ServiceLevelWindowReport`, schema version `1`). Summarises delivery success ratio, notification lag quantiles (`minMs`, `p50Ms`, `p95Ms`, `maxMs`), and chain data-gap indicators (`gapEvents`, `missedLedgers`, `truncatedScans`, `failedScans`, `gapFree`, `healthyCycleRatio`) computed strictly from bounded in-memory ring buffers (`maxSamples`, default `256`, rolling `windowMs`, default `3600000` ms).
+
+Incomplete windows are explicitly flagged via `complete: false` and `incompleteReasons`:
+
+- `"warming_up"` — process uptime (`observedDurationMs`) has not yet covered a full `windowMs`.
+- `"sample_buffer_truncated"` — sample burst evicted older entries inside the current `windowMs` before they expired naturally (`coverageRatio` reflects the retained fraction).
+- `"no_cycles_observed"` — zero poll cycles were recorded inside the current `windowMs`.
+
+**Response — always 200**, `Content-Type: application/json; charset=utf-8`
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-19T10:00:00.000Z",
+  "windowMs": 3600000,
+  "observedDurationMs": 3720000,
+  "coverageRatio": 1,
+  "complete": true,
+  "incompleteReasons": [],
+  "sampleCapacity": 256,
+  "indicators": {
+    "delivery": {
+      "attempts": 12,
+      "succeeded": 12,
+      "failed": 0,
+      "successRatio": 1
+    },
+    "lag": {
+      "samples": 12,
+      "missingTimestampCount": 0,
+      "minMs": 950,
+      "p50Ms": 1400,
+      "p95Ms": 2800,
+      "maxMs": 3100
+    },
+    "dataGap": {
+      "cyclesObserved": 120,
+      "gapEvents": 0,
+      "missedLedgers": 0,
+      "truncatedScans": 0,
+      "failedScans": 0,
+      "gapFree": true,
+      "healthyCycleRatio": 1
+    }
+  }
+}
+```
+
+The same object is embedded at `poller.serviceLevelWindow` in `GET /health`.
+
+```bash
+curl -s http://127.0.0.1:8787/health/window | jq .
+```
+
+---
+
 ### `GET /metrics`
 
 Prometheus text exposition (format version 0.0.4). Scraped by Prometheus or
@@ -317,6 +375,7 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_sli_window_complete` | gauge | `1` when the rolling service-level window has full coverage, `0` when incomplete |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment
@@ -329,6 +388,16 @@ curl -s http://127.0.0.1:9090/metrics
 - job_name: mimir-telegram-metrics
   static_configs:
     - targets: ['127.0.0.1:9090']
+```
+
+---
+
+### `GET /metrics/window` (metrics server)
+
+Returns the `ServiceLevelWindowReport` JSON document (`200 OK`, `application/json; charset=utf-8`, `Cache-Control: no-store`) backed by the registry's bounded rolling window.
+
+```bash
+curl -s http://127.0.0.1:9090/metrics/window | jq .
 ```
 
 ---
@@ -366,10 +435,12 @@ methods (`Allow: GET` header set).
 | Health | GET | `/healthz` | 200, 503 | Alias for `/health` |
 | Health | GET | `/health/live` | 200 | Liveness only (no poller state) |
 | Health | GET | `/livez` | 200 | Alias for `/health/live` |
+| Health | GET | `/health/window` | 200 | Machine-readable service-level window report |
 | Health | GET | `/metrics` | 200 | Prometheus text (poller-level) |
 | Health | POST | `/telegram-webhook` | 200, 401, 404 | Webhook updates (webhook mode only) |
 | Health | GET | `<other>` | 404 | — |
 | Metrics | GET | `/metrics` | 200 | Prometheus text (registry-level) |
+| Metrics | GET | `/metrics/window` | 200 | Machine-readable service-level window report |
 | Metrics | GET | `/health` | 200 | Plain-text liveness |
 | Metrics | GET | `<other>` | 404 | — |
 | Metrics | non-GET | `<any>` | 405 | — |

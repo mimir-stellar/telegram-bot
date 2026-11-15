@@ -21,6 +21,10 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import {
+  ServiceLevelWindow,
+  type ServiceLevelWindowReport,
+} from "./stellar/metrics.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -152,6 +156,8 @@ export interface HealthReport {
     }>;
     persistentVolumeAvailable: boolean;
     persistentVolumeError: string | null;
+    /** Machine-readable rolling service-level window report. */
+    serviceLevelWindow: ServiceLevelWindowReport;
   };
   /**
    * Where configuration came from: each setting's name and the source that
@@ -357,6 +363,12 @@ export function buildHealthReport(
       })),
       persistentVolumeAvailable: poller.persistentVolumeAvailable ?? true,
       persistentVolumeError: poller.persistentVolumeError ?? null,
+      serviceLevelWindow:
+        poller.serviceLevelWindow ??
+        new ServiceLevelWindow({
+          clock: () => nowMs,
+          startedAtMs: poller.startedAt > 0 ? poller.startedAt : nowMs,
+        }).report(nowMs),
     },
     config: provenance,
   };
@@ -511,6 +523,19 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         version: config.version,
         checkedAt: new Date(now()).toISOString(),
       });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/health/window") {
+      const currentMs = now();
+      const snap = status();
+      const windowReport =
+        snap.serviceLevelWindow ??
+        new ServiceLevelWindow({
+          clock: () => currentMs,
+          startedAtMs: snap.startedAt > 0 ? snap.startedAt : currentMs,
+        }).report(currentMs);
+      sendJson(res, 200, windowReport);
       return;
     }
 

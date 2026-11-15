@@ -103,6 +103,11 @@ import {
   type WatchTarget,
 } from "./stellar/events.js";
 import {
+  ServiceLevelWindow,
+  type ServiceLevelWindowOptions,
+  type ServiceLevelWindowReport,
+} from "./stellar/metrics.js";
+import {
   isAdminPayload,
   normalizeContractVersion,
   toAdminAuditRecord,
@@ -361,6 +366,8 @@ export interface PollerStatus {
     failureCount: number;
     lastFailureAt: number | null;
   };
+  /** Bounded rolling service-level window report. */
+  serviceLevelWindow?: ServiceLevelWindowReport;
 }
 
 /** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
@@ -535,6 +542,8 @@ export interface PollerDeps {
    * tests can shrink the window to observe a comparison quickly.
    */
   activityBaselineOptions?: ActivityBaselineOptions;
+  /** Optional rolling service-level window configuration. */
+  serviceLevelWindowOptions?: ServiceLevelWindowOptions;
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
   now?: () => number;
   /**
@@ -1348,6 +1357,10 @@ export function createPoller(deps: PollerDeps) {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? defaultSleep;
   const activityBaseline = new ActivityBaseline(deps.activityBaselineOptions);
+  const serviceLevelWindow = new ServiceLevelWindow({
+    clock: now,
+    ...deps.serviceLevelWindowOptions,
+  });
   const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
   const targetMaxBackoff = deps.targetBackoffOptions?.maxBackoffMs ?? DEFAULT_TARGET_MAX_BACKOFF_MS;
   const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
@@ -1530,6 +1543,7 @@ export function createPoller(deps: PollerDeps) {
       failureCount: 0,
       lastFailureAt: null,
     },
+    serviceLevelWindow: serviceLevelWindow.report(),
   };
 
   function syncCounterSnapshots(): void {
@@ -2203,6 +2217,16 @@ export function createPoller(deps: PollerDeps) {
         );
         recordSentIncrement();
         metrics?.notificationsSent.inc();
+        const sentAtMs = now();
+        const eventClosedMs = event.at > 0 ? event.at * 1_000 : null;
+        const lagMs =
+          eventClosedMs !== null &&
+          isPlausibleChainClock(eventClosedMs) &&
+          sentAtMs >= eventClosedMs
+            ? sentAtMs - eventClosedMs
+            : null;
+        serviceLevelWindow.recordDelivery({ ok: true, lagMs, atMs: sentAtMs });
+        metrics?.serviceLevelWindow.recordDelivery({ ok: true, lagMs, atMs: sentAtMs });
         sentThisCycle += 1;
         if (sendJournal) {
           try {
@@ -2219,6 +2243,9 @@ export function createPoller(deps: PollerDeps) {
         // transient Telegram outage costs a delay rather than the notification.
         recordFailedIncrement();
         metrics?.notificationsFailed.inc();
+        const failedAtMs = now();
+        serviceLevelWindow.recordDelivery({ ok: false, lagMs: null, atMs: failedAtMs });
+        metrics?.serviceLevelWindow.recordDelivery({ ok: false, lagMs: null, atMs: failedAtMs });
         failed += 1;
         audit.recordError(err, "send_failed", {
           source: event.source,
@@ -2487,6 +2514,9 @@ export function createPoller(deps: PollerDeps) {
     let cyclePages = 0;
     let cycleEmptyPages = 0;
     let cycleFailures = 0;
+    let cycleTruncatedScans = 0;
+    const prevRestartGaps = status.restartGaps;
+    const prevLastRestartGap = status.lastRestartGap;
     let cycleScans = 0;
     // Events handed back by every successful scan in this cycle. Compared with
     // the rolling baseline only when every target was scanned, so a target in
@@ -2589,6 +2619,7 @@ export function createPoller(deps: PollerDeps) {
           cycleEvents += scan.events.length;
           cyclePages += scan.pages;
           cycleEmptyPages += scan.emptyPages;
+          if (scan.truncated) cycleTruncatedScans += 1;
           status.pagesScanned += scan.pages;
           status.emptyPages += scan.emptyPages;
 
@@ -2873,6 +2904,22 @@ export function createPoller(deps: PollerDeps) {
       // The write and the tracking promise are what a shutdown waits for, so
       // they run even when the body above threw.
       try {
+        const gapOccurred = status.restartGaps > prevRestartGaps;
+        const cycleMissedLedgers =
+          gapOccurred && status.lastRestartGap && status.lastRestartGap !== prevLastRestartGap
+            ? status.lastRestartGap.missedLedgers
+            : 0;
+        const cycleSampleAt = now();
+        const cycleSample = {
+          atMs: cycleSampleAt,
+          gapDetected: gapOccurred,
+          missedLedgers: cycleMissedLedgers,
+          truncatedScans: cycleTruncatedScans,
+          failedScans: cycleFailures,
+        };
+        serviceLevelWindow.recordCycle(cycleSample);
+        metrics?.serviceLevelWindow.recordCycle(cycleSample);
+        status.serviceLevelWindow = serviceLevelWindow.report(cycleSampleAt);
         status.targets = [...state.values()].map((t) => ({ ...t }));
         await saveCounters("cycle");
         await saveCursors("cycle");
@@ -3160,6 +3207,7 @@ export function createPoller(deps: PollerDeps) {
       syncCounterSnapshots();
       return {
         ...status,
+        serviceLevelWindow: serviceLevelWindow.report(now()),
         sinceStart: { ...sinceStartCounters },
         cumulative: {
           cycles: status.cycles,
