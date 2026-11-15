@@ -1,7 +1,26 @@
-import { open, mkdir, readdir, unlink, chmod } from "node:fs/promises";
+import { open, mkdir, readdir, rename, unlink, writeFile, chmod } from "node:fs/promises";
 import path from "node:path";
-import { scanJsonReplacer } from "./events.js";
+import { eventHistogram, scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  CANONICAL_NEWLINE,
+  computeArchiveRecordIdentity,
+  decodeArchiveText,
+  normalizeScanJsonl,
+  parseScanJsonlEvents,
+  serializeCanonicalRecord,
+  splitNormalizedJsonlLines,
+} from "./scan-jsonl.js";
+
+export {
+  CANONICAL_NEWLINE,
+  computeArchiveRecordIdentity,
+  decodeArchiveText,
+  normalizeScanJsonl,
+  parseScanJsonlEvents,
+  serializeCanonicalRecord,
+  splitNormalizedJsonlLines,
+};
 
 export interface EventArchiveOptions {
   dir: string;
@@ -12,6 +31,11 @@ export interface EventArchiveOptions {
 export interface EventArchive {
   append(events: readonly DecodedEvent[]): Promise<void>;
   close(): Promise<void>;
+}
+
+export interface CanonicalArchiveExportOptions {
+  /** Include `{ type: "event" }` wrapper and trailing `{ type: "summary" }` line. */
+  includeSummary?: boolean | undefined;
 }
 
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
@@ -89,7 +113,7 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
     if (!events || events.length === 0) return;
 
     for (const event of events) {
-      const line = JSON.stringify(event, scanJsonReplacer) + "\n";
+      const line = JSON.stringify(event, scanJsonReplacer) + CANONICAL_NEWLINE;
       const buffer = Buffer.from(line, "utf8");
       const bytes = buffer.byteLength;
 
@@ -116,12 +140,14 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
 
   return {
     async append(events: readonly DecodedEvent[]): Promise<void> {
-      queue = queue.then(() => doAppend(events));
-      return queue;
+      const op = queue.then(() => doAppend(events));
+      queue = op.catch(() => {});
+      return op;
     },
     async close(): Promise<void> {
-      queue = queue.then(() => doClose());
-      return queue;
+      const op = queue.then(() => doClose());
+      queue = op.catch(() => {});
+      return op;
     },
   };
 }
@@ -143,16 +169,100 @@ export async function* readArchive(dir: string): AsyncGenerator<DecodedEvent, vo
     const filePath = path.join(dir, file);
     const handle = await open(filePath, "r");
     try {
-      const content = await handle.readFile({ encoding: "utf8" });
-      const lines = content.split("\n");
+      const rawBytes = await handle.readFile();
+      const lines = splitNormalizedJsonlLines(rawBytes);
       for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        const parsed = JSON.parse(trimmed);
-        yield parsed as DecodedEvent;
+        const parsed = JSON.parse(line);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error(`Invalid archive JSON record in ${file}`);
+        }
+        const obj = parsed as Record<string, unknown>;
+        if (obj.type === "summary") continue;
+        const { type: _ignoredType, ...rest } = obj;
+        yield rest as unknown as DecodedEvent;
       }
     } finally {
       await handle.close();
     }
   }
+}
+
+/**
+ * Export all records in an archive directory in the documented canonical
+ * platform-neutral format: UTF-8 without BOM, sorted JSON object keys, decimal
+ * bigint strings, and single `\n` (LF, 0x0A) line terminators.
+ */
+export async function exportCanonicalArchive(
+  dir: string,
+  options: CanonicalArchiveExportOptions = {},
+): Promise<string> {
+  const events: DecodedEvent[] = [];
+  for await (const event of readArchive(dir)) {
+    events.push(event);
+  }
+
+  if (events.length === 0 && !options.includeSummary) {
+    return "";
+  }
+
+  const lines: string[] = [];
+  for (const event of events) {
+    const record = options.includeSummary ? { type: "event", ...event } : event;
+    lines.push(serializeCanonicalRecord(record));
+  }
+
+  if (options.includeSummary) {
+    lines.push(
+      serializeCanonicalRecord({
+        type: "summary",
+        eventCount: events.length,
+        histogram: eventHistogram(events),
+      }),
+    );
+  }
+
+  return lines.join(CANONICAL_NEWLINE) + CANONICAL_NEWLINE;
+}
+
+/**
+ * Normalize all `events-*.jsonl` segment files in `dir` to canonical UTF-8 LF
+ * line endings in place (atomic temp-file + rename per segment) without
+ * altering record identities.
+ */
+export async function normalizeArchiveDirectoryNewlines(
+  dir: string,
+): Promise<{ filesNormalized: number; recordCount: number }> {
+  const files = await listArchiveFiles(dir);
+  let filesNormalized = 0;
+  let recordCount = 0;
+
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    const handle = await open(filePath, "r");
+    let rawBytes: Buffer;
+    try {
+      rawBytes = await handle.readFile();
+    } finally {
+      await handle.close();
+    }
+
+    const lines = splitNormalizedJsonlLines(rawBytes);
+    recordCount += lines.length;
+    const normalized = normalizeScanJsonl(rawBytes);
+    const normalizedBytes = Buffer.from(normalized, "utf8");
+
+    if (!rawBytes.equals(normalizedBytes)) {
+      const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+      await writeFile(tmpPath, normalizedBytes, { mode: FILE_MODE });
+      try {
+        await chmod(tmpPath, FILE_MODE);
+      } catch {
+        // ignore
+      }
+      await rename(tmpPath, filePath);
+      filesNormalized += 1;
+    }
+  }
+
+  return { filesNormalized, recordCount };
 }

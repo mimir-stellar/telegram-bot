@@ -223,3 +223,12 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Cross-Platform Archive Newline & Canonical Export Format
+
+Event archives (`src/stellar/archive.ts`) and JSONL helpers (`src/stellar/scan-jsonl.ts`) normalize line endings across Windows and Unix so captures moved through `git` (`core.autocrlf`), PowerShell, or POSIX shells preserve identical record identities:
+
+* **Accepted Input Terminators:** `readArchive`, `parseScanJsonlEvents`, `splitNormalizedJsonlLines`, and `normalizeScanJsonl` accept `\n` (LF), `\r\n` (CRLF), `\r` (CR), mixed outer line endings, and an optional leading UTF-8 BOM (`0xEF 0xBB 0xBF`) without modifying escaped `\r\n` (`\\r\\n`) inside JSON string values. Invalid UTF-8 byte sequences and malformed JSON lines are rejected.
+* **Canonical Export Format:** `createEventArchive`, `formatScanJsonl`, `exportCanonicalArchive`, and `normalizeArchiveDirectoryNewlines` always emit UTF-8 without BOM and terminate every record with a single `\n` (`CANONICAL_NEWLINE`, `0x0A`) with zero `0x0D` (`\r`) bytes. `exportCanonicalArchive` and `normalizeScanJsonl` additionally sort object keys lexicographically so LF and CRLF sources yield byte-identical exports and identical `computeArchiveRecordIdentity` SHA-256 digests.
