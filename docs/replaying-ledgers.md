@@ -223,3 +223,13 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Comparing Coverage Between Two Event Captures
+
+When reconciling two offline event archives or JSONL scans (for example, comparing a full network capture against a filtered or partial replay capture), use the coverage helpers in [`src/stellar/archive.ts`](../src/stellar/archive.ts) and [`src/stellar/scan-jsonl.ts`](../src/stellar/scan-jsonl.ts):
+
+* **`compareArchiveCoverage(left, right)` / `compareArchiveDirectories(leftDir, rightDir, options)`:** Deduplicates events deterministically by chain identity (`source`, `contractId`, and `eventId` / transaction coordinates) and computes `overlappingRanges`, `missingInLeft`, `missingInRight`, and `uncoveredGapRanges` with stable event counts.
+* **`parseScanJsonl(jsonl)` and `formatScanJsonl(events, captureMeta)`:** Round-trips NDJSON event streams alongside optional capture acquisition bounds (`startLedger`, `endLedger`, `truncated`, `startClamped`) and filter declarations (`sources`, `contractIds`, `eventNames`, `categories`).
+* **Discrepancy Classification (`status`):** Distinguishes `"intentional_filter"` (events excluded by a capture's declared contract, event-name, or category filter) from `"incomplete_acquisition"` (missing ledger sub-ranges, missing intra-overlap events, page-cap truncation, or retention-floor clamping), reporting `"mixed"` when both occur and `"none"` when captures agree.
