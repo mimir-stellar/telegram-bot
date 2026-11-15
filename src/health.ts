@@ -21,6 +21,7 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import { RPC_BUDGET_TARGETS } from "./stellar/metrics.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -441,6 +442,51 @@ export function buildMetricsReport(
         `mimir_telegram_target_last_event_ledger{network="${network}",source="${target.source}",contract="${target.contractId}"} ${target.lastEventLedger}`
       );
     }
+  }
+
+  if (poller.rpcBudget) {
+    const budget = poller.rpcBudget;
+    const emittedTargets = RPC_BUDGET_TARGETS.filter(
+      (t) =>
+        t === "market" ||
+        t === "squad" ||
+        budget.targets[t].used > 0 ||
+        budget.targets[t].exceededTotal > 0,
+    );
+    lines.push(
+      ``,
+      `# HELP mimir_telegram_rpc_budget_window_ms Fixed window duration in milliseconds for per-target Soroban RPC request budgets`,
+      `# TYPE mimir_telegram_rpc_budget_window_ms gauge`,
+      `mimir_telegram_rpc_budget_window_ms{network="${network}"} ${budget.windowMs}`,
+      ``,
+      `# HELP mimir_telegram_rpc_budget_configured_requests Configured Soroban RPC request budget per target over the fixed window`,
+      `# TYPE mimir_telegram_rpc_budget_configured_requests gauge`,
+      ...emittedTargets.map(
+        (t) =>
+          `mimir_telegram_rpc_budget_configured_requests{network="${network}",target="${t}"} ${budget.targets[t].configured}`,
+      ),
+      ``,
+      `# HELP mimir_telegram_rpc_budget_used_requests Soroban RPC requests used per target within the active fixed window`,
+      `# TYPE mimir_telegram_rpc_budget_used_requests gauge`,
+      ...emittedTargets.map(
+        (t) =>
+          `mimir_telegram_rpc_budget_used_requests{network="${network}",target="${t}"} ${budget.targets[t].used}`,
+      ),
+      ``,
+      `# HELP mimir_telegram_rpc_budget_saturation_ratio Bounded 0-to-1 ratio of used to configured Soroban RPC requests per target`,
+      `# TYPE mimir_telegram_rpc_budget_saturation_ratio gauge`,
+      ...emittedTargets.map(
+        (t) =>
+          `mimir_telegram_rpc_budget_saturation_ratio{network="${network}",target="${t}"} ${budget.targets[t].saturation}`,
+      ),
+      ``,
+      `# HELP mimir_telegram_rpc_budget_exceeded_total Total Soroban RPC requests exceeding the configured fixed-window budget per target`,
+      `# TYPE mimir_telegram_rpc_budget_exceeded_total counter`,
+      ...emittedTargets.map(
+        (t) =>
+          `mimir_telegram_rpc_budget_exceeded_total{network="${network}",target="${t}"} ${budget.targets[t].exceededTotal}`,
+      ),
+    );
   }
 
   return lines.join("\\n") + "\\n";

@@ -97,11 +97,18 @@ import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./sta
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
 import {
+  EVENT_MAX_PAGES,
   eventCursorLedger,
   readContractEvents,
   resumeCursorProblem,
   type WatchTarget,
 } from "./stellar/events.js";
+import {
+  DEFAULT_RPC_BUDGET_WINDOW_MS,
+  RpcBudgetTracker,
+  type RpcBudgetSnapshot,
+  type RpcBudgetTrackerOptions,
+} from "./stellar/metrics.js";
 import {
   isAdminPayload,
   normalizeContractVersion,
@@ -361,6 +368,8 @@ export interface PollerStatus {
     failureCount: number;
     lastFailureAt: number | null;
   };
+  /** Fixed-window per-target RPC request budget usage and saturation. */
+  rpcBudget?: RpcBudgetSnapshot;
 }
 
 /** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
@@ -535,6 +544,8 @@ export interface PollerDeps {
    * tests can shrink the window to observe a comparison quickly.
    */
   activityBaselineOptions?: ActivityBaselineOptions;
+  /** Optional fixed-window per-target RPC budget configuration. */
+  rpcBudgetOptions?: RpcBudgetTrackerOptions;
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
   now?: () => number;
   /**
@@ -1348,6 +1359,21 @@ export function createPoller(deps: PollerDeps) {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? defaultSleep;
   const activityBaseline = new ActivityBaseline(deps.activityBaselineOptions);
+  const budgetWindowMs = deps.rpcBudgetOptions?.windowMs ?? DEFAULT_RPC_BUDGET_WINDOW_MS;
+  const cyclesPerWindow = Math.max(
+    1,
+    Math.ceil(budgetWindowMs / Math.max(1, config.pollIntervalMs || 30_000)),
+  );
+  const defaultTargetPageBudget = cyclesPerWindow * EVENT_MAX_PAGES;
+  const rpcBudget = new RpcBudgetTracker({
+    windowMs: budgetWindowMs,
+    defaultBudget: deps.rpcBudgetOptions?.defaultBudget ?? defaultTargetPageBudget,
+    targetBudgets: {
+      health: deps.rpcBudgetOptions?.targetBudgets?.health ?? Math.max(2, cyclesPerWindow * 2),
+      ...deps.rpcBudgetOptions?.targetBudgets,
+    },
+    clock: deps.rpcBudgetOptions?.clock ?? now,
+  });
   const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
   const targetMaxBackoff = deps.targetBackoffOptions?.maxBackoffMs ?? DEFAULT_TARGET_MAX_BACKOFF_MS;
   const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
@@ -1530,6 +1556,7 @@ export function createPoller(deps: PollerDeps) {
       failureCount: 0,
       lastFailureAt: null,
     },
+    rpcBudget: rpcBudget.snapshot(),
   };
 
   function syncCounterSnapshots(): void {
@@ -2554,7 +2581,12 @@ export function createPoller(deps: PollerDeps) {
           // it. A failed fetch is not cached, so this target fails on its own
           // and a later target still retries. Bounded by the same scan budget,
           // so a wedged `getHealth()` cannot stall the cycle.
+          const prevCacheMisses = ledgerCache.stats().misses;
           const tip = await withTimeout(ledgerCache.get(server), SCAN_TIMEOUT_MS, "RPC health");
+          if (ledgerCache.stats().misses > prevCacheMisses) {
+            rpcBudget.record("health", 1, now());
+            metrics?.rpcBudget.record("health", 1, now());
+          }
           const scan = await withTimeout(
             readContractEvents(server, target, {
               ledgerTip: tip,
@@ -2573,6 +2605,9 @@ export function createPoller(deps: PollerDeps) {
             "RPC scan",
           );
 
+          const pagesSpent = Math.max(1, scan.pages);
+          rpcBudget.record(target.source, pagesSpent, now());
+          metrics?.rpcBudget.record(target.source, pagesSpent, now());
           metrics?.rpcRequests.inc();
           // Stale-cursor check runs on every successful scan so it catches the
           // condition even when the cursor has not moved (empty pages).
@@ -2737,6 +2772,8 @@ export function createPoller(deps: PollerDeps) {
           trackCursorAdvance(current, previousCursor, scan.latestLedger);
         } catch (err) {
           cycleFailures++;
+          rpcBudget.record(target.source, 1, now());
+          metrics?.rpcBudget.record(target.source, 1, now());
           metrics?.rpcErrors.inc();
           current.consecutiveFailures += 1;
           const delayMs = Math.min(
@@ -2874,6 +2911,7 @@ export function createPoller(deps: PollerDeps) {
       // they run even when the body above threw.
       try {
         status.targets = [...state.values()].map((t) => ({ ...t }));
+        status.rpcBudget = rpcBudget.snapshot(now());
         await saveCounters("cycle");
         await saveCursors("cycle");
         await persistStatus();

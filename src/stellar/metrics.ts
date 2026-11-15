@@ -136,3 +136,249 @@ export function formatRpcTiming(summary: RpcTimingSummary): string {
     `health=${operations.health.requests} events=${operations.events.requests}`
   );
 }
+
+// ── Per-target RPC request budget saturation ─────────────────────────────────
+
+/**
+ * Closed set of target labels permitted on RPC budget metrics.
+ *
+ * Raw contract IDs, RPC URLs, chat IDs, or caller-supplied strings are never
+ * placed in Prometheus labels; anything outside the known operational targets
+ * collapses to `"other"` so label cardinality is strictly bounded at <= 4.
+ */
+export type RpcBudgetTarget = "market" | "squad" | "health" | "other";
+
+export const RPC_BUDGET_TARGETS: readonly RpcBudgetTarget[] = [
+  "market",
+  "squad",
+  "health",
+  "other",
+] as const;
+
+/** Default fixed measurement window for RPC budget tracking (60 seconds). */
+export const DEFAULT_RPC_BUDGET_WINDOW_MS = 60_000;
+
+/** Default request budget per target per fixed window. */
+export const DEFAULT_RPC_TARGET_BUDGET = 40;
+
+/** Normalize an arbitrary target identifier into the bounded {@link RpcBudgetTarget} set. */
+export function normalizeRpcBudgetTarget(target: unknown): RpcBudgetTarget {
+  if (typeof target !== "string") return "other";
+  const normalized = target.trim().toLowerCase();
+  if (normalized === "market" || normalized === "squad" || normalized === "health") {
+    return normalized;
+  }
+  return "other";
+}
+
+export interface RpcTargetBudgetSnapshot {
+  target: RpcBudgetTarget;
+  /** Requests consumed in the active fixed window. */
+  used: number;
+  /** Configured request budget for this target over `windowMs`. */
+  configured: number;
+  /** Remaining requests in the active fixed window (`max(0, configured - used)`). */
+  remaining: number;
+  /** Bounded `[0, 1]` saturation ratio (`min(1, used / configured)`). */
+  saturation: number;
+  /** Cumulative requests recorded above `configured` across all windows. */
+  exceededTotal: number;
+  /** Fixed window length in milliseconds. */
+  windowMs: number;
+}
+
+export interface RpcBudgetSnapshot {
+  windowMs: number;
+  targets: Record<RpcBudgetTarget, RpcTargetBudgetSnapshot>;
+}
+
+export interface RpcBudgetTrackerOptions {
+  /** Fixed window duration in milliseconds (default: 60_000). */
+  windowMs?: number;
+  /** Default per-target request budget per window (default: 40). */
+  defaultBudget?: number;
+  /** Optional per-target budget overrides. */
+  targetBudgets?: Partial<Record<RpcBudgetTarget, number>>;
+  /** Monotonic millisecond clock (defaults to `performance.now()`). */
+  clock?: () => number;
+}
+
+interface TargetWindowState {
+  configured: number;
+  used: number;
+  exceededTotal: number;
+  windowStartMs: number | null;
+}
+
+function sanitizePositiveInt(value: number | undefined, fallback: number, label: string): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value) || value < 1 || !Number.isInteger(value)) {
+    throw new RangeError(`${label} must be a positive integer; got ${String(value)}`);
+  }
+  return value;
+}
+
+function roundRatio(value: number): number {
+  return Math.round(value * 10_000) / 10_000;
+}
+
+/**
+ * Fixed-window per-target RPC request budget tracker.
+ *
+ * Keeps O(1) state per bounded target (`market`, `squad`, `health`, `other`),
+ * advancing windows arithmetically without retaining per-request timestamps or
+ * payloads.
+ */
+export class RpcBudgetTracker {
+  readonly windowMs: number;
+  private readonly clock: () => number;
+  private readonly states: Record<RpcBudgetTarget, TargetWindowState>;
+  private readonly activeTargets = new Set<RpcBudgetTarget>(["market", "squad"]);
+
+  constructor(options: RpcBudgetTrackerOptions = {}) {
+    this.windowMs = sanitizePositiveInt(
+      options.windowMs,
+      DEFAULT_RPC_BUDGET_WINDOW_MS,
+      "windowMs",
+    );
+    const defaultBudget = sanitizePositiveInt(
+      options.defaultBudget,
+      DEFAULT_RPC_TARGET_BUDGET,
+      "defaultBudget",
+    );
+    this.clock = options.clock ?? (() => performance.now());
+
+    this.states = {
+      market: {
+        configured: sanitizePositiveInt(
+          options.targetBudgets?.market,
+          defaultBudget,
+          "targetBudgets.market",
+        ),
+        used: 0,
+        exceededTotal: 0,
+        windowStartMs: null,
+      },
+      squad: {
+        configured: sanitizePositiveInt(
+          options.targetBudgets?.squad,
+          defaultBudget,
+          "targetBudgets.squad",
+        ),
+        used: 0,
+        exceededTotal: 0,
+        windowStartMs: null,
+      },
+      health: {
+        configured: sanitizePositiveInt(
+          options.targetBudgets?.health,
+          defaultBudget,
+          "targetBudgets.health",
+        ),
+        used: 0,
+        exceededTotal: 0,
+        windowStartMs: null,
+      },
+      other: {
+        configured: sanitizePositiveInt(
+          options.targetBudgets?.other,
+          defaultBudget,
+          "targetBudgets.other",
+        ),
+        used: 0,
+        exceededTotal: 0,
+        windowStartMs: null,
+      },
+    };
+
+    if (options.targetBudgets?.health !== undefined) this.activeTargets.add("health");
+    if (options.targetBudgets?.other !== undefined) this.activeTargets.add("other");
+  }
+
+  private advanceWindow(state: TargetWindowState, nowMs: number): void {
+    const safeNow = Number.isFinite(nowMs) ? nowMs : this.clock();
+    if (state.windowStartMs === null) {
+      state.windowStartMs = safeNow;
+      return;
+    }
+    const elapsed = safeNow - state.windowStartMs;
+    if (elapsed >= this.windowMs) {
+      const steps = Math.floor(elapsed / this.windowMs);
+      state.windowStartMs += steps * this.windowMs;
+      state.used = 0;
+    }
+  }
+
+  /** Update the configured request budget for a bounded target. */
+  configureTarget(target: unknown, configuredBudget: number): void {
+    const key = normalizeRpcBudgetTarget(target);
+    const sanitized = sanitizePositiveInt(configuredBudget, DEFAULT_RPC_TARGET_BUDGET, "budget");
+    this.states[key].configured = sanitized;
+    this.activeTargets.add(key);
+  }
+
+  /** Record `requests` (default 1) spent against `target` in the current window. */
+  record(target: unknown, requests = 1, nowMs?: number): RpcTargetBudgetSnapshot {
+    if (!Number.isFinite(requests) || requests < 0 || !Number.isInteger(requests)) {
+      throw new RangeError(`RpcBudgetTracker.record requests must be a non-negative integer; got ${String(requests)}`);
+    }
+    const key = normalizeRpcBudgetTarget(target);
+    this.activeTargets.add(key);
+    const state = this.states[key];
+    const timestamp = nowMs ?? this.clock();
+    this.advanceWindow(state, timestamp);
+
+    const prevOverflow = Math.max(0, state.used - state.configured);
+    state.used += requests;
+    const nextOverflow = Math.max(0, state.used - state.configured);
+    if (nextOverflow > prevOverflow) {
+      state.exceededTotal += nextOverflow - prevOverflow;
+    }
+
+    return this.buildTargetSnapshot(key);
+  }
+
+  /** Targets that are configured by default (`market`, `squad`) or have recorded activity. */
+  trackedTargets(): RpcBudgetTarget[] {
+    return RPC_BUDGET_TARGETS.filter((t) => this.activeTargets.has(t));
+  }
+
+  private buildTargetSnapshot(target: RpcBudgetTarget): RpcTargetBudgetSnapshot {
+    const state = this.states[target];
+    const remaining = Math.max(0, state.configured - state.used);
+    const saturation =
+      state.used <= 0 ? 0 : Math.min(1, roundRatio(state.used / state.configured));
+    return {
+      target,
+      used: state.used,
+      configured: state.configured,
+      remaining,
+      saturation,
+      exceededTotal: state.exceededTotal,
+      windowMs: this.windowMs,
+    };
+  }
+
+  /** Snapshot all bounded targets at `nowMs` (rolling over expired windows first). */
+  snapshot(nowMs?: number): RpcBudgetSnapshot {
+    const timestamp = nowMs ?? this.clock();
+    const targets = {} as Record<RpcBudgetTarget, RpcTargetBudgetSnapshot>;
+    for (const key of RPC_BUDGET_TARGETS) {
+      this.advanceWindow(this.states[key], timestamp);
+      targets[key] = this.buildTargetSnapshot(key);
+    }
+    return {
+      windowMs: this.windowMs,
+      targets,
+    };
+  }
+}
+
+/** One-line, secret-free summary of per-target RPC budget usage. */
+export function formatRpcBudget(snapshot: RpcBudgetSnapshot): string {
+  const parts = (["market", "squad"] as const).map((t) => {
+    const s = snapshot.targets[t];
+    return `${t}=${s.used}/${s.configured}`;
+  });
+  return `rpc_budget window=${snapshot.windowMs}ms ${parts.join(" ")}`;
+}

@@ -317,6 +317,18 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_rpc_budget_window_ms` | gauge | Fixed window duration in milliseconds for per-target Soroban RPC budgets |
+| `mimir_bot_rpc_budget_configured_requests{target}` | gauge | Configured Soroban RPC request budget per bounded target (`market`, `squad`, `health`, `other`) |
+| `mimir_bot_rpc_budget_used_requests{target}` | gauge | Soroban RPC requests consumed per target in the active fixed window |
+| `mimir_bot_rpc_budget_saturation_ratio{target}` | gauge | Bounded `[0, 1]` saturation ratio (`min(1, used / configured)`) in the active window |
+| `mimir_bot_rpc_budget_exceeded_total{target}` | counter | Cumulative Soroban RPC requests recorded above `configured` per target |
+
+> **Label cardinality guard:** `target` is restricted to the closed set
+> `market | squad | health | other` (`normalizeRpcBudgetTarget` in
+> `src/stellar/metrics.ts`). Raw contract IDs, RPC URLs, chat IDs, and
+> caller-supplied identifiers collapse to `other` and are never emitted as
+> Prometheus label values. The health server's `GET /metrics` mirrors the same
+> series under the `mimir_telegram_rpc_budget_*` prefix.
 
 ```bash
 METRICS_PORT=9090  # in .env or environment

@@ -25,6 +25,13 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import {
+  RpcBudgetTracker,
+  type RpcBudgetSnapshot,
+  type RpcBudgetTrackerOptions,
+  type RpcTargetBudgetSnapshot,
+} from "./stellar/metrics.js";
+
 // ── Metric types ──────────────────────────────────────────────────────────────
 
 export interface Counter {
@@ -39,6 +46,21 @@ export interface Gauge {
   set(value: number): void;
   /** Current value. */
   value(): number;
+}
+
+export interface CreateMetricsOptions {
+  /** Optional fixed-window RPC budget configuration. */
+  rpcBudget?: RpcBudgetTrackerOptions;
+}
+
+/** Per-target RPC budget instrumentation exposed by {@link MetricsRegistry}. */
+export interface RpcBudgetMetrics {
+  /** Record `requests` (default 1) against a target (normalized to a bounded label). */
+  record(target: unknown, requests?: number, nowMs?: number): RpcTargetBudgetSnapshot;
+  /** Override the configured per-window request budget for a bounded target. */
+  configureTarget(target: unknown, configuredBudget: number): void;
+  /** Inspect current fixed-window usage and saturation across bounded targets. */
+  snapshot(nowMs?: number): RpcBudgetSnapshot;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -89,6 +111,8 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** Fixed-window per-target Soroban RPC request budget usage and saturation. */
+  rpcBudget: RpcBudgetMetrics;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -146,7 +170,8 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
-export function createMetrics(): MetricsRegistry {
+export function createMetrics(options: CreateMetricsOptions = {}): MetricsRegistry {
+  const rpcBudgetTracker = new RpcBudgetTracker(options.rpcBudget);
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -222,6 +247,52 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`# HELP ${g._name} ${g._help}`);
       lines.push(`# TYPE ${g._name} gauge`);
       lines.push(`${g._name} ${g.value()}`);
+    }
+
+    const budgetSnap = rpcBudgetTracker.snapshot();
+    const trackedTargets = rpcBudgetTracker.trackedTargets();
+
+    lines.push(
+      `# HELP ${METRICS_PREFIX}rpc_budget_window_ms Fixed window duration in milliseconds for per-target Soroban RPC request budgets.`,
+      `# TYPE ${METRICS_PREFIX}rpc_budget_window_ms gauge`,
+      `${METRICS_PREFIX}rpc_budget_window_ms ${budgetSnap.windowMs}`,
+      `# HELP ${METRICS_PREFIX}rpc_budget_configured_requests Configured Soroban RPC request budget per target over the fixed window.`,
+      `# TYPE ${METRICS_PREFIX}rpc_budget_configured_requests gauge`,
+    );
+    for (const target of trackedTargets) {
+      lines.push(
+        `${METRICS_PREFIX}rpc_budget_configured_requests{target="${target}"} ${budgetSnap.targets[target].configured}`,
+      );
+    }
+
+    lines.push(
+      `# HELP ${METRICS_PREFIX}rpc_budget_used_requests Soroban RPC requests used per target within the active fixed window.`,
+      `# TYPE ${METRICS_PREFIX}rpc_budget_used_requests gauge`,
+    );
+    for (const target of trackedTargets) {
+      lines.push(
+        `${METRICS_PREFIX}rpc_budget_used_requests{target="${target}"} ${budgetSnap.targets[target].used}`,
+      );
+    }
+
+    lines.push(
+      `# HELP ${METRICS_PREFIX}rpc_budget_saturation_ratio Bounded 0-to-1 ratio of used to configured Soroban RPC requests per target in the active window.`,
+      `# TYPE ${METRICS_PREFIX}rpc_budget_saturation_ratio gauge`,
+    );
+    for (const target of trackedTargets) {
+      lines.push(
+        `${METRICS_PREFIX}rpc_budget_saturation_ratio{target="${target}"} ${budgetSnap.targets[target].saturation}`,
+      );
+    }
+
+    lines.push(
+      `# HELP ${METRICS_PREFIX}rpc_budget_exceeded_total Total Soroban RPC requests exceeding the configured fixed-window budget per target.`,
+      `# TYPE ${METRICS_PREFIX}rpc_budget_exceeded_total counter`,
+    );
+    for (const target of trackedTargets) {
+      lines.push(
+        `${METRICS_PREFIX}rpc_budget_exceeded_total{target="${target}"} ${budgetSnap.targets[target].exceededTotal}`,
+      );
     }
 
     // Prometheus text format requires a trailing newline.
@@ -306,6 +377,12 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    rpcBudget: {
+      record: (target, requests, nowMs) => rpcBudgetTracker.record(target, requests, nowMs),
+      configureTarget: (target, configuredBudget) =>
+        rpcBudgetTracker.configureTarget(target, configuredBudget),
+      snapshot: (nowMs) => rpcBudgetTracker.snapshot(nowMs),
+    },
     render,
     startServer,
   };
