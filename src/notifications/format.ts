@@ -27,7 +27,14 @@ import {
 import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
 import { iconForCategory } from "./category-icons.js";
-import { groupDigestEvents } from "./digest-grouping.js";
+import {
+  describeIncompleteDigestReasons,
+  groupDigestEvents,
+} from "./digest-grouping.js";
+import {
+  normalizeDigestCompleteness,
+  type DigestPeriodCompletenessInput,
+} from "./schedule.js";
 import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
@@ -326,6 +333,13 @@ export interface FormatDigestOptions {
    * option is omitted or set to `false`.
    */
   grouped?: boolean;
+  /**
+   * Optional completeness metadata for the digest period. When the period was
+   * affected by an RPC gap, scan interruption, cursor reset, or mid-period
+   * restart, the header explicitly labels the digest as an incomplete period
+   * and presents an observed/partial count instead of a complete cycle summary.
+   */
+  completeness?: DigestPeriodCompletenessInput;
 }
 
 /**
@@ -337,12 +351,41 @@ function flatLine(event: DecodedEvent): string {
   return `· mimir\\-${escapeMd(event.source)} \`${escapeMd(clip(name, 80))}\` at ledger ${event.ledger}`;
 }
 
+function digestHeaderBlock(
+  eventCount: number,
+  completenessInput: DigestPeriodCompletenessInput | undefined,
+): { complete: boolean; lines: string[] } {
+  if (completenessInput === undefined) {
+    return {
+      complete: true,
+      lines: [`*Mimir Digest* — ${eventCount} events in this cycle`],
+    };
+  }
+  const completeness = normalizeDigestCompleteness(completenessInput);
+  if (completeness.complete) {
+    return {
+      complete: true,
+      lines: [`*Mimir Digest* — ${eventCount} events in this cycle`],
+    };
+  }
+  const header =
+    `*Mimir Digest ${escapeMd("(incomplete period)")}* — ` +
+    `${eventCount} observed events ${escapeMd("(partial — ledger coverage incomplete)")}`;
+  const reasonLine = `_${escapeMd(describeIncompleteDigestReasons(completeness))}_`;
+  return {
+    complete: false,
+    lines: [header, reasonLine],
+  };
+}
+
 /**
  * Render a grouped digest.  Called only when `options.grouped` is `true`.
  */
-function renderGroupedDigest(events: readonly DecodedEvent[]): string {
+function renderGroupedDigest(
+  events: readonly DecodedEvent[],
+  headerLines: readonly string[],
+): string {
   const groups = groupDigestEvents(events);
-  const header = `*Mimir Digest* — ${events.length} events in this cycle`;
   const body: string[] = [];
 
   for (const group of groups) {
@@ -360,7 +403,7 @@ function renderGroupedDigest(events: readonly DecodedEvent[]): string {
     }
   }
 
-  return [header, "", ...body].join("\n");
+  return body.length > 0 ? [...headerLines, "", ...body].join("\n") : headerLines.join("\n");
 }
 
 /**
@@ -374,10 +417,11 @@ export function formatDigest(
   events: readonly DecodedEvent[],
   options: FormatDigestOptions = {},
 ): string | null {
-  if (events.length === 0) return null;
-  if (options.grouped) return renderGroupedDigest(events);
+  const header = digestHeaderBlock(events.length, options.completeness);
+  if (events.length === 0 && header.complete) return null;
+  if (options.grouped) return renderGroupedDigest(events, header.lines);
   const lines = events.map(flatLine);
-  return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
+  return lines.length > 0 ? [...header.lines, "", ...lines].join("\n") : header.lines.join("\n");
 }
 
 /**

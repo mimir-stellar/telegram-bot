@@ -111,6 +111,178 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+export type DigestIncompletenessReason =
+  | "rpc_gap"
+  | "restart"
+  | "rpc_error"
+  | "cursor_reset";
+
+export interface DigestPeriodGapRange {
+  fromLedger: number;
+  toLedger: number;
+  source?: string;
+}
+
+export interface DigestPeriodCompletenessInput {
+  complete?: boolean;
+  reasons?: readonly DigestIncompletenessReason[];
+  missedLedgers?: number;
+  gaps?: readonly DigestPeriodGapRange[];
+}
+
+export interface DigestPeriodCompleteness {
+  complete: boolean;
+  status: "complete" | "incomplete";
+  reasons: DigestIncompletenessReason[];
+  missedLedgers: number;
+  gaps: DigestPeriodGapRange[];
+}
+
+const VALID_INCOMPLETENESS_REASONS: ReadonlySet<string> = new Set([
+  "rpc_gap",
+  "restart",
+  "rpc_error",
+  "cursor_reset",
+]);
+
+/**
+ * Normalize and validate digest period completeness metadata. Any recorded
+ * reason, gap range, or positive `missedLedgers` count forces `incomplete`
+ * status so a partial period can never masquerade as complete.
+ */
+export function normalizeDigestCompleteness(
+  input: DigestPeriodCompletenessInput = {},
+): DigestPeriodCompleteness {
+  const seenReasons = new Set<DigestIncompletenessReason>();
+  for (const reason of input.reasons ?? []) {
+    if (!VALID_INCOMPLETENESS_REASONS.has(reason)) {
+      throw new ScheduleParseError(`Unsupported digest incompleteness reason "${String(reason)}"`);
+    }
+    seenReasons.add(reason);
+  }
+
+  const gaps: DigestPeriodGapRange[] = [];
+  let derivedMissed = 0;
+  for (const gap of input.gaps ?? []) {
+    if (
+      !Number.isInteger(gap.fromLedger) ||
+      !Number.isInteger(gap.toLedger) ||
+      gap.fromLedger < 0 ||
+      gap.toLedger < gap.fromLedger
+    ) {
+      throw new ScheduleParseError(
+        `Invalid ledger gap range [${gap.fromLedger}, ${gap.toLedger}]`,
+      );
+    }
+    gaps.push({
+      fromLedger: gap.fromLedger,
+      toLedger: gap.toLedger,
+      ...(gap.source ? { source: gap.source } : {}),
+    });
+    derivedMissed += gap.toLedger - gap.fromLedger + 1;
+  }
+
+  if (gaps.length > 0) {
+    seenReasons.add("rpc_gap");
+  }
+
+  if (input.missedLedgers !== undefined) {
+    if (!Number.isInteger(input.missedLedgers) || input.missedLedgers < 0) {
+      throw new ScheduleParseError("missedLedgers must be a non-negative integer");
+    }
+    if (input.missedLedgers > 0 && seenReasons.size === 0) {
+      seenReasons.add("rpc_gap");
+    }
+  }
+
+  const missedLedgers = Math.max(input.missedLedgers ?? 0, derivedMissed);
+  const explicitlyIncomplete = input.complete === false;
+  if (explicitlyIncomplete && seenReasons.size === 0) {
+    seenReasons.add("restart");
+  }
+
+  const reasons = [...seenReasons];
+  const complete = !explicitlyIncomplete && reasons.length === 0 && missedLedgers === 0;
+  return {
+    complete,
+    status: complete ? "complete" : "incomplete",
+    reasons,
+    missedLedgers,
+    gaps,
+  };
+}
+
+export interface DigestPeriodTracker {
+  recordRpcGap(gap?: {
+    fromLedger?: number;
+    toLedger?: number;
+    missedLedgers?: number;
+    source?: string;
+  }): void;
+  recordRestart(): void;
+  recordRpcError(): void;
+  recordCursorReset(): void;
+  snapshot(): DigestPeriodCompleteness;
+  reset(): void;
+}
+
+/**
+ * Stateful tracker accumulating RPC gaps, restarts, scan errors, or cursor
+ * resets observed within the active scheduled digest period.
+ */
+export function createDigestPeriodTracker(): DigestPeriodTracker {
+  let reasons = new Set<DigestIncompletenessReason>();
+  let missedLedgers = 0;
+  let gaps: DigestPeriodGapRange[] = [];
+
+  return {
+    recordRpcGap(gap = {}) {
+      reasons.add("rpc_gap");
+      if (gap.fromLedger !== undefined && gap.toLedger !== undefined) {
+        const validated = normalizeDigestCompleteness({
+          gaps: [
+            {
+              fromLedger: gap.fromLedger,
+              toLedger: gap.toLedger,
+              source: gap.source,
+            },
+          ],
+        });
+        gaps.push(...validated.gaps);
+        missedLedgers += validated.missedLedgers;
+        return;
+      }
+      if (gap.missedLedgers !== undefined) {
+        if (!Number.isInteger(gap.missedLedgers) || gap.missedLedgers < 0) {
+          throw new ScheduleParseError("missedLedgers must be a non-negative integer");
+        }
+        missedLedgers += gap.missedLedgers;
+      }
+    },
+    recordRestart() {
+      reasons.add("restart");
+    },
+    recordRpcError() {
+      reasons.add("rpc_error");
+    },
+    recordCursorReset() {
+      reasons.add("cursor_reset");
+    },
+    snapshot() {
+      return normalizeDigestCompleteness({
+        reasons: [...reasons],
+        missedLedgers,
+        gaps,
+      });
+    },
+    reset() {
+      reasons = new Set();
+      missedLedgers = 0;
+      gaps = [];
+    },
+  };
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;

@@ -129,6 +129,7 @@ Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's
 - **Bounded fields**: Contract strings clipped at 200 Unicode code points
 - **Explorer links**: Includes transaction links to stellar.expert
 - **Preview mode**: Optional `[PREVIEW MODE]` badge for testing
+- **Incomplete digest periods (`src/notifications/digest-grouping.ts`, `src/notifications/schedule.ts`, `src/notifications/format.ts`)**: `createDigestPeriodTracker()`, `normalizeDigestCompleteness()`, and `buildDigestPeriodSummary()` explicitly label digest windows affected by RPC retention gaps, scan interruptions, cursor resets, or mid-period restarts (`status: "incomplete"`), rendering observed/partial counts rather than presenting a partial count as a complete ledger cycle summary.
 
 ### Telegram Integration (`src/bot.ts`)
 
