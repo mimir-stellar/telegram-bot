@@ -19,11 +19,12 @@ Operational reference describing all on-disk state files maintained by the Mimir
 ## Detailed Component Behaviors
 
 ### 1. Cursor File (`CURSOR_FILE`)
-- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`, `loadCursors`, `quarantineCorruptCursorFile`)
+- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`, `loadCursors`, `quarantineCorruptCursorFile`, `classifyCursorFailure`), [`src/cursor-cli.ts`](../src/cursor-cli.ts) (`backupCursor`, `restoreCursor`)
 - **Default Path**: `./data/cursor.json` (configured via `DEFAULTS.cursorFile` in [`src/config.ts`](../src/config.ts))
 - **Write Pattern**: Atomic write-then-rename (`${cursorFile}.tmp` -> `${cursorFile}`) on every successful scan commit, graceful shutdown flush, or schema migration.
-- **Deleted**: Poller logs that no cursor was found and falls back to a cold start lookback `START_LOOKBACK_LEDGERS` (default: 60 ledgers) behind the chain tip.
-- **Corrupt**: If JSON is invalid or fails schema validation (or references an unsupported future schema version), `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>` and starts cold.
+- **Deleted**: Poller logs that no cursor was found (`ENOENT` / `CURSOR_MISSING`) and falls back to a cold start lookback `START_LOOKBACK_LEDGERS` (default: 60 ledgers) behind the chain tip.
+- **Permission / Operational Failure**: When reading or persisting fails due to directory/file permissions (`EACCES`, `EPERM`, `EROFS` -> `CURSOR_PERMISSION_DENIED`) or other operational filesystem errors (`EISDIR`, `ENOTDIR`, `EBUSY`, `EIO` -> `CURSOR_FS_OPERATIONAL_ERROR`), existing cursor and backup files are preserved in place (never quarantined and never overwritten from a cold-started memory state), and the stable diagnostic code is surfaced in poller logs/status and `cursor` CLI output.
+- **Corrupt**: If JSON is invalid (`CURSOR_CORRUPT_JSON`) or fails schema validation / references an unsupported future schema version (`CURSOR_INVALID_SCHEMA`), `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>` and starts cold.
 
 ### 2. Cursor Backup Copy
 - **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`)

@@ -9,68 +9,144 @@ import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
-import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import { acquireInstanceLock, InstanceLockError } from "./instanceLock.js";
+import {
+  classifyCursorFailure,
+  parseAndMigrateCursorFile,
+  type CursorDiagnosticCategory,
+  type CursorDiagnosticCode,
+  type CursorFailureDiagnostic,
+} from "./poller.js";
+
+export { classifyCursorFailure };
+export type { CursorDiagnosticCategory, CursorDiagnosticCode, CursorFailureDiagnostic };
+
+export interface CursorCliFsOps {
+  access: typeof access;
+  link: typeof link;
+  mkdir: typeof mkdir;
+  readFile: typeof readFile;
+  rename: typeof rename;
+  unlink: typeof unlink;
+  writeFile: typeof writeFile;
+}
+
+export class CursorCliError extends Error {
+  readonly category: CursorDiagnosticCategory;
+  readonly diagnosticCode: CursorDiagnosticCode;
+  readonly operational: boolean;
+  readonly errnoCode: string | null;
+
+  constructor(diag: CursorFailureDiagnostic, options?: { cause?: unknown }) {
+    super(diag.summary, options);
+    this.name = "CursorCliError";
+    this.category = diag.category;
+    this.diagnosticCode = diag.diagnosticCode;
+    this.operational = diag.operational;
+    this.errnoCode = diag.errnoCode;
+  }
+}
 
 export interface BackupCursorOptions {
   cursorFile: string;
   backupFile: string;
   force?: boolean;
+  fsOps?: Partial<CursorCliFsOps>;
 }
 
 export interface RestoreCursorOptions extends BackupCursorOptions {
   lockFile: string;
 }
 
-async function exists(filePath: string): Promise<boolean> {
+function resolveFsOps(overrides?: Partial<CursorCliFsOps>): CursorCliFsOps {
+  return {
+    access: overrides?.access ?? access,
+    link: overrides?.link ?? link,
+    mkdir: overrides?.mkdir ?? mkdir,
+    readFile: overrides?.readFile ?? readFile,
+    rename: overrides?.rename ?? rename,
+    unlink: overrides?.unlink ?? unlink,
+    writeFile: overrides?.writeFile ?? writeFile,
+  };
+}
+
+async function exists(filePath: string, fsOps: CursorCliFsOps): Promise<boolean> {
   try {
-    await access(filePath);
+    await fsOps.access(filePath);
     return true;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw err;
+    throw new CursorCliError(classifyCursorFailure(err, filePath), { cause: err });
   }
 }
 
-function validateCursor(raw: string): ReturnType<typeof parseAndMigrateCursorFile> {
+function validateCursor(
+  raw: string,
+  sourcePath: string,
+): ReturnType<typeof parseAndMigrateCursorFile> {
   try {
     return parseAndMigrateCursorFile(raw);
-  } catch {
-    throw new Error("cursor file is malformed or uses an unsupported schema");
+  } catch (err) {
+    throw new CursorCliError(classifyCursorFailure(err, sourcePath), { cause: err });
   }
 }
 
-async function writeAtomic(filePath: string, contents: string, replace: boolean): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
+async function writeAtomic(
+  filePath: string,
+  contents: string,
+  replace: boolean,
+  fsOps: CursorCliFsOps,
+): Promise<void> {
+  const dirPath = path.dirname(filePath);
+  try {
+    await fsOps.mkdir(dirPath, { recursive: true });
+  } catch (err) {
+    throw new CursorCliError(classifyCursorFailure(err, dirPath), { cause: err });
+  }
+
   const temporaryPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
 
   try {
-    await writeFile(temporaryPath, contents, { encoding: "utf8", flag: "wx" });
+    try {
+      await fsOps.writeFile(temporaryPath, contents, { encoding: "utf8", flag: "wx" });
+    } catch (err) {
+      throw new CursorCliError(classifyCursorFailure(err, dirPath), { cause: err });
+    }
     if (replace) {
-      await rename(temporaryPath, filePath);
+      try {
+        await fsOps.rename(temporaryPath, filePath);
+      } catch (err) {
+        throw new CursorCliError(classifyCursorFailure(err, filePath), { cause: err });
+      }
     } else {
       try {
-        await link(temporaryPath, filePath);
+        await fsOps.link(temporaryPath, filePath);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "EEXIST") {
           throw new Error(`destination already exists at ${filePath}; pass --force to overwrite`);
         }
-        throw err;
+        throw new CursorCliError(classifyCursorFailure(err, filePath), { cause: err });
       }
     }
   } finally {
-    await unlink(temporaryPath).catch(() => undefined);
+    await fsOps.unlink(temporaryPath).catch(() => undefined);
   }
 }
 
 /** Copy a validated supported cursor snapshot without exposing cursor values. */
 export async function backupCursor(options: BackupCursorOptions): Promise<void> {
-  const raw = await readFile(options.cursorFile, "utf8");
-  const parsed = validateCursor(raw);
-  if (!options.force && (await exists(options.backupFile))) {
+  const fsOps = resolveFsOps(options.fsOps);
+  let raw: string;
+  try {
+    raw = await fsOps.readFile(options.cursorFile, "utf8");
+  } catch (err) {
+    throw new CursorCliError(classifyCursorFailure(err, options.cursorFile), { cause: err });
+  }
+  const parsed = validateCursor(raw, options.cursorFile);
+  if (!options.force && (await exists(options.backupFile, fsOps))) {
     throw new Error(`backup already exists at ${options.backupFile}; pass --force to overwrite`);
   }
-  await writeAtomic(options.backupFile, raw, options.force === true);
+  await writeAtomic(options.backupFile, raw, options.force === true, fsOps);
   console.log(
     `[cursor] backed up schema=v` + `${parsed.file.version} targets=${Object.keys(parsed.file.targets).length} ` +
       `from ${options.cursorFile} to ${options.backupFile}`,
@@ -79,15 +155,27 @@ export async function backupCursor(options: BackupCursorOptions): Promise<void> 
 
 /** Restore a compatible cursor while holding the poller's exclusive lock. */
 export async function restoreCursor(options: RestoreCursorOptions): Promise<void> {
-  const lock = await acquireInstanceLock(options.lockFile);
+  const fsOps = resolveFsOps(options.fsOps);
+  let lock: Awaited<ReturnType<typeof acquireInstanceLock>>;
   try {
-    const raw = await readFile(options.backupFile, "utf8");
-    const parsed = validateCursor(raw);
-    if (!options.force && (await exists(options.cursorFile))) {
+    lock = await acquireInstanceLock(options.lockFile);
+  } catch (err) {
+    if (err instanceof InstanceLockError) throw err;
+    throw new CursorCliError(classifyCursorFailure(err, options.lockFile), { cause: err });
+  }
+  try {
+    let raw: string;
+    try {
+      raw = await fsOps.readFile(options.backupFile, "utf8");
+    } catch (err) {
+      throw new CursorCliError(classifyCursorFailure(err, options.backupFile), { cause: err });
+    }
+    const parsed = validateCursor(raw, options.backupFile);
+    if (!options.force && (await exists(options.cursorFile, fsOps))) {
       throw new Error(`cursor already exists at ${options.cursorFile}; pass --force to replace it`);
     }
     const normalized = `${JSON.stringify(parsed.file, null, 2)}\n`;
-    await writeAtomic(options.cursorFile, normalized, options.force === true);
+    await writeAtomic(options.cursorFile, normalized, options.force === true, fsOps);
     console.log(
       `[cursor] restored schema=v${parsed.file.version} targets=${Object.keys(parsed.file.targets).length} ` +
         `from ${options.backupFile} to ${options.cursorFile}`,

@@ -351,6 +351,8 @@ export interface PollerStatus {
   /** Result of the startup persistent-volume probe, when reported. */
   persistentVolumeAvailable?: boolean;
   persistentVolumeError?: string | null;
+  /** Latest structured cursor diagnostic (permission/operational vs corrupt JSON/schema). */
+  cursorDiagnostic?: CursorFailureDiagnostic | null;
   targets: TargetState[];
   /** SHA-256 digest of the SBOM generated for this deployment image. */
   sbomDigest: string | null;
@@ -361,6 +363,38 @@ export interface PollerStatus {
     failureCount: number;
     lastFailureAt: number | null;
   };
+}
+
+export type CursorDiagnosticCategory =
+  | "missing"
+  | "permission_denied"
+  | "operational_fs_error"
+  | "corrupt_json"
+  | "invalid_schema";
+
+export type CursorDiagnosticCode =
+  | "CURSOR_MISSING"
+  | "CURSOR_PERMISSION_DENIED"
+  | "CURSOR_FS_OPERATIONAL_ERROR"
+  | "CURSOR_CORRUPT_JSON"
+  | "CURSOR_INVALID_SCHEMA";
+
+export interface CursorFailureDiagnostic {
+  category: CursorDiagnosticCategory;
+  diagnosticCode: CursorDiagnosticCode;
+  /** True when the failure is operational (permissions, read-only volume, I/O) and files must be preserved. */
+  operational: boolean;
+  errnoCode: string | null;
+  summary: string;
+}
+
+export interface CursorFsOps {
+  readFile: typeof readFile;
+  writeFile: typeof writeFile;
+  rename: typeof rename;
+  copyFile: typeof copyFile;
+  mkdir: typeof mkdir;
+  unlink: typeof unlink;
 }
 
 /** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
@@ -543,6 +577,8 @@ export interface PollerDeps {
    * avoid waiting for real wall-clock time.
    */
   sleep?: (ms: number) => Promise<void>;
+  /** Optional cursor filesystem adapter for deterministic operational-error testing. */
+  cursorFs?: Partial<CursorFsOps>;
 }
 
 export interface ShutdownOptions {
@@ -806,6 +842,85 @@ export function parseCursorFile(raw: string): CursorFile {
   };
 }
 
+const PERMISSION_ERRNO_CODES = new Set(["EACCES", "EPERM", "EROFS"]);
+
+/**
+ * Differentiate operational cursor directory/file errors (permissions, read-only
+ * volume, I/O, wrong file type) from missing files and corrupt JSON or invalid
+ * schema content. Operational failures never justify quarantining or clobbering
+ * an existing cursor file.
+ */
+export function classifyCursorFailure(
+  err: unknown,
+  targetPath?: string,
+  secrets: string[] = [],
+): CursorFailureDiagnostic {
+  const errno =
+    err && typeof err === "object" && typeof (err as NodeJS.ErrnoException).code === "string"
+      ? (err as NodeJS.ErrnoException).code!
+      : null;
+  const boundedReason = safeErrorMessage(err, secrets);
+  const pathPart = targetPath ? ` at ${targetPath}` : "";
+
+  if (errno === "ENOENT") {
+    return {
+      category: "missing",
+      diagnosticCode: "CURSOR_MISSING",
+      operational: false,
+      errnoCode: "ENOENT",
+      summary: `[CURSOR_MISSING] cursor file not found${pathPart}`,
+    };
+  }
+
+  if (errno !== null && PERMISSION_ERRNO_CODES.has(errno)) {
+    return {
+      category: "permission_denied",
+      diagnosticCode: "CURSOR_PERMISSION_DENIED",
+      operational: true,
+      errnoCode: errno,
+      summary:
+        `[CURSOR_PERMISSION_DENIED] cursor directory or file permission failure (${errno})` +
+        `${pathPart}: ${boundedReason}`,
+    };
+  }
+
+  if (errno !== null) {
+    return {
+      category: "operational_fs_error",
+      diagnosticCode: "CURSOR_FS_OPERATIONAL_ERROR",
+      operational: true,
+      errnoCode: errno,
+      summary:
+        `[CURSOR_FS_OPERATIONAL_ERROR] operational cursor filesystem error (${errno})` +
+        `${pathPart}: ${boundedReason}`,
+    };
+  }
+
+  const isJsonSyntax =
+    err instanceof SyntaxError ||
+    /^invalid JSON:|Unexpected token|Unexpected end of JSON|JSON at position/i.test(boundedReason);
+
+  if (isJsonSyntax) {
+    return {
+      category: "corrupt_json",
+      diagnosticCode: "CURSOR_CORRUPT_JSON",
+      operational: false,
+      errnoCode: null,
+      summary: `[CURSOR_CORRUPT_JSON] cursor file contains malformed JSON${pathPart}: ${boundedReason}`,
+    };
+  }
+
+  return {
+    category: "invalid_schema",
+    diagnosticCode: "CURSOR_INVALID_SCHEMA",
+    operational: false,
+    errnoCode: null,
+    summary:
+      `[CURSOR_INVALID_SCHEMA] cursor file is malformed or uses an unsupported schema` +
+      `${pathPart}: ${boundedReason}`,
+  };
+}
+
 /**
  * Move a corrupt cursor file aside so the next save starts clean and operators
  * can inspect the bad file. Returns the quarantine path, or null if rename failed.
@@ -814,23 +929,43 @@ export async function quarantineCorruptCursorFile(
   cursorFile: string,
   reason: string,
   at: Date = new Date(),
+  options: {
+    diagnosticCode?: CursorDiagnosticCode;
+    fsOps?: Pick<CursorFsOps, "rename">;
+  } = {},
 ): Promise<string | null> {
   const dest = cursorQuarantinePath(cursorFile, at);
+  const renameFn = options.fsOps?.rename ?? rename;
+  const contentDiagCode =
+    options.diagnosticCode ??
+    (/^invalid JSON:|Unexpected token|Unexpected end of JSON|JSON at position/i.test(reason)
+      ? "CURSOR_CORRUPT_JSON"
+      : "CURSOR_INVALID_SCHEMA");
   try {
-    await rename(cursorFile, dest);
+    await renameFn(cursorFile, dest);
     Logger.warn(
       "poller",
-      `[poller] cursor file unreadable, starting cold: quarantined it to ${dest} (${reason})`,
-      { action: "cursor_quarantined", cursorFile, quarantined: dest, reason },
+      `[poller] [${contentDiagCode}] cursor file unreadable, starting cold: quarantined it to ${dest} (${reason})`,
+      {
+        action: "cursor_quarantined",
+        diagnosticCode: contentDiagCode,
+        cursorFile,
+        quarantined: dest,
+        reason,
+      },
     );
     return dest;
   } catch (err) {
+    const renameDiag = classifyCursorFailure(err, cursorFile);
     Logger.warn(
       "poller",
-      `[poller] cursor file unreadable, starting cold: could not quarantine ${cursorFile}: ` +
+      `[poller] [${renameDiag.diagnosticCode}] cursor file unreadable, starting cold: could not quarantine ${cursorFile}: ` +
         `${safeErrorMessage(err, [])}; the file was left in place (${reason})`,
       {
         action: "cursor_quarantine_failed",
+        diagnosticCode: renameDiag.diagnosticCode,
+        errnoCode: renameDiag.errnoCode,
+        contentDiagnosticCode: contentDiagCode,
         cursorFile,
         reason,
         error: safeErrorMessage(err, []),
@@ -1347,6 +1482,14 @@ export function createPoller(deps: PollerDeps) {
   };
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? defaultSleep;
+  const cursorFs: CursorFsOps = {
+    readFile: deps.cursorFs?.readFile ?? readFile,
+    writeFile: deps.cursorFs?.writeFile ?? writeFile,
+    rename: deps.cursorFs?.rename ?? rename,
+    copyFile: deps.cursorFs?.copyFile ?? copyFile,
+    mkdir: deps.cursorFs?.mkdir ?? mkdir,
+    unlink: deps.cursorFs?.unlink ?? unlink,
+  };
   const activityBaseline = new ActivityBaseline(deps.activityBaselineOptions);
   const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
   const targetMaxBackoff = deps.targetBackoffOptions?.maxBackoffMs ?? DEFAULT_TARGET_MAX_BACKOFF_MS;
@@ -1714,17 +1857,54 @@ export function createPoller(deps: PollerDeps) {
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
+  /**
+   * Set when cursor loading failed for an operational reason (permissions,
+   * read-only volume, I/O, or directory type mismatch) rather than missing or
+   * corrupt content. While set, `saveCursors` refuses to overwrite the existing
+   * cursor file from a cold-started in-memory state.
+   */
+  let preserveUnreadableCursor = false;
+
   async function loadCursors(): Promise<void> {
     let raw: string;
     try {
-      raw = await readFile(config.cursorFile, "utf8");
-    } catch {
-      console.log(
-        `[poller] no cursor file at ${config.cursorFile}; cold start ` +
-          `${config.startLookbackLedgers} ledgers behind the tip`,
+      raw = await cursorFs.readFile(config.cursorFile, "utf8");
+    } catch (err) {
+      const diag = classifyCursorFailure(err, config.cursorFile, [config.botToken]);
+      if (diag.category === "missing") {
+        preserveUnreadableCursor = false;
+        status.cursorDiagnostic = null;
+        console.log(
+          `[poller] no cursor file at ${config.cursorFile}; cold start ` +
+            `${config.startLookbackLedgers} ledgers behind the tip`,
+        );
+        return;
+      }
+
+      // Operational failure (permissions, read-only directory, I/O): NEVER
+      // quarantine or clobber the existing cursor file.
+      preserveUnreadableCursor = true;
+      status.cursorDiagnostic = diag;
+      Logger.error(
+        "poller",
+        `[poller] ${diag.summary}; preserving existing cursor file without quarantine`,
+        {
+          action:
+            diag.category === "permission_denied"
+              ? "cursor_permission_denied"
+              : "cursor_operational_error",
+          diagnosticCode: diag.diagnosticCode,
+          category: diag.category,
+          errnoCode: diag.errnoCode,
+          cursorFile: config.cursorFile,
+          error: errorMessage(err),
+        },
       );
+      audit.recordError(err, "boot", { detail: diag.diagnosticCode });
       return;
     }
+
+    preserveUnreadableCursor = false;
 
     try {
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
@@ -1746,6 +1926,7 @@ export function createPoller(deps: PollerDeps) {
       // Memory now equals the file; nothing is waiting to be flushed — unless
       // the file was a legacy shape, which start() rewrites before any cycle.
       status.pendingFlush = false;
+      status.cursorDiagnostic = null;
       if (result.migrated) {
         pendingRewrite = true;
         markDirty();
@@ -1783,8 +1964,13 @@ export function createPoller(deps: PollerDeps) {
     } catch (err) {
       // Quarantine then cold-start: never wedge on a corrupt state file, and
       // keep the bad bytes for operators instead of overwriting them on save.
+      const diag = classifyCursorFailure(err, config.cursorFile, [config.botToken]);
+      status.cursorDiagnostic = diag;
       const reason = errorMessage(err);
-      await quarantineCorruptCursorFile(config.cursorFile, reason);
+      await quarantineCorruptCursorFile(config.cursorFile, reason, new Date(now()), {
+        diagnosticCode: diag.diagnosticCode,
+        fsOps: cursorFs,
+      });
     }
   }
 
@@ -1798,6 +1984,22 @@ export function createPoller(deps: PollerDeps) {
   }
 
   async function saveCursors(reason: "cycle" | "shutdown" | "migration"): Promise<boolean> {
+    if (preserveUnreadableCursor) {
+      const diagCode = status.cursorDiagnostic?.diagnosticCode ?? "CURSOR_FS_OPERATIONAL_ERROR";
+      Logger.error(
+        "poller",
+        `[poller] [${diagCode}] refusing to overwrite preserved cursor file at ${config.cursorFile} ` +
+          `after startup operational read failure (${reason})`,
+        {
+          action: "cursor_preserve_operational",
+          diagnosticCode: diagCode,
+          reason,
+          cursorFile: config.cursorFile,
+        },
+      );
+      return false;
+    }
+
     const payload = buildCursorFile(
       [...state.values()].map((t) => ({
         source: t.source,
@@ -1810,31 +2012,49 @@ export function createPoller(deps: PollerDeps) {
       status.chainClockAt,
     );
 
+    const tmp = `${config.cursorFile}.tmp`;
+    let committedPrimary = false;
     try {
-      await mkdir(path.dirname(config.cursorFile), { recursive: true });
+      await cursorFs.mkdir(path.dirname(config.cursorFile), { recursive: true });
       // Write-then-rename: a crash mid-write must not leave a truncated file
       // that sends the next start back to the beginning of the retained window.
-      const tmp = `${config.cursorFile}.tmp`;
-      await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-      await rename(tmp, config.cursorFile);
+      await cursorFs.writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+      await cursorFs.rename(tmp, config.cursorFile);
+      committedPrimary = true;
       // Copy the committed file to the backup. `copyFile` is not atomic
       // cross-filesystem, but the backup is always at least one generation
       // older than the primary — a crash here leaves the primary intact.
       const backupFile = `${config.cursorFile}.bak`;
-      await copyFile(config.cursorFile, backupFile);
+      await cursorFs.copyFile(config.cursorFile, backupFile);
       status.pendingFlush = false;
       status.lastFlushAt = now();
+      status.cursorDiagnostic = null;
       pendingRewrite = false;
       return true;
     } catch (err) {
+      if (!committedPrimary) {
+        await cursorFs.unlink(tmp).catch(() => undefined);
+      }
+      const diag = classifyCursorFailure(err, config.cursorFile, [config.botToken]);
+      status.cursorDiagnostic = diag;
       // `pendingFlush` is deliberately left as it was: if state was ahead of
       // the file it stays ahead, so a later cycle — or the shutdown flush —
       // retries. If nothing had changed, write-then-rename left the old file
       // intact and there is still nothing to flush.
       Logger.error(
         "poller",
-        `[poller] could not persist cursor (${reason}): ${errorMessage(err)}`,
-        { action: "cursor_persist_failed", reason, error: errorMessage(err) },
+        `[poller] [${diag.diagnosticCode}] could not persist cursor (${reason}): ${errorMessage(err)}`,
+        {
+          action:
+            diag.category === "permission_denied"
+              ? "cursor_permission_denied"
+              : "cursor_persist_failed",
+          diagnosticCode: diag.diagnosticCode,
+          category: diag.category,
+          errnoCode: diag.errnoCode,
+          reason,
+          error: errorMessage(err),
+        },
       );
       audit.recordError(err, "cursor_persist_failed");
       return false;
@@ -2951,20 +3171,29 @@ export function createPoller(deps: PollerDeps) {
       // file, and every cycle retries the write.
       const cursorDir = path.dirname(config.cursorFile);
       try {
-        await mkdir(cursorDir, { recursive: true });
+        await cursorFs.mkdir(cursorDir, { recursive: true });
         const probeFile = path.join(cursorDir, `.volume-probe.${process.pid}.${Date.now()}`);
-        await writeFile(probeFile, "", "utf8");
-        await unlink(probeFile).catch(() => {});
+        await cursorFs.writeFile(probeFile, "", "utf8");
+        await cursorFs.unlink(probeFile).catch(() => {});
         status.persistentVolumeAvailable = true;
         status.persistentVolumeError = null;
       } catch (err) {
+        const volumeDiag = classifyCursorFailure(err, cursorDir, [config.botToken]);
         status.persistentVolumeAvailable = false;
         status.persistentVolumeError = errorMessage(err);
+        status.cursorDiagnostic = volumeDiag;
         Logger.error(
           "poller",
-          `[poller] Persistent volume is not writable at ${cursorDir}: ${errorMessage(err)}; ` +
+          `[poller] [${volumeDiag.diagnosticCode}] Persistent volume is not writable at ${cursorDir}: ${errorMessage(err)}; ` +
             `cursor state will not survive a restart until this is fixed`,
-          { action: "persistent_volume_unwritable", cursorDir, error: errorMessage(err) },
+          {
+            action: "persistent_volume_unwritable",
+            diagnosticCode: volumeDiag.diagnosticCode,
+            category: volumeDiag.category,
+            errnoCode: volumeDiag.errnoCode,
+            cursorDir,
+            error: errorMessage(err),
+          },
         );
       }
 
