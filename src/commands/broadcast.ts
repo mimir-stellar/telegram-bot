@@ -14,6 +14,25 @@ import { isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
 
+const BROADCAST_OPAQUE_ID_PATTERN = /^(?:b_)?[a-z][a-z0-9]{0,15}_[0-9]{1,7}_[a-z0-9]{1,8}$/;
+const MAX_SAFE_ID_DIGITS = 16;
+
+/**
+ * Validate a broadcast confirmation identifier before store lookup.
+ * Accepts either a canonical unsigned safe integer string (`0`..`9007199254740991`,
+ * no signs or leading zeros) or a `BroadcastStore` opaque token (`b_<ts>_<seq>_<rand>`).
+ */
+export function isValidBroadcastCallbackId(raw: unknown): raw is string {
+  if (typeof raw !== "string" || raw.length === 0) return false;
+  if (BROADCAST_OPAQUE_ID_PATTERN.test(raw)) return true;
+  if (!/^[0-9]+$/.test(raw)) return false;
+  if (raw.length > MAX_SAFE_ID_DIGITS) return false;
+  if (raw.length > 1 && raw.startsWith("0")) return false;
+  if (BigInt(raw) > BigInt(Number.MAX_SAFE_INTEGER)) return false;
+  const num = Number(raw);
+  return Number.isSafeInteger(num) && String(num) === raw;
+}
+
 /** Telegram Bot API maximum message length limit. */
 export const MAX_BROADCAST_LENGTH = 4096;
 
@@ -107,7 +126,8 @@ export class BroadcastStore {
   ): PendingBroadcast {
     this.cleanup();
     this.counter = (this.counter + 1) % 1_000_000;
-    const id = `${Date.now().toString(36)}_${this.counter}_${Math.random().toString(36).slice(2, 6)}`;
+    const rand = Math.random().toString(36).slice(2, 6) || "0";
+    const id = `b_${Date.now().toString(36)}_${this.counter}_${rand}`;
     const now = Date.now();
     const item: PendingBroadcast = {
       id,
@@ -313,7 +333,11 @@ export async function handleBroadcastCallback(
   const subAction = parts[1];
   const broadcastId = parts[2];
 
-  if (!broadcastId || (subAction !== "confirm" && subAction !== "cancel")) {
+  if (
+    parts.length !== 3 ||
+    !isValidBroadcastCallbackId(broadcastId) ||
+    (subAction !== "confirm" && subAction !== "cancel")
+  ) {
     await safeAnswerCallback(ctx, config, { text: "Invalid broadcast action" });
     return;
   }

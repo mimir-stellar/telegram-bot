@@ -49,6 +49,25 @@ export type CallbackValidationResult =
 /** Telegram's Bot API limits callback_data to 1-64 bytes. */
 export const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
 
+/** Maximum decimal digit length of a canonical safe integer ID (9007199254740991 = 16 digits). */
+export const MAX_CALLBACK_NUMERIC_ID_DIGITS = 16;
+
+/** Maximum integer value accepted for callback numeric identifiers. */
+export const MAX_CALLBACK_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+
+export type CallbackNumericIdRejectionReason =
+  | "missing-or-invalid-type"
+  | "empty"
+  | "leading-sign"
+  | "leading-zero"
+  | "non-decimal"
+  | "overlong-decimal"
+  | "unsafe-integer";
+
+export type CallbackNumericIdValidationResult =
+  | { ok: true; canonical: string; value: number }
+  | { ok: false; reason: CallbackNumericIdRejectionReason };
+
 export const CALLBACK_FALLBACK_PAYLOAD =
   "*Invalid request*\nThe requested action is unrecognized or malformed\\.";
 
@@ -58,8 +77,220 @@ export const CALLBACK_UNAUTHORIZED_PAYLOAD =
 export const CALLBACK_FALLBACK_FEEDBACK = "Invalid or unrecognized action";
 export const CALLBACK_UNAUTHORIZED_FEEDBACK = "Unauthorized: operator only";
 
+const SYMBOLIC_CALLBACK_SEGMENT = /^[A-Za-z][A-Za-z0-9_-]*$/;
+const BROADCAST_COMPOUND_ID = /^(?:b_)?[a-z][a-z0-9]{0,15}_[0-9]{1,7}_[a-z0-9]{1,8}$/;
+const NON_NUMERIC_SPECIAL_LITERAL = /^(?:NaN|Infinity)$/i;
+const NUMERIC_ONLY_JSON_KEY = /^(?:page|index|offset|limit|ledger|seq|sequence|count)$/i;
+const IDENTIFIER_JSON_KEY = /^(?:id|.*Id|.*_id)$/;
+
 function isKnownAction(val: string): val is CallbackActionType {
   return ["status", "contracts", "help", "pause", "resume", "broadcast"].includes(val);
+}
+
+/**
+ * Validate a callback numeric identifier in canonical unsigned decimal form (`0` or
+ * `[1-9][0-9]{0,15}` within `0..Number.MAX_SAFE_INTEGER`).
+ *
+ * Rejects leading `+`/`-` signs (and `-0`), leading zeros (`"01"`, `"007"`),
+ * non-decimal notations (`"1e5"`, `"0x10"`, `"1.5"`, `"1_000"`, whitespace),
+ * overlong decimal strings (`> 16` digits), and unsafe integers (`> 9007199254740991`).
+ */
+export function validateCallbackNumericId(raw: unknown): CallbackNumericIdValidationResult {
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) {
+      return { ok: false, reason: "non-decimal" };
+    }
+    if (raw < 0 || Object.is(raw, -0)) {
+      return { ok: false, reason: "leading-sign" };
+    }
+    if (!Number.isInteger(raw)) {
+      return { ok: false, reason: "non-decimal" };
+    }
+    if (!Number.isSafeInteger(raw) || raw > MAX_CALLBACK_SAFE_INTEGER) {
+      return { ok: false, reason: "unsafe-integer" };
+    }
+    return { ok: true, canonical: String(raw), value: raw };
+  }
+
+  if (typeof raw !== "string") {
+    return { ok: false, reason: "missing-or-invalid-type" };
+  }
+
+  if (raw.length === 0) {
+    return { ok: false, reason: "empty" };
+  }
+
+  if (/^\s*[+-]/.test(raw)) {
+    return { ok: false, reason: "leading-sign" };
+  }
+
+  if (!/^[0-9]+$/.test(raw)) {
+    return { ok: false, reason: "non-decimal" };
+  }
+
+  if (raw.length > MAX_CALLBACK_NUMERIC_ID_DIGITS) {
+    return { ok: false, reason: "overlong-decimal" };
+  }
+
+  if (raw.length > 1 && raw.startsWith("0")) {
+    return { ok: false, reason: "leading-zero" };
+  }
+
+  const parsedBigInt = BigInt(raw);
+  if (parsedBigInt > BigInt(MAX_CALLBACK_SAFE_INTEGER)) {
+    return { ok: false, reason: "unsafe-integer" };
+  }
+
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || String(value) !== raw) {
+    return { ok: false, reason: "unsafe-integer" };
+  }
+
+  return { ok: true, canonical: raw, value };
+}
+
+export function isCanonicalCallbackNumericId(raw: unknown): boolean {
+  return validateCallbackNumericId(raw).ok;
+}
+
+function isSymbolicSegment(segment: string): boolean {
+  return SYMBOLIC_CALLBACK_SEGMENT.test(segment) && !NON_NUMERIC_SPECIAL_LITERAL.test(segment);
+}
+
+function validateColonParamSegment(
+  segment: string,
+  action: CallbackActionType,
+  segmentIndex: number,
+): { ok: true } | { ok: false; reason: string } {
+  if (segment.length === 0) {
+    return { ok: false, reason: "empty-segment" };
+  }
+
+  // Broadcast callbacks take `broadcast:<confirm|cancel>:<id>`
+  if (action === "broadcast" && segmentIndex >= 1) {
+    if (isCanonicalCallbackNumericId(segment) || BROADCAST_COMPOUND_ID.test(segment)) {
+      return { ok: true };
+    }
+    return { ok: false, reason: "noncanonical-numeric-id" };
+  }
+
+  if (isCanonicalCallbackNumericId(segment)) {
+    return { ok: true };
+  }
+
+  if (isSymbolicSegment(segment)) {
+    return { ok: true };
+  }
+
+  return { ok: false, reason: "noncanonical-numeric-id" };
+}
+
+/**
+ * Scan raw JSON text outside string literals so noncanonical numeric tokens such as
+ * `-0`, `1e5`, `1.0`, `9007199254740993` (precision-loss), or 20-digit integers are
+ * rejected before `JSON.parse` coerces or rounds them.
+ */
+function hasNoncanonicalRawJsonNumber(jsonText: string): boolean {
+  let inString = false;
+  let i = 0;
+  while (i < jsonText.length) {
+    const ch = jsonText[i]!;
+    if (inString) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      i += 1;
+      continue;
+    }
+
+    if (ch === "+" || ch === "-" || (ch >= "0" && ch <= "9")) {
+      let end = i + 1;
+      while (end < jsonText.length && /[0-9a-zA-Z_.+-]/.test(jsonText[end]!)) {
+        end += 1;
+      }
+      const token = jsonText.slice(i, end);
+      if (!validateCallbackNumericId(token).ok) {
+        return true;
+      }
+      i = end;
+      continue;
+    }
+
+    i += 1;
+  }
+  return false;
+}
+
+function validateJsonFields(
+  obj: Record<string, unknown>,
+  action: CallbackActionType,
+  depth: number = 0,
+): boolean {
+  if (depth > 4) return false;
+
+  for (const [key, val] of Object.entries(obj)) {
+    if (key === "action" && depth === 0) continue;
+
+    if (typeof val === "number") {
+      if (!validateCallbackNumericId(val).ok) return false;
+      continue;
+    }
+
+    if (typeof val === "string") {
+      if (NUMERIC_ONLY_JSON_KEY.test(key)) {
+        if (!validateCallbackNumericId(val).ok) return false;
+        continue;
+      }
+      if (IDENTIFIER_JSON_KEY.test(key)) {
+        if (validateCallbackNumericId(val).ok) continue;
+        if (action === "broadcast" && BROADCAST_COMPOUND_ID.test(val)) continue;
+        return false;
+      }
+      if (!validateCallbackNumericId(val).ok && !isSymbolicSegment(val)) {
+        return false;
+      }
+      continue;
+    }
+
+    if (typeof val === "boolean") {
+      continue;
+    }
+
+    if (Array.isArray(val)) {
+      if (depth >= 4) return false;
+      for (const item of val) {
+        if (typeof item === "number") {
+          if (!validateCallbackNumericId(item).ok) return false;
+        } else if (typeof item === "string") {
+          if (!validateCallbackNumericId(item).ok && !isSymbolicSegment(item)) return false;
+        } else {
+          return false;
+        }
+      }
+      continue;
+    }
+
+    if (typeof val === "object" && val !== null) {
+      if (!validateJsonFields(val as Record<string, unknown>, action, depth + 1)) {
+        return false;
+      }
+      continue;
+    }
+
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -105,19 +336,41 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
   // 1. JSON payload: e.g. {"action":"status"}
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
     try {
-      const parsed = JSON.parse(trimmed) as { action?: unknown };
-      if (typeof parsed?.action === "string" && isKnownAction(parsed.action)) {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
         return {
-          ok: true,
-          action: { type: parsed.action, raw },
+          ok: false,
+          reason: "unknown-json-action",
+          fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+        };
+      }
+      const record = parsed as Record<string, unknown>;
+      if (typeof record.action !== "string" || !isKnownAction(record.action)) {
+        return {
+          ok: false,
+          reason: "unknown-json-action",
+          fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+        };
+      }
+      if (hasNoncanonicalRawJsonNumber(trimmed) || !validateJsonFields(record, record.action)) {
+        return {
+          ok: false,
+          reason: "noncanonical-numeric-id",
+          fallbackText: CALLBACK_FALLBACK_FEEDBACK,
         };
       }
       return {
-        ok: false,
-        reason: "unknown-json-action",
-        fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+        ok: true,
+        action: { type: record.action, raw },
       };
     } catch {
+      if (/:\s*(?:\+[0-9]|0[0-9])/.test(trimmed)) {
+        return {
+          ok: false,
+          reason: "noncanonical-numeric-id",
+          fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+        };
+      }
       return {
         ok: false,
         reason: "malformed-json",
@@ -128,23 +381,47 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
 
   // 2. Colon-delimited: e.g. "status:refresh", "mimir:contracts", etc.
   if (trimmed.includes(":")) {
+    if (raw !== trimmed) {
+      return {
+        ok: false,
+        reason: "noncanonical-numeric-id",
+        fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+      };
+    }
     const parts = trimmed.split(":");
+    let actionType: CallbackActionType | null = null;
+    let paramSegments: string[] = [];
+
     if (parts[0] === "mimir" && parts[1] && isKnownAction(parts[1])) {
+      actionType = parts[1];
+      paramSegments = parts.slice(2);
+    } else if (parts[0] && isKnownAction(parts[0])) {
+      actionType = parts[0];
+      paramSegments = parts.slice(1);
+    }
+
+    if (actionType === null) {
       return {
-        ok: true,
-        action: { type: parts[1], raw },
+        ok: false,
+        reason: "unknown-action",
+        fallbackText: CALLBACK_FALLBACK_FEEDBACK,
       };
     }
-    if (parts[0] && isKnownAction(parts[0])) {
-      return {
-        ok: true,
-        action: { type: parts[0], raw },
-      };
+
+    for (let i = 0; i < paramSegments.length; i += 1) {
+      const segCheck = validateColonParamSegment(paramSegments[i]!, actionType, i);
+      if (!segCheck.ok) {
+        return {
+          ok: false,
+          reason: segCheck.reason,
+          fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+        };
+      }
     }
+
     return {
-      ok: false,
-      reason: "unknown-action",
-      fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+      ok: true,
+      action: { type: actionType, raw },
     };
   }
 

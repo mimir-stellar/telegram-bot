@@ -142,6 +142,10 @@ The bot uses grammy for Telegram integration with a thin command layer and a sin
 - `/preview`: Preview notification formatting
 - `/pause`, `/resume`: Operator-only controls (requires `OPERATOR_TELEGRAM_USER_ID`)
 
+**Callback payload validation (`src/callbacks.ts`, `src/commands/broadcast.ts`):**
+- Inline callback data is bounded to 64 UTF-8 bytes with no ASCII control characters and must resolve to a known action (`status`, `contracts`, `help`, `pause`, `resume`, `broadcast`) or the dedicated `/pause` confirmation tokens (`pause-confirm`, `pause-cancel`).
+- Numeric callback identifiers must use canonical unsigned decimal form (`0` or `[1-9][0-9]{0,15}` within `0..Number.MAX_SAFE_INTEGER`, `9007199254740991`): leading `+`/`-` signs (including `-0`), leading zeros (`01`, `007`), scientific/hex/float/underscore notations, unsafe integers, and overlong decimal strings (`> 16` digits) are rejected before dispatch.
+
 **Send path:**
 - Single function: `bot.api.sendMessage(config.chatId, text, options)`
 - MarkdownV2 parsing mode
