@@ -128,6 +128,7 @@ The bot applies the following redaction rules to all operator-facing text (logs,
 - Credential-bearing query strings (`token=…`, `authorization: …`) → redacted
 - Chat ids in status file → coarse shape only (`…1234` or `@x…`)
 - Full Stellar strkeys in logs → shortened form (`GDV6…PKZI`)
+- Callback error and rejection logs → stable scalar `update_id` / `callback_id` and closed error categories only (nested Telegram `Update` objects, chat ids, usernames, and message bodies are never serialized)
 
 ## Compliance notes
 

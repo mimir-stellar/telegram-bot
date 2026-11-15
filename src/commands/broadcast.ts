@@ -9,6 +9,11 @@
  */
 
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
+import {
+  extractSafeUpdateId,
+  formatCallbackErrorLog,
+  formatCallbackRejectionLog,
+} from "../callback-log.js";
 import type { BotConfig } from "../config.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
@@ -242,7 +247,7 @@ export async function handleBroadcastCommand(
   const isPrivate = ctx.chat?.type === "private";
 
   if (!isOperator(ctx, config) || !isPrivate) {
-    console.warn(`[bot] ignored unauthorized /broadcast on update ${ctx.update?.update_id}`);
+    console.warn(`[bot] ignored unauthorized /broadcast on update ${extractSafeUpdateId(ctx)}`);
     return;
   }
 
@@ -300,7 +305,11 @@ export async function handleBroadcastCallback(
 
   if (!isOperator(ctx, config) || !isPrivate) {
     console.warn(
-      `[bot] ignored unauthorized broadcast callback on update ${ctx.update?.update_id}`,
+      formatCallbackRejectionLog(ctx, {
+        action: "broadcast",
+        reason: "unauthorized",
+        secrets: [config.botToken],
+      }),
     );
     await safeAnswerCallback(ctx, config, {
       text: "Unauthorized: operator in private chat only",
@@ -309,103 +318,113 @@ export async function handleBroadcastCallback(
     return;
   }
 
-  const parts = rawAction.split(":");
-  const subAction = parts[1];
-  const broadcastId = parts[2];
+  try {
+    const parts = rawAction.split(":");
+    const subAction = parts[1];
+    const broadcastId = parts[2];
 
-  if (!broadcastId || (subAction !== "confirm" && subAction !== "cancel")) {
-    await safeAnswerCallback(ctx, config, { text: "Invalid broadcast action" });
-    return;
-  }
-
-  const store = deps.broadcastStore ?? defaultBroadcastStore;
-  const pending = store.get(broadcastId);
-
-  if (!pending) {
-    await safeAnswerCallback(ctx, config, {
-      text: "Broadcast expired or already processed",
-      show_alert: true,
-    });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("⚠️ Broadcast confirmation expired or already processed.");
-      } catch {
-        // ignore edit failure
-      }
-    }
-    return;
-  }
-
-  if (Date.now() > pending.expiresAt) {
-    store.delete(broadcastId);
-    await safeAnswerCallback(ctx, config, {
-      text: "Broadcast confirmation expired",
-      show_alert: true,
-    });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("⚠️ Broadcast confirmation expired.");
-      } catch {
-        // ignore
-      }
-    }
-    return;
-  }
-
-  if (subAction === "cancel") {
-    store.delete(broadcastId);
-    await safeAnswerCallback(ctx, config, { text: "Broadcast cancelled" });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("❌ Broadcast cancelled.");
-      } catch {
-        // ignore
-      }
-    }
-    return;
-  }
-
-  // subAction === "confirm"
-  // Each chat receives the message at most once per confirmation.
-  if (pending.confirmed) {
-    await safeAnswerCallback(ctx, config, {
-      text: "Broadcast already in progress or sent",
-      show_alert: true,
-    });
-    return;
-  }
-  pending.confirmed = true;
-  store.delete(broadcastId);
-
-  await safeAnswerCallback(ctx, config, { text: "Broadcasting message..." });
-
-  if (ctx.callbackQuery?.message) {
-    try {
-      await ctx.editMessageText(`⏳ Broadcasting to ${pending.chats.length} chat(s)...`);
-    } catch {
-      // ignore
-    }
-  }
-
-  const interSendDelayMs = config.interSendDelayMs ?? 1500;
-  const results = await sendBroadcast({
-    api: ctx.api,
-    chats: pending.chats,
-    message: pending.message,
-    interSendDelayMs,
-    sleep: deps.sleep,
-  });
-
-  const report = formatBroadcastReport(results);
-  if (ctx.callbackQuery?.message) {
-    try {
-      await ctx.editMessageText(report);
+    if (!broadcastId || (subAction !== "confirm" && subAction !== "cancel")) {
+      await safeAnswerCallback(ctx, config, { text: "Invalid broadcast action" });
       return;
-    } catch {
-      // fallback to reply
     }
+
+    const store = deps.broadcastStore ?? defaultBroadcastStore;
+    const pending = store.get(broadcastId);
+
+    if (!pending) {
+      await safeAnswerCallback(ctx, config, {
+        text: "Broadcast expired or already processed",
+        show_alert: true,
+      });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText("⚠️ Broadcast confirmation expired or already processed.");
+        } catch {
+          // ignore edit failure
+        }
+      }
+      return;
+    }
+
+    if (Date.now() > pending.expiresAt) {
+      store.delete(broadcastId);
+      await safeAnswerCallback(ctx, config, {
+        text: "Broadcast confirmation expired",
+        show_alert: true,
+      });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText("⚠️ Broadcast confirmation expired.");
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
+
+    if (subAction === "cancel") {
+      store.delete(broadcastId);
+      await safeAnswerCallback(ctx, config, { text: "Broadcast cancelled" });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText("❌ Broadcast cancelled.");
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
+
+    // subAction === "confirm"
+    // Each chat receives the message at most once per confirmation.
+    if (pending.confirmed) {
+      await safeAnswerCallback(ctx, config, {
+        text: "Broadcast already in progress or sent",
+        show_alert: true,
+      });
+      return;
+    }
+    pending.confirmed = true;
+    store.delete(broadcastId);
+
+    await safeAnswerCallback(ctx, config, { text: "Broadcasting message..." });
+
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText(`⏳ Broadcasting to ${pending.chats.length} chat(s)...`);
+      } catch {
+        // ignore
+      }
+    }
+
+    const interSendDelayMs = config.interSendDelayMs ?? 1500;
+    const results = await sendBroadcast({
+      api: ctx.api,
+      chats: pending.chats,
+      message: pending.message,
+      interSendDelayMs,
+      sleep: deps.sleep,
+    });
+
+    const report = formatBroadcastReport(results);
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText(report);
+        return;
+      } catch {
+        // fallback to reply
+      }
+    }
+    await ctx.reply(report);
+  } catch (err) {
+    console.error(
+      formatCallbackErrorLog(ctx, err, {
+        action: "broadcast",
+        secrets: [config.botToken],
+      }),
+    );
+    await safeAnswerCallback(ctx, config, { text: "Action failed" });
   }
-  await ctx.reply(report);
 }
 
 /**

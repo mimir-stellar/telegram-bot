@@ -35,7 +35,10 @@ import {
   type CommandModule,
 } from "./commands/index.js";
 import {
+  extractSafeUpdateId,
+  formatCallbackErrorLog,
   handlePauseConfirmCallback,
+  isCallbackUpdateContext,
   registerCallbackHandlers,
   validatePauseConfirmData,
 } from "./callbacks.js";
@@ -79,15 +82,26 @@ export {
   CALLBACK_FALLBACK_PAYLOAD,
   CALLBACK_UNAUTHORIZED_FEEDBACK,
   CALLBACK_UNAUTHORIZED_PAYLOAD,
+  MAX_CALLBACK_ID_LOG_CHARS,
+  MAX_CALLBACK_LOG_LINE_CHARS,
   PAUSE_CONFIRM_TTL_MS,
   TELEGRAM_CALLBACK_DATA_MAX_BYTES,
+  classifyCallbackError,
+  extractCallbackLogIds,
+  extractSafeCallbackId,
+  extractSafeUpdateId,
+  formatCallbackErrorLog,
+  formatCallbackRejectionLog,
   handleCallbackQuery,
   handlePauseConfirmCallback,
+  isCallbackUpdateContext,
   registerCallbackHandlers,
   updateOrReplyMessage,
   validateCallbackData,
   validatePauseConfirmData,
   type CallbackActionType,
+  type CallbackErrorCategory,
+  type CallbackLogIds,
   type CallbackValidationResult,
   type ValidCallbackAction,
 } from "./callbacks.js";
@@ -353,10 +367,19 @@ export function createBot(deps: BotDeps): Bot {
   registerBroadcastHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process
-  // with it. Keep Telegram/RPC error text bounded and redact known secrets.
+  // with it. Callback updates log only stable IDs and redacted error categories
+  // so hostile or nested Telegram Update payloads are never serialized.
   bot.catch((err) => {
+    if (isCallbackUpdateContext(err.ctx)) {
+      console.error(
+        formatCallbackErrorLog(err.ctx, err.error, {
+          secrets: [deps.config.botToken],
+        }),
+      );
+      return;
+    }
     console.error(
-      `[bot] handler error on update ${err.ctx.update.update_id}: ` +
+      `[bot] handler error on update ${extractSafeUpdateId(err.ctx)}: ` +
         safeErrorMessage(err.error, [deps.config.botToken]),
     );
   });

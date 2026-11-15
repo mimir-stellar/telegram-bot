@@ -108,6 +108,14 @@ Emitted by top-level Node.js error listeners.
 |---|---|---|
 | `action` | `string` | `"unhandled_rejection"`, `"uncaught_exception"`. |
 
+### 5. Callback & Confirmation Error Logging (`[bot]`)
+Callback handlers (`src/callbacks.ts`, `src/commands/broadcast.ts`, `safeAnswerCallback`, and `bot.catch` on callback updates) never serialize Telegram `Update` objects, chat metadata, sender profiles, callback payloads, or raw error messages. Instead, callback rejection and error lines record only bounded scalar identifiers and closed error categories:
+
+- `update_id`: validated non-negative safe integer (`"unknown"` when absent or malformed).
+- `callback_id`: sanitized ASCII callback query identifier up to 64 characters (`"none"`, `"invalid"`, `"oversized"`, or `"[REDACTED]"` when malformed or secret-shaped).
+- `action`: closed action label (`status`, `contracts`, `help`, `pause`, `resume`, `broadcast`, `pause-confirm`, `pause-cancel`, `answer_callback`, `invalid`, `unknown`).
+- `category`: closed error/rejection category (`rate_limited`, `unauthorized`, `message_not_found`, `query_expired`, `bad_request`, `upstream_5xx`, `timeout`, `network`, `validation`, `internal`, or the closed validation reason).
+
 ---
 
 ## Safety Bounds & Redaction

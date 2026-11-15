@@ -10,7 +10,8 @@
 import type { CommandContext, Context } from "grammy";
 
 import type { BotConfig } from "../config.js";
-import { safeErrorMessage, splitTelegramMessage } from "../notifications/format.js";
+import { extractSafeUpdateId, formatCallbackErrorLog } from "../callback-log.js";
+import { splitTelegramMessage } from "../notifications/format.js";
 
 /** MarkdownV2 reply options used by every command message. */
 export const TELEGRAM_OPTIONS = {
@@ -87,7 +88,7 @@ export function operatorAllowed(
   command: string,
 ): boolean {
   if (isOperator(ctx, config)) return true;
-  console.warn(`[bot] ignored unauthorized /${command} on update ${ctx.update.update_id}`);
+  console.warn(`[bot] ignored unauthorized /${command} on update ${extractSafeUpdateId(ctx)}`);
   return false;
 }
 
@@ -105,7 +106,10 @@ export async function safeAnswerCallback(
       await ctx.answerCallbackQuery(params);
     } catch (err) {
       console.warn(
-        `[bot] answerCallbackQuery failed: ${safeErrorMessage(err, [config.botToken])}`,
+        formatCallbackErrorLog(ctx, err, {
+          action: "answer_callback",
+          secrets: [config.botToken],
+        }),
       );
     }
   }

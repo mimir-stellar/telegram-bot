@@ -16,8 +16,34 @@
 
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
-import { safeErrorMessage } from "./notifications/format.js";
+import {
+  MAX_CALLBACK_ID_LOG_CHARS,
+  MAX_CALLBACK_LOG_LINE_CHARS,
+  classifyCallbackError,
+  extractCallbackLogIds,
+  extractSafeCallbackId,
+  extractSafeUpdateId,
+  formatCallbackErrorLog,
+  formatCallbackRejectionLog,
+  isCallbackUpdateContext,
+  type CallbackErrorCategory,
+  type CallbackLogIds,
+} from "./callback-log.js";
 import { handleBroadcastCallback } from "./commands/broadcast.js";
+
+export {
+  MAX_CALLBACK_ID_LOG_CHARS,
+  MAX_CALLBACK_LOG_LINE_CHARS,
+  classifyCallbackError,
+  extractCallbackLogIds,
+  extractSafeCallbackId,
+  extractSafeUpdateId,
+  formatCallbackErrorLog,
+  formatCallbackRejectionLog,
+  isCallbackUpdateContext,
+  type CallbackErrorCategory,
+  type CallbackLogIds,
+};
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
@@ -212,45 +238,56 @@ export async function handleCallbackQuery(
   const { config, status } = deps;
   const pause = deps.pause ?? (() => "stopped");
   const resume = deps.resume ?? (() => "stopped");
-  const rawData = ctx.callbackQuery?.data;
+  let loggedAction = "unknown";
 
-  // The pause confirmation buttons carry their own payloads and TTL and are
-  // registered separately (`handlePauseConfirmCallback`); answering them here
-  // as unknown actions would double-handle the same tap.
-  if (validatePauseConfirmData(rawData) !== null) return;
+  try {
+    const rawData = ctx.callbackQuery?.data;
 
-  // Validate callback query data before acting
-  const validation = validateCallbackData(rawData);
+    // The pause confirmation buttons carry their own payloads and TTL and are
+    // registered separately (`handlePauseConfirmCallback`); answering them here
+    // as unknown actions would double-handle the same tap.
+    if (validatePauseConfirmData(rawData) !== null) return;
 
-  if (!validation.ok) {
-    console.warn(
-      `[bot] rejected invalid callback query (${validation.reason}) on update ${ctx.update.update_id}`,
-    );
-    await safeAnswerCallback(ctx, config, {
-      text: validation.fallbackText,
-      show_alert: false,
-    });
-    return;
-  }
+    // Validate callback query data before acting
+    const validation = validateCallbackData(rawData);
 
-  const { action } = validation;
-
-  // Enforce operator role authorization
-  if (action.type === "pause" || action.type === "resume" || action.type === "broadcast") {
-    if (!isOperator(ctx, config)) {
+    if (!validation.ok) {
       console.warn(
-        `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
+        formatCallbackRejectionLog(ctx, {
+          action: "invalid",
+          reason: validation.reason,
+          secrets: [config.botToken],
+        }),
       );
       await safeAnswerCallback(ctx, config, {
-        text: CALLBACK_UNAUTHORIZED_FEEDBACK,
-        show_alert: true,
+        text: validation.fallbackText,
+        show_alert: false,
       });
       return;
     }
-  }
 
-  // Execute validated action
-  try {
+    const { action } = validation;
+    loggedAction = action.type;
+
+    // Enforce operator role authorization
+    if (action.type === "pause" || action.type === "resume" || action.type === "broadcast") {
+      if (!isOperator(ctx, config)) {
+        console.warn(
+          formatCallbackRejectionLog(ctx, {
+            action: action.type,
+            reason: "unauthorized",
+            secrets: [config.botToken],
+          }),
+        );
+        await safeAnswerCallback(ctx, config, {
+          text: CALLBACK_UNAUTHORIZED_FEEDBACK,
+          show_alert: true,
+        });
+        return;
+      }
+    }
+
+    // Execute validated action
     switch (action.type) {
       case "broadcast": {
         await handleBroadcastCallback(ctx, deps, action.raw);
@@ -323,7 +360,10 @@ export async function handleCallbackQuery(
     }
   } catch (err) {
     console.error(
-      `[bot] callback error on action ${action.type}: ${safeErrorMessage(err, [config.botToken])}`,
+      formatCallbackErrorLog(ctx, err, {
+        action: loggedAction,
+        secrets: [config.botToken],
+      }),
     );
     await safeAnswerCallback(ctx, config, { text: "Action failed" });
   }
@@ -377,33 +417,43 @@ export async function handlePauseConfirmCallback(
   const action = validatePauseConfirmData(ctx.callbackQuery?.data);
   if (action === null) return; // unknown payload — silently ignore
 
-  // Only the operator may act on these buttons.
-  if (!isOperator(ctx, config)) {
-    await ctx.answerCallbackQuery({ text: "Only the operator can do that.", show_alert: true });
-    return;
-  }
+  try {
+    // Only the operator may act on these buttons.
+    if (!isOperator(ctx, config)) {
+      await ctx.answerCallbackQuery({ text: "Only the operator can do that.", show_alert: true });
+      return;
+    }
 
-  // Reject stale confirmations so an old message cannot stop the poller later.
-  const messageDate = ctx.callbackQuery?.message?.date ?? 0;
-  const ageMs = nowMs - messageDate * 1000;
-  if (ageMs > PAUSE_CONFIRM_TTL_MS) {
-    await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
-    await ctx.editMessageText(
-      "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
-      TELEGRAM_OPTIONS,
+    // Reject stale confirmations so an old message cannot stop the poller later.
+    const messageDate = ctx.callbackQuery?.message?.date ?? 0;
+    const ageMs = nowMs - messageDate * 1000;
+    if (ageMs > PAUSE_CONFIRM_TTL_MS) {
+      await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
+      await ctx.editMessageText(
+        "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
+        TELEGRAM_OPTIONS,
+      );
+      return;
+    }
+
+    if (action === CALLBACK_PAUSE_CONFIRM) {
+      const result = pause();
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Cancelled." });
+    await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
+  } catch (err) {
+    console.error(
+      formatCallbackErrorLog(ctx, err, {
+        action,
+        secrets: [config.botToken],
+      }),
     );
-    return;
+    await safeAnswerCallback(ctx, config, { text: "Action failed" });
   }
-
-  if (action === CALLBACK_PAUSE_CONFIRM) {
-    const result = pause();
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
-    return;
-  }
-
-  await ctx.answerCallbackQuery({ text: "Cancelled." });
-  await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
