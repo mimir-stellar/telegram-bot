@@ -25,7 +25,112 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
-// ── Metric types ──────────────────────────────────────────────────────────────
+// ── Metric types & label escaping ─────────────────────────────────────────────
+
+export type MetricLabelErrorCode =
+  | "INVALID_METRIC_NAME"
+  | "INVALID_LABEL_KEY"
+  | "RESERVED_LABEL_KEY"
+  | "UNDECLARED_LABEL_KEY"
+  | "MISSING_LABEL_KEY"
+  | "NON_STRING_LABEL_VALUE"
+  | "CONTROL_CHARACTER_IN_LABEL_VALUE";
+
+/** Thrown when a metric name, label key, or label value violates exposition safety rules. */
+export class MetricLabelError extends Error {
+  readonly code: MetricLabelErrorCode;
+
+  constructor(code: MetricLabelErrorCode, message: string) {
+    super(message);
+    this.name = "MetricLabelError";
+    this.code = code;
+  }
+}
+
+const PROMETHEUS_METRIC_NAME_RE = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
+const PROMETHEUS_LABEL_KEY_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+/**
+ * Disallowed ASCII C0, DEL, and C1 control characters in Prometheus label
+ * values. Line feed (`\n`, 0x0a) is the sole control character with a valid
+ * Prometheus v0.0.4 escape sequence (`\n`); all others (`\0`, `\r`, `\t`, ESC
+ * `\x1b`, BEL, DEL, C1 CSI `\x9b`, etc.) are rejected to prevent line-splitting
+ * and terminal/protocol control-character injection.
+ */
+const DISALLOWED_LABEL_CONTROL_CHAR_RE = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/;
+
+/** Validate a Prometheus metric name before registration or exposition. */
+export function validateMetricName(name: string): string {
+  if (typeof name !== "string" || !PROMETHEUS_METRIC_NAME_RE.test(name)) {
+    throw new MetricLabelError(
+      "INVALID_METRIC_NAME",
+      `Invalid Prometheus metric name: ${JSON.stringify(name)}`,
+    );
+  }
+  return name;
+}
+
+/**
+ * Validate a Prometheus label key before exposition.
+ * Rejects empty keys, reserved `__*` prefixes, punctuation, whitespace, and control characters.
+ */
+export function validateMetricLabelKey(key: string): string {
+  if (typeof key !== "string" || !PROMETHEUS_LABEL_KEY_RE.test(key)) {
+    throw new MetricLabelError(
+      "INVALID_LABEL_KEY",
+      `Invalid Prometheus label key: ${JSON.stringify(key)}`,
+    );
+  }
+  if (key.startsWith("__")) {
+    throw new MetricLabelError(
+      "RESERVED_LABEL_KEY",
+      `Prometheus label key ${JSON.stringify(key)} uses reserved "__" prefix`,
+    );
+  }
+  return key;
+}
+
+/**
+ * Escape a Prometheus v0.0.4 label value (`\` -> `\\`, `"` -> `\"`, `\n` -> `\n`)
+ * while rejecting disallowed C0/DEL/C1 control characters (`\r`, `\0`, `\x1b`, etc.).
+ */
+export function escapeMetricLabelValue(value: string): string {
+  if (typeof value !== "string") {
+    throw new MetricLabelError(
+      "NON_STRING_LABEL_VALUE",
+      `Prometheus label value must be a string; got ${typeof value}`,
+    );
+  }
+  const badMatch = DISALLOWED_LABEL_CONTROL_CHAR_RE.exec(value);
+  if (badMatch !== null) {
+    const codePoint = badMatch[0].charCodeAt(0);
+    const hex = `0x${codePoint.toString(16).padStart(2, "0")}`;
+    throw new MetricLabelError(
+      "CONTROL_CHARACTER_IN_LABEL_VALUE",
+      `Prometheus label value contains disallowed control character (${hex})`,
+    );
+  }
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n");
+}
+
+/**
+ * Validate all label keys and escape all label values into a Prometheus
+ * `{k1="v1",k2="v2"}` block (or `""` when `labels` is empty/undefined).
+ */
+export function formatMetricLabels(labels?: Readonly<Record<string, string>>): string {
+  if (!labels) return "";
+  const entries = Object.entries(labels);
+  if (entries.length === 0) return "";
+  const parts: string[] = [];
+  for (const [rawKey, rawValue] of entries) {
+    const key = validateMetricLabelKey(rawKey);
+    const escapedValue = escapeMetricLabelValue(rawValue);
+    parts.push(`${key}="${escapedValue}"`);
+  }
+  return `{${parts.join(",")}}`;
+}
 
 export interface Counter {
   /** Increment by 1 (default) or by `delta` (must be ≥ 0). */
@@ -39,6 +144,20 @@ export interface Gauge {
   set(value: number): void;
   /** Current value. */
   value(): number;
+}
+
+export interface LabeledCounter {
+  /** Increment labeled series by 1 (default) or `delta` (must be ≥ 0). */
+  inc(labels: Readonly<Record<string, string>>, delta?: number): void;
+  /** Read current value for `labels` (`0` before first observation). */
+  value(labels: Readonly<Record<string, string>>): number;
+}
+
+export interface LabeledGauge {
+  /** Set labeled series to `value`. */
+  set(labels: Readonly<Record<string, string>>, value: number): void;
+  /** Read current value for `labels` (`0` before first observation). */
+  value(labels: Readonly<Record<string, string>>): number;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -89,6 +208,20 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+
+  /** Register a custom counter with validated Prometheus label keys. */
+  registerLabeledCounter(
+    name: string,
+    help: string,
+    labelNames: readonly string[],
+  ): LabeledCounter;
+
+  /** Register a custom gauge with validated Prometheus label keys. */
+  registerLabeledGauge(
+    name: string,
+    help: string,
+    labelNames: readonly string[],
+  ): LabeledGauge;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -209,6 +342,105 @@ export function createMetrics(): MetricsRegistry {
   ];
   const gauges = [consecutiveFailures, lastCycleEvents, activityBaselineEvents];
 
+  interface LabeledMetricFamily {
+    name: string;
+    help: string;
+    type: "counter" | "gauge";
+    labelNames: readonly string[];
+    series: Map<string, number>;
+  }
+  const labeledFamilies: LabeledMetricFamily[] = [];
+
+  function canonicalizeDeclaredLabels(
+    declared: readonly string[],
+    labels: Readonly<Record<string, string>>,
+  ): string {
+    if (!labels || typeof labels !== "object" || Array.isArray(labels)) {
+      throw new MetricLabelError("INVALID_LABEL_KEY", "Labels must be a plain object");
+    }
+    const providedKeys = Object.keys(labels);
+    for (const k of providedKeys) {
+      validateMetricLabelKey(k);
+      if (!declared.includes(k)) {
+        throw new MetricLabelError(
+          "UNDECLARED_LABEL_KEY",
+          `Undeclared label key ${JSON.stringify(k)} (expected: ${declared.join(", ")})`,
+        );
+      }
+    }
+    const ordered: Record<string, string> = {};
+    for (const key of declared) {
+      if (!Object.prototype.hasOwnProperty.call(labels, key)) {
+        throw new MetricLabelError(
+          "MISSING_LABEL_KEY",
+          `Missing required label key ${JSON.stringify(key)}`,
+        );
+      }
+      ordered[key] = labels[key]!;
+    }
+    return formatMetricLabels(ordered);
+  }
+
+  function registerLabeledCounter(
+    name: string,
+    help: string,
+    labelNames: readonly string[],
+  ): LabeledCounter {
+    const validName = validateMetricName(name);
+    const validKeys = labelNames.map((k) => validateMetricLabelKey(k));
+    const family: LabeledMetricFamily = {
+      name: validName,
+      help,
+      type: "counter",
+      labelNames: validKeys,
+      series: new Map(),
+    };
+    labeledFamilies.push(family);
+    return {
+      inc(labels, delta = 1): void {
+        if (delta < 0 || !Number.isFinite(delta)) {
+          throw new RangeError(`Counter.inc delta must be a finite number >= 0; got ${delta}`);
+        }
+        const renderedLabels = canonicalizeDeclaredLabels(validKeys, labels);
+        family.series.set(renderedLabels, (family.series.get(renderedLabels) ?? 0) + delta);
+      },
+      value(labels): number {
+        const renderedLabels = canonicalizeDeclaredLabels(validKeys, labels);
+        return family.series.get(renderedLabels) ?? 0;
+      },
+    };
+  }
+
+  function registerLabeledGauge(
+    name: string,
+    help: string,
+    labelNames: readonly string[],
+  ): LabeledGauge {
+    const validName = validateMetricName(name);
+    const validKeys = labelNames.map((k) => validateMetricLabelKey(k));
+    const family: LabeledMetricFamily = {
+      name: validName,
+      help,
+      type: "gauge",
+      labelNames: validKeys,
+      series: new Map(),
+    };
+    labeledFamilies.push(family);
+    return {
+      set(labels, value): void {
+        if (!Number.isFinite(value)) {
+          throw new RangeError(`Gauge.set value must be finite; got ${value}`);
+        }
+        const renderedLabels = canonicalizeDeclaredLabels(validKeys, labels);
+        family.series.set(renderedLabels, value);
+      },
+      value(labels): number {
+        const renderedLabels = canonicalizeDeclaredLabels(validKeys, labels);
+        return family.series.get(renderedLabels) ?? 0;
+      },
+    };
+  }
+
   function render(): string {
     const lines: string[] = [];
 
@@ -222,6 +454,15 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`# HELP ${g._name} ${g._help}`);
       lines.push(`# TYPE ${g._name} gauge`);
       lines.push(`${g._name} ${g.value()}`);
+    }
+
+    for (const family of labeledFamilies) {
+      if (family.series.size === 0) continue;
+      lines.push(`# HELP ${family.name} ${family.help}`);
+      lines.push(`# TYPE ${family.name} ${family.type}`);
+      for (const [renderedLabels, val] of family.series.entries()) {
+        lines.push(`${family.name}${renderedLabels} ${val}`);
+      }
     }
 
     // Prometheus text format requires a trailing newline.
@@ -306,6 +547,8 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    registerLabeledCounter,
+    registerLabeledGauge,
     render,
     startServer,
   };

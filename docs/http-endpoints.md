@@ -238,6 +238,18 @@ The `mimir_telegram_latest_ledger` and `mimir_telegram_target_last_event_ledger`
 lines are omitted when no ledger has been observed yet (cold start or no
 events seen).
 
+**Label validation and escaping**: All Prometheus label keys and values emitted
+by `src/metrics.ts`, `src/stellar/metrics.ts`, and `src/health.ts` are validated
+before exposition:
+
+- Label keys must match `/^[a-zA-Z_][a-zA-Z0-9_]*$/` and must not start with the
+  reserved `__` prefix; malformed keys throw `MetricLabelError` before any bytes
+  are emitted.
+- Label values escape backslashes (`\` -> `\\`), double quotes (`"` -> `\"`), and
+  line feeds (`\n` -> `\n`) per Prometheus text format v0.0.4, while rejecting
+  disallowed C0/DEL/C1 control characters (`\r`, `\0`, `\t`, ANSI ESC `\x1b`,
+  etc.) with `MetricLabelError` (`CONTROL_CHARACTER_IN_LABEL_VALUE`).
+
 ```bash
 curl -s http://127.0.0.1:8787/metrics
 
