@@ -130,6 +130,10 @@ Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's
 - **Explorer links**: Includes transaction links to stellar.expert
 - **Preview mode**: Optional `[PREVIEW MODE]` badge for testing
 
+### Atom Feed Builder (`src/stellar/feed.ts`)
+
+Renders decoded contract events as RFC 4287 Atom 1.0 XML documents (`buildAtomFeed`, `buildAtomEntry`, `xmlText`, `boundEscapedXml`). Illegal C0 control characters are stripped, XML predefined entities (`&`, `<`, `>`, `"`, `'`) are escaped first, and titles/subtitles/descriptions are bounded by Unicode code points *after* XML escaping so entity expansion cannot blow past element size caps and truncation (`…`) never splits surrogate pairs or `&...;` escape sequences.
+
 ### Telegram Integration (`src/bot.ts`)
 
 The bot uses grammy for Telegram integration with a thin command layer and a single send path for the poller.

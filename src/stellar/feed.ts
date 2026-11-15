@@ -16,14 +16,16 @@ import type { DecodedEvent } from "./decode.js";
 import type { StellarConfig } from "../config.js";
 
 // ---------------------------------------------------------------------------
-// XML escaping
+// XML escaping & post-escape Unicode code-point bounding
 // ---------------------------------------------------------------------------
 
-/** Maximum byte length of a single feed-entry content block. */
+/** Maximum Unicode code-point length of an XML-escaped feed-entry content/summary block. */
 export const FEED_CONTENT_MAX_CHARS = 2_000;
 
-/** Maximum byte length of a title or subtitle string. */
+/** Maximum Unicode code-point length of an XML-escaped title or subtitle string. */
 export const FEED_TITLE_MAX_CHARS = 500;
+
+const XML_ENTITY_AT_OFFSET = /^&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/;
 
 /**
  * Escape the five XML predefined entities so a string is safe inside any
@@ -52,16 +54,100 @@ export function stripXmlIllegal(text: string): string {
   return text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
 }
 
+interface AtomicXmlToken {
+  raw: string;
+  codePoints: number;
+}
+
+function tokenizeEscapedXml(escaped: string): { tokens: AtomicXmlToken[]; totalCodePoints: number } {
+  const tokens: AtomicXmlToken[] = [];
+  let totalCodePoints = 0;
+  let i = 0;
+
+  while (i < escaped.length) {
+    if (escaped.charCodeAt(i) === 0x26 /* '&' */) {
+      const match = XML_ENTITY_AT_OFFSET.exec(escaped.slice(i));
+      if (match) {
+        const entity = match[0];
+        const cpLen = entity.length; // ASCII entity syntax: 1 UTF-16 unit == 1 code point
+        tokens.push({ raw: entity, codePoints: cpLen });
+        totalCodePoints += cpLen;
+        i += entity.length;
+        continue;
+      }
+    }
+
+    const cp = escaped.codePointAt(i)!;
+    const unitLen = cp > 0xffff ? 2 : 1;
+    const ch = escaped.slice(i, i + unitLen);
+    tokens.push({ raw: ch, codePoints: 1 });
+    totalCodePoints += 1;
+    i += unitLen;
+  }
+
+  return { tokens, totalCodePoints };
+}
+
 /**
- * Clip and clean a string for use inside an XML element.
- * Strips XML-illegal control characters, clips to `max` Unicode code points,
- * then XML-escapes the result.
+ * Bound an already XML-escaped string to at most `maxCodePoints` Unicode code points.
+ *
+ * - Never splits a UTF-16 surrogate pair (iterates full Unicode code points).
+ * - Never splits an XML entity escape sequence (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#...;`).
+ * - Preserves a readable `"…"` truncation marker within the `maxCodePoints` budget.
+ */
+export function boundEscapedXml(escaped: string, maxCodePoints: number): string {
+  const limit = Number.isFinite(maxCodePoints) ? Math.floor(maxCodePoints) : 0;
+  if (limit <= 0 || escaped.length === 0) {
+    return "";
+  }
+
+  const { tokens, totalCodePoints } = tokenizeEscapedXml(escaped);
+  if (totalCodePoints <= limit) {
+    return escaped;
+  }
+
+  if (limit === 1) {
+    return "…";
+  }
+
+  const budget = limit - 1; // Reserve 1 code point for "…"
+  let used = 0;
+  const kept: string[] = [];
+
+  for (const token of tokens) {
+    // Do not duplicate a trailing ellipsis if the input was already clipped
+    if (used + token.codePoints > budget) {
+      break;
+    }
+    kept.push(token.raw);
+    used += token.codePoints;
+  }
+
+  if (kept.length > 0 && kept[kept.length - 1] === "…") {
+    return kept.join("");
+  }
+  return `${kept.join("")}…`;
+}
+
+/**
+ * Strip XML-illegal control characters, XML-escape the string, and bound the
+ * escaped result to at most `max` Unicode code points without splitting
+ * surrogate pairs or XML entity sequences.
  */
 export function xmlText(text: string, max: number): string {
   const cleaned = stripXmlIllegal(text);
+  const escaped = escapeXml(cleaned);
+  return boundEscapedXml(escaped, max);
+}
+
+function clipPlainCodePoints(text: string, max: number): string {
+  const limit = Number.isFinite(max) ? Math.floor(max) : 0;
+  if (limit <= 0) return "";
+  const cleaned = stripXmlIllegal(text);
   const chars = Array.from(cleaned);
-  const clipped = chars.length <= max ? cleaned : `${chars.slice(0, max - 1).join("")}…`;
-  return escapeXml(clipped);
+  if (chars.length <= limit) return cleaned;
+  if (limit === 1) return "…";
+  return `${chars.slice(0, limit - 1).join("")}…`;
 }
 
 /**
@@ -92,6 +178,8 @@ export interface AtomEntry {
   updated: string;
   /** RFC 4287 §4.1.3.1: plain-text content, or null when not notifiable. */
   content: string | null;
+  /** RFC 4287 §4.2.13: optional short plain-text summary/description. */
+  summary?: string | null;
   /** RFC 4287 §4.2.7: alternate link (explorer URL), or null when absent. */
   link: string | null;
 }
@@ -115,6 +203,11 @@ export interface AtomFeedOptions {
   updatedAt?: string;
   /** Optional subtitle / description for the feed. */
   subtitle?: string;
+  /**
+   * Optional override for maximum post-escaping Unicode code points per entry
+   * description (`<content>` / `<summary>`). Defaults to {@link FEED_CONTENT_MAX_CHARS}.
+   */
+  maxContentChars?: number;
 }
 
 /**
@@ -123,11 +216,15 @@ export interface AtomFeedOptions {
  * The entry id is a stable tag URI derived from the event id so it is both
  * unique and dereferenceable: `tag:mimir,event:<eventId>`.
  * The title is the event name (payload.name).
- * The content is the plain-text rendering, bounded to {@link FEED_CONTENT_MAX_CHARS}.
+ * The content is the plain-text rendering, bounded to `maxContentChars`.
  * The link is the explorer URL when one exists.
  * The updated timestamp comes from `event.at` (ledger close time).
  */
-export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): AtomEntry {
+export function buildAtomEntry(
+  event: DecodedEvent,
+  config: StellarConfig,
+  maxContentChars: number = FEED_CONTENT_MAX_CHARS,
+): AtomEntry {
   const eventName =
     event.payload.name === "unknown"
       ? (event.payload.eventName ?? "unknown")
@@ -144,10 +241,7 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
   const updated = updatedDate.toISOString();
 
   const rawContent = formatPlainTextEvent(config, event);
-  const content =
-    rawContent !== null
-      ? Array.from(rawContent).slice(0, FEED_CONTENT_MAX_CHARS).join("")
-      : null;
+  const content = rawContent !== null ? clipPlainCodePoints(rawContent, maxContentChars) : null;
 
   const explorerUrl = eventExplorerUrl(config, event);
   const link = explorerUrl ? safeHttpsUrl(explorerUrl) : null;
@@ -165,7 +259,10 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
 // Feed serialisation
 // ---------------------------------------------------------------------------
 
-function renderEntry(entry: AtomEntry): string {
+export function renderAtomEntry(
+  entry: AtomEntry,
+  maxContentChars: number = FEED_CONTENT_MAX_CHARS,
+): string {
   const titleEl = `    <title type="text">${xmlText(entry.title, FEED_TITLE_MAX_CHARS)}</title>`;
   const idEl = `    <id>${escapeXml(entry.id)}</id>`;
   const updatedEl = `    <updated>${escapeXml(entry.updated)}</updated>`;
@@ -175,9 +272,14 @@ function renderEntry(entry: AtomEntry): string {
       ? `    <link rel="alternate" type="text/html" href="${escapeXml(entry.link)}"/>`
       : "";
 
+  const summaryEl =
+    entry.summary !== undefined && entry.summary !== null
+      ? `    <summary type="text">${xmlText(entry.summary, maxContentChars)}</summary>`
+      : "";
+
   const contentEl =
     entry.content !== null
-      ? `    <content type="text">${xmlText(entry.content, FEED_CONTENT_MAX_CHARS)}</content>`
+      ? `    <content type="text">${xmlText(entry.content, maxContentChars)}</content>`
       : `    <content type="text"/>`;
 
   return [
@@ -186,6 +288,7 @@ function renderEntry(entry: AtomEntry): string {
     idEl,
     updatedEl,
     linkEl,
+    summaryEl,
     contentEl,
     "  </entry>",
   ]
@@ -202,14 +305,15 @@ function renderEntry(entry: AtomEntry): string {
  * - Each event becomes one `<entry>`.  Events with no plain-text rendering still
  *   get an entry (with an empty `<content/>`), so feed readers always see the
  *   full event count.
- * - All dynamic content is XML-escaped; XML-illegal control characters are
- *   stripped before escaping.
+ * - All dynamic content is XML-escaped and bounded by Unicode code points *after*
+ *   escaping without splitting surrogate pairs or XML entity sequences.
  */
 export function buildAtomFeed(
   events: readonly DecodedEvent[],
   options: AtomFeedOptions,
 ): string {
   const { title, selfUrl, config, subtitle } = options;
+  const maxContentChars = options.maxContentChars ?? FEED_CONTENT_MAX_CHARS;
 
   // Feed <updated>: caller override → latest event.at → now.
   let feedUpdated: string;
@@ -246,8 +350,8 @@ export function buildAtomFeed(
   }
 
   for (const event of events) {
-    const entry = buildAtomEntry(event, config);
-    lines.push(renderEntry(entry));
+    const entry = buildAtomEntry(event, config, maxContentChars);
+    lines.push(renderAtomEntry(entry, maxContentChars));
   }
 
   lines.push("</feed>");
