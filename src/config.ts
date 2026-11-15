@@ -58,6 +58,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import { parseSchedule } from "./notifications/schedule.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -249,6 +250,12 @@ export interface BotConfig extends StellarConfig {
    * (see src/notifications/send-journal.ts). Empty disables the journal.
    */
   sendJournalFile: string;
+  /** Optional scheduled digest spec (`daily@HH:mm` or `weekly@day HH:mm`). Null sends per-event notifications immediately. */
+  digestSchedule?: string | null;
+  /** On-disk checkpoint path for pending scheduled digest events. */
+  digestFile?: string;
+  /** Maximum buffered events retained between scheduled digest flushes. */
+  digestMaxPending?: number;
   /** Loopback host for the local HTTP health endpoint. */
   healthHost: string;
   /** TCP port for the health endpoint. `0` disables the listener. */
@@ -350,6 +357,8 @@ const DEFAULTS = {
   deadLetterMax: 100,
   deadLetterMaxAttempts: 10,
   sendJournalFile: "./data/send-journal.jsonl",
+  digestFile: "./data/digest-checkpoint.json",
+  digestMaxPending: 200,
   healthHost: "127.0.0.1",
   healthPort: 8787,
   // 3Ã— default poll interval â€” one missed cycle is fine; three is not.
@@ -891,6 +900,20 @@ export function loadConfig(): BotConfig {
     );
   }
 
+  const digestScheduleInput = read("DIGEST_SCHEDULE");
+  let digestSchedule: string | null = null;
+  if (digestScheduleInput !== undefined) {
+    try {
+      const normalized = digestScheduleInput.trim().toLowerCase();
+      parseSchedule(normalized);
+      digestSchedule = normalized;
+    } catch (err) {
+      c.problems.push(
+        `DIGEST_SCHEDULE is invalid: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   const config: BotConfig = {
     ...stellar,
     locale: locale ?? DEFAULT_LOCALE,
@@ -938,6 +961,12 @@ export function loadConfig(): BotConfig {
       process.cwd(),
       read("SEND_JOURNAL_FILE") ?? DEFAULTS.sendJournalFile,
     ),
+    digestSchedule,
+    digestFile: path.resolve(
+      process.cwd(),
+      c.get("DIGEST_FILE") ?? DEFAULTS.digestFile,
+    ),
+    digestMaxPending: c.int("DIGEST_MAX_PENDING", DEFAULTS.digestMaxPending, 1),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
@@ -1124,6 +1153,9 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "SILENT_EVENTS", secret: false, hasBuiltInDefault: true },
   { key: "AUDIT_FILE", secret: false, hasBuiltInDefault: true },
   { key: "SEND_JOURNAL_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "DIGEST_SCHEDULE", secret: false },
+  { key: "DIGEST_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "DIGEST_MAX_PENDING", secret: false, hasBuiltInDefault: true },
   { key: "EVENT_DEDUP_WINDOW", secret: false, hasBuiltInDefault: true },
   { key: "DEAD_LETTER_FILE", secret: false, hasBuiltInDefault: true },
   { key: "DEAD_LETTER_MAX", secret: false, hasBuiltInDefault: true },

@@ -30,6 +30,9 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - `START_LOOKBACK_LEDGERS`: On a cold start (no cursor file), the number of recent ledgers to check for events. Defaults to 60. Limits unbounded backfilling.
 - `CURSOR_FILE`: Path to a persistent JSON file where the bot stores its last-seen ledger cursor. 
 - `MAX_NOTIFICATIONS_PER_CYCLE`: Operational safeguard. The maximum number of notifications to dispatch in a single poll cycle. Defaults to 20. Prevents Telegram rate limiting if a massive burst of events occurs on-chain. Additional events are skipped (logged), but the cursor advances.
+- `DIGEST_SCHEDULE`: Optional UTC digest schedule (`daily@HH:mm` or `weekly@day HH:mm`). When unset (default), notifications are dispatched immediately per event. When set, decoded notifiable events are buffered and flushed as a grouped digest (`groupDigestEvents` / `formatDigest(..., { grouped: true })`) at each scheduled boundary.
+- `DIGEST_FILE`: Path to the atomic JSON checkpoint file storing bounded pending digest events and `nextFlushAt` across restarts (default `./data/digest-checkpoint.json`). Only accessed when `DIGEST_SCHEDULE` is set.
+- `DIGEST_MAX_PENDING`: Maximum buffered events retained between scheduled digest runs (default `200`). Events arriving beyond the cap increment `droppedCount` and are summarized as omitted in the digest footer rather than growing memory or disk unboundedly.
 
 ### Notification Filtering
 - `NOTIFY_ENABLED`, `NOTIFY_MARKET`, `NOTIFY_SQUAD`: Coarse boolean kill switches for global or per-contract notifications (all default to `true`).

@@ -85,11 +85,23 @@ import {
 } from "./instanceLock.js";
 import {
   clip,
+  escapeMd,
   explorerKeyboard,
+  formatDigest,
   formatEvent,
   formatPlainTextEvent,
   safeErrorMessage,
+  splitTelegramMessage,
+  TELEGRAM_MAX_MESSAGE_LENGTH,
 } from "./notifications/format.js";
+import {
+  DEFAULT_DIGEST_MAX_PENDING,
+  groupDigestEvents,
+  parseDigestCheckpoint,
+  serializeDigestCheckpoint,
+} from "./notifications/digest-grouping.js";
+import { nextRun, parseSchedule, type Schedule } from "./notifications/schedule.js";
+import { messagesFor } from "./i18n.js";
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
@@ -258,6 +270,17 @@ export interface CountersFile {
     squadContractId: string;
   };
   counters: PollerCounters;
+}
+
+export interface ScheduledDigestStatus {
+  enabled: boolean;
+  schedule: string | null;
+  digestFile: string | null;
+  maxPending: number;
+  pendingCount: number;
+  droppedCount: number;
+  lastFlushAt: number | null;
+  nextFlushAt: number | null;
 }
 
 export interface PollerStatus {
@@ -1563,6 +1586,34 @@ export function createPoller(deps: PollerDeps) {
       ? config.countersFile
       : "";
 
+  // Scheduled digest mode: opt-in via `config.digestSchedule` (`daily@HH:mm` or
+  // `weekly@day HH:mm`). When unset, the poller delivers individual events
+  // immediately with zero checkpoint file I/O.
+  const rawDigestSchedule =
+    typeof config.digestSchedule === "string" && config.digestSchedule.trim().length > 0
+      ? config.digestSchedule.trim().toLowerCase()
+      : null;
+  const parsedDigestSchedule: Schedule | null =
+    rawDigestSchedule !== null ? parseSchedule(rawDigestSchedule) : null;
+  const digestEnabled = parsedDigestSchedule !== null;
+  const digestMaxPending = Math.max(
+    1,
+    Math.trunc(config.digestMaxPending ?? DEFAULT_DIGEST_MAX_PENDING),
+  );
+  const digestFile = digestEnabled
+    ? typeof config.digestFile === "string" && config.digestFile.trim().length > 0
+      ? config.digestFile
+      : path.join(path.dirname(config.cursorFile), "digest-checkpoint.json")
+    : null;
+  let digestPending: DecodedEvent[] = [];
+  const digestPendingIds = new Set<string>();
+  let digestDroppedCount = 0;
+  let digestLastFlushAt: number | null = null;
+  let digestNextFlushAt: number | null =
+    parsedDigestSchedule !== null ? nextRun(parsedDigestSchedule, now()) : null;
+  let digestDirty = false;
+  let digestLoaded = !digestEnabled;
+
   async function releaseInstanceLock(): Promise<void> {
     const lock = instanceLock;
     if (!lock) return;
@@ -1710,6 +1761,243 @@ export function createPoller(deps: PollerDeps) {
       );
       return false;
     }
+  }
+
+  // ── Scheduled digest checkpoint persistence ────────────────────────────────
+
+  async function quarantineCorruptDigestCheckpoint(
+    filePath: string,
+    reason: string,
+  ): Promise<string | null> {
+    const dest = cursorQuarantinePath(filePath, new Date(now()));
+    try {
+      await rename(filePath, dest);
+      Logger.warn(
+        "poller",
+        `[poller] digest checkpoint unreadable, starting clean: quarantined to ${dest} (${reason})`,
+        { action: "digest_checkpoint_quarantined", digestFile: filePath, quarantined: dest, reason },
+      );
+      return dest;
+    } catch (err) {
+      Logger.warn(
+        "poller",
+        `[poller] digest checkpoint unreadable, starting clean: could not quarantine ${filePath}: ` +
+          `${errorMessage(err)} (${reason})`,
+        {
+          action: "digest_checkpoint_quarantine_failed",
+          digestFile: filePath,
+          reason,
+          error: errorMessage(err),
+        },
+      );
+      return null;
+    }
+  }
+
+  async function loadDigestCheckpoint(): Promise<void> {
+    digestLoaded = true;
+    if (!digestEnabled || !digestFile || !parsedDigestSchedule || !rawDigestSchedule) return;
+
+    let raw: string;
+    try {
+      raw = await readFile(digestFile, "utf8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT") {
+        digestPending = [];
+        digestPendingIds.clear();
+        digestDroppedCount = 0;
+        digestLastFlushAt = null;
+        digestNextFlushAt = nextRun(parsedDigestSchedule, now());
+        digestDirty = true;
+        return;
+      }
+      Logger.warn(
+        "poller",
+        `[poller] could not read digest checkpoint at ${digestFile}: ${errorMessage(err)}; starting clean`,
+        { action: "digest_checkpoint_read_failed", digestFile, error: errorMessage(err) },
+      );
+      digestPending = [];
+      digestPendingIds.clear();
+      digestDroppedCount = 0;
+      digestLastFlushAt = null;
+      digestNextFlushAt = nextRun(parsedDigestSchedule, now());
+      return;
+    }
+
+    try {
+      const restored = parseDigestCheckpoint(raw, digestMaxPending);
+      digestPending = restored.pendingEvents;
+      digestPendingIds.clear();
+      for (const ev of digestPending) digestPendingIds.add(ev.eventId);
+      digestDroppedCount = restored.droppedCount;
+      digestLastFlushAt = restored.lastFlushAt;
+      if (restored.schedule.trim().toLowerCase() === rawDigestSchedule) {
+        digestNextFlushAt = restored.nextFlushAt;
+        digestDirty = false;
+      } else {
+        digestNextFlushAt = nextRun(parsedDigestSchedule, restored.lastFlushAt ?? now());
+        digestDirty = true;
+      }
+      Logger.info(
+        "poller",
+        `[poller] restored digest checkpoint from ${digestFile}: ` +
+          `pending=${digestPending.length} dropped=${digestDroppedCount} ` +
+          `nextFlushAt=${new Date(digestNextFlushAt).toISOString()}`,
+        {
+          action: "digest_checkpoint_restored",
+          digestFile,
+          pendingCount: digestPending.length,
+          droppedCount: digestDroppedCount,
+          nextFlushAt: digestNextFlushAt,
+        },
+      );
+    } catch (err) {
+      const reason = errorMessage(err);
+      await quarantineCorruptDigestCheckpoint(digestFile, reason);
+      digestPending = [];
+      digestPendingIds.clear();
+      digestDroppedCount = 0;
+      digestLastFlushAt = null;
+      digestNextFlushAt = nextRun(parsedDigestSchedule, now());
+      digestDirty = true;
+    }
+  }
+
+  async function saveDigestCheckpoint(
+    reason: "cycle" | "shutdown" | "flush",
+  ): Promise<boolean> {
+    if (!digestEnabled || !digestFile || !rawDigestSchedule || digestNextFlushAt === null) {
+      return true;
+    }
+    const serialized = serializeDigestCheckpoint(
+      {
+        version: 1,
+        updatedAt: new Date(now()).toISOString(),
+        schedule: rawDigestSchedule,
+        lastFlushAt: digestLastFlushAt,
+        nextFlushAt: digestNextFlushAt,
+        droppedCount: digestDroppedCount,
+        pendingEvents: digestPending,
+      },
+      digestMaxPending,
+    );
+    try {
+      await mkdir(path.dirname(digestFile), { recursive: true });
+      const tmp = `${digestFile}.tmp`;
+      await writeFile(tmp, serialized, "utf8");
+      await rename(tmp, digestFile);
+      digestDirty = false;
+      return true;
+    } catch (err) {
+      Logger.error(
+        "poller",
+        `[poller] could not persist digest checkpoint (${reason}): ${errorMessage(err)}`,
+        { action: "digest_checkpoint_persist_failed", reason, digestFile, error: errorMessage(err) },
+      );
+      return false;
+    }
+  }
+
+  async function flushScheduledDigestIfDue(
+    correlationId: string,
+  ): Promise<{ sent: number; failed: number }> {
+    if (!digestEnabled || !parsedDigestSchedule || digestNextFlushAt === null || status.stopping) {
+      return { sent: 0, failed: 0 };
+    }
+    const flushNow = now();
+    if (flushNow < digestNextFlushAt) {
+      return { sent: 0, failed: 0 };
+    }
+
+    if (digestPending.length === 0) {
+      digestLastFlushAt = flushNow;
+      digestNextFlushAt = nextRun(parsedDigestSchedule, flushNow);
+      digestDroppedCount = 0;
+      digestDirty = true;
+      return { sent: 0, failed: 0 };
+    }
+
+    const batch = [...digestPending];
+    const omitted = digestDroppedCount;
+    const groups = groupDigestEvents(batch);
+    let rendered = formatDigest(batch, { grouped: true }) ?? "";
+    if (omitted > 0) {
+      rendered += `\n\n_${escapeMd(`+${omitted} additional event(s) omitted (pending cap ${digestMaxPending})`)}_`;
+    }
+    if (config.channelPreviewMode) {
+      rendered = `${messagesFor(config.locale).notificationMd.previewModePrefix}\n${rendered}`;
+    }
+
+    const chunks = splitTelegramMessage(rendered, TELEGRAM_MAX_MESSAGE_LENGTH);
+    digestPending = [];
+    digestPendingIds.clear();
+    digestDroppedCount = 0;
+    digestLastFlushAt = flushNow;
+    digestNextFlushAt = nextRun(parsedDigestSchedule, flushNow);
+    digestDirty = true;
+
+    let sent = 0;
+    let failed = 0;
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i]!;
+      try {
+        await sendWithRetry(
+          (message) => send(message),
+          chunk,
+          config.botToken,
+          sendOptions,
+          () => !status.stopping,
+          sleep,
+        );
+        recordSentIncrement();
+        metrics?.notificationsSent.inc();
+        sent += 1;
+      } catch (err) {
+        recordFailedIncrement();
+        metrics?.notificationsFailed.inc();
+        failed += 1;
+        audit.recordError(err, "send_failed", {
+          detail: `scheduled digest (${batch.length} events, ${groups.length} groups)`,
+        });
+        console.error(
+          `[poller] scheduled digest send failed after retries: ` +
+            `${errorMessage(err)} correlation=${correlationId}`,
+        );
+        if (deadLetterEnabled) {
+          await deadLetter.enqueue({
+            source: batch[0]?.source ?? "market",
+            ledger: batch[batch.length - 1]?.ledger ?? 0,
+            eventName: "scheduled_digest",
+            text: chunk,
+            error: err,
+          });
+          refreshDeadLetterStatus();
+        }
+      }
+      if (!status.stopping && i + 1 < chunks.length && sendSpacing > 0) {
+        await sleep(sendSpacing);
+      }
+    }
+
+    Logger.info(
+      "poller",
+      `[poller] flushed scheduled digest (${rawDigestSchedule}): ` +
+        `events=${batch.length} groups=${groups.length} omitted=${omitted} ` +
+        `chunks=${chunks.length} sent=${sent} failed=${failed}`,
+      {
+        action: "scheduled_digest_flushed",
+        schedule: rawDigestSchedule,
+        eventCount: batch.length,
+        groupCount: groups.length,
+        omittedCount: omitted,
+        sent,
+        failed,
+        nextFlushAt: digestNextFlushAt,
+      },
+    );
+    await saveDigestCheckpoint("flush");
+    return { sent, failed };
   }
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
@@ -2003,6 +2291,7 @@ export function createPoller(deps: PollerDeps) {
     let skipped = 0;
     let droppedForShutdown = 0;
     let capLogged = false;
+    let digestCapLogged = false;
 
     for (const event of events) {
       metrics?.eventsDecoded.inc();
@@ -2112,6 +2401,29 @@ export function createPoller(deps: PollerDeps) {
             detail: `${event.payload.name} at ledger ${event.ledger}: notifiable text was null`,
           }),
         );
+        continue;
+      }
+
+      if (digestEnabled) {
+        if (digestPendingIds.has(event.eventId)) continue;
+        if (digestPending.length < digestMaxPending) {
+          digestPending.push(event);
+          digestPendingIds.add(event.eventId);
+          digestDirty = true;
+        } else {
+          digestDroppedCount += 1;
+          digestDirty = true;
+          recordSkippedIncrement();
+          metrics?.eventsSkipped.inc();
+          skipped += 1;
+          if (!digestCapLogged) {
+            digestCapLogged = true;
+            console.warn(
+              `[poller] DIGEST_MAX_PENDING cap (${digestMaxPending}) reached — ` +
+                `additional events will be counted as omitted until the next scheduled digest flush.`,
+            );
+          }
+        }
         continue;
       }
 
@@ -2518,6 +2830,9 @@ export function createPoller(deps: PollerDeps) {
     // Drain parked sends before this cycle's events, so a recovered channel
     // catches up in order. Budgeted like the burst below: one recovery must
     // not flood the chat.
+    if (digestEnabled && !digestLoaded) {
+      await loadDigestCheckpoint();
+    }
     await flushDeadLetter();
 
     try {
@@ -2797,6 +3112,10 @@ export function createPoller(deps: PollerDeps) {
       status.lastCyclePages = cyclePages;
       status.lastCycleEmptyPages = cycleEmptyPages;
 
+      if (digestEnabled) {
+        await flushScheduledDigestIfDue(correlationId);
+      }
+
       // ── Circuit breaker state update ─────────────────────────────────────────────
       if (cycleFailures > 0) {
         status.circuitBreaker.failureCount += cycleFailures;
@@ -2876,6 +3195,9 @@ export function createPoller(deps: PollerDeps) {
         status.targets = [...state.values()].map((t) => ({ ...t }));
         await saveCounters("cycle");
         await saveCursors("cycle");
+        if (digestDirty) {
+          await saveDigestCheckpoint("cycle");
+        }
         await persistStatus();
       } finally {
         inFlight = false;
@@ -2921,6 +3243,9 @@ export function createPoller(deps: PollerDeps) {
       const delay = await cycle();
       if (typeof delay === "number" && delay > nextDelay) {
         nextDelay = delay;
+      } else if (digestEnabled && digestNextFlushAt !== null && digestPending.length > 0) {
+        const untilDigest = Math.max(0, digestNextFlushAt - now());
+        if (untilDigest < nextDelay) nextDelay = untilDigest;
       }
     } catch (err) {
       // Belt and braces: `cycle` already swallows per-target failures, so
@@ -2988,6 +3313,7 @@ export function createPoller(deps: PollerDeps) {
 
       await loadCursors();
       await loadCounters();
+      await loadDigestCheckpoint();
       // Parked sends from the previous run are part of this run's work.
       await deadLetter.load();
       refreshDeadLetterStatus();
@@ -3148,6 +3474,10 @@ export function createPoller(deps: PollerDeps) {
       if (countersDirty) {
         await saveCounters("shutdown");
       }
+      if (digestDirty) {
+        const digestFlushed = await saveDigestCheckpoint("shutdown");
+        flushed = flushed && digestFlushed;
+      }
 
       status.running = false;
       await persistStatus();
@@ -3193,6 +3523,19 @@ export function createPoller(deps: PollerDeps) {
      */
     loadCursors,
     loadCounters,
+    loadDigestCheckpoint,
+    digestStatus(): ScheduledDigestStatus {
+      return {
+        enabled: digestEnabled,
+        schedule: rawDigestSchedule,
+        digestFile,
+        maxPending: digestMaxPending,
+        pendingCount: digestPending.length,
+        droppedCount: digestDroppedCount,
+        lastFlushAt: digestLastFlushAt,
+        nextFlushAt: digestNextFlushAt,
+      };
+    },
     /** Machine-readable snapshot, same shape as the file on disk. */
     snapshot(): StatusSnapshot {
       return snapshot();
@@ -3215,6 +3558,7 @@ export function createPoller(deps: PollerDeps) {
       if (status.startedAt === 0) {
         await loadCursors();
         await loadCounters();
+        await loadDigestCheckpoint();
         status.running = true;
         status.startedAt = Date.now();
       }

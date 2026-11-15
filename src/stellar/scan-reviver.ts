@@ -5,6 +5,7 @@
  * This is the inverse of scanJsonReplacer in events.ts.
  */
 
+import type { DecodedEvent } from "./decode.js";
 import type { ScanJsonReport, ScanJsonEvent, ScanJsonTarget } from "./events.js";
 
 /** Known bigint field paths per event name. */
@@ -77,6 +78,18 @@ function revivePayload(payload: ScanJsonEvent["payload"]): ScanJsonEvent["payloa
   }
 
   return revived;
+}
+
+/**
+ * Revive bigint fields in a persisted DecodedEvent after JSON.parse.
+ */
+export function reviveDecodedEvent(event: DecodedEvent): DecodedEvent {
+  return {
+    ...event,
+    payload: revivePayload(
+      event.payload as unknown as ScanJsonEvent["payload"],
+    ) as unknown as DecodedEvent["payload"],
+  };
 }
 
 /**

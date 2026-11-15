@@ -13,6 +13,7 @@ Operational reference describing all on-disk state files maintained by the Mimir
 | **Audit Trail File** | `AUDIT_FILE` | `./data/audit.jsonl` | `src/audit.ts` | Append (`appendFile` with JSON line per entry) | If absent, automatically created on next append. Historical audit records prior to deletion are lost. | `/audit` skips unreadable/malformed lines (`unreadableLines` count incremented) and processes valid lines. poller append operations continue appending new entries. |
 | **Status Snapshot File** | `STATUS_FILE` | `./data/status.json` | `src/status.ts` | Atomic (write temporary file `${STATUS_FILE}.tmp` then rename) | Harmless to poller loop. Recreated atomically on the next poll cycle. CLI `--status` command will fail to find status until rewritten. | Overwritten atomically on the next poll cycle. External tools or CLI reading corrupt file before next cycle encounter parse errors. |
 | **Instance Lock File** | `INSTANCE_LOCK_FILE` | `./data/poller.lock` | `src/instanceLock.ts` | Exclusive file creation (`O_EXCL` / `wx` flag via `open`) | Poller will re-acquire lock on next startup if no other instance holds it. During runtime, removal removes concurrency protection against double instances. | Stale or unparseable lock payload (non-JSON, bad schema, or dead PID) is warned and automatically unlinked by next acquiring instance. |
+| **Digest Checkpoint File** | `DIGEST_FILE` | `./data/digest-checkpoint.json` | `src/poller.ts` | Atomic (write temporary file `${DIGEST_FILE}.tmp` then rename) when `DIGEST_SCHEDULE` is set | Treated as a clean digest window: starts with zero buffered events and schedules the next future UTC boundary (`nextRun(schedule, now)`). | Quarantined to `${DIGEST_FILE}.corrupt.<timestamp>` to preserve forensics, then starts clean with an empty bounded buffer. |
 
 ---
 
@@ -64,3 +65,11 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Scheduled Digest Checkpoint File (`DIGEST_FILE`)
+- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveDigestCheckpoint`, `loadDigestCheckpoint`) with schema helpers in [`src/notifications/digest-grouping.ts`](../src/notifications/digest-grouping.ts)
+- **Default Path**: `./data/digest-checkpoint.json` (only read or written when `DIGEST_SCHEDULE` is set)
+- **Write Pattern**: Atomic write-then-rename (`${digestFile}.tmp` -> `${digestFile}`) on cycle completion, scheduled digest flush, and graceful shutdown. Pending events are bounded by `DIGEST_MAX_PENDING` (default `200`), with overflow events counted in `droppedCount`.
+- **Restart Behavior**: Restores pending events (including `bigint` USDC amounts) and `nextFlushAt`. If `now >= nextFlushAt` on startup, a missed scheduled window flushes at most once on the first cycle and advances to the next future UTC boundary; otherwise, buffered events continue accumulating until `nextFlushAt`.
+- **Deleted**: Treated as a cold digest start (`pendingEvents: []`, `nextFlushAt: nextRun(schedule, now)`).
+- **Corrupt**: Quarantined to `${digestFile}.corrupt.<YYYY-MM-DDTHH-mm-ss-sssZ>` with a bounded warning, then re-initialized cleanly without wedging the poller.
