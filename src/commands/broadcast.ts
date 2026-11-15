@@ -24,6 +24,39 @@ export const BROADCAST_USAGE_MESSAGE = "Usage: /broadcast <message>";
 export const BROADCAST_TOO_LONG_MESSAGE =
   "Broadcast message exceeds the maximum length of 4096 characters.";
 export const BROADCAST_NO_CHATS_MESSAGE = "No notification chats configured.";
+export const CALLBACK_WRONG_CHAT_FEEDBACK = "Confirmation must come from the originating chat";
+
+export type CallbackOriginChatResult =
+  | { ok: true; chatId: string }
+  | { ok: false; reason: "missing-chat" | "mismatched-chat" };
+
+/**
+ * Extract and cross-check the originating chat ID on an incoming callback query.
+ * Rejects callbacks when neither `ctx.chat` nor `callbackQuery.message.chat`
+ * carries an ID, or when both are present and disagree.
+ */
+export function resolveCallbackOriginChatId(ctx: Context): CallbackOriginChatResult {
+  const rawCtxChatId = ctx.chat?.id;
+  const rawMsgChatId = (
+    ctx.callbackQuery?.message as { chat?: { id?: number | string } } | undefined
+  )?.chat?.id;
+
+  const ctxChatId =
+    rawCtxChatId !== undefined && rawCtxChatId !== null ? String(rawCtxChatId).trim() : "";
+  const msgChatId =
+    rawMsgChatId !== undefined && rawMsgChatId !== null ? String(rawMsgChatId).trim() : "";
+
+  if (ctxChatId.length > 0 && msgChatId.length > 0 && ctxChatId !== msgChatId) {
+    return { ok: false, reason: "mismatched-chat" };
+  }
+
+  const resolved = msgChatId || ctxChatId;
+  if (!resolved) {
+    return { ok: false, reason: "missing-chat" };
+  }
+
+  return { ok: true, chatId: resolved };
+}
 
 /**
  * Extracts and deduplicates all unique configured notification chats from config.
@@ -83,6 +116,7 @@ export function getConfiguredBroadcastChats(
 export interface PendingBroadcast {
   id: string;
   operatorId: string;
+  originChatId: string;
   message: string;
   createdAt: number;
   expiresAt: number;
@@ -104,6 +138,7 @@ export class BroadcastStore {
     message: string,
     chats: readonly string[],
     ttlMs?: number,
+    originChatId?: string,
   ): PendingBroadcast {
     this.cleanup();
     this.counter = (this.counter + 1) % 1_000_000;
@@ -112,6 +147,7 @@ export class BroadcastStore {
     const item: PendingBroadcast = {
       id,
       operatorId,
+      originChatId: String(originChatId ?? operatorId).trim(),
       message,
       createdAt: now,
       expiresAt: now + (ttlMs ?? this.defaultTtlMs),
@@ -272,6 +308,7 @@ export async function handleBroadcastCommand(
     text,
     chats,
     deps.broadcastExpiryMs,
+    String(ctx.chat?.id ?? ctx.from?.id ?? ""),
   );
 
   const previewText = formatBroadcastPreview(text, chats);
@@ -298,7 +335,7 @@ export async function handleBroadcastCallback(
   const chatType = ctx.chat?.type ?? (ctx.callbackQuery?.message as any)?.chat?.type;
   const isPrivate = chatType === "private";
 
-  if (!isOperator(ctx, config) || !isPrivate) {
+  if (!isOperator(ctx, config)) {
     console.warn(
       `[bot] ignored unauthorized broadcast callback on update ${ctx.update?.update_id}`,
     );
@@ -313,13 +350,41 @@ export async function handleBroadcastCallback(
   const subAction = parts[1];
   const broadcastId = parts[2];
 
+  const store = deps.broadcastStore ?? defaultBroadcastStore;
+  const pending =
+    broadcastId && (subAction === "confirm" || subAction === "cancel")
+      ? store.get(broadcastId)
+      : undefined;
+
+  if (pending) {
+    const chatCheck = resolveCallbackOriginChatId(ctx);
+    if (!chatCheck.ok || chatCheck.chatId !== pending.originChatId) {
+      console.warn(
+        `[bot] rejected cross-chat broadcast confirmation on update ${ctx.update?.update_id}`,
+      );
+      await safeAnswerCallback(ctx, config, {
+        text: CALLBACK_WRONG_CHAT_FEEDBACK,
+        show_alert: true,
+      });
+      return;
+    }
+  }
+
+  if (!isPrivate) {
+    console.warn(
+      `[bot] ignored unauthorized broadcast callback on update ${ctx.update?.update_id}`,
+    );
+    await safeAnswerCallback(ctx, config, {
+      text: "Unauthorized: operator in private chat only",
+      show_alert: true,
+    });
+    return;
+  }
+
   if (!broadcastId || (subAction !== "confirm" && subAction !== "cancel")) {
     await safeAnswerCallback(ctx, config, { text: "Invalid broadcast action" });
     return;
   }
-
-  const store = deps.broadcastStore ?? defaultBroadcastStore;
-  const pending = store.get(broadcastId);
 
   if (!pending) {
     await safeAnswerCallback(ctx, config, {

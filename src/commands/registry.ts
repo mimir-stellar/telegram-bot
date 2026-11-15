@@ -18,6 +18,7 @@ import type { CommandContext, Context } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 
 import type { AuditLog } from "../audit.js";
+import type { PauseConfirmStore } from "../callbacks.js";
 import type { BotConfig } from "../config.js";
 import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
@@ -45,6 +46,8 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /** Originating-chat state store for /pause confirmation prompts. */
+  pauseConfirmStore?: PauseConfirmStore | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */

@@ -17,7 +17,18 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
 import { safeErrorMessage } from "./notifications/format.js";
-import { handleBroadcastCallback } from "./commands/broadcast.js";
+import {
+  CALLBACK_WRONG_CHAT_FEEDBACK,
+  handleBroadcastCallback,
+  resolveCallbackOriginChatId,
+  type CallbackOriginChatResult,
+} from "./commands/broadcast.js";
+
+export {
+  CALLBACK_WRONG_CHAT_FEEDBACK,
+  resolveCallbackOriginChatId,
+  type CallbackOriginChatResult,
+};
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
@@ -337,6 +348,65 @@ export async function handleCallbackQuery(
  */
 export const PAUSE_CONFIRM_TTL_MS = 60_000;
 
+export interface PendingPauseConfirmation {
+  operatorId: string;
+  originChatId: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export class PauseConfirmStore {
+  private readonly items = new Map<string, PendingPauseConfirmation>();
+  private readonly defaultTtlMs: number;
+
+  constructor(defaultTtlMs: number = PAUSE_CONFIRM_TTL_MS) {
+    this.defaultTtlMs = defaultTtlMs;
+  }
+
+  record(
+    operatorId: string,
+    originChatId: string,
+    now: number = Date.now(),
+    ttlMs?: number,
+  ): PendingPauseConfirmation {
+    this.cleanup(now);
+    const key = String(operatorId).trim();
+    const item: PendingPauseConfirmation = {
+      operatorId: key,
+      originChatId: String(originChatId).trim(),
+      createdAt: now,
+      expiresAt: now + (ttlMs ?? this.defaultTtlMs),
+    };
+    this.items.set(key, item);
+    return item;
+  }
+
+  get(operatorId: string, now: number = Date.now()): PendingPauseConfirmation | undefined {
+    this.cleanup(now);
+    return this.items.get(String(operatorId).trim());
+  }
+
+  delete(operatorId: string): boolean {
+    return this.items.delete(String(operatorId).trim());
+  }
+
+  cleanup(now: number = Date.now()): void {
+    for (const [key, item] of this.items.entries()) {
+      if (item.expiresAt <= now) {
+        this.items.delete(key);
+      }
+    }
+  }
+
+  clear(): void {
+    this.items.clear();
+  }
+
+  size(): number {
+    return this.items.size;
+  }
+}
+
 const VALID_CALLBACK_DATA = new Set<string>([
   CALLBACK_PAUSE_CONFIRM,
   CALLBACK_PAUSE_CANCEL,
@@ -369,10 +439,10 @@ export function validatePauseConfirmData(
  */
 export async function handlePauseConfirmCallback(
   ctx: Context,
-  deps: Pick<CommandDeps, "config" | "pause">,
+  deps: Pick<CommandDeps, "config" | "pause" | "pauseConfirmStore">,
   nowMs: number = Date.now(),
 ): Promise<void> {
-  const { config, pause } = deps;
+  const { config, pause, pauseConfirmStore } = deps;
 
   const action = validatePauseConfirmData(ctx.callbackQuery?.data);
   if (action === null) return; // unknown payload — silently ignore
@@ -383,10 +453,25 @@ export async function handlePauseConfirmCallback(
     return;
   }
 
+  const operatorId = String(ctx.from?.id ?? "");
+  const chatCheck = resolveCallbackOriginChatId(ctx);
+  const pendingPause = pauseConfirmStore?.get(operatorId, nowMs);
+
+  // Verify originating chat against stored confirmation state (and reject missing/conflicting chat IDs)
+  // before mutating or consuming any pending pause confirmation.
+  if (!chatCheck.ok || (pendingPause !== undefined && chatCheck.chatId !== pendingPause.originChatId)) {
+    console.warn(
+      `[bot] rejected cross-chat pause confirmation on update ${ctx.update?.update_id}`,
+    );
+    await ctx.answerCallbackQuery({ text: CALLBACK_WRONG_CHAT_FEEDBACK, show_alert: true });
+    return;
+  }
+
   // Reject stale confirmations so an old message cannot stop the poller later.
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
   const ageMs = nowMs - messageDate * 1000;
   if (ageMs > PAUSE_CONFIRM_TTL_MS) {
+    pauseConfirmStore?.delete(operatorId);
     await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
     await ctx.editMessageText(
       "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
@@ -394,6 +479,8 @@ export async function handlePauseConfirmCallback(
     );
     return;
   }
+
+  pauseConfirmStore?.delete(operatorId);
 
   if (action === CALLBACK_PAUSE_CONFIRM) {
     const result = pause();

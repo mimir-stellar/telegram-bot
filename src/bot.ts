@@ -35,6 +35,7 @@ import {
   type CommandModule,
 } from "./commands/index.js";
 import {
+  PauseConfirmStore,
   handlePauseConfirmCallback,
   registerCallbackHandlers,
   validatePauseConfirmData,
@@ -79,16 +80,21 @@ export {
   CALLBACK_FALLBACK_PAYLOAD,
   CALLBACK_UNAUTHORIZED_FEEDBACK,
   CALLBACK_UNAUTHORIZED_PAYLOAD,
+  CALLBACK_WRONG_CHAT_FEEDBACK,
   PAUSE_CONFIRM_TTL_MS,
+  PauseConfirmStore,
   TELEGRAM_CALLBACK_DATA_MAX_BYTES,
   handleCallbackQuery,
   handlePauseConfirmCallback,
   registerCallbackHandlers,
+  resolveCallbackOriginChatId,
   updateOrReplyMessage,
   validateCallbackData,
   validatePauseConfirmData,
   type CallbackActionType,
+  type CallbackOriginChatResult,
   type CallbackValidationResult,
+  type PendingPauseConfirmation,
   type ValidCallbackAction,
 } from "./callbacks.js";
 export {
@@ -235,11 +241,17 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
     return false;
   };
 
+  const pauseConfirmStore = deps.pauseConfirmStore ?? new PauseConfirmStore();
+  const effectiveDeps: BotDeps = {
+    ...deps,
+    pauseConfirmStore,
+  };
+
   const modules = registeredCommands();
   for (const module of modules) {
     registrar.command(module.command, async (ctx) => {
       if (!withinRateLimit(ctx, module.command)) return;
-      await dispatch(module, ctx, deps);
+      await dispatch(module, ctx, effectiveDeps);
     });
   }
 
@@ -248,10 +260,15 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
   registrar.callbackQuery?.(
     [CALLBACK_PAUSE_CONFIRM, CALLBACK_PAUSE_CANCEL],
     async (ctx: Context) =>
-      handlePauseConfirmCallback(ctx, {
-        config: deps.config,
-        pause: deps.pause ?? (() => "stopped"),
-      }),
+      handlePauseConfirmCallback(
+        ctx,
+        {
+          config: effectiveDeps.config,
+          pause: effectiveDeps.pause ?? (() => "stopped"),
+          pauseConfirmStore,
+        },
+        effectiveDeps.now ? effectiveDeps.now() : undefined,
+      ),
   );
 
   if (typeof registrar.on === "function") {
@@ -348,9 +365,9 @@ export function createBot(deps: BotDeps): Bot {
       ? { botInfo: deps.botInfo, ...clientOptions }
       : clientOptions,
   );
+  registerBroadcastHandlers(bot, deps);
   registerCommandHandlers(bot, deps);
   registerCallbackHandlers(bot, deps);
-  registerBroadcastHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.

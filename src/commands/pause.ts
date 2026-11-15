@@ -34,7 +34,11 @@ export function pauseMessage(result: PollerPauseResult, locale?: Locale): string
 export const pauseCommand = defineCommand({
   command: "pause",
   operatorOnly: true,
-  handler: async (ctx) => {
+  handler: async (ctx, deps) => {
+    if (ctx.chat?.id !== undefined && ctx.from?.id !== undefined) {
+      const now = deps.now ? deps.now() : Date.now();
+      deps.pauseConfirmStore?.record(String(ctx.from.id), String(ctx.chat.id), now);
+    }
     await ctx.reply(PAUSE_PROMPT, {
       ...TELEGRAM_OPTIONS,
       reply_markup: pauseConfirmKeyboard(),
