@@ -21,6 +21,7 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import type { MetricsResetMarker } from "./stellar/metrics.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -82,6 +83,8 @@ export interface HealthReport {
     notificationsSent: number;
     notificationsFailed: number;
     eventsSkipped: number;
+    /** Versioned metrics reset marker persisted across restarts, or null. */
+    resetMarker: MetricsResetMarker | null;
     /** Events suppressed as already-seen across overlapping pages / resumes. */
     eventsDeduplicated: number;
     /**
@@ -308,6 +311,7 @@ export function buildHealthReport(
       notificationsSent: poller.notificationsSent,
       notificationsFailed: poller.notificationsFailed,
       eventsSkipped: poller.eventsSkipped,
+      resetMarker: poller.resetMarker ? { ...poller.resetMarker } : null,
       eventsDeduplicated: poller.eventsDeduplicated ?? 0,
       activity: poller.activityBaseline ?? emptyActivityBaseline(),
       notificationsDropped: poller.notificationsDropped ?? 0,
@@ -398,6 +402,14 @@ export function buildMetricsReport(
     `# HELP mimir_telegram_events_skipped_total Total number of events skipped (unrecognized, unformatted, or rate-limited)`,
     `# TYPE mimir_telegram_events_skipped_total counter`,
     `mimir_telegram_events_skipped_total{network="${network}"} ${poller.eventsSkipped}`,
+    ``,
+    `# HELP mimir_telegram_metrics_reset_generation Monotonic metrics reset generation persisted across restarts`,
+    `# TYPE mimir_telegram_metrics_reset_generation gauge`,
+    `mimir_telegram_metrics_reset_generation{network="${network}"} ${poller.resetMarker?.resetGeneration ?? 1}`,
+    ``,
+    `# HELP mimir_telegram_metrics_retained_epoch Monotonic epoch of retained cumulative counters`,
+    `# TYPE mimir_telegram_metrics_retained_epoch gauge`,
+    `mimir_telegram_metrics_retained_epoch{network="${network}"} ${poller.resetMarker?.retainedEpoch ?? 1}`,
     ``,
     `# HELP mimir_telegram_consecutive_failures Current number of consecutive failed poll cycles`,
     `# TYPE mimir_telegram_consecutive_failures gauge`,

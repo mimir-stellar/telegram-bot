@@ -30,6 +30,7 @@ import path from "node:path";
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import type { MetricsResetMarker } from "./stellar/metrics.js";
 
 /** Bumped when the shape of the snapshot changes incompatibly. */
 export const STATUS_SCHEMA_VERSION = 1;
@@ -128,6 +129,8 @@ export interface StatusSnapshot {
   sinceStart: PollerCounterSnapshot;
   /** Cumulative counter values persisted across restarts for the current contract IDs. */
   cumulative: PollerCounterSnapshot;
+  /** Versioned metrics reset marker persisted alongside retained counters, or null. */
+  resetMarker: MetricsResetMarker | null;
   /** Suppressed by the bounded dedup window as already-processed. */
   eventsDeduplicated: number;
   /** Cursors automatically rewound to the RPC's retained floor this run. */
@@ -196,6 +199,7 @@ export function buildStatusSnapshot(
     eventsSkipped: status.eventsSkipped,
     sinceStart,
     cumulative,
+    resetMarker: status.resetMarker ? { ...status.resetMarker } : null,
     eventsDeduplicated: status.eventsDeduplicated ?? 0,
     cursorRewinds: status.cursorRewinds ?? 0,
     consecutiveFailures: status.consecutiveFailures,

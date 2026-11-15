@@ -25,6 +25,13 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import {
+  isValidMetricsResetMarker,
+  loadAndAdvanceMetricsResetMarker,
+  type MetricsResetMarker,
+  type MetricsResetReason,
+} from "./stellar/metrics.js";
+
 // ── Metric types ──────────────────────────────────────────────────────────────
 
 export interface Counter {
@@ -39,6 +46,24 @@ export interface Gauge {
   set(value: number): void;
   /** Current value. */
   value(): number;
+}
+
+export interface CreateMetricsOptions {
+  /** Optional initial versioned reset marker to expose on creation. */
+  resetMarker?: MetricsResetMarker;
+}
+
+/** Versioned reset-marker controller exposed by {@link MetricsRegistry}. */
+export interface MetricsResetMarkerControl {
+  /** Current reset marker snapshot, or `null` when none has been attached yet. */
+  get(): MetricsResetMarker | null;
+  /** Attach or update the active reset marker and sync exposition gauges. */
+  set(marker: MetricsResetMarker): void;
+  /** Load, advance, and atomically persist a standalone reset marker file. */
+  loadAndAdvance(
+    filePath: string,
+    options?: { reason?: MetricsResetReason; now?: () => number },
+  ): Promise<{ marker: MetricsResetMarker; corrupted: boolean; persisted: boolean }>;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -89,6 +114,12 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** Monotonic metrics reset generation persisted across restarts (`0` until loaded). */
+  metricsResetGeneration: Gauge;
+  /** Monotonic retained-counter epoch (`0` until loaded; increments when retained counters reset). */
+  metricsRetainedEpoch: Gauge;
+  /** Versioned metrics reset marker state and persistence helper. */
+  resetMarker: MetricsResetMarkerControl;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -146,7 +177,7 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
-export function createMetrics(): MetricsRegistry {
+export function createMetrics(options: CreateMetricsOptions = {}): MetricsRegistry {
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -195,6 +226,28 @@ export function createMetrics(): MetricsRegistry {
     `${METRICS_PREFIX}activity_anomalies_total`,
     "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
   );
+  const metricsResetGeneration = makeGauge(
+    `${METRICS_PREFIX}metrics_reset_generation`,
+    "Monotonic metrics reset generation persisted across process restarts (0 before marker load).",
+  );
+  const metricsRetainedEpoch = makeGauge(
+    `${METRICS_PREFIX}metrics_retained_epoch`,
+    "Monotonic epoch of retained cumulative counters (increments only when retained counters reset).",
+  );
+
+  let currentResetMarker: MetricsResetMarker | null = null;
+  function setResetMarker(marker: MetricsResetMarker): void {
+    if (!isValidMetricsResetMarker(marker)) {
+      throw new RangeError("Invalid MetricsResetMarker");
+    }
+    currentResetMarker = { ...marker };
+    metricsResetGeneration.set(marker.resetGeneration);
+    metricsRetainedEpoch.set(marker.retainedEpoch);
+  }
+
+  if (options.resetMarker) {
+    setResetMarker(options.resetMarker);
+  }
 
   const counters = [
     pollCycles,
@@ -207,7 +260,13 @@ export function createMetrics(): MetricsRegistry {
     staleCursorEvents,
     activityAnomalies,
   ];
-  const gauges = [consecutiveFailures, lastCycleEvents, activityBaselineEvents];
+  const gauges = [
+    consecutiveFailures,
+    lastCycleEvents,
+    activityBaselineEvents,
+    metricsResetGeneration,
+    metricsRetainedEpoch,
+  ];
 
   function render(): string {
     const lines: string[] = [];
@@ -306,6 +365,17 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    metricsResetGeneration,
+    metricsRetainedEpoch,
+    resetMarker: {
+      get: () => (currentResetMarker ? { ...currentResetMarker } : null),
+      set: (marker) => setResetMarker(marker),
+      async loadAndAdvance(filePath, loadOptions) {
+        const result = await loadAndAdvanceMetricsResetMarker(filePath, loadOptions);
+        setResetMarker(result.marker);
+        return result;
+      },
+    },
     render,
     startServer,
   };

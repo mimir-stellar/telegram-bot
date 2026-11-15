@@ -101,6 +101,13 @@ is the machine-readable signal; the JSON body adds detail.
     "notificationsSent": 12,
     "notificationsFailed": 0,
     "eventsSkipped": 2,
+    "resetMarker": {
+      "version": 1,
+      "resetGeneration": 3,            // increments on every process restart or reset
+      "retainedEpoch": 1,              // increments only when retained counters reset
+      "lastResetAt": "2026-10-19T09:00:00.000Z",
+      "lastResetReason": "process_restart"
+    },
     "eventsDeduplicated": 0,
     "notificationsDropped": 0,
     "cursorRewinds": 0,                // auto floor-rewinds since process start
@@ -317,6 +324,8 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_metrics_reset_generation` | gauge | Monotonic metrics reset generation persisted across restarts (`0` before marker load) |
+| `mimir_bot_metrics_retained_epoch` | gauge | Monotonic epoch of retained cumulative counters (increments only when retained counters reset) |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment

@@ -64,6 +64,11 @@ import {
   type ActivityBaselineSnapshot,
 } from "./activity-baseline.js";
 import type { Metrics } from "./metrics.js";
+import {
+  advanceMetricsResetMarker,
+  isValidMetricsResetMarker,
+  type MetricsResetMarker,
+} from "./stellar/metrics.js";
 import type { SendExtra } from "./bot.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
@@ -258,6 +263,11 @@ export interface CountersFile {
     squadContractId: string;
   };
   counters: PollerCounters;
+  /**
+   * Additive versioned reset marker persisted alongside retained counters so
+   * operators can distinguish a process restart from a real activity drop.
+   */
+  resetMarker?: MetricsResetMarker;
 }
 
 export interface PollerStatus {
@@ -298,6 +308,8 @@ export interface PollerStatus {
   sinceStart?: PollerCounters;
   /** Cumulative counter values persisted across restarts for the current contract IDs. */
   cumulative?: PollerCounters;
+  /** Versioned metrics reset marker persisted across restarts alongside retained counters. */
+  resetMarker?: MetricsResetMarker;
   /** Cumulative empty getEvents pages across all successful target scans. */
   emptyPages: number;
   /** Cumulative pages walked across all successful target scans. */
@@ -1046,6 +1058,9 @@ export function isValidCountersFile(value: unknown): value is CountersFile {
     return false;
   }
   if (!isPlainObject(value.counters)) return false;
+  if (value.resetMarker !== undefined && !isValidMetricsResetMarker(value.resetMarker)) {
+    return false;
+  }
   return (
     isNonNegativeSafeInteger(value.counters.cycles) &&
     isNonNegativeSafeInteger(value.counters.notificationsSent) &&
@@ -1087,6 +1102,9 @@ export function parseCountersFile(raw: string): CountersFile {
       notificationsFailed: parsed.counters.notificationsFailed,
       eventsSkipped: parsed.counters.eventsSkipped,
     },
+    ...(parsed.resetMarker !== undefined
+      ? { resetMarker: { ...parsed.resetMarker } }
+      : {}),
   };
 }
 
@@ -1095,6 +1113,7 @@ export function buildCountersFile(
   contracts: { marketContractId: string; squadContractId: string },
   counters: PollerCounters,
   updatedAt: string,
+  resetMarker?: MetricsResetMarker,
 ): CountersFile {
   return {
     version: COUNTERS_SCHEMA_VERSION,
@@ -1109,6 +1128,7 @@ export function buildCountersFile(
       notificationsFailed: counters.notificationsFailed,
       eventsSkipped: counters.eventsSkipped,
     },
+    ...(resetMarker !== undefined ? { resetMarker: { ...resetMarker } } : {}),
   };
 }
 
@@ -1481,6 +1501,12 @@ export function createPoller(deps: PollerDeps) {
     eventsSkipped: 0,
   };
 
+  let currentResetMarker: MetricsResetMarker = advanceMetricsResetMarker(
+    null,
+    "initial",
+    now(),
+  );
+
   const status: PollerStatus = {
     running: false,
     paused: false,
@@ -1503,6 +1529,7 @@ export function createPoller(deps: PollerDeps) {
       notificationsFailed: 0,
       eventsSkipped: 0,
     },
+    resetMarker: { ...currentResetMarker },
     emptyPages: 0,
     pagesScanned: 0,
     activityBaseline: activityBaseline.snapshot(),
@@ -1532,6 +1559,13 @@ export function createPoller(deps: PollerDeps) {
     },
   };
 
+  function applyResetMarker(marker: MetricsResetMarker): void {
+    currentResetMarker = { ...marker };
+    status.resetMarker = { ...marker };
+    metrics?.resetMarker.set(marker);
+  }
+  applyResetMarker(currentResetMarker);
+
   function syncCounterSnapshots(): void {
     status.sinceStart = { ...sinceStartCounters };
     status.cumulative = {
@@ -1540,6 +1574,7 @@ export function createPoller(deps: PollerDeps) {
       notificationsFailed: status.notificationsFailed,
       eventsSkipped: status.eventsSkipped,
     };
+    status.resetMarker = { ...currentResetMarker };
   }
 
   // One chain tip per poll cycle. An infinite TTL plus a `reset()` at the top
@@ -1606,6 +1641,7 @@ export function createPoller(deps: PollerDeps) {
     } catch (err) {
       const code = (err as NodeJS.ErrnoException | undefined)?.code;
       if (code === "ENOENT") {
+        applyResetMarker(advanceMetricsResetMarker(null, "initial", now()));
         resetCumulativeCounters();
         return;
       }
@@ -1614,6 +1650,7 @@ export function createPoller(deps: PollerDeps) {
         `[poller] could not read counters file at ${countersFile}: ${errorMessage(err)}; starting fresh`,
         { action: "counters_read_failed", countersFile, error: errorMessage(err) },
       );
+      applyResetMarker(advanceMetricsResetMarker(null, "corrupt_state", now()));
       resetCumulativeCounters();
       return;
     }
@@ -1628,15 +1665,26 @@ export function createPoller(deps: PollerDeps) {
         `[poller] counters file at ${countersFile} is corrupt or invalid (${reason}); starting fresh`,
         { action: "counters_corrupt", countersFile, reason },
       );
+      applyResetMarker(advanceMetricsResetMarker(null, "corrupt_state", now()));
       resetCumulativeCounters();
       countersDirty = true;
       return;
     }
 
+    // Legacy v1 files written before resetMarker existed synthesized generation 1.
+    const priorMarker: MetricsResetMarker = parsed.resetMarker ?? {
+      version: 1,
+      resetGeneration: 1,
+      retainedEpoch: 1,
+      lastResetAt: parsed.updatedAt || new Date(now()).toISOString(),
+      lastResetReason: "initial",
+    };
+
     if (
       parsed.contracts.marketContractId !== config.marketContractId ||
       parsed.contracts.squadContractId !== config.squadContractId
     ) {
+      applyResetMarker(advanceMetricsResetMarker(priorMarker, "contract_changed", now()));
       Logger.warn(
         "poller",
         `[poller] counters file contract ids changed ` +
@@ -1650,6 +1698,8 @@ export function createPoller(deps: PollerDeps) {
           marketContractId: config.marketContractId,
           previousSquadContractId: parsed.contracts.squadContractId,
           squadContractId: config.squadContractId,
+          resetGeneration: currentResetMarker.resetGeneration,
+          retainedEpoch: currentResetMarker.retainedEpoch,
         },
       );
       resetCumulativeCounters();
@@ -1657,6 +1707,7 @@ export function createPoller(deps: PollerDeps) {
       return;
     }
 
+    applyResetMarker(advanceMetricsResetMarker(priorMarker, "process_restart", now()));
     status.cycles = parsed.counters.cycles + sinceStartCounters.cycles;
     status.notificationsSent =
       parsed.counters.notificationsSent + sinceStartCounters.notificationsSent;
@@ -1664,16 +1715,18 @@ export function createPoller(deps: PollerDeps) {
       parsed.counters.notificationsFailed + sinceStartCounters.notificationsFailed;
     status.eventsSkipped = parsed.counters.eventsSkipped + sinceStartCounters.eventsSkipped;
     syncCounterSnapshots();
-    countersDirty = false;
+    countersDirty = true;
     Logger.info(
       "poller",
       `[poller] restored counters from ${countersFile}: ` +
         `cycles=${status.cycles} sent=${status.notificationsSent} ` +
-        `failed=${status.notificationsFailed} skipped=${status.eventsSkipped}`,
+        `failed=${status.notificationsFailed} skipped=${status.eventsSkipped} ` +
+        `resetGeneration=${currentResetMarker.resetGeneration}`,
       {
         action: "counters_restored",
         countersFile,
         counters: { ...status.cumulative },
+        resetMarker: { ...currentResetMarker },
       },
     );
   }
@@ -1693,6 +1746,7 @@ export function createPoller(deps: PollerDeps) {
         eventsSkipped: status.eventsSkipped,
       },
       new Date(now()).toISOString(),
+      currentResetMarker,
     );
 
     try {
@@ -3167,6 +3221,7 @@ export function createPoller(deps: PollerDeps) {
           notificationsFailed: status.notificationsFailed,
           eventsSkipped: status.eventsSkipped,
         },
+        resetMarker: { ...currentResetMarker },
         ledgerCache: ledgerCache.stats(),
         suppressedLogs: errorSampler.suppressedTotal(),
         targets: [...state.values()].map((t) => ({ ...t })),

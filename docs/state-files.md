@@ -12,6 +12,7 @@ Operational reference describing all on-disk state files maintained by the Mimir
 | **Dead-Letter Queue File** | `DEAD_LETTER_FILE` | `./data/dead-letter.json` | `src/deadLetter.ts` | Atomic (write temporary file `${DEAD_LETTER_FILE}.tmp` then rename) | Treated as empty queue on boot. If deleted while running, re-created on the next failed send enqueue or persist. Unsent parked messages previously queued are lost unless recovered from backups. | Logged with a warning (`[dead-letter] unreadable queue... starting empty`). Queue initializes empty in memory; subsequent persists overwrite with valid state. |
 | **Audit Trail File** | `AUDIT_FILE` | `./data/audit.jsonl` | `src/audit.ts` | Append (`appendFile` with JSON line per entry) | If absent, automatically created on next append. Historical audit records prior to deletion are lost. | `/audit` skips unreadable/malformed lines (`unreadableLines` count incremented) and processes valid lines. poller append operations continue appending new entries. |
 | **Status Snapshot File** | `STATUS_FILE` | `./data/status.json` | `src/status.ts` | Atomic (write temporary file `${STATUS_FILE}.tmp` then rename) | Harmless to poller loop. Recreated atomically on the next poll cycle. CLI `--status` command will fail to find status until rewritten. | Overwritten atomically on the next poll cycle. External tools or CLI reading corrupt file before next cycle encounter parse errors. |
+| **Counters & Reset Marker File** | `COUNTERS_FILE` | `./data/counters.json` | `src/poller.ts` / `src/stellar/metrics.ts` | Atomic (write temporary file `${COUNTERS_FILE}.tmp` then rename) | Treated as initial boot (`resetGeneration: 1`, `retainedEpoch: 1`, `lastResetReason: "initial"`). Retained cumulative counters start at `0`. | Logged with a warning; starts fresh with `lastResetReason: "corrupt_state"`, `resetGeneration: 1`, and overwrites atomically on the next save. |
 | **Instance Lock File** | `INSTANCE_LOCK_FILE` | `./data/poller.lock` | `src/instanceLock.ts` | Exclusive file creation (`O_EXCL` / `wx` flag via `open`) | Poller will re-acquire lock on next startup if no other instance holds it. During runtime, removal removes concurrency protection against double instances. | Stale or unparseable lock payload (non-JSON, bad schema, or dead PID) is warned and automatically unlinked by next acquiring instance. |
 
 ---
@@ -64,3 +65,15 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Counters & Metrics Reset Marker (`COUNTERS_FILE`)
+- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`loadCounters`, `saveCounters`) and [`src/stellar/metrics.ts`](../src/stellar/metrics.ts) (`loadAndAdvanceMetricsResetMarker`, `writeMetricsResetMarker`)
+- **Default Path**: `./data/counters.json`
+- **Write Pattern**: Atomic write-then-rename (`${file}.tmp` -> `${file}`).
+- **Schema (`version: 1`)**: Persists cumulative counters (`cycles`, `notificationsSent`, `notificationsFailed`, `eventsSkipped`) together with an additive versioned `resetMarker`:
+  - `version`: `1`
+  - `resetGeneration`: monotonic integer incremented on every process restart or counter reset.
+  - `retainedEpoch`: monotonic integer incremented only when retained cumulative counters reset (e.g. `contract_changed` or `corrupt_state`), remaining unchanged across normal restarts.
+  - `lastResetAt`: ISO-8601 timestamp of the latest boot/reset.
+  - `lastResetReason`: `"initial" | "process_restart" | "corrupt_state" | "contract_changed" | "manual_reset"`.
+- **Operator Interpretation**: If notification rate drops to zero while `resetGeneration` stays constant, the chain is genuinely quiet ("real activity drop"). If `resetGeneration` increments while `retainedEpoch` stays constant, the process restarted and retained its cumulative counters. If both increment, cumulative counters were reset.
