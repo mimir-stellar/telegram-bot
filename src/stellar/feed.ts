@@ -12,8 +12,12 @@
  */
 
 import { formatPlainTextEvent, eventExplorerUrl } from "../notifications/format.js";
+import { appUrlFor } from "../notifications/app-links.js";
 import type { DecodedEvent } from "./decode.js";
 import type { StellarConfig } from "../config.js";
+
+/** JSON Feed 1.1 specification URL. */
+export const JSON_FEED_VERSION = "https://jsonfeed.org/version/1.1";
 
 // ---------------------------------------------------------------------------
 // XML escaping
@@ -94,6 +98,26 @@ export interface AtomEntry {
   content: string | null;
   /** RFC 4287 §4.2.7: alternate link (explorer URL), or null when absent. */
   link: string | null;
+  /** Optional safe HTTPS deep link into the Mimir web app when configured. */
+  appLink?: string | null;
+}
+
+export interface JsonFeedItem {
+  id: string;
+  title: string;
+  content_text: string;
+  date_modified: string;
+  url?: string;
+  external_url?: string;
+}
+
+export interface JsonFeedDocument {
+  version: typeof JSON_FEED_VERSION;
+  title: string;
+  description?: string;
+  feed_url?: string;
+  home_page_url?: string;
+  items: JsonFeedItem[];
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +139,8 @@ export interface AtomFeedOptions {
   updatedAt?: string;
   /** Optional subtitle / description for the feed. */
   subtitle?: string;
+  /** Optional Mimir web-app base URL for deep links (`MIMIR_APP_URL`). */
+  mimirAppUrl?: string | null;
 }
 
 /**
@@ -127,7 +153,11 @@ export interface AtomFeedOptions {
  * The link is the explorer URL when one exists.
  * The updated timestamp comes from `event.at` (ledger close time).
  */
-export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): AtomEntry {
+export function buildAtomEntry(
+  event: DecodedEvent,
+  config: StellarConfig,
+  mimirAppUrl?: string | null,
+): AtomEntry {
   const eventName =
     event.payload.name === "unknown"
       ? (event.payload.eventName ?? "unknown")
@@ -152,13 +182,60 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
   const explorerUrl = eventExplorerUrl(config, event);
   const link = explorerUrl ? safeHttpsUrl(explorerUrl) : null;
 
-  return {
+  const resolvedAppBase =
+    mimirAppUrl ?? (config as { mimirAppUrl?: string | null }).mimirAppUrl ?? null;
+  const rawAppUrl = appUrlFor(event, resolvedAppBase);
+  const appLink = rawAppUrl ? safeHttpsUrl(rawAppUrl) : null;
+
+  const result: AtomEntry = {
     id: `tag:mimir,event:${event.eventId}`,
     title,
     updated,
     content,
     link,
   };
+  if (appLink !== null) {
+    result.appLink = appLink;
+  }
+  return result;
+}
+
+/**
+ * Build one JSON Feed 1.1 item from a decoded event.
+ */
+export function buildJsonFeedEntry(
+  event: DecodedEvent,
+  config: StellarConfig,
+  mimirAppUrl?: string | null,
+): JsonFeedItem {
+  const entry = buildAtomEntry(event, config, mimirAppUrl);
+  const cleanedTitle = stripXmlIllegal(entry.title);
+  const titleChars = Array.from(cleanedTitle);
+  const clippedTitle =
+    titleChars.length <= FEED_TITLE_MAX_CHARS
+      ? cleanedTitle
+      : `${titleChars.slice(0, FEED_TITLE_MAX_CHARS - 1).join("")}…`;
+
+  const cleanedContent = entry.content !== null ? stripXmlIllegal(entry.content) : "";
+  const contentChars = Array.from(cleanedContent);
+  const clippedContent =
+    contentChars.length <= FEED_CONTENT_MAX_CHARS
+      ? cleanedContent
+      : `${contentChars.slice(0, FEED_CONTENT_MAX_CHARS - 1).join("")}…`;
+
+  const item: JsonFeedItem = {
+    id: entry.id,
+    title: clippedTitle,
+    content_text: clippedContent,
+    date_modified: entry.updated,
+  };
+  if (entry.link !== null) {
+    item.url = entry.link;
+  }
+  if (entry.appLink) {
+    item.external_url = entry.appLink;
+  }
+  return item;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +252,11 @@ function renderEntry(entry: AtomEntry): string {
       ? `    <link rel="alternate" type="text/html" href="${escapeXml(entry.link)}"/>`
       : "";
 
+  const appLinkEl =
+    entry.appLink
+      ? `    <link rel="related" type="text/html" href="${escapeXml(entry.appLink)}"/>`
+      : "";
+
   const contentEl =
     entry.content !== null
       ? `    <content type="text">${xmlText(entry.content, FEED_CONTENT_MAX_CHARS)}</content>`
@@ -186,6 +268,7 @@ function renderEntry(entry: AtomEntry): string {
     idEl,
     updatedEl,
     linkEl,
+    appLinkEl,
     contentEl,
     "  </entry>",
   ]
@@ -246,10 +329,55 @@ export function buildAtomFeed(
   }
 
   for (const event of events) {
-    const entry = buildAtomEntry(event, config);
+    const entry = buildAtomEntry(event, config, options.mimirAppUrl);
     lines.push(renderEntry(entry));
   }
 
   lines.push("</feed>");
   return lines.join("\n");
+}
+
+/**
+ * Build a complete JSON Feed 1.1 document string from an array of decoded events.
+ */
+export function buildJsonFeed(
+  events: readonly DecodedEvent[],
+  options: AtomFeedOptions,
+): string {
+  const { title, selfUrl, config, subtitle, mimirAppUrl } = options;
+  const cleanedTitle = stripXmlIllegal(title);
+  const titleChars = Array.from(cleanedTitle);
+  const clippedTitle =
+    titleChars.length <= FEED_TITLE_MAX_CHARS
+      ? cleanedTitle
+      : `${titleChars.slice(0, FEED_TITLE_MAX_CHARS - 1).join("")}…`;
+
+  const doc: JsonFeedDocument = {
+    version: JSON_FEED_VERSION,
+    title: clippedTitle,
+    items: events.map((event) => buildJsonFeedEntry(event, config, mimirAppUrl)),
+  };
+
+  if (subtitle) {
+    const cleanedSub = stripXmlIllegal(subtitle);
+    const subChars = Array.from(cleanedSub);
+    doc.description =
+      subChars.length <= FEED_TITLE_MAX_CHARS
+        ? cleanedSub
+        : `${subChars.slice(0, FEED_TITLE_MAX_CHARS - 1).join("")}…`;
+  }
+
+  const validSelfUrl = safeHttpsUrl(selfUrl);
+  if (validSelfUrl !== null) {
+    doc.feed_url = validSelfUrl;
+  }
+
+  const resolvedAppBase =
+    mimirAppUrl ?? (config as { mimirAppUrl?: string | null }).mimirAppUrl ?? null;
+  const validHomeUrl = resolvedAppBase ? safeHttpsUrl(resolvedAppBase) : null;
+  if (validHomeUrl !== null) {
+    doc.home_page_url = validHomeUrl;
+  }
+
+  return `${JSON.stringify(doc, null, 2)}\n`;
 }

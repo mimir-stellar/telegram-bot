@@ -184,6 +184,13 @@ Thin wrapper around Stellar SDK's `rpc.Server` with explorer URL helpers.
 - **Unauthenticated**: Public Testnet RPC requires no keys
 - **HTTP-aware**: Allows HTTP for local quickstart containers
 
+### Event Feeds and Offline Preview (`src/stellar/feed.ts`, `src/feed-preview-cli.ts`)
+
+Builds bounded, escaped syndication feeds from decoded Mimir events without external XML dependencies:
+
+- **Formats**: Atom 1.0 (`buildAtomFeed`) and JSON Feed 1.1 (`buildJsonFeed`), including validated HTTPS explorer links and optional Mimir web-app deep links (`src/notifications/app-links.ts`).
+- **Offline preview (`npm run feed:preview`)**: Validates local event archive directories (`events-*.jsonl`), `.jsonl` captures, or `mimir-scan-v1` JSON reports, revives atomic `bigint` amounts, and writes Atom or JSON Feed output with no `BOT_TOKEN` requirement and zero live network requests.
+
 ## Data Flow
 
 ### Event Processing Pipeline
