@@ -277,6 +277,8 @@ export interface BotConfig extends StellarConfig {
   telegramSendTimeoutMs: number;
   /** Alias of `telegramSendTimeoutMs` accepted from hand-built configs. */
   sendTimeoutMs?: number;
+  /** Global cap on concurrent outbound Telegram API sends across all routes. */
+  telegramMaxConcurrentSends?: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
   /** Show Telegram link previews on market notifications (LINK_PREVIEW_MARKET). */
@@ -313,6 +315,10 @@ export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 
 /** Fallback per-send budget when a config object predates `TELEGRAM_SEND_TIMEOUT_MS`. */
 export const DEFAULT_TELEGRAM_SEND_TIMEOUT_MS = 10_000;
+
+/** Default and upper bound for `TELEGRAM_MAX_CONCURRENT_SENDS`. */
+export const DEFAULT_TELEGRAM_MAX_CONCURRENT_SENDS = 4;
+export const MAX_TELEGRAM_MAX_CONCURRENT_SENDS = 32;
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -363,6 +369,7 @@ const DEFAULTS = {
   // Bounded so one wedged Telegram send cannot stall the poll loop; long
   // enough for a normal API round-trip on a slow link.
   telegramSendTimeoutMs: DEFAULT_TELEGRAM_SEND_TIMEOUT_MS,
+  telegramMaxConcurrentSends: DEFAULT_TELEGRAM_MAX_CONCURRENT_SENDS,
   channelPreviewMode: false,
   linkPreviewMarket: false,
   linkPreviewSquad: false,
@@ -628,7 +635,7 @@ function collector(profile: Record<string, string>) {
       return value;
     },
 
-    int(name: string, fallback: number, min: number): number {
+    int(name: string, fallback: number, min: number, max?: number): number {
       const raw = read(name);
       if (raw === undefined) return fallback;
       const parsed = Number(raw);
@@ -638,6 +645,10 @@ function collector(profile: Record<string, string>) {
       }
       if (parsed < min) {
         problems.push(`${name} must be >= ${min}; got ${parsed}`);
+        return fallback;
+      }
+      if (max !== undefined && parsed > max) {
+        problems.push(`${name} must be <= ${max}; got ${parsed}`);
         return fallback;
       }
       return parsed;
@@ -959,6 +970,12 @@ export function loadConfig(): BotConfig {
       DEFAULTS.telegramSendTimeoutMs,
       0,
     ),
+    telegramMaxConcurrentSends: c.int(
+      "TELEGRAM_MAX_CONCURRENT_SENDS",
+      DEFAULTS.telegramMaxConcurrentSends,
+      1,
+      MAX_TELEGRAM_MAX_CONCURRENT_SENDS,
+    ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
     linkPreviewMarket: c.bool("LINK_PREVIEW_MARKET", DEFAULTS.linkPreviewMarket),
     linkPreviewSquad: c.bool("LINK_PREVIEW_SQUAD", DEFAULTS.linkPreviewSquad),
@@ -1149,6 +1166,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "STARTUP_HEALTH_RETRY_MS", secret: false, hasBuiltInDefault: true },
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "TELEGRAM_SEND_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
+  { key: "TELEGRAM_MAX_CONCURRENT_SENDS", secret: false, hasBuiltInDefault: true },
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_MARKET", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_SQUAD", secret: false, hasBuiltInDefault: true },

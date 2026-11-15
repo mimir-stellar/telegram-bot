@@ -14,6 +14,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Telegram Settings
 - `BOT_TOKEN`: The API token for the Telegram bot. Required.
 - `TELEGRAM_CHAT_ID`: The numeric ID or `@channelusername` where notifications are posted. Required.
+- `TELEGRAM_MAX_CONCURRENT_SENDS`: Bounded global concurrency limit shared across all outbound Telegram destination routes (`1`–`32`, default `4`). Prevents parallel route sends and operator notifications from exceeding Telegram API rate ceilings, and allows shutdown to deterministically drain or cancel queued sends.
 - `MIMIR_LOCALE`: Language for bot replies and notifications. Supported: `en` (default) and `es`; region tags such as `es-MX` resolve to the base language. Any other value fails fast at startup. See [Translator Guide](translating.md).
 
 ### Mimir Contract Settings

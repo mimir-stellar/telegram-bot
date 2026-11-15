@@ -64,7 +64,10 @@ import {
   type ActivityBaselineSnapshot,
 } from "./activity-baseline.js";
 import type { Metrics } from "./metrics.js";
-import type { SendExtra } from "./bot.js";
+import {
+  TelegramSendLimiterCancelledError,
+  type SendExtra,
+} from "./bot.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
 import { EventDedupWindow } from "./dedup.js";
@@ -2214,6 +2217,9 @@ export function createPoller(deps: PollerDeps) {
           }
         }
       } catch (err) {
+        if (sendJournal && err instanceof TelegramSendLimiterCancelledError) {
+          await sendJournal.recordCancelled(event.eventId).catch(() => {});
+        }
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.

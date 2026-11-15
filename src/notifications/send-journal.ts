@@ -2,14 +2,15 @@
  * Crash-safe send journal for Telegram notifications.
  *
  * Before a send is attempted the poller appends an `intent` line; after the
- * send succeeds it appends a matching `done` line. On restart, lines that carry
- * an `intent` but no `done` identify notifications that may or may not have
- * been delivered -- instead of guessing from the cursor.
+ * send succeeds it appends a matching `done` line. If a queued send is
+ * deterministically cancelled before reaching Telegram (for example during
+ * concurrency-limiter shutdown), `recordCancelled` settles the intent so a
+ * restart does not mistake an unsent queued item for a maybe-sent crash.
  *
  * Every append is fsynced before it returns, so a journal entry survives an
  * abrupt termination. The file is JSONL and is kept bounded by compaction:
- * resolved (`intent` + `done`) pairs are dropped, leaving only unresolved
- * intents.
+ * resolved (`intent` + `done` / `cancelled`) pairs are dropped, leaving only
+ * unresolved intents.
  *
  * The journal is best-effort: a write failure is logged and the poller carries
  * on, falling back to guessing from the cursor exactly as it does today.
@@ -22,7 +23,7 @@ export const DEFAULT_SEND_JOURNAL_MAX_ENTRIES = 1_000;
 export const DEFAULT_SEND_JOURNAL_MAX_BYTES = 1_000_000;
 
 export interface JournalEntry {
-  kind: "intent" | "done";
+  kind: "intent" | "done" | "cancelled";
   id: string;
   source: string;
   ledger: number;
@@ -54,7 +55,9 @@ export interface SendJournal {
     at: number;
   }): Promise<void>;
   recordDone(id: string): Promise<void>;
-  /** Intents with no matching done: notifications that may have been sent. */
+  /** Settle an intent that was cancelled in the local queue before any HTTP send ran. */
+  recordCancelled(id: string): Promise<void>;
+  /** Intents with no matching done/cancelled: notifications that may have been sent. */
   loadPending(): Promise<JournalEntry[]>;
   compact(): Promise<void>;
   stats(): Promise<SendJournalStats>;
@@ -138,6 +141,13 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     }
   }
 
+  async function maybeCompact(): Promise<void> {
+    const currentStats = await journalStats();
+    if (currentStats.entries > maxEntries || currentStats.bytes > maxBytes) {
+      await compact();
+    }
+  }
+
   async function recordIntent(entry: {
     id: string;
     source: string;
@@ -153,30 +163,36 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     await append({ kind: "done", id, source: "", ledger: 0, eventName: "", at: now() });
     // Once a send is accounted for, compact resolved pairs away when the file
     // has grown past its budget so the journal stays bounded.
-    const stats = await journalStats();
-    if (stats.entries > maxEntries || stats.bytes > maxBytes) {
-      await compact();
+    await maybeCompact();
+  }
+
+  async function recordCancelled(id: string): Promise<void> {
+    await append({ kind: "cancelled", id, source: "", ledger: 0, eventName: "", at: now() });
+    await maybeCompact();
+  }
+
+  function collectSettledIds(entries: readonly JournalEntry[]): Set<string> {
+    const settled = new Set<string>();
+    for (const entry of entries) {
+      if (entry.kind === "done" || entry.kind === "cancelled") {
+        settled.add(entry.id);
+      }
     }
+    return settled;
   }
 
   async function loadPending(): Promise<JournalEntry[]> {
     const entries = await readLines();
-    const done = new Set<string>();
-    for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
-    }
-    return entries.filter((e) => e.kind === "intent" && !done.has(e.id));
+    const settled = collectSettledIds(entries);
+    return entries.filter((e) => e.kind === "intent" && !settled.has(e.id));
   }
 
   async function compact(): Promise<void> {
     const entries = await readLines();
-    const done = new Set<string>();
-    for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
-    }
-    // A done line settles its intent: both lines can be dropped. Keep only
-    // unresolved intents.
-    const unresolved = entries.filter((e) => e.kind === "intent" && !done.has(e.id));
+    const settled = collectSettledIds(entries);
+    // A done or cancelled line settles its intent: both lines can be dropped.
+    // Keep only unresolved intents.
+    const unresolved = entries.filter((e) => e.kind === "intent" && !settled.has(e.id));
     await persist(unresolved);
   }
 
@@ -199,5 +215,5 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     return journalStats();
   }
 
-  return { recordIntent, recordDone, loadPending, compact, stats };
+  return { recordIntent, recordDone, recordCancelled, loadPending, compact, stats };
 }

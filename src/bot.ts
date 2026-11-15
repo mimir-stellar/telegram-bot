@@ -368,9 +368,23 @@ export function createBot(deps: BotDeps): Bot {
 // existing imports from "bot.js" keep resolving without modification.
 export {
   createNotifier,
+  createTelegramSendLimiter,
+  DEFAULT_TELEGRAM_MAX_CONCURRENT_SENDS,
+  DEFAULT_TELEGRAM_SEND_MAX_QUEUE,
   isMarkdownParseError,
+  MAX_TELEGRAM_MAX_CONCURRENT_SENDS,
+  MIN_TELEGRAM_MAX_CONCURRENT_SENDS,
   notifierSkips,
+  TelegramSendLimiterCancelledError,
+  type Notifier,
+  type NotifierOptions,
   type SendExtra,
+  type TelegramSendCancelResult,
+  type TelegramSendDrainResult,
+  type TelegramSendLimiter,
+  type TelegramSendLimiterOptions,
+  type TelegramSendLimiterState,
+  type TelegramSendLimiterStats,
 } from "./notifications/notifier.js";
 
 /** Registers the command list so Telegram's UI offers autocompletion. */

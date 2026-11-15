@@ -24,7 +24,13 @@ import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
 import { attachConsole, createLogCapture, Logger, secretsFor } from "./logger.js";
-import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
+import {
+  createBot,
+  createNotifier,
+  createTelegramSendLimiter,
+  registerCommands,
+  type SendExtra,
+} from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
@@ -252,13 +258,19 @@ async function main(): Promise<void> {
       detail: `network=${networkLabel(config)} poll=${config.pollIntervalMs}ms`,
     }),
   );
+  const sendLimiter = createTelegramSendLimiter({
+    maxConcurrent: config.telegramMaxConcurrentSends,
+  });
   const poller = createPoller({
     config,
     server,
     send: (text, source, extra) => notify(text, source, extra),
     notifyOperator: config.operatorTelegramUserId
       ? async (text: string) => {
-          await bot.api.sendMessage(config.operatorTelegramUserId!, text);
+          await sendLimiter.run(
+            () => bot.api.sendMessage(config.operatorTelegramUserId!, text),
+            { route: "operator" },
+          );
         }
       : undefined,
     audit,
@@ -272,7 +284,7 @@ async function main(): Promise<void> {
     resume: () => poller.resume(),
     logs: logCapture,
   });
-  notify = createNotifier(bot, config);
+  notify = createNotifier(bot, config, { limiter: sendLimiter });
 
   // Webhook mode only accepts updates carrying this per-process secret, so a
   // reachable health port cannot be used to inject fake Telegram updates.
@@ -370,6 +382,12 @@ async function main(): Promise<void> {
     void (async () => {
       try {
         const result = await poller.shutdown();
+        if (result.drained) {
+          const remainingMs = Math.max(0, config.shutdownTimeoutMs - result.waitedMs);
+          await sendLimiter.drain({ timeoutMs: remainingMs });
+        } else {
+          sendLimiter.cancelPending("shutdown_timeout");
+        }
         Logger.info(
           "shutdown",
           `[shutdown] poller ${result.drained ? "drained" : "hit the drain deadline"}; ` +
