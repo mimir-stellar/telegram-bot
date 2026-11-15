@@ -85,6 +85,114 @@ export function parseUsdcThreshold(text: string): bigint {
   return whole * 10_000_000n + frac;
 }
 
+/** Distinct diagnostic reason returned by {@link evaluateThresholdDryRun}. */
+export type ThresholdDiagnosticReason =
+  | "matched"
+  | "not_applicable"
+  | "false_predicate"
+  | "missing_field";
+
+/** Structured dry-run diagnostic for amount-threshold evaluation. */
+export interface ThresholdDryRunResult {
+  allowed: boolean;
+  reason: ThresholdDiagnosticReason;
+  field?: "stake" | "amount";
+  detail: string;
+}
+
+/**
+ * Evaluates whether an event meets the configured amount thresholds in dry-run mode,
+ * distinguishing missing amount fields (`reason: "missing_field"`) from present
+ * amounts below the configured threshold (`reason: "false_predicate"`).
+ */
+export function evaluateThresholdDryRun(
+  event: DecodedEvent,
+  thresholds?: AmountThresholds,
+): ThresholdDryRunResult {
+  if (!thresholds) {
+    return {
+      allowed: true,
+      reason: "not_applicable",
+      detail: "No amount thresholds configured",
+    };
+  }
+
+  const payload = event.payload as Record<string, unknown>;
+  if (event.payload.name === "claim_challenged") {
+    const minStake = thresholds.marketChallenge;
+    if (minStake === undefined || minStake <= 0n) {
+      return {
+        allowed: true,
+        reason: "not_applicable",
+        field: "stake",
+        detail: "No active marketChallenge threshold configured",
+      };
+    }
+    if (!Object.prototype.hasOwnProperty.call(payload, "stake") || typeof payload.stake !== "bigint") {
+      return {
+        allowed: false,
+        reason: "missing_field",
+        field: "stake",
+        detail: 'Field "stake" is missing on event "claim_challenged"',
+      };
+    }
+    if (payload.stake >= minStake) {
+      return {
+        allowed: true,
+        reason: "matched",
+        field: "stake",
+        detail: `Predicate "stake >= ${minStake.toString()}" matched`,
+      };
+    }
+    return {
+      allowed: false,
+      reason: "false_predicate",
+      field: "stake",
+      detail: `Predicate "stake >= ${minStake.toString()}" evaluated to false`,
+    };
+  }
+
+  if (event.payload.name === "deposited") {
+    const minAmount = thresholds.squadDeposit;
+    if (minAmount === undefined || minAmount <= 0n) {
+      return {
+        allowed: true,
+        reason: "not_applicable",
+        field: "amount",
+        detail: "No active squadDeposit threshold configured",
+      };
+    }
+    if (!Object.prototype.hasOwnProperty.call(payload, "amount") || typeof payload.amount !== "bigint") {
+      return {
+        allowed: false,
+        reason: "missing_field",
+        field: "amount",
+        detail: 'Field "amount" is missing on event "deposited"',
+      };
+    }
+    if (payload.amount >= minAmount) {
+      return {
+        allowed: true,
+        reason: "matched",
+        field: "amount",
+        detail: `Predicate "amount >= ${minAmount.toString()}" matched`,
+      };
+    }
+    return {
+      allowed: false,
+      reason: "false_predicate",
+      field: "amount",
+      detail: `Predicate "amount >= ${minAmount.toString()}" evaluated to false`,
+    };
+  }
+
+  return {
+    allowed: true,
+    reason: "not_applicable",
+    detail: `No amount threshold applies to event "${String(payload.name ?? "unknown")}"`,
+  };
+}
+
 /**
  * Evaluates whether an event meets the configured amount thresholds.
  *
@@ -97,25 +205,5 @@ export function meetsThreshold(
   event: DecodedEvent,
   thresholds?: AmountThresholds,
 ): boolean {
-  if (!thresholds) {
-    return true;
-  }
-
-  if (event.payload.name === "claim_challenged") {
-    const minStake = thresholds.marketChallenge;
-    if (minStake === undefined || minStake <= 0n) {
-      return true;
-    }
-    return event.payload.stake >= minStake;
-  }
-
-  if (event.payload.name === "deposited") {
-    const minAmount = thresholds.squadDeposit;
-    if (minAmount === undefined || minAmount <= 0n) {
-      return true;
-    }
-    return event.payload.amount >= minAmount;
-  }
-
-  return true;
+  return evaluateThresholdDryRun(event, thresholds).allowed;
 }

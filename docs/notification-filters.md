@@ -153,3 +153,18 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_created` events**: Muted by `eventAllowedByCategory` because `config.notificationCategories` is non-empty (`["__none__"]`) and no real on-chain claim category matches `"__none__"`.
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
+
+---
+
+## 4. Dry-Run Diagnostics: Missing Fields vs. False Predicates
+
+Programmatic filter expression and amount-threshold utilities in [`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts) and [`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts) expose dry-run diagnostic evaluators alongside the live boolean predicates:
+
+- **Live evaluation (`evaluateFilterRule`, `meetsThreshold`)**: Returns `boolean` (`true` to allow, `false` to deny). Any comparison against an absent, `undefined`, or `null` payload field evaluates to `false`, preserving fail-closed predicate evaluation without throwing.
+- **Dry-run evaluation (`evaluateFilterRuleDryRun`, `evaluateThresholdDryRun`)**: Preserves the exact live `allowed` boolean while exposing a structured `reason`:
+  - `"matched"`: The rule or threshold matched the event.
+  - `"not_applicable"` *(thresholds only)*: No active threshold applies to the event.
+  - `"event_name_mismatch"` *(filter expressions only)*: `rule.eventName` did not match `event.payload.name`.
+  - `"false_predicate"`: The referenced payload field(s) existed and evaluated to `false` (listed in `failedPredicates`).
+  - `"missing_field"`: Denial depended on one or more payload fields absent/`null`/`undefined` on the event (listed in `missingFields`).
+

@@ -721,8 +721,235 @@ export function parseFilterExpression(input: string): FilterRule {
 }
 
 // ----------------------------------------------------
-// Evaluator
+// Evaluator & Dry-Run Diagnostics
 // ----------------------------------------------------
+
+/** Distinct outcome reason exposed in dry-run mode. */
+export type FilterDiagnosticReason =
+  | "matched"
+  | "event_name_mismatch"
+  | "false_predicate"
+  | "missing_field";
+
+/** Leaf-level comparison outcome recorded during dry-run evaluation. */
+export interface FilterPredicateDiagnostic {
+  field: string;
+  op: ComparisonOp;
+  matched: boolean;
+  reason: "matched" | "false_predicate" | "missing_field";
+  detail: string;
+}
+
+/** Structured dry-run evaluation result distinguishing missing fields from false predicates. */
+export interface FilterDryRunResult {
+  /** Exact live allow-or-deny outcome (`evaluateFilterRule(rule, event)`). */
+  allowed: boolean;
+  /** Primary diagnostic reason for the dry-run outcome. */
+  reason: FilterDiagnosticReason;
+  /** Deduplicated field names missing (`undefined`, `null`, or absent) on the event payload. */
+  missingFields: string[];
+  /** Formatted predicates whose field existed on the payload and evaluated to `false`. */
+  failedPredicates: string[];
+  /** Ordered leaf diagnostics evaluated across the condition AST. */
+  predicates: FilterPredicateDiagnostic[];
+  /** Human-readable diagnostic summary. */
+  detail: string;
+}
+
+function hasPayloadField(payload: Record<string, unknown>, field: string): boolean {
+  if (!Object.prototype.hasOwnProperty.call(payload, field)) {
+    return false;
+  }
+  const value = payload[field];
+  return value !== undefined && value !== null;
+}
+
+function formatLiteralValue(literal: LiteralValue): string {
+  switch (literal.kind) {
+    case "string":
+      return JSON.stringify(literal.value);
+    case "number":
+      return String(literal.value);
+    case "boolean":
+      return String(literal.value);
+    case "usdc":
+      return literal.rawDecimal;
+  }
+}
+
+type TriState = "true" | "false" | "missing";
+
+function evaluateNodeDryRun(
+  node: ExprNode,
+  payload: Record<string, unknown>,
+  eventLabel: string,
+  predicates: FilterPredicateDiagnostic[],
+  missingSet: Set<string>,
+  failedPredicates: string[],
+): { matched: boolean; triState: TriState } {
+  if (node.type === "logical") {
+    const left = evaluateNodeDryRun(
+      node.left,
+      payload,
+      eventLabel,
+      predicates,
+      missingSet,
+      failedPredicates,
+    );
+    const right = evaluateNodeDryRun(
+      node.right,
+      payload,
+      eventLabel,
+      predicates,
+      missingSet,
+      failedPredicates,
+    );
+
+    if (node.op === "and") {
+      const matched = left.matched && right.matched;
+      let triState: TriState;
+      if (left.triState === "true" && right.triState === "true") {
+        triState = "true";
+      } else if (left.triState === "false" || right.triState === "false") {
+        triState = "false";
+      } else {
+        triState = "missing";
+      }
+      return { matched, triState };
+    }
+
+    const matched = left.matched || right.matched;
+    let triState: TriState;
+    if (left.triState === "true" || right.triState === "true") {
+      triState = "true";
+    } else if (left.triState === "false" && right.triState === "false") {
+      triState = "false";
+    } else {
+      triState = "missing";
+    }
+    return { matched, triState };
+  }
+
+  const predicateLabel = `${node.field} ${node.op} ${formatLiteralValue(node.value)}`;
+  if (!hasPayloadField(payload, node.field)) {
+    missingSet.add(node.field);
+    predicates.push({
+      field: node.field,
+      op: node.op,
+      matched: false,
+      reason: "missing_field",
+      detail: `Field "${node.field}" is missing on event "${eventLabel}"`,
+    });
+    return { matched: false, triState: "missing" };
+  }
+
+  const matched = compareValues(payload[node.field], node.op, node.value);
+  if (matched) {
+    predicates.push({
+      field: node.field,
+      op: node.op,
+      matched: true,
+      reason: "matched",
+      detail: `Predicate "${predicateLabel}" matched`,
+    });
+    return { matched: true, triState: "true" };
+  }
+
+  failedPredicates.push(predicateLabel);
+  predicates.push({
+    field: node.field,
+    op: node.op,
+    matched: false,
+    reason: "false_predicate",
+    detail: `Predicate "${predicateLabel}" evaluated to false`,
+  });
+  return { matched: false, triState: "false" };
+}
+
+/**
+ * Evaluates a parsed {@link FilterRule} in dry-run mode, reporting missing event
+ * fields (`reason: "missing_field"`) distinctly from present fields whose
+ * predicate evaluated to `false` (`reason: "false_predicate"`).
+ *
+ * The `allowed` boolean always matches {@link evaluateFilterRule} live allow/deny behavior.
+ */
+export function evaluateFilterRuleDryRun(
+  rule: FilterRule,
+  event: DecodedEvent,
+): FilterDryRunResult {
+  const payload = event.payload as Record<string, unknown>;
+  const eventLabel = typeof payload.name === "string" && payload.name.length > 0
+    ? payload.name
+    : "unknown";
+
+  if (rule.eventName && rule.eventName !== payload.name) {
+    return {
+      allowed: false,
+      reason: "event_name_mismatch",
+      missingFields: [],
+      failedPredicates: [],
+      predicates: [],
+      detail: `Event "${eventLabel}" does not match expected event "${rule.eventName}"`,
+    };
+  }
+
+  if (!rule.condition) {
+    return {
+      allowed: true,
+      reason: "matched",
+      missingFields: [],
+      failedPredicates: [],
+      predicates: [],
+      detail: rule.eventName
+        ? `Matched event "${rule.eventName}" (unconditional)`
+        : "Matched event (unconditional)",
+    };
+  }
+
+  const predicates: FilterPredicateDiagnostic[] = [];
+  const missingSet = new Set<string>();
+  const failedPredicates: string[] = [];
+  const outcome = evaluateNodeDryRun(
+    rule.condition,
+    payload,
+    eventLabel,
+    predicates,
+    missingSet,
+    failedPredicates,
+  );
+  const missingFields = [...missingSet];
+
+  if (outcome.matched) {
+    return {
+      allowed: true,
+      reason: "matched",
+      missingFields,
+      failedPredicates,
+      predicates,
+      detail: `Filter rule matched event "${eventLabel}"`,
+    };
+  }
+
+  if (outcome.triState === "missing") {
+    return {
+      allowed: false,
+      reason: "missing_field",
+      missingFields,
+      failedPredicates,
+      predicates,
+      detail: `Missing event field(s) [${missingFields.join(", ")}] on event "${eventLabel}"`,
+    };
+  }
+
+  return {
+    allowed: false,
+    reason: "false_predicate",
+    missingFields,
+    failedPredicates,
+    predicates,
+    detail: `Predicate evaluated to false on event "${eventLabel}": ${failedPredicates.join("; ")}`,
+  };
+}
 
 /**
  * Evaluates a parsed FilterRule against a DecodedEvent purely (no eval, no side effects).
@@ -758,12 +985,11 @@ function evaluateNode(node: ExprNode, payload: Record<string, unknown>): boolean
   }
 
   if (node.type === "comparison") {
-    const rawVal = payload[node.field];
-    if (rawVal === undefined || rawVal === null) {
+    if (!hasPayloadField(payload, node.field)) {
       return false;
     }
 
-    return compareValues(rawVal, node.op, node.value);
+    return compareValues(payload[node.field], node.op, node.value);
   }
 
   return false;
