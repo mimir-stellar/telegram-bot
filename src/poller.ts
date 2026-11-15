@@ -351,6 +351,8 @@ export interface PollerStatus {
   /** Result of the startup persistent-volume probe, when reported. */
   persistentVolumeAvailable?: boolean;
   persistentVolumeError?: string | null;
+  /** Rollback details when startup detected a cursor older than backup metadata. */
+  cursorRollback?: CursorRollbackDetails | null;
   targets: TargetState[];
   /** SHA-256 digest of the SBOM generated for this deployment image. */
   sbomDigest: string | null;
@@ -366,9 +368,68 @@ export interface PollerStatus {
 /** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
 export const CURSOR_SCHEMA_VERSION = 1 as const;
 
+export interface CursorRollbackAcknowledgement {
+  /** Monotonic generation of the older snapshot that was restored. */
+  fromGeneration: number;
+  /** High-water monotonic generation observed before the rollback. */
+  previousGeneration: number;
+  /** ISO-8601 timestamp when intended replay was acknowledged. */
+  acknowledgedAt: string;
+}
+
+export interface CursorRollbackTargetDiff {
+  target: string;
+  candidateLedger: number | null;
+  referenceLedger: number | null;
+  replayedLedgers: number | null;
+}
+
+export interface CursorRollbackDetails {
+  candidateGeneration: number;
+  referenceGeneration: number;
+  rolledBackTargets: CursorRollbackTargetDiff[];
+  reason: "generation_behind_backup" | "ledger_behind_backup";
+}
+
+export class CursorRollbackError extends Error {
+  readonly details: CursorRollbackDetails;
+  readonly cursorFile: string;
+
+  constructor(details: CursorRollbackDetails, cursorFile: string) {
+    const targetDesc =
+      details.rolledBackTargets.length > 0
+        ? ` (${details.rolledBackTargets
+            .map(
+              (t) =>
+                `${t.target}:${t.candidateLedger ?? "none"}<${t.referenceLedger ?? "none"}`,
+            )
+            .join(", ")})`
+        : "";
+    super(
+      `cursor rollback detected at ${cursorFile}: generation ${details.candidateGeneration} ` +
+        `is older than recorded backup generation ${details.referenceGeneration}${targetDesc}; ` +
+        `explicit acknowledgement of intended replay is required (--acknowledge-replay or CURSOR_ACKNOWLEDGE_REPLAY=true)`,
+    );
+    this.name = "CursorRollbackError";
+    this.details = details;
+    this.cursorFile = cursorFile;
+  }
+}
+
 export interface CursorFile {
   version: typeof CURSOR_SCHEMA_VERSION;
   updatedAt: string;
+  /**
+   * Monotonic persistence/recovery generation counter (increments on every
+   * cursor write and acknowledged restore). Additive and optional so legacy
+   * cursor files continue to load cleanly.
+   */
+  recoveryGeneration?: number;
+  /**
+   * Present when an operator explicitly acknowledged rolling back behind a
+   * newer generation to replay historical events.
+   */
+  acknowledgedRollback?: CursorRollbackAcknowledgement;
   /**
    * Newest observed chain close time (unix ms). Optional and additive: files
    * written before this field existed load as `null`, and older builds ignore
@@ -543,6 +604,11 @@ export interface PollerDeps {
    * avoid waiting for real wall-clock time.
    */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Explicit acknowledgement of intended historical replay when loading a
+   * cursor file whose monotonic generation is older than `.bak` metadata.
+   */
+  acknowledgeReplay?: boolean;
 }
 
 export interface ShutdownOptions {
@@ -733,6 +799,39 @@ function isNullOrNumber(value: unknown): value is number | null {
   return value === null || (typeof value === "number" && Number.isFinite(value));
 }
 
+function parseRecoveryGeneration(value: unknown, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label}: recoveryGeneration must be a non-negative integer`);
+  }
+  return value;
+}
+
+function parseAcknowledgedRollback(
+  value: unknown,
+): CursorRollbackAcknowledgement | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+  const obj = value as Record<string, unknown>;
+  if (
+    typeof obj.fromGeneration !== "number" ||
+    !Number.isSafeInteger(obj.fromGeneration) ||
+    obj.fromGeneration < 0 ||
+    typeof obj.previousGeneration !== "number" ||
+    !Number.isSafeInteger(obj.previousGeneration) ||
+    obj.previousGeneration < 0 ||
+    typeof obj.acknowledgedAt !== "string" ||
+    obj.acknowledgedAt.length === 0
+  ) {
+    return undefined;
+  }
+  return {
+    fromGeneration: obj.fromGeneration,
+    previousGeneration: obj.previousGeneration,
+    acknowledgedAt: obj.acknowledgedAt,
+  };
+}
+
 /**
  * Strict schema check for persisted cursor state.
  * Valid JSON with the wrong shape is treated as corrupt so we never resume
@@ -743,6 +842,14 @@ export function isValidCursorFile(value: unknown): value is CursorFile {
   const obj = value as Record<string, unknown>;
   if (obj.version !== 1) return false;
   if (obj.updatedAt !== undefined && typeof obj.updatedAt !== "string") return false;
+  if (
+    obj.recoveryGeneration !== undefined &&
+    (typeof obj.recoveryGeneration !== "number" ||
+      !Number.isSafeInteger(obj.recoveryGeneration) ||
+      obj.recoveryGeneration < 0)
+  ) {
+    return false;
+  }
   if (obj.targets === null || typeof obj.targets !== "object" || Array.isArray(obj.targets)) {
     return false;
   }
@@ -797,9 +904,15 @@ export function parseCursorFile(raw: string): CursorFile {
     };
   }
 
+  const rawObj = parsed as unknown as Record<string, unknown>;
+  const recoveryGeneration = parseRecoveryGeneration(rawObj.recoveryGeneration, "cursor file v1");
+  const acknowledgedRollback = parseAcknowledgedRollback(rawObj.acknowledgedRollback);
+
   return {
     version: 1,
     updatedAt: parsed.updatedAt ?? "",
+    ...(recoveryGeneration !== undefined ? { recoveryGeneration } : {}),
+    ...(acknowledgedRollback !== undefined ? { acknowledgedRollback } : {}),
     // Additive field: only present when the file carried it.
     ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
     targets,
@@ -945,7 +1058,14 @@ export function parseAndMigrateCursorFile(
       typeof parsed.updatedAt === "string" && parsed.updatedAt.length > 0
         ? parsed.updatedAt
         : nowIso;
+    const recoveryGeneration = parseRecoveryGeneration(
+      parsed.recoveryGeneration,
+      "cursor file v1",
+    );
+    const acknowledgedRollback = parseAcknowledgedRollback(parsed.acknowledgedRollback);
     const file: CursorFile = { version: CURSOR_SCHEMA_VERSION, updatedAt, targets };
+    if (recoveryGeneration !== undefined) file.recoveryGeneration = recoveryGeneration;
+    if (acknowledgedRollback !== undefined) file.acknowledgedRollback = acknowledgedRollback;
     if (parsed.chainClockAt !== undefined) file.chainClockAt = parseChainClock(parsed.chainClockAt);
     return {
       file,
@@ -998,10 +1118,14 @@ export function buildCursorFile(
   }>,
   updatedAt: string,
   chainClockAt?: number | null,
+  recoveryGeneration?: number,
+  acknowledgedRollback?: CursorRollbackAcknowledgement,
 ): CursorFile {
   return {
     version: CURSOR_SCHEMA_VERSION,
     updatedAt,
+    ...(recoveryGeneration !== undefined ? { recoveryGeneration } : {}),
+    ...(acknowledgedRollback !== undefined ? { acknowledgedRollback } : {}),
     ...(chainClockAt !== undefined ? { chainClockAt } : {}),
     targets: Object.fromEntries(
       [...targets].map((t) => [
@@ -1019,6 +1143,73 @@ export function buildCursorFile(
       ]),
     ),
   };
+}
+
+function targetEffectiveLedger(entry: CursorTarget | undefined): number | null {
+  if (!entry) return null;
+  const cursorLedger = entry.cursor !== null ? eventCursorLedger(entry.cursor) : null;
+  if (cursorLedger !== null && entry.lastEventLedger !== null) {
+    return Math.max(cursorLedger, entry.lastEventLedger);
+  }
+  return cursorLedger ?? entry.lastEventLedger ?? null;
+}
+
+/**
+ * Compare a candidate cursor file against recorded backup/live metadata and
+ * detect whether loading or restoring `candidate` would roll backward behind
+ * `reference` without explicit replay acknowledgement.
+ */
+export function detectCursorRollback(
+  candidate: CursorFile,
+  reference: CursorFile,
+): CursorRollbackDetails | null {
+  const candidateGen = candidate.recoveryGeneration ?? 0;
+  const referenceGen = reference.recoveryGeneration ?? 0;
+
+  // Explicit acknowledgement stamped at >= referenceGen satisfies rollback detection.
+  if (
+    candidate.acknowledgedRollback !== undefined &&
+    candidate.acknowledgedRollback.previousGeneration >= referenceGen &&
+    candidateGen >= referenceGen
+  ) {
+    return null;
+  }
+
+  const rolledBackTargets: CursorRollbackTargetDiff[] = [];
+  for (const [targetName, refEntry] of Object.entries(reference.targets)) {
+    const refLedger = targetEffectiveLedger(refEntry);
+    if (refLedger === null) continue;
+    const candEntry = candidate.targets[targetName];
+    const candLedger = targetEffectiveLedger(candEntry);
+    if (candLedger === null || candLedger < refLedger) {
+      rolledBackTargets.push({
+        target: targetName,
+        candidateLedger: candLedger,
+        referenceLedger: refLedger,
+        replayedLedgers: candLedger !== null ? refLedger - candLedger : null,
+      });
+    }
+  }
+
+  if (referenceGen > 0 && candidateGen < referenceGen) {
+    return {
+      candidateGeneration: candidateGen,
+      referenceGeneration: referenceGen,
+      rolledBackTargets,
+      reason: "generation_behind_backup",
+    };
+  }
+
+  if (referenceGen === 0 && candidateGen === 0 && rolledBackTargets.length > 0) {
+    return {
+      candidateGeneration: 0,
+      referenceGeneration: 0,
+      rolledBackTargets,
+      reason: "ledger_behind_backup",
+    };
+  }
+
+  return null;
 }
 
 function isNonNegativeSafeInteger(value: unknown): value is number {
@@ -1714,11 +1905,33 @@ export function createPoller(deps: PollerDeps) {
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
+  let recoveryGeneration = 0;
+  let pendingAcknowledgedRollback: CursorRollbackAcknowledgement | undefined;
+
+  async function readOptionalBackupMetadata(): Promise<CursorFile | null> {
+    const backupPath = `${config.cursorFile}.bak`;
+    let rawBackup: string;
+    try {
+      rawBackup = await readFile(backupPath, "utf8");
+    } catch {
+      return null;
+    }
+    try {
+      return parseAndMigrateCursorFile(rawBackup, { now: () => new Date(now()) }).file;
+    } catch {
+      return null;
+    }
+  }
+
   async function loadCursors(): Promise<void> {
     let raw: string;
     try {
       raw = await readFile(config.cursorFile, "utf8");
     } catch {
+      const backupMeta = await readOptionalBackupMetadata();
+      if (backupMeta?.recoveryGeneration !== undefined) {
+        recoveryGeneration = Math.max(recoveryGeneration, backupMeta.recoveryGeneration);
+      }
       console.log(
         `[poller] no cursor file at ${config.cursorFile}; cold start ` +
           `${config.startLookbackLedgers} ledgers behind the tip`,
@@ -1726,66 +1939,139 @@ export function createPoller(deps: PollerDeps) {
       return;
     }
 
+    let result: CursorMigrateResult;
     try {
-      const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
-      const parsed = result.file;
-      for (const [source, saved] of Object.entries(parsed.targets)) {
-        const key = source as ContractSource;
-        const target = state.get(key);
-        if (!target) continue;
-        target.cursor = saved.cursor ?? null;
-        target.lastEventLedger = saved.lastEventLedger ?? null;
-        // A rewind that was still pending when the process stopped resumes from
-        // the same floor instead of falling back to a lookback cold start.
-        target.rewindFromLedger = saved.rewindFromLedger ?? null;
-        target.cursorStale = target.rewindFromLedger !== null;
-        // Restore the redelivery window too. Without this a restart would
-        // re-notify the last event the inclusive cursor hands back.
-        dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
-      }
-      // Memory now equals the file; nothing is waiting to be flushed — unless
-      // the file was a legacy shape, which start() rewrites before any cycle.
-      status.pendingFlush = false;
-      if (result.migrated) {
-        pendingRewrite = true;
-        markDirty();
-        console.log(
-          `[poller] migrated cursor file from ${result.source} → ` +
-            `schema v${CURSOR_SCHEMA_VERSION} at ${config.cursorFile}`,
-        );
-      }
-      // Resume the chain clock alongside the cursors. Without this a restart
-      // between two quiet scans would report `unknown` until the next event
-      // happened to land, hiding a perfectly healthy (or long-stalled) chain.
-      status.chainClockAt = parsed.chainClockAt ?? null;
-      audit.record(
-        auditEntry("cursor_loaded", {
-          detail: [...state.values()].map((t) => `${t.source}@${t.cursor ?? "none"}`).join(" "),
-        }),
-      );
-      Logger.info(
-        "poller",
-        `[poller] resumed from ${config.cursorFile}: ` +
-          [...state.values()]
-            .map((t) => `${t.source}@${cursorPreview(t.cursor)}`)
-            .join(" "),
-        {
-          action: "resume",
-          cursorFile: config.cursorFile,
-          targets: [...state.values()].map((t) => ({
-            source: t.source,
-            cursorLedger: t.cursor ? eventCursorLedger(t.cursor) : null,
-            lastEventLedger: t.lastEventLedger,
-            rewindFromLedger: t.rewindFromLedger,
-          })),
-        },
-      );
+      result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
     } catch (err) {
       // Quarantine then cold-start: never wedge on a corrupt state file, and
       // keep the bad bytes for operators instead of overwriting them on save.
       const reason = errorMessage(err);
       await quarantineCorruptCursorFile(config.cursorFile, reason);
+      return;
     }
+
+    const parsed = result.file;
+    const backupMeta = await readOptionalBackupMetadata();
+    if (backupMeta !== null) {
+      const rollback = detectCursorRollback(parsed, backupMeta);
+      if (rollback !== null) {
+        const envAck = /^(?:true|1|yes)$/i.test(
+          (process.env.CURSOR_ACKNOWLEDGE_REPLAY ?? "").trim(),
+        );
+        const configAck =
+          (config as unknown as { acknowledgeCursorReplay?: boolean }).acknowledgeCursorReplay ===
+          true;
+        const replayAcknowledged = deps.acknowledgeReplay === true || configAck || envAck;
+
+        if (!replayAcknowledged) {
+          status.cursorRollback = rollback;
+          const rollbackErr = new CursorRollbackError(rollback, config.cursorFile);
+          Logger.error("poller", `[poller] ${rollbackErr.message}`, {
+            action: "cursor_rollback_rejected",
+            cursorFile: config.cursorFile,
+            candidateGeneration: rollback.candidateGeneration,
+            referenceGeneration: rollback.referenceGeneration,
+            rolledBackTargets: rollback.rolledBackTargets,
+          });
+          audit.recordError(rollbackErr, "boot");
+          throw rollbackErr;
+        }
+
+        status.cursorRollback = rollback;
+        recoveryGeneration = Math.max(
+          recoveryGeneration,
+          parsed.recoveryGeneration ?? 0,
+          backupMeta.recoveryGeneration ?? 0,
+        );
+        pendingAcknowledgedRollback = {
+          fromGeneration: rollback.candidateGeneration,
+          previousGeneration: rollback.referenceGeneration,
+          acknowledgedAt: new Date(now()).toISOString(),
+        };
+        pendingRewrite = true;
+        markDirty();
+        Logger.warn(
+          "poller",
+          `[poller] acknowledged cursor rollback at ${config.cursorFile}: ` +
+            `generation ${rollback.candidateGeneration} -> ${recoveryGeneration + 1} ` +
+            `(was ${rollback.referenceGeneration}); proceeding with intended replay`,
+          {
+            action: "cursor_rollback_acknowledged",
+            cursorFile: config.cursorFile,
+            candidateGeneration: rollback.candidateGeneration,
+            referenceGeneration: rollback.referenceGeneration,
+            rolledBackTargets: rollback.rolledBackTargets,
+          },
+        );
+      }
+    }
+
+    if (pendingAcknowledgedRollback === undefined) {
+      status.cursorRollback = null;
+      recoveryGeneration = Math.max(
+        recoveryGeneration,
+        parsed.recoveryGeneration ?? 0,
+        backupMeta?.recoveryGeneration ?? 0,
+      );
+      if (parsed.acknowledgedRollback !== undefined) {
+        pendingAcknowledgedRollback = parsed.acknowledgedRollback;
+      }
+    }
+
+    for (const [source, saved] of Object.entries(parsed.targets)) {
+      const key = source as ContractSource;
+      const target = state.get(key);
+      if (!target) continue;
+      target.cursor = saved.cursor ?? null;
+      target.lastEventLedger = saved.lastEventLedger ?? null;
+      // A rewind that was still pending when the process stopped resumes from
+      // the same floor instead of falling back to a lookback cold start.
+      target.rewindFromLedger = saved.rewindFromLedger ?? null;
+      target.cursorStale = target.rewindFromLedger !== null;
+      // Restore the redelivery window too. Without this a restart would
+      // re-notify the last event the inclusive cursor hands back.
+      dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
+    }
+    // Memory now equals the file; nothing is waiting to be flushed — unless
+    // the file was a legacy shape or an acknowledged rollback, which start() rewrites before any cycle.
+    if (!pendingRewrite) {
+      status.pendingFlush = false;
+    }
+    if (result.migrated) {
+      pendingRewrite = true;
+      markDirty();
+      console.log(
+        `[poller] migrated cursor file from ${result.source} → ` +
+          `schema v${CURSOR_SCHEMA_VERSION} at ${config.cursorFile}`,
+      );
+    }
+    // Resume the chain clock alongside the cursors. Without this a restart
+    // between two quiet scans would report `unknown` until the next event
+    // happened to land, hiding a perfectly healthy (or long-stalled) chain.
+    status.chainClockAt = parsed.chainClockAt ?? null;
+    audit.record(
+      auditEntry("cursor_loaded", {
+        detail: [...state.values()].map((t) => `${t.source}@${t.cursor ?? "none"}`).join(" "),
+      }),
+    );
+    Logger.info(
+      "poller",
+      `[poller] resumed from ${config.cursorFile}: ` +
+        [...state.values()]
+          .map((t) => `${t.source}@${cursorPreview(t.cursor)}`)
+          .join(" "),
+      {
+        action: "resume",
+        cursorFile: config.cursorFile,
+        recoveryGeneration,
+        targets: [...state.values()].map((t) => ({
+          source: t.source,
+          cursorLedger: t.cursor ? eventCursorLedger(t.cursor) : null,
+          lastEventLedger: t.lastEventLedger,
+          rewindFromLedger: t.rewindFromLedger,
+        })),
+      },
+    );
   }
 
   /**
@@ -1798,6 +2084,7 @@ export function createPoller(deps: PollerDeps) {
   }
 
   async function saveCursors(reason: "cycle" | "shutdown" | "migration"): Promise<boolean> {
+    const nextGeneration = recoveryGeneration + 1;
     const payload = buildCursorFile(
       [...state.values()].map((t) => ({
         source: t.source,
@@ -1808,6 +2095,8 @@ export function createPoller(deps: PollerDeps) {
       })),
       new Date(now()).toISOString(),
       status.chainClockAt,
+      nextGeneration,
+      pendingAcknowledgedRollback,
     );
 
     try {
@@ -1817,6 +2106,7 @@ export function createPoller(deps: PollerDeps) {
       const tmp = `${config.cursorFile}.tmp`;
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, config.cursorFile);
+      recoveryGeneration = nextGeneration;
       // Copy the committed file to the backup. `copyFile` is not atomic
       // cross-filesystem, but the backup is always at least one generation
       // older than the primary — a crash here leaves the primary intact.
@@ -2986,7 +3276,12 @@ export function createPoller(deps: PollerDeps) {
         console.warn(`[poller] could not take instance lock at ${lockFile}: ${errorMessage(err)}`);
       }
 
-      await loadCursors();
+      try {
+        await loadCursors();
+      } catch (err) {
+        await releaseInstanceLock();
+        throw err;
+      }
       await loadCounters();
       // Parked sends from the previous run are part of this run's work.
       await deadLetter.load();

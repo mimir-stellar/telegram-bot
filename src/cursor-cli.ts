@@ -10,7 +10,16 @@ import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import {
+  CursorRollbackError,
+  detectCursorRollback,
+  parseAndMigrateCursorFile,
+  type CursorFile,
+  type CursorRollbackDetails,
+} from "./poller.js";
+
+export { CursorRollbackError, detectCursorRollback };
+export type { CursorRollbackDetails };
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -20,6 +29,25 @@ export interface BackupCursorOptions {
 
 export interface RestoreCursorOptions extends BackupCursorOptions {
   lockFile: string;
+  /**
+   * Required when restoring a cursor backup whose monotonic generation (or
+   * ledger position) sits behind the current live cursor or `.bak` metadata.
+   */
+  acknowledgeReplay?: boolean;
+}
+
+async function readOptionalValidCursor(filePath: string): Promise<CursorFile | null> {
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    return parseAndMigrateCursorFile(raw).file;
+  } catch {
+    return null;
+  }
 }
 
 async function exists(filePath: string): Promise<boolean> {
@@ -86,6 +114,38 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
     if (!options.force && (await exists(options.cursorFile))) {
       throw new Error(`cursor already exists at ${options.cursorFile}; pass --force to replace it`);
     }
+
+    const liveMeta = await readOptionalValidCursor(options.cursorFile);
+    const bakMeta = await readOptionalValidCursor(`${options.cursorFile}.bak`);
+    const references = [liveMeta, bakMeta].filter((item): item is CursorFile => item !== null);
+
+    let worstRollback: CursorRollbackDetails | null = null;
+    for (const ref of references) {
+      const check = detectCursorRollback(parsed.file, ref);
+      if (check !== null) {
+        if (
+          worstRollback === null ||
+          check.referenceGeneration > worstRollback.referenceGeneration
+        ) {
+          worstRollback = check;
+        }
+      }
+    }
+
+    if (worstRollback !== null) {
+      if (options.acknowledgeReplay !== true) {
+        throw new CursorRollbackError(worstRollback, options.cursorFile);
+      }
+      const nextGeneration =
+        Math.max(parsed.file.recoveryGeneration ?? 0, worstRollback.referenceGeneration) + 1;
+      parsed.file.recoveryGeneration = nextGeneration;
+      parsed.file.acknowledgedRollback = {
+        fromGeneration: worstRollback.candidateGeneration,
+        previousGeneration: worstRollback.referenceGeneration,
+        acknowledgedAt: new Date().toISOString(),
+      };
+    }
+
     const normalized = `${JSON.stringify(parsed.file, null, 2)}\n`;
     await writeAtomic(options.cursorFile, normalized, options.force === true);
     console.log(
@@ -102,10 +162,11 @@ interface CliOptions {
   out?: string;
   from?: string;
   force: boolean;
+  acknowledgeReplay: boolean;
 }
 
 function parseOptions(args: string[]): CliOptions {
-  const options: CliOptions = { force: false };
+  const options: CliOptions = { force: false, acknowledgeReplay: false };
   const seen = new Set<string>();
 
   for (let index = 0; index < args.length; index += 1) {
@@ -114,6 +175,12 @@ function parseOptions(args: string[]): CliOptions {
       if (seen.has(arg)) throw new Error("duplicate --force option");
       seen.add(arg);
       options.force = true;
+      continue;
+    }
+    if (arg === "--acknowledge-replay") {
+      if (seen.has(arg)) throw new Error("duplicate --acknowledge-replay option");
+      seen.add(arg);
+      options.acknowledgeReplay = true;
       continue;
     }
     if (arg !== "--file" && arg !== "--out" && arg !== "--from") {
@@ -146,7 +213,9 @@ async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
   if (action !== "backup" && action !== "restore") {
-    throw new Error("usage: npm run cursor -- <backup|restore> [--file PATH] [--out PATH|--from PATH] [--force]");
+    throw new Error(
+      "usage: npm run cursor -- <backup|restore> [--file PATH] [--out PATH|--from PATH] [--force] [--acknowledge-replay]",
+    );
   }
 
   const options = parseOptions(args);
@@ -169,6 +238,7 @@ async function main(): Promise<void> {
     backupFile,
     lockFile,
     force: options.force,
+    acknowledgeReplay: options.acknowledgeReplay,
   });
 }
 

@@ -26,10 +26,10 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Corrupt**: If JSON is invalid or fails schema validation (or references an unsupported future schema version), `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>` and starts cold.
 
 ### 2. Cursor Backup Copy
-- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`)
+- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`), [`src/cursor-cli.ts`](../src/cursor-cli.ts) (`backupCursor`, `restoreCursor`)
 - **Default Path**: `${cursorFile}.bak` (typically `./data/cursor.json.bak`)
-- **Write Pattern**: Non-atomic `copyFile` immediately following atomic commit of primary cursor file.
-- **Recovery Role**: Acts as an offline recovery snapshot one generation older than the live cursor.
+- **Write Pattern**: Non-atomic `copyFile` immediately following atomic commit of primary cursor file, carrying the monotonic `recoveryGeneration` counter incremented on each save.
+- **Recovery Role & Rollback Protection**: Acts as an offline recovery snapshot and high-water generation anchor. At startup (`loadCursors`) and during `npm run cursor -- restore`, the candidate cursor's `recoveryGeneration` (and target ledger positions) are compared against backup metadata; rolling backward to an older snapshot fails with `CursorRollbackError` unless intended replay is explicitly acknowledged via `--acknowledge-replay` or `CURSOR_ACKNOWLEDGE_REPLAY=true`.
 
 ### 3. Cursor Quarantine Copy
 - **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`quarantineCorruptCursorFile`)
