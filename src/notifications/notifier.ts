@@ -6,7 +6,10 @@
  *
  * Public API (all re-exported from `src/bot.ts` for backwards compatibility):
  *   - {@link SendExtra}         — extra options a caller attaches to a send
+ *   - {@link NotifierOptions}   — optional journal & strict `message_id` settings
  *   - {@link isMarkdownParseError} — classifier for Telegram entity-parse failures
+ *   - {@link isValidTelegramDeliveryResult} — validator for Telegram `message_id` responses
+ *   - {@link InvalidTelegramDeliveryResultError} — error raised when `message_id` is missing/invalid
  *   - {@link notifierSkips}    — counters for suppressed sends
  *   - {@link createNotifier}   — factory that returns the poller's send function
  */
@@ -21,8 +24,24 @@ import {
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+import {
+  describeInvalidDeliveryResult,
+  InvalidTelegramDeliveryResultError,
+  isValidTelegramDeliveryResult,
+  isValidTelegramMessageId,
+  MAX_JOURNAL_DIAGNOSTIC_CHARS,
+  type SendJournal,
+} from "./send-journal.js";
 
-// ── SendExtra ────────────────────────────────────────────────────────────────
+export {
+  describeInvalidDeliveryResult,
+  InvalidTelegramDeliveryResultError,
+  isValidTelegramDeliveryResult,
+  isValidTelegramMessageId,
+  MAX_JOURNAL_DIAGNOSTIC_CHARS,
+};
+
+// ── SendExtra & NotifierOptions ──────────────────────────────────────────────
 
 /** Extra Telegram send options the poller may attach to a notification. */
 export interface SendExtra {
@@ -35,7 +54,8 @@ export interface SendExtra {
    */
   plainText?: string | undefined;
   /**
-   * Bounded identifiers for fallback logging only. Optional; never sent.
+   * Bounded identifiers for fallback and delivery diagnostic logging only.
+   * Optional; never sent to Telegram.
    */
   eventRef?: { eventId?: string | undefined; ledger?: number | undefined; source?: string | undefined } | undefined;
   /**
@@ -46,6 +66,27 @@ export interface SendExtra {
   replyToMessageId?: number | undefined;
   /** Decoded contract event name used to apply silent-notification policy. */
   eventName?: string | undefined;
+  /**
+   * Require a positive integer `message_id` on every Telegram response for this
+   * call, rejecting empty `{}` or `undefined` responses as invalid.
+   */
+  requireMessageId?: boolean | undefined;
+}
+
+/** Optional notifier-wide confirmation and journal wiring. */
+export interface NotifierOptions {
+  /**
+   * Optional send journal used to record bounded diagnostics whenever Telegram
+   * returns a payload missing a valid `message_id`, leaving the journal intent
+   * unresolved and recoverable.
+   */
+  sendJournal?: SendJournal | undefined;
+  /**
+   * Enforce that every `sendMessage` call returns a positive integer
+   * `message_id` (including rejecting bare `{}` / `undefined` responses).
+   * Defaults to `true` when `sendJournal` is attached.
+   */
+  requireMessageId?: boolean | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -111,6 +152,11 @@ export const notifierSkips = { emptyText: 0 };
  * unspecified one into a single call, so the MarkdownV2-to-plain-text
  * retry happens at most once per chunk, never in a loop.
  *
+ * A Telegram response missing a valid positive integer `message_id` is treated
+ * as an invalid delivery result (`InvalidTelegramDeliveryResultError`),
+ * recorded as a bounded diagnostic in `sendJournal` when attached, and never
+ * marked as a confirmed delivery.
+ *
  * A rendering that is empty, whitespace-only, or not a string at all is
  * skipped before any API call: Telegram rejects blank message text with a
  * 400, and a formatters' `null` must never turn into a doomed send. The skip
@@ -120,6 +166,7 @@ export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
     Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  options?: NotifierOptions,
 ) {
   return async (
     text: string | null,
@@ -137,6 +184,62 @@ export function createNotifier(
       );
       return;
     }
+
+    const strictMessageId =
+      extra?.requireMessageId ??
+      options?.requireMessageId ??
+      Boolean(options?.sendJournal);
+
+    const verifyDeliveryResult = async (
+      result: unknown,
+      chunkIndex?: number,
+      chunkCount?: number,
+    ): Promise<void> => {
+      if (isValidTelegramDeliveryResult(result)) {
+        return;
+      }
+
+      // Legacy 2-argument unit-test stubs often return `undefined` or a bare
+      // 0-key `{}` when no `sendJournal` or `requireMessageId` option is passed.
+      // Any non-empty object missing `message_id` (such as `{ ok: true }` or
+      // `{ chat: { id } }`), `null`, primitive, or explicit invalid `message_id`
+      // is always rejected, and strict mode rejects `{}` and `undefined` too.
+      const isLegacyBareStub =
+        !strictMessageId &&
+        (result === undefined ||
+          (typeof result === "object" &&
+            result !== null &&
+            !Array.isArray(result) &&
+            Object.keys(result).length === 0));
+      if (isLegacyBareStub) {
+        return;
+      }
+
+      const diagnostic = describeInvalidDeliveryResult(result, chunkIndex, chunkCount);
+      const err = new InvalidTelegramDeliveryResultError(diagnostic);
+      const eventId = extra?.eventRef?.eventId;
+      if (options?.sendJournal && typeof eventId === "string" && eventId !== "") {
+        try {
+          await options.sendJournal.recordDiagnostic({
+            id: eventId,
+            diagnostic,
+            secrets: typeof config.botToken === "string" && config.botToken ? [config.botToken] : [],
+          });
+          err.recordedInJournal = true;
+        } catch (journalErr) {
+          console.error(
+            `[notifier] send journal diagnostic failed for ${eventId}: ${safeErrorMessage(
+              journalErr,
+              typeof config.botToken === "string" && config.botToken ? [config.botToken] : [],
+            )}`,
+          );
+        }
+      }
+      console.warn(
+        `[notifier] invalid Telegram delivery result${eventRefLabel(extra?.eventRef)}: ${diagnostic}`,
+      );
+      throw err;
+    };
 
     const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
     const chatId = source === "market"
@@ -168,7 +271,7 @@ export function createNotifier(
     const parts = splitTelegramMessage(text);
     if (parts.length > 1) {
       for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
+        const res = await bot.api.sendMessage(chatId, part, {
           ...notificationOptions,
           ...(index === parts.length - 1 && extra?.reply_markup
             ? { reply_markup: extra.reply_markup }
@@ -177,20 +280,27 @@ export function createNotifier(
             ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
             : {}),
         });
+        await verifyDeliveryResult(res, index, parts.length);
       }
       return;
     }
 
     try {
-      await bot.api.sendMessage(chatId, text, {
+      const res = await bot.api.sendMessage(chatId, text, {
         ...notificationOptions,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(extra?.replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
           : {}),
       });
+      await verifyDeliveryResult(res);
       return;
     } catch (err) {
+      // Do not treat an invalid delivery result from a syntactically accepted
+      // call as an entity-parse failure.
+      if (err instanceof InvalidTelegramDeliveryResultError) {
+        throw err;
+      }
       // A blank fallback is no fallback: sending whitespace-only text would
       // just draw the same 400, so the original parse error propagates.
       const fallback = extra?.plainText;
@@ -208,7 +318,7 @@ export function createNotifier(
           )}`,
       );
       // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
+      const fallbackRes = await bot.api.sendMessage(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
         ...silentOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
@@ -216,6 +326,7 @@ export function createNotifier(
           ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
           : {}),
       });
+      await verifyDeliveryResult(fallbackRes);
     }
   };
 }

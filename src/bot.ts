@@ -368,8 +368,14 @@ export function createBot(deps: BotDeps): Bot {
 // existing imports from "bot.js" keep resolving without modification.
 export {
   createNotifier,
+  describeInvalidDeliveryResult,
+  InvalidTelegramDeliveryResultError,
   isMarkdownParseError,
+  isValidTelegramDeliveryResult,
+  isValidTelegramMessageId,
+  MAX_JOURNAL_DIAGNOSTIC_CHARS,
   notifierSkips,
+  type NotifierOptions,
   type SendExtra,
 } from "./notifications/notifier.js";
 

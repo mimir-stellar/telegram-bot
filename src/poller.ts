@@ -76,6 +76,7 @@ import {
 } from "./deadLetter.js";
 import {
   createSendJournal,
+  InvalidTelegramDeliveryResultError,
   type SendJournal,
 } from "./notifications/send-journal.js";
 import {
@@ -2214,6 +2215,25 @@ export function createPoller(deps: PollerDeps) {
           }
         }
       } catch (err) {
+        if (
+          sendJournal &&
+          err instanceof InvalidTelegramDeliveryResultError &&
+          !err.recordedInJournal
+        ) {
+          try {
+            await sendJournal.recordDiagnostic({
+              id: event.eventId,
+              diagnostic: err.diagnostic,
+              secrets: config.botToken ? [config.botToken] : [],
+            });
+          } catch (journalErr) {
+            console.error(
+              `[poller] send journal diagnostic failed for ${event.eventId}: ${safeErrorMessage(
+                journalErr,
+              )}`,
+            );
+          }
+        }
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
