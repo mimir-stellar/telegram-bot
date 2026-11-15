@@ -96,6 +96,20 @@ The queue is strictly bounded across every dimension:
 
 ---
 
+## Operator Status Summary (`status` & `/status`)
+
+Operator status surfaces (`npm run dlq -- status [--json]`, `/status`, and the machine-readable `status.json` snapshot) expose a **destination-safe dead-letter summary** without revealing raw failed message bodies or raw destination chat identifiers:
+
+* **Counts & closed reason categories only**: Reports `depth`, `enqueued`, `replayed`, `dropped`, coarse reason categories (`rate_limited`, `timeout`, `network`, `auth_or_permission`, `bad_request`, `server_error`, `unknown`), and per-destination counts with `redactChatId` formatting (`-…7890`, `@m…`).
+* **Payload-free**: Raw failed `text` payloads and unredacted remote `lastError` strings are omitted from status output.
+
+```bash
+npm run dlq -- status
+npm run dlq -- status --json
+```
+
+---
+
 ## Operator Inspection with `jq`
 
 Because the file contains standard JSON, operators can safely inspect queue status and contents on host or container storage using `jq`.

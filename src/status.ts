@@ -29,6 +29,13 @@ import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { networkLabel, type BotConfig } from "./config.js";
+import {
+  DEAD_LETTER_REASON_CATEGORIES,
+  type DeadLetterDestinationSummary,
+  type DeadLetterReasonCategory,
+  type DeadLetterStats,
+  type DeadLetterStatusSummary,
+} from "./deadLetter.js";
 import type { PollerStatus } from "./poller.js";
 
 /** Bumped when the shape of the snapshot changes incompatibly. */
@@ -140,8 +147,62 @@ export interface StatusSnapshot {
   sendTimeouts: number;
   /** Bounded description of the most recent per-send timeout, or null. */
   lastSendTimeout: string | null;
+  /**
+   * Destination-safe dead-letter summary: counts, closed reason categories, and
+   * redacted destination counts only — never raw failed message text or raw chat ids.
+   */
+  deadLetter: DeadLetterStatusSummary;
   lastError: { at: number; message: string } | null;
   targets: StatusTargetSnapshot[];
+}
+
+function buildSafeDeadLetterSummary(
+  config: BotConfig,
+  dlq: DeadLetterStats | undefined,
+): DeadLetterStatusSummary {
+  const depth = typeof dlq?.depth === "number" && dlq.depth >= 0 ? dlq.depth : 0;
+  const enqueued = typeof dlq?.enqueued === "number" && dlq.enqueued >= 0 ? dlq.enqueued : 0;
+  const replayed = typeof dlq?.replayed === "number" && dlq.replayed >= 0 ? dlq.replayed : 0;
+  const dropped = typeof dlq?.dropped === "number" && dlq.dropped >= 0 ? dlq.dropped : 0;
+
+  const reasons: Partial<Record<DeadLetterReasonCategory, number>> = {};
+  if (dlq?.reasonCounts) {
+    for (const cat of DEAD_LETTER_REASON_CATEGORIES) {
+      const count = dlq.reasonCounts[cat];
+      if (typeof count === "number" && count > 0) {
+        reasons[cat] = count;
+      }
+    }
+  }
+
+  const defaultChat = config.chatId ?? config.chatIds?.[0];
+  const byDest = new Map<string, number>();
+  if (dlq?.sourceCounts) {
+    for (const [source, count] of Object.entries(dlq.sourceCounts)) {
+      if (typeof count !== "number" || count <= 0) continue;
+      const rawDest =
+        source === "market"
+          ? config.marketChatId || defaultChat
+          : source === "squad"
+            ? config.squadChatId || defaultChat
+            : defaultChat;
+      const safeDest = redactChatId(rawDest);
+      byDest.set(safeDest, (byDest.get(safeDest) ?? 0) + count);
+    }
+  }
+
+  const destinations: DeadLetterDestinationSummary[] = [...byDest.entries()]
+    .map(([destination, count]) => ({ destination, count, reasons: {} }))
+    .sort((a, b) => b.count - a.count || a.destination.localeCompare(b.destination));
+
+  return {
+    depth,
+    enqueued,
+    replayed,
+    dropped,
+    reasons,
+    destinations,
+  };
 }
 
 /**
@@ -203,6 +264,7 @@ export function buildStatusSnapshot(
     lastSendTimeout: status.lastSendTimeout
       ? boundText(status.lastSendTimeout, MAX_SEND_DURATION_CHARS)
       : null,
+    deadLetter: buildSafeDeadLetterSummary(config, status.deadLetter),
     lastError: status.lastError
       ? { at: status.lastError.at, message: boundText(status.lastError.message) }
       : null,

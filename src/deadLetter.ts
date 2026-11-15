@@ -48,11 +48,48 @@ export interface DeadLetterFile {
   entries: DeadLetterEntry[];
 }
 
+export type DeadLetterReasonCategory =
+  | "rate_limited"
+  | "timeout"
+  | "network"
+  | "auth_or_permission"
+  | "bad_request"
+  | "server_error"
+  | "unknown";
+
+export const DEAD_LETTER_REASON_CATEGORIES: readonly DeadLetterReasonCategory[] = [
+  "rate_limited",
+  "timeout",
+  "network",
+  "auth_or_permission",
+  "bad_request",
+  "server_error",
+  "unknown",
+] as const;
+
+export interface DeadLetterDestinationSummary {
+  /** Coarse redacted destination shape (e.g. "-…7890" or "@m…") or logical source name. */
+  destination: string;
+  count: number;
+  reasons: Partial<Record<DeadLetterReasonCategory, number>>;
+}
+
+export interface DeadLetterStatusSummary {
+  depth: number;
+  enqueued: number;
+  replayed: number;
+  dropped: number;
+  reasons: Partial<Record<DeadLetterReasonCategory, number>>;
+  destinations: DeadLetterDestinationSummary[];
+}
+
 export interface DeadLetterStats {
   depth: number;
   enqueued: number;
   replayed: number;
   dropped: number;
+  reasonCounts?: Partial<Record<DeadLetterReasonCategory, number>>;
+  sourceCounts?: Record<string, number>;
 }
 
 export interface DeadLetterQueueOptions {
@@ -106,6 +143,105 @@ export function makeEntryId(
   text: string,
 ): string {
   return `${source}:${ledger}:${eventName}:${shortHash(text)}`;
+}
+
+/**
+ * Redact a destination chat id to its coarse shape (matching `redactChatId` in
+ * `src/status.ts`) so raw numeric chat ids and @channelusernames never leak into
+ * operator status summaries.
+ */
+function redactDestination(raw: string | undefined): string {
+  if (typeof raw !== "string") return "…";
+  const trimmed = raw.trim();
+  if (trimmed === "") return "…";
+  if (trimmed.startsWith("@")) {
+    return trimmed.length > 1 ? `@${trimmed[1]}…` : "@…";
+  }
+  const digits = trimmed.replace(/[^0-9]/g, "");
+  if (digits.length === 0) {
+    // Logical source label such as "market" or "squad" when no chat id is supplied.
+    if (/^[a-z0-9_-]{1,32}$/i.test(trimmed)) return trimmed;
+    return "…";
+  }
+  const sign = trimmed.startsWith("-") ? "-" : "";
+  return `${sign}…${digits.slice(-4)}`;
+}
+
+/**
+ * Classify a stored dead-letter error string into a bounded, payload-free reason
+ * category safe for operator status surfaces.
+ */
+export function classifyDeadLetterReason(
+  lastError: string | null | undefined,
+): DeadLetterReasonCategory {
+  if (typeof lastError !== "string" || lastError.trim() === "") {
+    return "unknown";
+  }
+  const lower = lastError.toLowerCase();
+  if (/\b429\b|too many requests|retry[_ -]?after|flood/i.test(lower)) {
+    return "rate_limited";
+  }
+  if (/timed?\s*out|etimedout|abort/i.test(lower)) {
+    return "timeout";
+  }
+  if (/\b(?:401|403)\b|unauthorized|forbidden|bot was blocked|kicked|not a member/i.test(lower)) {
+    return "auth_or_permission";
+  }
+  if (/\b400\b|bad request|parse entities|can't find end of the entity|chat not found/i.test(lower)) {
+    return "bad_request";
+  }
+  if (/\b50[0234]\b|bad gateway|service unavailable|gateway timeout|internal server error/i.test(lower)) {
+    return "server_error";
+  }
+  if (/econnreset|econnrefused|enotfound|eai_again|fetch failed|socket|network/i.test(lower)) {
+    return "network";
+  }
+  return "unknown";
+}
+
+/**
+ * Build a destination-safe summary from parked dead-letter entries and counters.
+ * Reports counts and reason categories only — raw failed message text and raw
+ * error descriptions are never included.
+ */
+export function summarizeDeadLetters(
+  entries: readonly DeadLetterEntry[],
+  counters?: Partial<Pick<DeadLetterStats, "enqueued" | "replayed" | "dropped">>,
+  resolveDestination?: (source: string, entry: DeadLetterEntry) => string | undefined,
+): DeadLetterStatusSummary {
+  const reasons: Partial<Record<DeadLetterReasonCategory, number>> = {};
+  const byDest = new Map<string, DeadLetterDestinationSummary>();
+
+  for (const entry of entries) {
+    const category = classifyDeadLetterReason(entry.lastError);
+    reasons[category] = (reasons[category] ?? 0) + 1;
+
+    const rawDest = resolveDestination
+      ? resolveDestination(entry.source, entry)
+      : entry.source;
+    const destination = redactDestination(rawDest ?? entry.source);
+
+    let bucket = byDest.get(destination);
+    if (!bucket) {
+      bucket = { destination, count: 0, reasons: {} };
+      byDest.set(destination, bucket);
+    }
+    bucket.count += 1;
+    bucket.reasons[category] = (bucket.reasons[category] ?? 0) + 1;
+  }
+
+  const destinations = [...byDest.values()].sort(
+    (a, b) => b.count - a.count || a.destination.localeCompare(b.destination),
+  );
+
+  return {
+    depth: entries.length,
+    enqueued: counters?.enqueued ?? 0,
+    replayed: counters?.replayed ?? 0,
+    dropped: counters?.dropped ?? 0,
+    reasons,
+    destinations,
+  };
 }
 
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
@@ -319,12 +455,39 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     return { sent, remaining: entries.length };
   }
 
+  function computeBreakdown(): {
+    reasonCounts: Partial<Record<DeadLetterReasonCategory, number>>;
+    sourceCounts: Record<string, number>;
+  } {
+    const reasonCounts: Partial<Record<DeadLetterReasonCategory, number>> = {};
+    const sourceCounts: Record<string, number> = {};
+    for (const entry of entries) {
+      const cat = classifyDeadLetterReason(entry.lastError);
+      reasonCounts[cat] = (reasonCounts[cat] ?? 0) + 1;
+      const src = typeof entry.source === "string" && entry.source ? entry.source : "unknown";
+      sourceCounts[src] = (sourceCounts[src] ?? 0) + 1;
+    }
+    return { reasonCounts, sourceCounts };
+  }
+
   return {
     load,
     enqueue,
     flush,
     stats(): DeadLetterStats {
-      return { ...stats, depth: entries.length };
+      const { reasonCounts, sourceCounts } = computeBreakdown();
+      return {
+        ...stats,
+        depth: entries.length,
+        reasonCounts,
+        sourceCounts,
+      };
+    },
+    /** Destination-safe summary reporting counts and reason categories only (never message text). */
+    summary(
+      resolveDestination?: (source: string, entry: DeadLetterEntry) => string | undefined,
+    ): DeadLetterStatusSummary {
+      return summarizeDeadLetters(entries, stats, resolveDestination);
     },
     /** Test helper — snapshot of current entries. */
     snapshot(): DeadLetterEntry[] {

@@ -11,9 +11,11 @@ import {
   formatLastEvent,
 } from "../notifications/format.js";
 import { networkLabel, type BotConfig } from "../config.js";
+import { DEAD_LETTER_REASON_CATEGORIES } from "../deadLetter.js";
 import { chainClockLabel } from "../health.js";
 import { formatFeatureFlags } from "../notifications/featureFlags.js";
 import type { PollerStatus } from "../poller.js";
+import { redactChatId } from "../status.js";
 import { defineCommand } from "./registry.js";
 import { TELEGRAM_OPTIONS } from "./runtime.js";
 
@@ -66,13 +68,45 @@ export function statusMessage(
   ];
 
   // Only shown when the queue is holding or has replayed something, so an
-  // ordinary /status is unchanged.
+  // ordinary /status is unchanged. Reports counts, reason categories, and
+  // redacted destinations only — never raw failed message text or raw chat ids.
   if (status.deadLetter && (status.deadLetter.depth > 0 || status.deadLetter.replayed > 0)) {
     lines.push(
       `Parked sends: ${status.deadLetter.depth} waiting \u00b7 ` +
         `${status.deadLetter.replayed} replayed \u00b7 ${status.deadLetter.dropped} dropped`,
-      "",
     );
+    const reasonEntries = DEAD_LETTER_REASON_CATEGORIES
+      .map((cat) => [cat, status.deadLetter.reasonCounts?.[cat] ?? 0] as const)
+      .filter(([, count]) => count > 0);
+    if (reasonEntries.length > 0) {
+      lines.push(
+        `Parked reasons: ${reasonEntries.map(([cat, count]) => `${escapeMd(cat)} \\(${count}\\)`).join(" \u00b7 ")}`,
+      );
+    }
+    if (status.deadLetter.sourceCounts) {
+      const defaultChat = config.chatId ?? config.chatIds?.[0];
+      const byDest = new Map<string, number>();
+      for (const [source, count] of Object.entries(status.deadLetter.sourceCounts)) {
+        if (typeof count !== "number" || count <= 0) continue;
+        const rawDest =
+          source === "market"
+            ? config.marketChatId || defaultChat
+            : source === "squad"
+              ? config.squadChatId || defaultChat
+              : defaultChat;
+        const safeDest = redactChatId(rawDest);
+        byDest.set(safeDest, (byDest.get(safeDest) ?? 0) + count);
+      }
+      if (byDest.size > 0) {
+        lines.push(
+          `Parked destinations: ${[...byDest.entries()]
+            .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+            .map(([dest, count]) => `${escapeMd(dest)} \\(${count}\\)`)
+            .join(" \u00b7 ")}`,
+        );
+      }
+    }
+    lines.push("");
   }
 
   // Only shown after an automatic recovery, so an ordinary /status is unchanged.
