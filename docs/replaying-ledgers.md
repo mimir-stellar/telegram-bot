@@ -223,3 +223,14 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Archive & JSONL Metadata Validation
+
+Offline event archives (`src/stellar/archive.ts`) and JSONL captures (`src/stellar/scan-jsonl.ts`) validate network and contract metadata before event iteration begins so conflicting captures never leak into replay plans or offline aggregates:
+
+* **Sidecar & Stream Metadata:** `createEventArchive({ dir, metadata })` persists `archive-metadata.json` (`format: "mimir-archive-meta-v1"`) with `network` and `contracts` (`market` / `squad` contract IDs) and checks every appended batch before writing bytes. `formatScanJsonl(events, metadata)` emits a leading `{ type: "meta" }` record and mirrors resolved metadata in the `{ type: "summary" }` footer while remaining backward-compatible when `metadata` is omitted.
+* **Pre-Iteration Verification:** `validateArchiveMetadata`, `openVerifiedArchive`, `readArchive`, and `iterateScanJsonlEvents` inspect `archive-metadata.json` and all rotated `events-*.jsonl` segments before yielding the first event. Any network mismatch (`NETWORK_MISMATCH`), conflicting contract ID (`CONTRACT_MISMATCH`), or cross-role collision (`DUPLICATE_CONTRACT_ROLE`) throws `ArchiveMetadataError` with zero events yielded.
+* **Offline Aggregation Quarantine:** `aggregateOfflineCaptures(captures, options)` validates each capture up front and excludes conflicting or network-missing captures (`rejectedCaptures`) so incompatible captures never alter combined event counts, histograms, or ledger bounds.
+
