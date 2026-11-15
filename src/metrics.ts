@@ -24,6 +24,12 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { RpcProviderLatencyHistograms } from "./stellar/rpc-guard.js";
+
+export interface MetricsOptions {
+  /** Optional bounded per-provider Soroban RPC latency histogram recorder. */
+  rpcLatencyHistograms?: RpcProviderLatencyHistograms | undefined;
+}
 
 // ── Metric types ──────────────────────────────────────────────────────────────
 
@@ -89,6 +95,8 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** Optional bounded per-provider Soroban RPC latency histograms. */
+  rpcLatencyHistograms?: RpcProviderLatencyHistograms | undefined;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -146,7 +154,8 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
-export function createMetrics(): MetricsRegistry {
+export function createMetrics(options: MetricsOptions = {}): MetricsRegistry {
+  const rpcLatencyHistograms = options.rpcLatencyHistograms;
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -222,6 +231,11 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`# HELP ${g._name} ${g._help}`);
       lines.push(`# TYPE ${g._name} gauge`);
       lines.push(`${g._name} ${g.value()}`);
+    }
+
+    const histogramBlock = rpcLatencyHistograms?.renderPrometheus() ?? "";
+    if (histogramBlock.length > 0) {
+      lines.push(histogramBlock.trimEnd());
     }
 
     // Prometheus text format requires a trailing newline.
@@ -306,6 +320,7 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    rpcLatencyHistograms,
     render,
     startServer,
   };

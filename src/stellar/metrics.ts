@@ -136,3 +136,18 @@ export function formatRpcTiming(summary: RpcTimingSummary): string {
     `health=${operations.health.requests} events=${operations.events.requests}`
   );
 }
+
+export {
+  DEFAULT_MAX_RPC_HISTOGRAM_PROVIDERS,
+  DEFAULT_RPC_LATENCY_BUCKETS_MS,
+  INVALID_RPC_PROVIDER_ID,
+  MAX_RPC_LATENCY_BUCKETS,
+  OVERFLOW_RPC_PROVIDER_ID,
+  RpcProviderLatencyHistograms,
+  canonicalRpcProviderId,
+  type RpcHistogramOperation,
+  type RpcLatencyBucketCount,
+  type RpcLatencyHistogramSnapshot,
+  type RpcProviderLatencyHistogramOptions,
+  type RpcProviderOperationHistogram,
+} from "./rpc-guard.js";

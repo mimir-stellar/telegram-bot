@@ -15,6 +15,35 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  DEFAULT_MAX_RPC_HISTOGRAM_PROVIDERS,
+  DEFAULT_RPC_LATENCY_BUCKETS_MS,
+  INVALID_RPC_PROVIDER_ID,
+  MAX_RPC_LATENCY_BUCKETS,
+  OVERFLOW_RPC_PROVIDER_ID,
+  RpcProviderLatencyHistograms,
+  canonicalRpcProviderId,
+  type RpcHistogramOperation,
+  type RpcLatencyBucketCount,
+  type RpcLatencyHistogramSnapshot,
+  type RpcProviderLatencyHistogramOptions,
+  type RpcProviderOperationHistogram,
+} from "./rpc-guard.js";
+
+export {
+  DEFAULT_MAX_RPC_HISTOGRAM_PROVIDERS,
+  DEFAULT_RPC_LATENCY_BUCKETS_MS,
+  INVALID_RPC_PROVIDER_ID,
+  MAX_RPC_LATENCY_BUCKETS,
+  OVERFLOW_RPC_PROVIDER_ID,
+  RpcProviderLatencyHistograms,
+  canonicalRpcProviderId,
+  type RpcHistogramOperation,
+  type RpcLatencyBucketCount,
+  type RpcLatencyHistogramSnapshot,
+  type RpcProviderLatencyHistogramOptions,
+  type RpcProviderOperationHistogram,
+};
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -26,16 +55,66 @@ export class RpcPassphraseError extends Error {
   }
 }
 
+export interface CreateRpcServerOptions {
+  /**
+   * Optional bounded per-provider latency histogram recorder. When provided,
+   * `getHealth`, `getEvents`, and `getNetwork` calls on the returned server
+   * record duration samples under the canonical provider origin of `config.rpcUrl`.
+   */
+  latencyHistograms?: RpcProviderLatencyHistograms | undefined;
+}
+
+/**
+ * Wrap a Soroban RPC server (or compatible mock) so `getHealth`, `getEvents`,
+ * and `getNetwork` record bounded latency histogram observations under the
+ * canonical, query-free provider origin derived from `rpcUrl`.
+ */
+export function instrumentRpcServer<T extends object>(
+  server: T,
+  rpcUrl: string,
+  histograms: RpcProviderLatencyHistograms,
+): T {
+  const providerLabel = histograms.resolveProviderLabel(rpcUrl);
+  const methodMap: ReadonlyArray<[keyof rpc.Server & string, RpcHistogramOperation]> = [
+    ["getHealth", "health"],
+    ["getEvents", "events"],
+    ["getNetwork", "network"],
+  ];
+
+  for (const [methodName, operation] of methodMap) {
+    const candidate = (server as Record<string, unknown>)[methodName];
+    if (typeof candidate === "function") {
+      const original = candidate.bind(server) as (...args: unknown[]) => Promise<unknown>;
+      Object.defineProperty(server, methodName, {
+        configurable: true,
+        writable: true,
+        enumerable: false,
+        value: (...args: unknown[]) =>
+          histograms.measure(providerLabel, operation, () => original(...args)),
+      });
+    }
+  }
+
+  return server;
+}
+
 /**
  * Create an RPC server. Construction is offline; the network passphrase is
  * verified separately at boot by {@link validateNetworkPassphrase}.
  */
-export function createRpcServer(config: StellarConfig): rpc.Server {
-  return new rpc.Server(config.rpcUrl, {
+export function createRpcServer(
+  config: StellarConfig,
+  options: CreateRpcServerOptions = {},
+): rpc.Server {
+  const server = new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
     timeout: 15000,
   });
+  if (options.latencyHistograms) {
+    return instrumentRpcServer(server, config.rpcUrl, options.latencyHistograms);
+  }
+  return server;
 }
 
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */
