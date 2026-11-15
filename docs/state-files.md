@@ -64,3 +64,8 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Send Journal File (`SEND_JOURNAL_FILE`) & Archive Path Protection
+- **Writer Module**: [`src/notifications/send-journal.ts`](../src/notifications/send-journal.ts) (`createSendJournal`)
+- **Default Path**: `./data/send-journal.jsonl` (configured via `DEFAULTS.sendJournalFile` in [`src/config.ts`](../src/config.ts))
+- **Archive & JSONL Path Guard**: Event archive and JSONL file helpers in [`src/stellar/archive.ts`](../src/stellar/archive.ts) and [`src/stellar/scan-jsonl.ts`](../src/stellar/scan-jsonl.ts) resolve relative segments and symlinks via `assertSafeArchivePath` before opening any file descriptor. Any source or destination path resolving to a live cursor (`CURSOR_FILE`, `.bak`, `.tmp`, `.corrupt.*`), send journal (`SEND_JOURNAL_FILE`, `.tmp`), or runtime state file (`AUDIT_FILE`, `DEAD_LETTER_FILE`, `STATUS_FILE`, `INSTANCE_LOCK_FILE`, `COUNTERS_FILE`) is rejected immediately with `ProtectedStatePathError` while leaving live state untouched.

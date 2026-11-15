@@ -2,8 +2,31 @@ import { open, mkdir, readdir, unlink, chmod } from "node:fs/promises";
 import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  ProtectedStatePathError,
+  assertSafeArchivePath,
+  assertSafeSourceAndDestinationPaths,
+  readScanJsonlFile,
+  resolveCanonicalPathSync,
+  writeScanJsonlFile,
+  type ArchivePathRole,
+  type LiveStateGuardOptions,
+  type ProtectedPathKind,
+} from "./scan-jsonl.js";
 
-export interface EventArchiveOptions {
+export {
+  ProtectedStatePathError,
+  assertSafeArchivePath,
+  assertSafeSourceAndDestinationPaths,
+  readScanJsonlFile,
+  resolveCanonicalPathSync,
+  writeScanJsonlFile,
+  type ArchivePathRole,
+  type LiveStateGuardOptions,
+  type ProtectedPathKind,
+};
+
+export interface EventArchiveOptions extends LiveStateGuardOptions {
   dir: string;
   maxBytes?: number;
   maxFiles?: number;
@@ -25,7 +48,9 @@ function formatArchiveFilename(index: number, timestamp: number): string {
 }
 
 export function createEventArchive(options: EventArchiveOptions): EventArchive {
-  const { dir } = options;
+  assertSafeArchivePath(options.dir, "destination", options);
+
+  const dir = path.resolve(options.cwd ?? process.cwd(), options.dir);
   const maxBytes = Math.max(1, options.maxBytes ?? DEFAULT_MAX_BYTES);
   const maxFiles = Math.max(1, options.maxFiles ?? DEFAULT_MAX_FILES);
 
@@ -49,6 +74,7 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
       currentFilePath = null;
     }
 
+    assertSafeArchivePath(dir, "destination", options);
     await mkdir(dir, { recursive: true });
 
     // Enforce maxFiles by deleting older files if needed
@@ -59,8 +85,10 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
     for (let i = 0; i < toRemoveCount; i++) {
       const target = existing[i];
       if (!target) continue;
+      const candidateRemove = path.join(dir, target);
+      assertSafeArchivePath(candidateRemove, "destination", options);
       try {
-        await unlink(path.join(dir, target));
+        await unlink(candidateRemove);
       } catch {
         // ignore
       }
@@ -68,7 +96,9 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
 
     fileIndex += 1;
     const filename = formatArchiveFilename(fileIndex, Date.now());
-    currentFilePath = path.join(dir, filename);
+    const nextFilePath = path.join(dir, filename);
+    assertSafeArchivePath(nextFilePath, "destination", options);
+    currentFilePath = nextFilePath;
 
     // Open with 'a+' flag (append and reading), 0o600 permissions
     currentHandle = await open(currentFilePath, "a+", FILE_MODE);
@@ -116,12 +146,14 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
 
   return {
     async append(events: readonly DecodedEvent[]): Promise<void> {
-      queue = queue.then(() => doAppend(events));
-      return queue;
+      const op = queue.then(() => doAppend(events));
+      queue = op.catch(() => {});
+      return op;
     },
     async close(): Promise<void> {
-      queue = queue.then(() => doClose());
-      return queue;
+      const op = queue.then(() => doClose());
+      queue = op.catch(() => {});
+      return op;
     },
   };
 }
@@ -137,10 +169,15 @@ async function listArchiveFiles(dir: string): Promise<string[]> {
   }
 }
 
-export async function* readArchive(dir: string): AsyncGenerator<DecodedEvent, void, unknown> {
-  const files = await listArchiveFiles(dir);
+async function* readArchiveValidated(
+  dir: string,
+  options: LiveStateGuardOptions,
+): AsyncGenerator<DecodedEvent, void, unknown> {
+  const absDir = path.resolve(options.cwd ?? process.cwd(), dir);
+  const files = await listArchiveFiles(absDir);
   for (const file of files) {
-    const filePath = path.join(dir, file);
+    const filePath = path.join(absDir, file);
+    assertSafeArchivePath(filePath, "source", options);
     const handle = await open(filePath, "r");
     try {
       const content = await handle.readFile({ encoding: "utf8" });
@@ -155,4 +192,55 @@ export async function* readArchive(dir: string): AsyncGenerator<DecodedEvent, vo
       await handle.close();
     }
   }
+}
+
+export function readArchive(
+  dir: string,
+  options: LiveStateGuardOptions = {},
+): AsyncGenerator<DecodedEvent, void, unknown> {
+  assertSafeArchivePath(dir, "source", options);
+  return readArchiveValidated(dir, options);
+}
+
+/**
+ * Export an event archive directory to a standalone JSONL capture file after
+ * checking both resolved source and destination paths up front.
+ */
+export async function exportArchiveToJsonlFile(
+  sourceDir: string,
+  destinationFile: string,
+  options: LiveStateGuardOptions = {},
+): Promise<{ exportedCount: number }> {
+  assertSafeSourceAndDestinationPaths(
+    { sourcePath: sourceDir, destinationPath: destinationFile },
+    options,
+  );
+  const events: DecodedEvent[] = [];
+  for await (const ev of readArchive(sourceDir, options)) {
+    events.push(ev);
+  }
+  await writeScanJsonlFile(destinationFile, events, options);
+  return { exportedCount: events.length };
+}
+
+/**
+ * Import a standalone JSONL capture file into an event archive directory after
+ * checking both resolved source and destination paths before opening either.
+ */
+export async function importJsonlFileToArchive(
+  sourceFile: string,
+  destinationOptions: EventArchiveOptions,
+): Promise<{ importedCount: number }> {
+  assertSafeSourceAndDestinationPaths(
+    { sourcePath: sourceFile, destinationPath: destinationOptions.dir },
+    destinationOptions,
+  );
+  const events = await readScanJsonlFile(sourceFile, destinationOptions);
+  const archive = createEventArchive(destinationOptions);
+  try {
+    await archive.append(events);
+  } finally {
+    await archive.close();
+  }
+  return { importedCount: events.length };
 }
