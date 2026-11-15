@@ -144,6 +144,23 @@ Repetitive RPC errors or network disconnects can flood aggregators. The poller p
 
 ---
 
+## Operator Log Export (`/export`) & Truncation Reporting
+
+Operators can inspect the bounded in-memory log ring (`LOG_BUFFER_LINES`, default `500`, `0` disables capture) via the hidden operator-only `/export` command (`src/logger.ts` and `src/commands/log-export.ts`).
+
+### Size & Telegram Delivery Bounds
+- **Character limit (`MAX_EXPORT_CHARS`)**: Rendered exports are capped at `32,000` characters.
+- **UTF-8 byte limit (`MAX_EXPORT_BYTES` / `TELEGRAM_DOCUMENT_MAX_BYTES`)**: Exports are capped in UTF-8 bytes (`MAX_EXPORT_BYTES` = `65,536` bytes by default, and hard-clamped to `TELEGRAM_DOCUMENT_MAX_BYTES` = `50 MiB`) without splitting UTF-16 surrogate pairs or multi-byte code points.
+- **Inline vs. Document Delivery**: Exports up to `TELEGRAM_MESSAGE_MAX_CHARS` (`4,096` characters) are sent inline via plain-text `ctx.reply`. Larger exports are uploaded as a plain-text UTF-8 `.txt` document (`mimir-log-export.txt`) via `ctx.replyWithDocument` with a bounded plain-text caption (`<= 1,024` characters).
+
+### Retained vs. Omitted Counts & Time Bounds
+Whenever log lines are dropped—either because the `LOG_BUFFER_LINES` ring wrapped around or because the rendered export was middle-trimmed to stay within character/byte limits—the export includes a structured plain-text `[truncation: ...]` notice (and exposes structured `LogExportMetadata` via `renderLogExportWithMeta`):
+- **`retained <R> of <T> lines`**: Count of captured lines retained in the export versus total lines captured since startup.
+- **`omitted <O> (ring: <R_evicted>, export: <E_omitted>)`**: Total omitted line count broken down by ring-buffer eviction versus export middle-trimming (plus `middle-trimmed: <bytes>B` when middle bytes were cut).
+- **`retained bounds` & `omitted bounds`**: Inclusive ISO-8601 UTC and relative-age time spans (`<startIso>..<endIso> (<startAge>..<endAge> ago)`) for both retained and omitted log lines.
+
+---
+
 ## Aggregator Ingestion & `jq` Examples
 
 Because each JSON line is valid JSON, standard tools like `jq`, Vector, FluentBit, Datadog Agent, or Promtail/Loki can ingest and index fields directly.

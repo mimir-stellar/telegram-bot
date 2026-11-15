@@ -6,7 +6,13 @@
  * needs its own `bot.command("export", …)` in `createBot`.
  */
 
-import { renderLogExport } from "../logger.js";
+import { InputFile } from "grammy";
+
+import {
+  TELEGRAM_MESSAGE_MAX_CHARS,
+  formatLogExportCaption,
+  renderLogExportWithMeta,
+} from "../logger.js";
 import { defineCommand } from "./registry.js";
 
 export const logExportCommand = defineCommand({
@@ -19,10 +25,25 @@ export const logExportCommand = defineCommand({
       await ctx.reply("Log export is disabled (LOG_BUFFER_LINES=0).");
       return;
     }
+    const now = Date.now();
+    const { text, meta } = renderLogExportWithMeta(config, deps.status(), logs, { now });
+
+    // Inline replies are rejected by Telegram above 4,096 characters; send
+    // larger exports as a plain-text document attachment within Telegram's
+    // document size limit while keeping lightweight test stubs compatible.
+    if (text.length > TELEGRAM_MESSAGE_MAX_CHARS && typeof ctx.replyWithDocument === "function") {
+      const payload = Buffer.from(text, "utf8");
+      const caption = formatLogExportCaption(config, meta, now);
+      await ctx.replyWithDocument(new InputFile(payload, "mimir-log-export.txt"), {
+        caption,
+      });
+      return;
+    }
+
     // Plain text, no parse mode: the content is redacted but untrusted, and
     // MarkdownV2 would make any escaping slip a parsing error instead of a
     // cosmetic wart.
-    await ctx.reply(renderLogExport(config, deps.status(), logs), {
+    await ctx.reply(text, {
       link_preview_options: { is_disabled: true },
     });
   },
