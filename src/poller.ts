@@ -352,6 +352,8 @@ export interface PollerStatus {
   persistentVolumeAvailable?: boolean;
   persistentVolumeError?: string | null;
   targets: TargetState[];
+  /** Bounded history of cursor recovery transitions (positions only; no payloads or secrets). */
+  recoveryHistory?: CursorRecoveryRecord[];
   /** SHA-256 digest of the SBOM generated for this deployment image. */
   sbomDigest: string | null;
   /** RPC circuit breaker state */
@@ -361,6 +363,39 @@ export interface PollerStatus {
     failureCount: number;
     lastFailureAt: number | null;
   };
+}
+
+/** Maximum number of cursor recovery records retained on disk and in memory. */
+export const MAX_CURSOR_RECOVERY_HISTORY = 20;
+
+export type CursorRecoveryPositionKind =
+  | "none"
+  | "ledger"
+  | "rewind"
+  | "opaque"
+  | "unreadable";
+
+export interface CursorRecoveryPosition {
+  kind: CursorRecoveryPositionKind;
+  ledger: number | null;
+  lastEventLedger: number | null;
+}
+
+export type CursorRecoveryReason =
+  | "floor_rewind"
+  | "quarantine_cold_start"
+  | "schema_migration"
+  | "operator_restore";
+
+export interface CursorRecoveryTargetTransition {
+  before: CursorRecoveryPosition;
+  after: CursorRecoveryPosition;
+}
+
+export interface CursorRecoveryRecord {
+  at: string;
+  reason: CursorRecoveryReason;
+  targets: Record<string, CursorRecoveryTargetTransition>;
 }
 
 /** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
@@ -375,6 +410,12 @@ export interface CursorFile {
    * it, so the on-disk format stays version 1 either way.
    */
   chainClockAt?: number | null;
+  /**
+   * Bounded FIFO ring of recent cursor recovery transitions (max 20 entries).
+   * Stores only sanitized ledger positions, reason enum, and ISO timestamp —
+   * never raw opaque cursor strings, event payloads, or secrets.
+   */
+  recoveryHistory?: CursorRecoveryRecord[];
   targets: Record<string, CursorTarget>;
 }
 
@@ -755,6 +796,161 @@ export function isValidCursorFile(value: unknown): value is CursorFile {
   return true;
 }
 
+const VALID_RECOVERY_POSITION_KINDS = new Set<CursorRecoveryPositionKind>([
+  "none",
+  "ledger",
+  "rewind",
+  "opaque",
+  "unreadable",
+]);
+
+const VALID_RECOVERY_REASONS = new Set<CursorRecoveryReason>([
+  "floor_rewind",
+  "quarantine_cold_start",
+  "schema_migration",
+  "operator_restore",
+]);
+
+const SAFE_TARGET_KEY_PATTERN = /^[a-zA-Z0-9_.-]{1,64}$/;
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
+
+/**
+ * Summarize a target cursor into a strictly numeric/enum recovery position.
+ * Never includes raw opaque cursor strings, event payloads, recentEventIds,
+ * bot tokens, or URLs.
+ */
+export function summarizeCursorRecoveryPosition(
+  entry:
+    | {
+        cursor?: string | null;
+        lastEventLedger?: number | null;
+        rewindFromLedger?: number | null;
+      }
+    | null
+    | undefined,
+): CursorRecoveryPosition {
+  if (!entry) {
+    return { kind: "none", ledger: null, lastEventLedger: null };
+  }
+  const lastEventLedger =
+    typeof entry.lastEventLedger === "number" &&
+    Number.isSafeInteger(entry.lastEventLedger) &&
+    entry.lastEventLedger >= 0
+      ? entry.lastEventLedger
+      : null;
+  const rewind = parseRewindFromLedger(entry.rewindFromLedger);
+  if (rewind !== null) {
+    return { kind: "rewind", ledger: rewind, lastEventLedger };
+  }
+  if (entry.cursor === null || entry.cursor === undefined || entry.cursor === "") {
+    return { kind: "none", ledger: null, lastEventLedger };
+  }
+  const parsedLedger = eventCursorLedger(entry.cursor);
+  if (parsedLedger !== null && Number.isSafeInteger(parsedLedger) && parsedLedger >= 0) {
+    return { kind: "ledger", ledger: parsedLedger, lastEventLedger };
+  }
+  return { kind: "opaque", ledger: null, lastEventLedger };
+}
+
+function sanitizeRecoveryPosition(value: unknown): CursorRecoveryPosition | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+  if (
+    typeof obj.kind !== "string" ||
+    !VALID_RECOVERY_POSITION_KINDS.has(obj.kind as CursorRecoveryPositionKind)
+  ) {
+    return null;
+  }
+  const kind = obj.kind as CursorRecoveryPositionKind;
+  const ledger =
+    obj.ledger === null || obj.ledger === undefined
+      ? null
+      : typeof obj.ledger === "number" && Number.isSafeInteger(obj.ledger) && obj.ledger >= 0
+        ? obj.ledger
+        : undefined;
+  if (ledger === undefined) return null;
+  const lastEventLedger =
+    obj.lastEventLedger === null || obj.lastEventLedger === undefined
+      ? null
+      : typeof obj.lastEventLedger === "number" &&
+          Number.isSafeInteger(obj.lastEventLedger) &&
+          obj.lastEventLedger >= 0
+        ? obj.lastEventLedger
+        : undefined;
+  if (lastEventLedger === undefined) return null;
+
+  return {
+    kind,
+    ledger: kind === "ledger" || kind === "rewind" ? ledger : null,
+    lastEventLedger,
+  };
+}
+
+/**
+ * Validate, strip unknown fields (preventing payload or secret leakage), and
+ * bound a persisted `recoveryHistory` list to the newest `maxEntries` records.
+ */
+export function sanitizeCursorRecoveryHistory(
+  value: unknown,
+  maxEntries: number = MAX_CURSOR_RECOVERY_HISTORY,
+): CursorRecoveryRecord[] {
+  if (!Array.isArray(value) || maxEntries <= 0) return [];
+  const cap = Math.min(Math.max(1, Math.trunc(maxEntries)), MAX_CURSOR_RECOVERY_HISTORY);
+  const cleaned: CursorRecoveryRecord[] = [];
+
+  for (const item of value) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+    const raw = item as Record<string, unknown>;
+    if (typeof raw.at !== "string" || !ISO_TIMESTAMP_PATTERN.test(raw.at)) continue;
+    if (
+      typeof raw.reason !== "string" ||
+      !VALID_RECOVERY_REASONS.has(raw.reason as CursorRecoveryReason)
+    ) {
+      continue;
+    }
+    if (raw.targets === null || typeof raw.targets !== "object" || Array.isArray(raw.targets)) {
+      continue;
+    }
+
+    const targets: Record<string, CursorRecoveryTargetTransition> = {};
+    for (const [targetKey, transitionVal] of Object.entries(
+      raw.targets as Record<string, unknown>,
+    )) {
+      if (!SAFE_TARGET_KEY_PATTERN.test(targetKey)) continue;
+      if (
+        transitionVal === null ||
+        typeof transitionVal !== "object" ||
+        Array.isArray(transitionVal)
+      ) {
+        continue;
+      }
+      const transObj = transitionVal as Record<string, unknown>;
+      const before = sanitizeRecoveryPosition(transObj.before);
+      const after = sanitizeRecoveryPosition(transObj.after);
+      if (!before || !after) continue;
+      targets[targetKey] = { before, after };
+    }
+
+    if (Object.keys(targets).length === 0) continue;
+    cleaned.push({
+      at: raw.at,
+      reason: raw.reason as CursorRecoveryReason,
+      targets,
+    });
+  }
+
+  return cleaned.length > cap ? cleaned.slice(cleaned.length - cap) : cleaned;
+}
+
+/** Append one sanitized recovery record while enforcing the bounded FIFO cap. */
+export function appendCursorRecoveryRecord(
+  existing: readonly CursorRecoveryRecord[] | undefined,
+  record: CursorRecoveryRecord,
+  maxEntries: number = MAX_CURSOR_RECOVERY_HISTORY,
+): CursorRecoveryRecord[] {
+  return sanitizeCursorRecoveryHistory([...(existing ?? []), record], maxEntries);
+}
+
 /** Parse + validate a cursor file body; throws on JSON or schema failure. */
 export function parseCursorFile(raw: string): CursorFile {
   let parsed: unknown;
@@ -797,11 +993,16 @@ export function parseCursorFile(raw: string): CursorFile {
     };
   }
 
+  const recoveryHistory = sanitizeCursorRecoveryHistory(
+    (parsed as unknown as Record<string, unknown>).recoveryHistory,
+  );
+
   return {
     version: 1,
     updatedAt: parsed.updatedAt ?? "",
     // Additive field: only present when the file carried it.
     ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
+    ...(recoveryHistory.length > 0 ? { recoveryHistory } : {}),
     targets,
   };
 }
@@ -947,6 +1148,8 @@ export function parseAndMigrateCursorFile(
         : nowIso;
     const file: CursorFile = { version: CURSOR_SCHEMA_VERSION, updatedAt, targets };
     if (parsed.chainClockAt !== undefined) file.chainClockAt = parseChainClock(parsed.chainClockAt);
+    const recoveryHistory = sanitizeCursorRecoveryHistory(parsed.recoveryHistory);
+    if (recoveryHistory.length > 0) file.recoveryHistory = recoveryHistory;
     return {
       file,
       migrated: typeof parsed.updatedAt !== "string" || parsed.updatedAt.length === 0,
@@ -965,8 +1168,14 @@ export function parseAndMigrateCursorFile(
   // ── Legacy: unversioned envelope with `targets` ────────────────────────────
   if (isPlainObject(parsed.targets)) {
     const targets = normalizeTargets(parsed.targets, "legacy-unversioned");
+    const recoveryHistory = sanitizeCursorRecoveryHistory(parsed.recoveryHistory);
     return {
-      file: { version: CURSOR_SCHEMA_VERSION, updatedAt: nowIso, targets },
+      file: {
+        version: CURSOR_SCHEMA_VERSION,
+        updatedAt: nowIso,
+        ...(recoveryHistory.length > 0 ? { recoveryHistory } : {}),
+        targets,
+      },
       migrated: true,
       source: "legacy-unversioned",
     };
@@ -998,11 +1207,15 @@ export function buildCursorFile(
   }>,
   updatedAt: string,
   chainClockAt?: number | null,
+  recoveryHistory?: readonly CursorRecoveryRecord[],
 ): CursorFile {
+  const sanitizedHistory =
+    recoveryHistory !== undefined ? sanitizeCursorRecoveryHistory(recoveryHistory) : [];
   return {
     version: CURSOR_SCHEMA_VERSION,
     updatedAt,
     ...(chainClockAt !== undefined ? { chainClockAt } : {}),
+    ...(sanitizedHistory.length > 0 ? { recoveryHistory: sanitizedHistory } : {}),
     targets: Object.fromEntries(
       [...targets].map((t) => [
         t.source,
@@ -1714,6 +1927,8 @@ export function createPoller(deps: PollerDeps) {
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
+  let recoveryHistory: CursorRecoveryRecord[] = [];
+
   async function loadCursors(): Promise<void> {
     let raw: string;
     try {
@@ -1729,6 +1944,7 @@ export function createPoller(deps: PollerDeps) {
     try {
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
       const parsed = result.file;
+      recoveryHistory = sanitizeCursorRecoveryHistory(parsed.recoveryHistory);
       for (const [source, saved] of Object.entries(parsed.targets)) {
         const key = source as ContractSource;
         const target = state.get(key);
@@ -1747,6 +1963,18 @@ export function createPoller(deps: PollerDeps) {
       // the file was a legacy shape, which start() rewrites before any cycle.
       status.pendingFlush = false;
       if (result.migrated) {
+        const migrationTargets: Record<string, CursorRecoveryTargetTransition> = {};
+        for (const [source, saved] of Object.entries(parsed.targets)) {
+          const pos = summarizeCursorRecoveryPosition(saved);
+          migrationTargets[source] = { before: pos, after: pos };
+        }
+        if (Object.keys(migrationTargets).length > 0) {
+          recoveryHistory = appendCursorRecoveryRecord(recoveryHistory, {
+            at: new Date(now()).toISOString(),
+            reason: "schema_migration",
+            targets: migrationTargets,
+          });
+        }
         pendingRewrite = true;
         markDirty();
         console.log(
@@ -1785,6 +2013,21 @@ export function createPoller(deps: PollerDeps) {
       // keep the bad bytes for operators instead of overwriting them on save.
       const reason = errorMessage(err);
       await quarantineCorruptCursorFile(config.cursorFile, reason);
+      const quarantineTargets: Record<string, CursorRecoveryTargetTransition> = {};
+      for (const target of state.values()) {
+        quarantineTargets[target.source] = {
+          before: { kind: "unreadable", ledger: null, lastEventLedger: null },
+          after: summarizeCursorRecoveryPosition(target),
+        };
+      }
+      if (Object.keys(quarantineTargets).length > 0) {
+        recoveryHistory = appendCursorRecoveryRecord(recoveryHistory, {
+          at: new Date(now()).toISOString(),
+          reason: "quarantine_cold_start",
+          targets: quarantineTargets,
+        });
+        markDirty();
+      }
     }
   }
 
@@ -1808,6 +2051,7 @@ export function createPoller(deps: PollerDeps) {
       })),
       new Date(now()).toISOString(),
       status.chainClockAt,
+      recoveryHistory.length > 0 ? recoveryHistory : undefined,
     );
 
     try {
@@ -2350,6 +2594,7 @@ export function createPoller(deps: PollerDeps) {
       return null;
     }
 
+    const beforePosition = summarizeCursorRecoveryPosition(current);
     const cursorLedger = eventCursorLedger(cursor);
     const missed = cursorLedger === null ? 0 : Math.max(0, window.oldestLedger - cursorLedger);
     rewindAttempts.set(target.source, attempts + 1);
@@ -2357,6 +2602,17 @@ export function createPoller(deps: PollerDeps) {
     current.cursor = null;
     current.lastEventLedger = null;
     current.rewindFromLedger = window.oldestLedger;
+    const afterPosition = summarizeCursorRecoveryPosition(current);
+    recoveryHistory = appendCursorRecoveryRecord(recoveryHistory, {
+      at: new Date(at).toISOString(),
+      reason: "floor_rewind",
+      targets: {
+        [target.source]: {
+          before: beforePosition,
+          after: afterPosition,
+        },
+      },
+    });
     // The position becomes a floor walk, so any "could not be read" flag it
     // carried is spent. The gap itself is what an operator needs, and it is
     // recorded once per occurrence: after the rewind the position *is* the
@@ -3169,6 +3425,19 @@ export function createPoller(deps: PollerDeps) {
         },
         ledgerCache: ledgerCache.stats(),
         suppressedLogs: errorSampler.suppressedTotal(),
+        recoveryHistory: recoveryHistory.map((record) => ({
+          at: record.at,
+          reason: record.reason,
+          targets: Object.fromEntries(
+            Object.entries(record.targets).map(([source, transition]) => [
+              source,
+              {
+                before: { ...transition.before },
+                after: { ...transition.after },
+              },
+            ]),
+          ),
+        })),
         targets: [...state.values()].map((t) => ({ ...t })),
       };
     },
