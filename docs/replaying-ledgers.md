@@ -73,6 +73,8 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--cap` | `<number>` | Maximum notifications to send/count per contract. | `config.maxNotificationsPerCycle` in `--send` mode; `20` in dry-run mode |
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
+| `--output` (`--out`) | `<path>` | Stream committed `mimir-replay-output-v1` JSONL event disposition records to disk. When paired with `--progress-file`, checkpoints the last fully committed output record and repairs only uncommitted trailing fragments on resume without truncating or duplicating committed records. | None |
+| `--progress-file` | `<path>` | Persist and resume replay checkpoints (`mimir-replay-progress-v1`), including output record offsets and committed event IDs when `--output` is active. | None |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
 
 ### Exit Codes
