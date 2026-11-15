@@ -36,6 +36,7 @@
     "replay:mock": "tsx src/replay-cli.ts --mock",
     "decode": "tsx src/decode-cli.ts",
     "doctor": "tsx src/doctor-cli.ts",
+    "health:report": "tsx src/healthcheck.ts --offline",
     "rpc-compare": "tsx src/rpc-compare-cli.ts"
   },
   "c8": {

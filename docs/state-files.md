@@ -53,10 +53,11 @@ Operational reference describing all on-disk state files maintained by the Mimir
 
 ### 6. Status Snapshot File (`STATUS_FILE`)
 - **Writer Module**: [`src/status.ts`](../src/status.ts) (`writeStatusFile`)
+- **Offline Reader**: [`src/health.ts`](../src/health.ts) (`readOfflineHealthReport`) / `npm run health:report -- --file ./data/status.json`
 - **Default Path**: `./data/status.json` (configured via `DEFAULTS.statusFile` in [`src/config.ts`](../src/config.ts))
 - **Write Pattern**: Atomic write-then-rename (`${file}.tmp` -> `${file}`) on each poll cycle.
-- **Deleted**: Recreated on next poll cycle.
-- **Corrupt**: Replaced atomically on next cycle write.
+- **Deleted**: Recreated on next poll cycle; `npm run health:report` reports `status: "missing"`.
+- **Corrupt**: Replaced atomically on next cycle write; `npm run health:report` reports `status: "malformed"` with schema diagnostics.
 
 ### 7. Instance Lock File (`INSTANCE_LOCK_FILE`)
 - **Writer Module**: [`src/instanceLock.ts`](../src/instanceLock.ts) (`acquireInstanceLock`)

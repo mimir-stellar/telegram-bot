@@ -9,6 +9,7 @@
  */
 
 import crypto from "node:crypto";
+import { readFile } from "node:fs/promises";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -16,11 +17,24 @@ import {
   emptyActivityBaseline,
   type ActivityBaselineSnapshot,
 } from "./activity-baseline.js";
-import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
+import {
+  APP_VERSION,
+  configProvenance,
+  networkLabel,
+  resolveStatusFile,
+  type BotConfig,
+  type ConfigProvenance,
+} from "./config.js";
 import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
-import { redactText } from "./redact.js";
+import { redactText, redactUrl } from "./redact.js";
+import {
+  STATUS_SCHEMA_VERSION,
+  boundText,
+  redactChatId,
+  type StatusSnapshot,
+} from "./status.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -561,4 +575,438 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         server.close((err) => (err ? reject(err) : resolve()));
       }),
   };
+}
+
+export type OfflineHealthState =
+  | "ok"
+  | "degraded"
+  | "stopped"
+  | "stale"
+  | "malformed"
+  | "missing";
+
+export interface OfflineHealthOptions {
+  /** Max allowed age (ms) for snapshot / last successful poll (`0` disables staleness checks). */
+  staleMs?: number;
+  /** Deterministic reference clock in unix milliseconds (defaults to `Date.now()`). */
+  nowMs?: number;
+}
+
+export interface OfflineHealthReport {
+  ok: boolean;
+  status: OfflineHealthState;
+  mode: "offline";
+  service: "mimir-telegram-bot";
+  version: string;
+  file: string;
+  checkedAt: string;
+  staleThresholdMs: number;
+  problems: string[];
+  snapshot: {
+    schemaVersion: number;
+    generatedAt: string;
+    ageMs: number;
+    stale: boolean;
+    running: boolean;
+    network: string;
+    rpcUrl: string;
+    chatId: string;
+    pollIntervalMs: number;
+    uptimeMs: number | null;
+    cycles: number;
+    lastPollAt: string | null;
+    lastSuccessAt: string | null;
+    lastSuccessAgeMs: number | null;
+    latestLedger: number | null;
+    oldestLedger: number | null;
+    notificationsSent: number;
+    notificationsFailed: number;
+    eventsSkipped: number;
+    eventsDeduplicated: number;
+    cursorRewinds: number;
+    consecutiveFailures: number;
+    sendTimeouts: number;
+    lastError: { at: string; message: string } | null;
+    targets: Array<{
+      source: string;
+      contractId: string;
+      lastCycleMs: number;
+      maxCycleMs: number;
+      cursorPreview: string | null;
+      lastEventLedger: number | null;
+      rewindFromLedger: number | null;
+      cursorStale: boolean;
+      hasError: boolean;
+      lastError: string | null;
+    }>;
+  } | null;
+}
+
+const DEFAULT_OFFLINE_STALE_MS = 90_000;
+
+function isNonNegativeInt(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isNullableNonNegativeInt(value: unknown): value is number | null {
+  return value === null || isNonNegativeInt(value);
+}
+
+function resolveOfflineStaleMs(
+  explicitStaleMs: number | undefined,
+  pollIntervalMs?: number,
+): number {
+  if (
+    typeof explicitStaleMs === "number" &&
+    Number.isFinite(explicitStaleMs) &&
+    explicitStaleMs >= 0
+  ) {
+    return Math.floor(explicitStaleMs);
+  }
+  const envRaw = process.env.HEALTH_STALE_MS?.trim();
+  if (envRaw !== undefined && envRaw !== "") {
+    const parsed = Number(envRaw);
+    if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  }
+  if (typeof pollIntervalMs === "number" && Number.isFinite(pollIntervalMs) && pollIntervalMs > 0) {
+    return Math.max(DEFAULT_OFFLINE_STALE_MS, Math.floor(pollIntervalMs) * 3);
+  }
+  return DEFAULT_OFFLINE_STALE_MS;
+}
+
+function validateStatusSnapshot(parsed: unknown): {
+  snapshot: StatusSnapshot | null;
+  problems: string[];
+} {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { snapshot: null, problems: ["status snapshot must be a JSON object"] };
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  const problems: string[] = [];
+
+  if (typeof obj.schemaVersion !== "number" || !Number.isInteger(obj.schemaVersion)) {
+    problems.push("schemaVersion must be an integer");
+  } else if (obj.schemaVersion !== STATUS_SCHEMA_VERSION) {
+    problems.push(
+      `unsupported status schemaVersion ${obj.schemaVersion} (expected ${STATUS_SCHEMA_VERSION})`,
+    );
+  }
+
+  if (typeof obj.generatedAt !== "string" || !Number.isFinite(Date.parse(obj.generatedAt))) {
+    problems.push("generatedAt must be a valid ISO-8601 timestamp");
+  }
+  if (typeof obj.running !== "boolean") {
+    problems.push("running must be a boolean");
+  }
+  if (typeof obj.network !== "string" || obj.network.trim() === "") {
+    problems.push("network must be a non-empty string");
+  }
+  if (typeof obj.rpcUrl !== "string" || obj.rpcUrl.trim() === "") {
+    problems.push("rpcUrl must be a non-empty string");
+  }
+  if (typeof obj.chatId !== "string") {
+    problems.push("chatId must be a string");
+  }
+  if (!isNonNegativeInt(obj.pollIntervalMs) || obj.pollIntervalMs < 1) {
+    problems.push("pollIntervalMs must be a positive integer");
+  }
+  if (!isNullableNonNegativeInt(obj.uptimeMs)) {
+    problems.push("uptimeMs must be a non-negative integer or null");
+  }
+  for (const field of [
+    "cycles",
+    "notificationsSent",
+    "notificationsFailed",
+    "eventsSkipped",
+    "consecutiveFailures",
+  ] as const) {
+    if (!isNonNegativeInt(obj[field])) {
+      problems.push(`${field} must be a non-negative integer`);
+    }
+  }
+  for (const field of ["lastPollAt", "lastSuccessAt", "latestLedger", "oldestLedger"] as const) {
+    if (!isNullableNonNegativeInt(obj[field])) {
+      problems.push(`${field} must be a non-negative integer or null`);
+    }
+  }
+
+  if (obj.lastError !== null && obj.lastError !== undefined) {
+    if (typeof obj.lastError !== "object" || Array.isArray(obj.lastError)) {
+      problems.push("lastError must be an object or null");
+    } else {
+      const errObj = obj.lastError as Record<string, unknown>;
+      if (!isNonNegativeInt(errObj.at) || typeof errObj.message !== "string") {
+        problems.push("lastError must include numeric timestamp 'at' and string 'message'");
+      }
+    }
+  } else if (obj.lastError === undefined) {
+    problems.push("lastError must be present (object or null)");
+  }
+
+  if (!Array.isArray(obj.targets)) {
+    problems.push("targets must be an array");
+  } else {
+    obj.targets.forEach((entry, idx) => {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        problems.push(`targets[${idx}] must be an object`);
+        return;
+      }
+      const target = entry as Record<string, unknown>;
+      if (typeof target.source !== "string" || target.source.trim() === "") {
+        problems.push(`targets[${idx}].source must be a non-empty string`);
+      }
+      if (typeof target.contractId !== "string" || target.contractId.trim() === "") {
+        problems.push(`targets[${idx}].contractId must be a non-empty string`);
+      }
+      if (target.cursor !== null && typeof target.cursor !== "string") {
+        problems.push(`targets[${idx}].cursor must be a string or null`);
+      }
+      if (!isNullableNonNegativeInt(target.lastEventLedger)) {
+        problems.push(`targets[${idx}].lastEventLedger must be a non-negative integer or null`);
+      }
+      if (typeof target.cursorStale !== "boolean") {
+        problems.push(`targets[${idx}].cursorStale must be a boolean`);
+      }
+      if (target.lastError !== null && typeof target.lastError !== "string") {
+        problems.push(`targets[${idx}].lastError must be a string or null`);
+      }
+    });
+  }
+
+  if (problems.length > 0) {
+    return { snapshot: null, problems };
+  }
+
+  return { snapshot: obj as unknown as StatusSnapshot, problems: [] };
+}
+
+/**
+ * Evaluate raw persisted status file contents into an offline health report
+ * suitable for incident bundles without opening any HTTP server or network socket.
+ */
+export function evaluateOfflineStatusContent(
+  raw: string,
+  file: string,
+  options: OfflineHealthOptions = {},
+): OfflineHealthReport {
+  const nowMs =
+    typeof options.nowMs === "number" && Number.isFinite(options.nowMs)
+      ? options.nowMs
+      : Date.now();
+  const checkedAt = new Date(nowMs).toISOString();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const detail = boundText(err instanceof Error ? err.message : String(err), 120);
+    return {
+      ok: false,
+      status: "malformed",
+      mode: "offline",
+      service: "mimir-telegram-bot",
+      version: APP_VERSION,
+      file,
+      checkedAt,
+      staleThresholdMs: resolveOfflineStaleMs(options.staleMs),
+      problems: [`status file is not valid JSON (${redactText(detail)})`],
+      snapshot: null,
+    };
+  }
+
+  const validated = validateStatusSnapshot(parsed);
+  if (validated.snapshot === null) {
+    return {
+      ok: false,
+      status: "malformed",
+      mode: "offline",
+      service: "mimir-telegram-bot",
+      version: APP_VERSION,
+      file,
+      checkedAt,
+      staleThresholdMs: resolveOfflineStaleMs(options.staleMs),
+      problems: validated.problems,
+      snapshot: null,
+    };
+  }
+
+  const snap = validated.snapshot;
+  const staleThresholdMs = resolveOfflineStaleMs(options.staleMs, snap.pollIntervalMs);
+  const generatedMs = Date.parse(snap.generatedAt);
+  const ageMs = Math.max(0, nowMs - generatedMs);
+  const lastSuccessAgeMs =
+    snap.lastSuccessAt === null ? null : Math.max(0, nowMs - snap.lastSuccessAt);
+
+  const isSnapshotStale = staleThresholdMs > 0 && ageMs > staleThresholdMs;
+  const isSuccessStale =
+    snap.running &&
+    lastSuccessAgeMs !== null &&
+    staleThresholdMs > 0 &&
+    lastSuccessAgeMs > staleThresholdMs;
+
+  const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(snap.pollIntervalMs, 1)));
+  const tooManyFailures = snap.consecutiveFailures >= failureBudget;
+  const staleTargets = snap.targets.filter((t) => t.cursorStale === true);
+
+  const problems: string[] = [];
+  if (isSnapshotStale) {
+    problems.push(`status snapshot is stale (age ${ageMs}ms exceeds ${staleThresholdMs}ms)`);
+  }
+  if (isSuccessStale) {
+    problems.push(
+      `last successful poll is stale (age ${lastSuccessAgeMs}ms exceeds ${staleThresholdMs}ms)`,
+    );
+  }
+  if (!snap.running) {
+    problems.push("poller is stopped in persisted status snapshot");
+  }
+  if (staleTargets.length > 0) {
+    const names = staleTargets.map((t) => boundText(t.source, 32)).join(", ");
+    problems.push(`target cursor marked stale (${names})`);
+  }
+  if (tooManyFailures) {
+    problems.push(
+      `consecutive poll failures (${snap.consecutiveFailures}) reached threshold (${failureBudget})`,
+    );
+  }
+
+  let status: OfflineHealthState;
+  if (isSnapshotStale || isSuccessStale) {
+    status = "stale";
+  } else if (!snap.running) {
+    status = "stopped";
+  } else if (tooManyFailures || staleTargets.length > 0) {
+    status = "degraded";
+  } else {
+    status = "ok";
+  }
+
+  return {
+    ok: status === "ok",
+    status,
+    mode: "offline",
+    service: "mimir-telegram-bot",
+    version: APP_VERSION,
+    file,
+    checkedAt,
+    staleThresholdMs,
+    problems,
+    snapshot: {
+      schemaVersion: snap.schemaVersion,
+      generatedAt: new Date(generatedMs).toISOString(),
+      ageMs,
+      stale: isSnapshotStale || isSuccessStale,
+      running: snap.running,
+      network: boundText(snap.network, 64),
+      rpcUrl: redactUrl(snap.rpcUrl),
+      chatId: redactChatId(snap.chatId),
+      pollIntervalMs: snap.pollIntervalMs,
+      uptimeMs: snap.uptimeMs,
+      cycles: snap.cycles,
+      lastPollAt: iso(snap.lastPollAt),
+      lastSuccessAt: iso(snap.lastSuccessAt),
+      lastSuccessAgeMs,
+      latestLedger: snap.latestLedger,
+      oldestLedger: snap.oldestLedger,
+      notificationsSent: snap.notificationsSent,
+      notificationsFailed: snap.notificationsFailed,
+      eventsSkipped: snap.eventsSkipped,
+      eventsDeduplicated: isNonNegativeInt(snap.eventsDeduplicated) ? snap.eventsDeduplicated : 0,
+      cursorRewinds: isNonNegativeInt(snap.cursorRewinds) ? snap.cursorRewinds : 0,
+      consecutiveFailures: snap.consecutiveFailures,
+      sendTimeouts: isNonNegativeInt(snap.sendTimeouts) ? snap.sendTimeouts : 0,
+      lastError: snap.lastError
+        ? {
+            at: new Date(snap.lastError.at).toISOString(),
+            message: redactText(boundText(snap.lastError.message)),
+          }
+        : null,
+      targets: snap.targets.map((t) => ({
+        source: boundText(t.source, 32),
+        contractId: boundText(t.contractId, 64),
+        lastCycleMs: isNonNegativeInt(t.lastCycleMs) ? t.lastCycleMs : 0,
+        maxCycleMs: isNonNegativeInt(t.maxCycleMs) ? t.maxCycleMs : 0,
+        cursorPreview: previewCursor(t.cursor),
+        lastEventLedger: t.lastEventLedger,
+        rewindFromLedger: isNullableNonNegativeInt(t.rewindFromLedger) ? t.rewindFromLedger : null,
+        cursorStale: t.cursorStale === true,
+        hasError: t.lastError !== null,
+        lastError: t.lastError === null ? null : redactText(boundText(t.lastError)),
+      })),
+    },
+  };
+}
+
+/**
+ * Read a persisted status file (`STATUS_FILE` by default) and build an offline
+ * health report without opening any server or requiring Telegram/RPC credentials.
+ */
+export async function readOfflineHealthReport(
+  file: string = resolveStatusFile(),
+  options: OfflineHealthOptions = {},
+): Promise<OfflineHealthReport> {
+  const nowMs =
+    typeof options.nowMs === "number" && Number.isFinite(options.nowMs)
+      ? options.nowMs
+      : Date.now();
+  let raw: string;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    const reason =
+      code === "ENOENT"
+        ? "status file not found"
+        : `status file unreadable (${redactText(boundText(safeErrorMessage(err), 120))})`;
+    return {
+      ok: false,
+      status: "missing",
+      mode: "offline",
+      service: "mimir-telegram-bot",
+      version: APP_VERSION,
+      file,
+      checkedAt: new Date(nowMs).toISOString(),
+      staleThresholdMs: resolveOfflineStaleMs(options.staleMs),
+      problems: [reason],
+      snapshot: null,
+    };
+  }
+
+  return evaluateOfflineStatusContent(raw, file, options);
+}
+
+/**
+ * Render an {@link OfflineHealthReport} as a concise, redacted text summary for
+ * operator terminals and incident bundles.
+ */
+export function formatOfflineHealthReport(report: OfflineHealthReport): string {
+  const lines: string[] = [
+    `[health:offline] status=${report.status.toUpperCase()} ok=${report.ok} file=${report.file}`,
+    `  checkedAt: ${report.checkedAt} (staleThresholdMs=${report.staleThresholdMs})`,
+  ];
+
+  if (report.snapshot !== null) {
+    const s = report.snapshot;
+    lines.push(
+      `  snapshot: schema=v${s.schemaVersion} generatedAt=${s.generatedAt} ageMs=${s.ageMs} running=${s.running}`,
+      `  network: ${s.network} (${s.rpcUrl}) chat=${s.chatId}`,
+      `  ledgers: oldest=${s.oldestLedger ?? "unknown"} latest=${s.latestLedger ?? "unknown"}`,
+      `  counters: cycles=${s.cycles} sent=${s.notificationsSent} failed=${s.notificationsFailed} skipped=${s.eventsSkipped} consecutiveFailures=${s.consecutiveFailures}`,
+    );
+    for (const target of s.targets) {
+      lines.push(
+        `  target[${target.source}]: contract=${target.contractId} ledger=${target.lastEventLedger ?? "none"} cursorStale=${target.cursorStale} hasError=${target.hasError}`,
+      );
+    }
+  }
+
+  if (report.problems.length > 0) {
+    lines.push("  problems:");
+    for (const problem of report.problems) {
+      lines.push(`    - ${problem}`);
+    }
+  }
+
+  return lines.join("\n");
 }

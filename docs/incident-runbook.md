@@ -65,6 +65,15 @@ npm run scan
 
 Use `--from`, `--pages`, or `--show` when a narrower or deeper scan is needed.
 
+For an offline health report against an incident bundle or local `STATUS_FILE` without starting a server or requiring credentials:
+
+```bash
+npm run health:report -- --file ./data/status.json
+npm run health:report -- --file ./data/status.json --json
+```
+
+The offline report validates the persisted status schema (`STATUS_SCHEMA_VERSION = 1`) and explicitly classifies `ok`, `degraded`, `stopped`, `stale`, `malformed`, or `missing` snapshots.
+
 ## Chain clock skew
 
 `/status` and `GET /health` show how far this host's clock is from the newest
