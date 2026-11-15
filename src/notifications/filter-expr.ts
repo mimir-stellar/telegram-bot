@@ -857,3 +857,18 @@ function compareValues(
 
   return false;
 }
+
+export {
+  FilterConfigValidationError,
+  createAtomicFilterStore,
+  evaluateCompiledFilterSet,
+  validateCandidateFilterConfig,
+  type AtomicFilterStore,
+  type AtomicFilterStoreStatus,
+  type CandidateFeatureFlagsInput,
+  type CandidateFilterConfig,
+  type CompiledFilterSet,
+  type FilterReloadResult,
+  type FilterRuleMatchMode,
+  type FilterValidationResult,
+} from "./filter-reload.js";

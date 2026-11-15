@@ -24,6 +24,71 @@ export interface AmountThresholds {
   squadDeposit?: bigint;
 }
 
+/** Raw candidate threshold values accepted during configuration load or reload. */
+export interface RawAmountThresholds {
+  marketChallenge?: string | bigint | null;
+  squadDeposit?: string | bigint | null;
+}
+
+const KNOWN_THRESHOLD_KEYS = new Set(["marketChallenge", "squadDeposit"]);
+
+/**
+ * Validates a complete threshold configuration object without mutating any active state.
+ * Collects all threshold validation problems before returning.
+ */
+export function validateAmountThresholds(
+  raw: unknown,
+): { thresholds: AmountThresholds; problems: string[] } {
+  const problems: string[] = [];
+  if (raw === undefined || raw === null) {
+    return { thresholds: {}, problems };
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      thresholds: {},
+      problems: ["thresholds must be an object with optional marketChallenge / squadDeposit keys"],
+    };
+  }
+
+  const record = raw as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!KNOWN_THRESHOLD_KEYS.has(key)) {
+      problems.push(`thresholds.${key}: unknown threshold key`);
+    }
+  }
+
+  const thresholds: AmountThresholds = {};
+  for (const key of ["marketChallenge", "squadDeposit"] as const) {
+    const value = record[key];
+    if (value === undefined || value === null) {
+      continue;
+    }
+    if (typeof value === "bigint") {
+      if (value < 0n) {
+        problems.push(`thresholds.${key}: Threshold cannot be negative: "${value.toString()}"`);
+      } else {
+        thresholds[key] = value;
+      }
+      continue;
+    }
+    if (typeof value === "string") {
+      try {
+        thresholds[key] = parseUsdcThreshold(value);
+      } catch (err) {
+        problems.push(
+          `thresholds.${key}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      continue;
+    }
+    problems.push(
+      `thresholds.${key}: Threshold must be a decimal string or bigint, got ${typeof value}`,
+    );
+  }
+
+  return { thresholds, problems };
+}
+
 /**
  * Parses a decimal string representing a USDC amount into atomic 7-decimal units (bigint).
  *

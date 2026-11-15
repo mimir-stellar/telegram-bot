@@ -153,3 +153,14 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_created` events**: Muted by `eventAllowedByCategory` because `config.notificationCategories` is non-empty (`["__none__"]`) and no real on-chain claim category matches `"__none__"`.
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
+
+---
+
+## 4. Atomic Filter Configuration Reloads
+
+Programmatic filter stores created with [`createAtomicFilterStore`](../src/notifications/filter-reload.ts) (re-exported from [`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts)) validate the entire candidate configuration before swapping active rules:
+
+- **Full upfront validation (`validateCandidateFilterConfig`)**: Parses every expression in `rules` via [`parseFilterExpression`](../src/notifications/filter-expr.ts), every USDC threshold in `thresholds` via [`validateAmountThresholds`](../src/notifications/amount-threshold.ts), `ruleMode` (`"any"` default or `"all"`), `featureFlags`, and `categories` before mutating active state. Unknown keys and multi-field errors are collected in a single `problems` list.
+- **Fail-safe retention on reload failure (`reload`, `reloadFromJson`, `reloadFromFile`)**: If JSON parsing fails, the target file cannot be read, or any single rule/threshold/flag is invalid, the active frozen `CompiledFilterSet` (`version`, `rules`, `thresholds`, `featureFlags`, `categories`) remains unchanged while `status().failedReloads` and `status().lastReloadError` record the failure.
+- **Immutable snapshots**: Each successful reload swaps to a deeply frozen `CompiledFilterSet` and increments `version`, ensuring in-flight evaluations reading `store.current()` never observe partially updated rules.
+
