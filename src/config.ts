@@ -58,6 +58,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import { redactText } from "./redact.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -187,7 +188,221 @@ export interface StellarConfig {
 
 export interface TelegramRoute {
   chatId: string;
+  /** Optional forum topic id (`message_thread_id`) within a supergroup chat. */
+  topicId?: number | undefined;
+  /** Canonical `(chat, topic)` identity (`<canonicalChatId>#<topicId|root>`). */
+  canonicalKey?: string | undefined;
   channelPreviewMode: boolean;
+}
+
+export interface RouteTargetInput {
+  chatId: string;
+  topicId?: number | string | null | undefined;
+  channelPreviewMode?: boolean | undefined;
+}
+
+export interface CanonicalNotificationRoute extends TelegramRoute {
+  canonicalKey: string;
+}
+
+const NUMERIC_CHAT_ID_RE = /^-?\d+$/;
+const CHANNEL_USERNAME_RE = /^@[A-Za-z0-9_]{4,}$/;
+
+function parseTopicIdValue(raw: number | string): number | null {
+  if (typeof raw === "number") {
+    if (!Number.isInteger(raw) || raw < 1 || raw > Number.MAX_SAFE_INTEGER) return null;
+    return raw;
+  }
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const asBigInt = BigInt(trimmed);
+  if (asBigInt < 1n || asBigInt > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(asBigInt);
+}
+
+function splitRawRouteTarget(raw: string): { chatPart: string; topicPart?: string } | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  // Never split a Telegram bot token shape (`<digits>:<35+ chars>`) as chat:topic.
+  if (/^\d+:[A-Za-z0-9_-]{20,}$/.test(trimmed)) return null;
+
+  const sepMatch = /^([^:#/\s]+)(?:[:#/])([^:#/\s]*)$/.exec(trimmed);
+  if (sepMatch) {
+    return { chatPart: sepMatch[1]!, topicPart: sepMatch[2]! };
+  }
+  if (/[:#/]/.test(trimmed)) {
+    return null;
+  }
+  return { chatPart: trimmed };
+}
+
+/**
+ * Canonicalizes a single Telegram route target (`chatId`, `chatId:topicId`,
+ * `chatId#topicId`, `chatId/topicId`, or `{ chatId, topicId }`).
+ *
+ * Numeric chat ids normalize leading zeros (`-00100123` -> `-100123`),
+ * `@channelusername` handles case-fold to lowercase, and forum topic ids
+ * normalize to positive integers (`042` -> `42`). Any invalid value reported
+ * in an error is redacted against known secrets and credential shapes so a
+ * misconfigured `BOT_TOKEN` can never leak.
+ */
+export function canonicalizeNotificationRoute(
+  input: string | RouteTargetInput,
+  options: {
+    channelPreviewMode?: boolean | undefined;
+    secrets?: readonly string[] | undefined;
+    strict?: boolean | undefined;
+  } = {},
+): CanonicalNotificationRoute {
+  const secrets = options.secrets ?? [];
+  const strict = options.strict !== false;
+  const preview =
+    typeof input === "object" && input !== null && typeof input.channelPreviewMode === "boolean"
+      ? input.channelPreviewMode
+      : (options.channelPreviewMode ?? false);
+
+  const rawChat = typeof input === "string" ? input : input?.chatId;
+  if (typeof rawChat !== "string" || rawChat.trim() === "") {
+    throw new Error("route chatId must be a non-empty string");
+  }
+
+  const split = splitRawRouteTarget(rawChat);
+  if (!split) {
+    const safeDisplay = redactText(rawChat.trim(), { secrets, maxLen: 80 });
+    throw new Error(
+      `must contain numeric chat ids or @channelusernames (with optional :topicId); got "${safeDisplay}"`,
+    );
+  }
+
+  let canonicalChatId: string;
+  if (NUMERIC_CHAT_ID_RE.test(split.chatPart)) {
+    canonicalChatId = BigInt(split.chatPart).toString();
+  } else if (CHANNEL_USERNAME_RE.test(split.chatPart)) {
+    canonicalChatId = split.chatPart.toLowerCase();
+  } else if (!strict && !/\s/.test(split.chatPart)) {
+    canonicalChatId = split.chatPart;
+  } else {
+    const safeDisplay = redactText(rawChat.trim(), { secrets, maxLen: 80 });
+    throw new Error(
+      `must contain numeric chat ids or @channelusernames (with optional :topicId); got "${safeDisplay}"`,
+    );
+  }
+
+  let inlineTopicId: number | undefined;
+  if (split.topicPart !== undefined) {
+    const parsedTopic = parseTopicIdValue(split.topicPart);
+    if (parsedTopic === null) {
+      const safeTopic = redactText(split.topicPart, { secrets, maxLen: 40 });
+      throw new Error(
+        `topic id must be a positive integer; got "${safeTopic}"`,
+      );
+    }
+    inlineTopicId = parsedTopic;
+  }
+
+  let explicitTopicId: number | undefined;
+  if (typeof input === "object" && input !== null && input.topicId !== undefined && input.topicId !== null && input.topicId !== "") {
+    const parsedExplicit = parseTopicIdValue(input.topicId);
+    if (parsedExplicit === null) {
+      const safeTopic = redactText(String(input.topicId), { secrets, maxLen: 40 });
+      throw new Error(
+        `topic id must be a positive integer; got "${safeTopic}"`,
+      );
+    }
+    explicitTopicId = parsedExplicit;
+  }
+
+  if (
+    inlineTopicId !== undefined &&
+    explicitTopicId !== undefined &&
+    inlineTopicId !== explicitTopicId
+  ) {
+    throw new Error(
+      `conflicting topic ids on route (${inlineTopicId} vs ${explicitTopicId})`,
+    );
+  }
+
+  const topicId = explicitTopicId ?? inlineTopicId;
+  const canonicalKey =
+    topicId !== undefined ? `${canonicalChatId}#${topicId}` : `${canonicalChatId}#root`;
+
+  return {
+    chatId: canonicalChatId,
+    ...(topicId !== undefined ? { topicId } : {}),
+    canonicalKey,
+    channelPreviewMode: preview,
+  };
+}
+
+/** Format a canonical route back into its compact string target (`chatId` or `chatId:topicId`). */
+export function formatCanonicalRouteTarget(
+  route: Pick<TelegramRoute, "chatId" | "topicId">,
+): string {
+  return route.topicId !== undefined ? `${route.chatId}:${route.topicId}` : route.chatId;
+}
+
+/**
+ * Canonicalizes a list of notification routes and reports any malformed or
+ * duplicate `(chat, topic)` destinations without exposing `BOT_TOKEN`.
+ */
+export function canonicalizeNotificationRoutes(
+  inputs: readonly (string | RouteTargetInput)[],
+  options: {
+    sourceName?: string | undefined;
+    channelPreviewMode?: boolean | undefined;
+    secrets?: readonly string[] | undefined;
+    strict?: boolean | undefined;
+  } = {},
+): {
+  routes: CanonicalNotificationRoute[];
+  problems: string[];
+  duplicateKeys: string[];
+} {
+  const sourceName = options.sourceName ?? "TELEGRAM_CHAT_ID";
+  const secrets = options.secrets ?? [];
+  const routes: CanonicalNotificationRoute[] = [];
+  const problems: string[] = [];
+  const duplicateKeys: string[] = [];
+  const seenByKey = new Map<string, number>();
+
+  for (const [index, entry] of inputs.entries()) {
+    let canonical: CanonicalNotificationRoute;
+    try {
+      canonical = canonicalizeNotificationRoute(entry, {
+        channelPreviewMode: options.channelPreviewMode,
+        secrets,
+        strict: options.strict,
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      problems.push(
+        redactText(`${sourceName} ${detail}`, { secrets, maxLen: 240 }),
+      );
+      continue;
+    }
+
+    const firstIndex = seenByKey.get(canonical.canonicalKey);
+    if (firstIndex !== undefined) {
+      duplicateKeys.push(canonical.canonicalKey);
+      const safeTarget = redactText(formatCanonicalRouteTarget(canonical), {
+        secrets,
+        maxLen: 80,
+      });
+      problems.push(
+        redactText(
+          `${sourceName} contains duplicate notification route "${safeTarget}" ` +
+            `(canonical identity "${canonical.canonicalKey}" matches route #${firstIndex + 1} and route #${index + 1})`,
+          { secrets, maxLen: 240 },
+        ),
+      );
+      continue;
+    }
+
+    seenByKey.set(canonical.canonicalKey, index);
+    routes.push(canonical);
+  }
+
+  return { routes, problems, duplicateKeys };
 }
 
 export interface BotConfig extends StellarConfig {
@@ -653,23 +868,33 @@ function collector(profile: Record<string, string>) {
       return fallback;
     },
 
-    chatIds(name: string): string[] {
+    notificationRoutes(
+      name: string,
+      channelPreviewMode: boolean,
+      secrets: readonly string[] = [],
+    ): CanonicalNotificationRoute[] {
       const value = this.required(name);
       if (value === "") return [];
-      
-      const ids = value.split(",").map(s => s.trim()).filter(s => s !== "");
-      if (ids.length === 0) {
+
+      const rawItems = value
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s !== "");
+      if (rawItems.length === 0) {
         problems.push(`${name} is required but not set`);
         return [];
       }
-      for (const id of ids) {
-        if (!/^-?\d+$/.test(id) && !/^@[A-Za-z0-9_]{4,}$/.test(id)) {
-          problems.push(
-            `${name} must contain numeric chat ids or @channelusernames; got "${id}"`,
-          );
-        }
+
+      const result = canonicalizeNotificationRoutes(rawItems, {
+        sourceName: name,
+        channelPreviewMode,
+        secrets,
+        strict: true,
+      });
+      for (const problem of result.problems) {
+        problems.push(problem);
       }
-      return ids;
+      return result.routes;
     },
 
     /**
@@ -691,15 +916,58 @@ function collector(profile: Record<string, string>) {
       return parsed;
     },
 
-    optionalChatId(name: string, fallback: string): string {
-      const value = read(name) ?? fallback;
-      if (value === "") return value;
-      if (!/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
-        problems.push(
-          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
-        );
+    optionalChatId(
+      name: string,
+      fallback: string,
+      secrets: readonly string[] = [],
+    ): string {
+      const raw = read(name);
+      if (raw === undefined) return fallback;
+      if (raw === "") return "";
+      const items = raw
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s !== "");
+      if (items.length === 0) return fallback;
+      if (items.length > 1) {
+        const check = canonicalizeNotificationRoutes(items, {
+          sourceName: name,
+          secrets,
+          strict: true,
+        });
+        for (const problem of check.problems) {
+          problems.push(problem);
+        }
+        if (check.problems.length === 0) {
+          problems.push(
+            `${name} must specify a single chat or chat:topic destination; got ${items.length} entries`,
+          );
+        }
+        return check.routes[0] ? formatCanonicalRouteTarget(check.routes[0]) : fallback;
       }
-      return value;
+      try {
+        const canonical = canonicalizeNotificationRoute(items[0]!, {
+          secrets,
+          strict: true,
+        });
+        return formatCanonicalRouteTarget(canonical);
+      } catch (err) {
+        const safeVal = redactText(raw, { secrets, maxLen: 80 });
+        const detail = err instanceof Error ? err.message : String(err);
+        if (detail.startsWith("topic id")) {
+          problems.push(
+            redactText(`${name} ${detail}`, { secrets, maxLen: 240 }),
+          );
+        } else {
+          problems.push(
+            redactText(
+              `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername (with optional :topicId); got "${safeVal}"`,
+              { secrets, maxLen: 240 },
+            ),
+          );
+        }
+        return fallback;
+      }
     },
 
     /**
@@ -881,7 +1149,12 @@ export function loadConfig(): BotConfig {
     NOTIFY_SQUAD: read("NOTIFY_SQUAD"),
   });
   for (const problem of featureFlagsParsed.problems) c.problems.push(problem);
-  const chatIds = c.chatIds("TELEGRAM_CHAT_ID");
+  const botToken = c.botToken("BOT_TOKEN");
+  const tokenSecrets = botToken !== "" ? [botToken] : [];
+  const channelPreviewMode = c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode);
+  const routes = c.notificationRoutes("TELEGRAM_CHAT_ID", channelPreviewMode, tokenSecrets);
+  const chatIds = routes.map((route) => formatCanonicalRouteTarget(route));
+  const primaryChatId = chatIds[0] ?? "";
 
   const localeInput = read("MIMIR_LOCALE");
   const locale = localeInput === undefined ? DEFAULT_LOCALE : normalizeLocale(localeInput);
@@ -895,11 +1168,12 @@ export function loadConfig(): BotConfig {
     ...stellar,
     locale: locale ?? DEFAULT_LOCALE,
     version: APP_VERSION,
-    botToken: c.botToken("BOT_TOKEN"),
-    chatId: chatIds[0] ?? "",
+    botToken,
+    chatId: primaryChatId,
     chatIds,
-    marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
-    squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
+    routes,
+    marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", primaryChatId, tokenSecrets),
+    squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", primaryChatId, tokenSecrets),
     allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
@@ -959,7 +1233,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.telegramSendTimeoutMs,
       0,
     ),
-    channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
+    channelPreviewMode,
     linkPreviewMarket: c.bool("LINK_PREVIEW_MARKET", DEFAULTS.linkPreviewMarket),
     linkPreviewSquad: c.bool("LINK_PREVIEW_SQUAD", DEFAULTS.linkPreviewSquad),
     logSampleMaxPerWindow: c.int(
@@ -976,7 +1250,12 @@ export function loadConfig(): BotConfig {
     healthAuthToken: c.optionalSecret("HEALTH_AUTH_TOKEN"),
   };
 
-  if (c.problems.length > 0) throw new ConfigError(c.problems);
+  if (c.problems.length > 0) {
+    const safeProblems = c.problems.map((problem) =>
+      redactText(problem, { secrets: tokenSecrets, maxLen: 300 }),
+    );
+    throw new ConfigError(safeProblems);
+  }
 
   // Warn if health endpoint is exposed beyond loopback without authentication.
   if (config.healthPort !== 0 && !isLoopback(config.healthHost) && config.healthAuthToken === null) {

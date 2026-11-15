@@ -13,7 +13,15 @@
 
 import type { Bot } from "grammy";
 
-import type { BotConfig } from "../config.js";
+import {
+  ConfigError,
+  canonicalizeNotificationRoute,
+  canonicalizeNotificationRoutes,
+  type BotConfig,
+  type CanonicalNotificationRoute,
+  type RouteTargetInput,
+} from "../config.js";
+import { redactText } from "../redact.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
   safeErrorMessage,
@@ -21,6 +29,127 @@ import {
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+
+/**
+ * Raised when `createNotifier` receives duplicate `(chat, topic)` routes in a
+ * programmatically constructed config. Extends `ConfigError` so startup error
+ * handlers treat it as a configuration problem without leaking `BOT_TOKEN`.
+ */
+export class DuplicateRouteError extends ConfigError {
+  readonly duplicateKeys: readonly string[];
+
+  constructor(
+    problems: readonly string[],
+    duplicateKeys: readonly string[],
+    secrets: readonly string[] = [],
+  ) {
+    const safeProblems = problems.map((problem) =>
+      redactText(problem, { secrets, maxLen: 240 }),
+    );
+    super(
+      safeProblems,
+      "Remove duplicate chat/topic destinations so each notification route is unique.",
+    );
+    this.name = "DuplicateRouteError";
+    this.duplicateKeys = duplicateKeys.map((key) =>
+      redactText(key, { secrets, maxLen: 120 }),
+    );
+  }
+}
+
+export interface NotifierRouteConfig {
+  chatId?: string | undefined;
+  chatIds?: readonly string[] | undefined;
+  routes?: readonly RouteTargetInput[] | undefined;
+  marketChatId?: string | undefined;
+  squadChatId?: string | undefined;
+  botToken?: string | undefined;
+  channelPreviewMode?: boolean | undefined;
+  linkPreviewMarket?: boolean | undefined;
+  linkPreviewSquad?: boolean | undefined;
+  silentEvents?: readonly string[] | undefined;
+}
+
+/**
+ * Canonicalizes and validates all route lists on a notifier config before
+ * startup. Throws {@link DuplicateRouteError} if any duplicate `(chat, topic)`
+ * routes exist, redacting `botToken` and credential-shaped strings.
+ */
+export function validateNotifierRoutes(config: NotifierRouteConfig): {
+  routes: CanonicalNotificationRoute[];
+  defaultRoute: CanonicalNotificationRoute | null;
+  marketRoute: CanonicalNotificationRoute | null;
+  squadRoute: CanonicalNotificationRoute | null;
+} {
+  const secrets =
+    typeof config.botToken === "string" && config.botToken !== ""
+      ? [config.botToken]
+      : [];
+  const preview = config.channelPreviewMode ?? false;
+
+  const problems: string[] = [];
+  const duplicateKeys: string[] = [];
+  let canonicalRoutes: CanonicalNotificationRoute[] = [];
+
+  if (Array.isArray(config.routes) && config.routes.length > 0) {
+    const parsed = canonicalizeNotificationRoutes(config.routes, {
+      sourceName: "routes",
+      channelPreviewMode: preview,
+      secrets,
+      strict: false,
+    });
+    canonicalRoutes = parsed.routes;
+    problems.push(...parsed.problems);
+    duplicateKeys.push(...parsed.duplicateKeys);
+  }
+
+  if (Array.isArray(config.chatIds) && config.chatIds.length > 0) {
+    const parsedChatIds = canonicalizeNotificationRoutes(config.chatIds, {
+      sourceName: "TELEGRAM_CHAT_ID",
+      channelPreviewMode: preview,
+      secrets,
+      strict: false,
+    });
+    if (canonicalRoutes.length === 0) {
+      canonicalRoutes = parsedChatIds.routes;
+    }
+    problems.push(...parsedChatIds.problems);
+    duplicateKeys.push(...parsedChatIds.duplicateKeys);
+  }
+
+  if (problems.length > 0) {
+    throw new DuplicateRouteError(problems, duplicateKeys, secrets);
+  }
+
+  const parseSingle = (
+    raw: string | undefined,
+    sourceName: string,
+  ): CanonicalNotificationRoute | null => {
+    if (typeof raw !== "string" || raw.trim() === "") return null;
+    try {
+      return canonicalizeNotificationRoute(raw, {
+        channelPreviewMode: preview,
+        secrets,
+        strict: false,
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new DuplicateRouteError([`${sourceName} ${detail}`], [], secrets);
+    }
+  };
+
+  const defaultRoute =
+    parseSingle(config.chatId, "TELEGRAM_CHAT_ID") ?? canonicalRoutes[0] ?? null;
+  const marketRoute = parseSingle(config.marketChatId, "TELEGRAM_MARKET_CHAT_ID");
+  const squadRoute = parseSingle(config.squadChatId, "TELEGRAM_SQUAD_CHAT_ID");
+
+  return {
+    routes: canonicalRoutes,
+    defaultRoute,
+    marketRoute,
+    squadRoute,
+  };
+}
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
 
@@ -118,9 +247,24 @@ export const notifierSkips = { emptyText: 0 };
  */
 export function createNotifier(
   bot: Pick<Bot, "api">,
-  config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
-    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  config: Pick<BotConfig, "chatId"> &
+    Partial<
+      Pick<
+        BotConfig,
+        | "marketChatId"
+        | "squadChatId"
+        | "botToken"
+        | "chatIds"
+        | "routes"
+        | "channelPreviewMode"
+        | "linkPreviewMarket"
+        | "linkPreviewSquad"
+        | "silentEvents"
+      >
+    >,
 ) {
+  const validated = validateNotifierRoutes(config);
+
   return async (
     text: string | null,
     source?: ContractSource,
@@ -138,12 +282,18 @@ export function createNotifier(
       return;
     }
 
-    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
-    const chatId = source === "market"
-      ? config.marketChatId || defaultChat
-      : source === "squad"
-        ? config.squadChatId || defaultChat
-        : defaultChat;
+    const fallbackChat = config.chatId ?? config.chatIds?.[0] ?? "";
+    const resolvedRoute =
+      source === "market"
+        ? validated.marketRoute ?? validated.defaultRoute
+        : source === "squad"
+          ? validated.squadRoute ?? validated.defaultRoute
+          : validated.defaultRoute;
+    const chatId = resolvedRoute?.chatId ?? fallbackChat;
+    const threadOption =
+      resolvedRoute?.topicId !== undefined
+        ? { message_thread_id: resolvedRoute.topicId }
+        : {};
 
     // Select link preview settings based on the contract source.
     // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
@@ -160,6 +310,7 @@ export function createNotifier(
       parse_mode: "MarkdownV2" as const,
       link_preview_options: { is_disabled: linkPreviewDisabled },
       ...silentOption,
+      ...threadOption,
     };
 
     // Oversized payloads go out as ordered chunks under Telegram's limit. The
@@ -211,6 +362,7 @@ export function createNotifier(
       await bot.api.sendMessage(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
         ...silentOption,
+        ...threadOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(extra?.replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }

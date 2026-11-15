@@ -13,7 +13,8 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 
 ### Telegram Settings
 - `BOT_TOKEN`: The API token for the Telegram bot. Required.
-- `TELEGRAM_CHAT_ID`: The numeric ID or `@channelusername` where notifications are posted. Required.
+- `TELEGRAM_CHAT_ID`: The numeric ID or `@channelusername` where notifications are posted (with optional `:topicId` / `#topicId` forum topic suffix, e.g. `-1001234567890:42`). Required. Comma-separated routes are canonicalized before startup (trimming whitespace, lowercasing `@channelusername` handles, and normalizing numeric chat/topic IDs); duplicate `(chat, topic)` routes fail fast during startup validation without exposing `BOT_TOKEN`.
+- `TELEGRAM_MARKET_CHAT_ID` / `TELEGRAM_SQUAD_CHAT_ID`: Optional per-contract destination overrides (also supporting optional `:topicId` forum topic routing). When omitted, each contract defaults to the primary `TELEGRAM_CHAT_ID` route.
 - `MIMIR_LOCALE`: Language for bot replies and notifications. Supported: `en` (default) and `es`; region tags such as `es-MX` resolve to the base language. Any other value fails fast at startup. See [Translator Guide](translating.md).
 
 ### Mimir Contract Settings
