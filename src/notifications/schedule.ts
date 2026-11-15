@@ -111,6 +111,118 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+/**
+ * Explicit start-inclusive, end-exclusive (`[periodStartUtc, periodEndUtc)`) UTC
+ * period metadata attached to scheduled digest exports.
+ */
+export interface DigestPeriodBounds {
+  /** Inclusive period start as UTC epoch milliseconds. */
+  periodStartMs: number;
+  /** Exclusive period end as UTC epoch milliseconds. */
+  periodEndMs: number;
+  /** Inclusive period start formatted in canonical ISO-8601 UTC (`...Z`). */
+  periodStartUtc: string;
+  /** Exclusive period end formatted in canonical ISO-8601 UTC (`...Z`). */
+  periodEndUtc: string;
+  /** Half-open boundary contract (`[start, end)`). */
+  inclusivity: "[start, end)";
+  /** Canonical zone identifier (`"UTC"`). */
+  timezone: "UTC";
+}
+
+const EXPLICIT_UTC_ISO_RE =
+  /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d{1,3})?(?:Z|\+00:00)$/;
+
+/**
+ * Parse an explicit UTC boundary timestamp (`number` epoch ms or strict ISO-8601
+ * UTC string ending in `Z` / `+00:00`), rejecting timezone-ambiguous strings.
+ */
+export function parseUtcBoundaryMs(value: number | string, label = "boundary"): number {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || !Number.isInteger(value)) {
+      throw new ScheduleParseError(`${label} must be a finite integer UTC millisecond timestamp`);
+    }
+    return value;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    const match = EXPLICIT_UTC_ISO_RE.exec(trimmed);
+    if (!match) {
+      throw new ScheduleParseError(
+        `${label} "${value}" must be an explicit UTC ISO-8601 timestamp ending in Z or +00:00`,
+      );
+    }
+    const ms = Date.parse(trimmed);
+    if (!Number.isFinite(ms)) {
+      throw new ScheduleParseError(`${label} "${value}" is not a valid calendar UTC timestamp`);
+    }
+    const canonical = new Date(ms).toISOString();
+    if (!canonical.startsWith(`${match[1]}T${match[2]}`)) {
+      throw new ScheduleParseError(`${label} "${value}" is not a valid calendar UTC timestamp`);
+    }
+    return ms;
+  }
+  throw new ScheduleParseError(`${label} must be a UTC timestamp number or ISO-8601 UTC string`);
+}
+
+/** Format an integer UTC millisecond timestamp as canonical ISO-8601 UTC (`...Z`). */
+export function formatUtcBoundary(timestampMs: number): string {
+  const ms = parseUtcBoundaryMs(timestampMs, "timestampMs");
+  return new Date(ms).toISOString();
+}
+
+/**
+ * Construct validated start-inclusive, end-exclusive UTC digest period bounds.
+ */
+export function createDigestPeriodBounds(
+  start: number | string,
+  end: number | string,
+): DigestPeriodBounds {
+  const periodStartMs = parseUtcBoundaryMs(start, "periodStart");
+  const periodEndMs = parseUtcBoundaryMs(end, "periodEnd");
+  if (periodEndMs <= periodStartMs) {
+    throw new ScheduleParseError(
+      `Digest periodEnd (${periodEndMs}) must be strictly greater than periodStart (${periodStartMs})`,
+    );
+  }
+  return {
+    periodStartMs,
+    periodEndMs,
+    periodStartUtc: new Date(periodStartMs).toISOString(),
+    periodEndUtc: new Date(periodEndMs).toISOString(),
+    inclusivity: "[start, end)",
+    timezone: "UTC",
+  };
+}
+
+/**
+ * Compute the `[periodStart, periodEnd)` UTC window ending at `periodEnd` for a
+ * daily (`24h`) or weekly (`7d`) schedule without consulting host local time.
+ */
+export function digestPeriodForSchedule(
+  scheduleInput: Schedule | string,
+  periodEnd: number | string,
+): DigestPeriodBounds {
+  const schedule =
+    typeof scheduleInput === "string" ? parseSchedule(scheduleInput) : scheduleInput;
+  const endMs = parseUtcBoundaryMs(periodEnd, "periodEnd");
+  const spanMs = schedule.kind === "weekly" ? MS_PER_WEEK : MS_PER_DAY;
+  return createDigestPeriodBounds(endMs - spanMs, endMs);
+}
+
+/**
+ * Evaluate half-open `[periodStartMs, periodEndMs)` membership for an event timestamp.
+ */
+export function isWithinDigestPeriod(
+  timestamp: number,
+  bounds: Pick<DigestPeriodBounds, "periodStartMs" | "periodEndMs">,
+  unit: "seconds" | "ms" = "seconds",
+): boolean {
+  if (!Number.isFinite(timestamp)) return false;
+  const tsMs = unit === "seconds" ? timestamp * 1000 : timestamp;
+  return tsMs >= bounds.periodStartMs && tsMs < bounds.periodEndMs;
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;

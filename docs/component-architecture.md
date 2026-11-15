@@ -129,6 +129,7 @@ Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's
 - **Bounded fields**: Contract strings clipped at 200 Unicode code points
 - **Explorer links**: Includes transaction links to stellar.expert
 - **Preview mode**: Optional `[PREVIEW MODE]` badge for testing
+- **Digest exports (`src/notifications/digest-grouping.ts`, `src/notifications/schedule.ts`)**: `exportDigest()` and `createDigestPeriodBounds()` record explicit start-inclusive, end-exclusive (`[periodStartUtc, periodEndUtc)`) ISO-8601 UTC boundaries (`timezone: "UTC"`, `inclusivity: "[start, end)"`), rejecting timezone-ambiguous inputs so exports remain deterministic across host time zones. Optional `periodBounds` on `formatDigest()` renders the same half-open UTC window without changing default digest output.
 
 ### Telegram Integration (`src/bot.ts`)
 
