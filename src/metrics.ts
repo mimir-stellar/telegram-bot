@@ -229,12 +229,12 @@ export function createMetrics(): MetricsRegistry {
   }
 
   function handleRequest(req: IncomingMessage, res: ServerResponse): void {
-    const method = req.method ?? "GET";
+    const method = (req.method ?? "GET").toUpperCase();
     const url = req.url ?? "/";
 
-    // Only GET is meaningful for a read-only metrics endpoint.
-    if (method !== "GET") {
-      res.writeHead(405, { "Content-Type": "text/plain", Allow: "GET" });
+    // Only GET and HEAD are meaningful for a read-only metrics endpoint.
+    if (method !== "GET" && method !== "HEAD") {
+      res.writeHead(405, { "Content-Type": "text/plain", Allow: "GET, HEAD" });
       res.end("Method Not Allowed\n");
       return;
     }
@@ -243,6 +243,14 @@ export function createMetrics(): MetricsRegistry {
     const path = url.split("?")[0] ?? "/";
 
     if (path === "/metrics") {
+      if (method === "HEAD") {
+        res.writeHead(200, {
+          "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+          "Cache-Control": "no-store",
+        });
+        res.end();
+        return;
+      }
       const body = render();
       res.writeHead(200, {
         "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
@@ -255,13 +263,16 @@ export function createMetrics(): MetricsRegistry {
     }
 
     if (path === "/health") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("OK\n");
+      res.writeHead(200, {
+        "Content-Type": "text/plain",
+        "Cache-Control": "no-store",
+      });
+      res.end(method === "HEAD" ? undefined : "OK\n");
       return;
     }
 
     res.writeHead(404, { "Content-Type": "text/plain" });
-    res.end("Not Found\n");
+    res.end(method === "HEAD" ? undefined : "Not Found\n");
   }
 
   function startServer(port: number, host = "127.0.0.1"): Promise<MetricsServer> {

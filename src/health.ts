@@ -236,6 +236,42 @@ export function chainClockLabel(chainClockAt: number | null | undefined, nowMs: 
 }
 
 /**
+ * Evaluate top-level readiness status (`"ok" | "degraded" | "stopped"`) without
+ * building or serializing the full {@link HealthReport} or config provenance.
+ */
+export function evaluateHealthStatus(
+  config: BotConfig,
+  poller: PollerStatus,
+  nowMs: number = Date.now(),
+): HealthReport["status"] {
+  if (!poller.running) {
+    return "stopped";
+  }
+  if (poller.stopping === true) {
+    // A deliberate drain is doing exactly what it was asked to do. It is not a
+    // stale or failing poller, and `poller.stopping` is how clients tell the
+    // difference from an operator pause.
+    return "ok";
+  }
+  if (poller.paused) {
+    // A deliberate operator pause is healthy, not a stale or failing poller.
+    return "ok";
+  }
+  const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
+  const tooManyFailures = poller.consecutiveFailures >= failureBudget;
+  const hasStaleCursor = poller.targets.some((target) => target.cursorStale === true);
+  // A stalled cursor is a live fault the failure counters cannot see: every
+  // cycle succeeds, it just never makes progress.
+  const hasStalledCursor = poller.targets.some((target) => target.cursorStalled === true);
+  const hasEverSucceeded = poller.lastSuccessAt !== null;
+  const stale =
+    hasEverSucceeded &&
+    config.healthStaleMs > 0 &&
+    nowMs - (poller.lastSuccessAt as number) > config.healthStaleMs;
+  return tooManyFailures || stale || hasStaleCursor || hasStalledCursor ? "degraded" : "ok";
+}
+
+/**
  * Build a health report from poller status.
  *
  * - `ok` / HTTP 200 when the poller is running and has not exceeded the
@@ -258,31 +294,7 @@ export function buildHealthReport(
       ? poller.chainClockAt
       : null;
 
-  let status: HealthReport["status"];
-  if (!poller.running) {
-    status = "stopped";
-  } else if (poller.stopping === true) {
-    // A deliberate drain is doing exactly what it was asked to do. It is not a
-    // stale or failing poller, and `poller.stopping` is how clients tell the
-    // difference from an operator pause.
-    status = "ok";
-  } else if (poller.paused) {
-    // A deliberate operator pause is healthy, not a stale or failing poller.
-    status = "ok";
-  } else {
-    const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
-    const tooManyFailures = poller.consecutiveFailures >= failureBudget;
-    const hasStaleCursor = poller.targets.some((target) => target.cursorStale === true);
-    // A stalled cursor is a live fault the failure counters cannot see: every
-    // cycle succeeds, it just never makes progress.
-    const hasStalledCursor = poller.targets.some((target) => target.cursorStalled === true);
-    const hasEverSucceeded = poller.lastSuccessAt !== null;
-    const stale =
-      hasEverSucceeded &&
-      config.healthStaleMs > 0 &&
-      nowMs - (poller.lastSuccessAt as number) > config.healthStaleMs;
-    status = tooManyFailures || stale || hasStaleCursor || hasStalledCursor ? "degraded" : "ok";
-  }
+  const status = evaluateHealthStatus(config, poller, nowMs);
 
   return {
     ok: status === "ok",
@@ -460,6 +472,22 @@ function sendJson(
   res.end(payload);
 }
 
+function sendJsonHead(res: http.ServerResponse, statusCode: number): void {
+  res.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  res.end();
+}
+
+function sendMetricsHead(res: http.ServerResponse): void {
+  res.writeHead(200, {
+    "content-type": "text/plain; version=0.0.4; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  res.end();
+}
+
 function sendUnauthorized(res: http.ServerResponse): void {
   res.writeHead(401, {
     "content-type": "application/json; charset=utf-8",
@@ -486,7 +514,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   }
 
   const server = http.createServer((req, res) => {
-    const method = req.method ?? "GET";
+    const method = (req.method ?? "GET").toUpperCase();
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
     // Check authentication for all routes when token is configured
@@ -495,13 +523,22 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
-    if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
+    if ((method === "GET" || method === "HEAD") && (url.pathname === "/health" || url.pathname === "/healthz")) {
+      if (method === "HEAD") {
+        const currentStatus = evaluateHealthStatus(config, status(), now());
+        sendJsonHead(res, currentStatus === "ok" ? 200 : 503);
+        return;
+      }
       const report = buildHealthReport(config, status(), now(), provenance());
       sendJson(res, report.ok ? 200 : 503, report);
       return;
     }
 
-    if (method === "GET" && (url.pathname === "/health/live" || url.pathname === "/livez")) {
+    if ((method === "GET" || method === "HEAD") && (url.pathname === "/health/live" || url.pathname === "/livez")) {
+      if (method === "HEAD") {
+        sendJsonHead(res, 200);
+        return;
+      }
       // Liveness: the process is up and the HTTP server can answer. Do not
       // reflect poller degradation here — supervisors use /health for that.
       sendJson(res, 200, {
@@ -514,7 +551,11 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
-    if (method === "GET" && url.pathname === "/metrics") {
+    if ((method === "GET" || method === "HEAD") && url.pathname === "/metrics") {
+      if (method === "HEAD") {
+        sendMetricsHead(res);
+        return;
+      }
       const metrics = buildMetricsReport(config, status(), now());
       res.writeHead(200, {
         "content-type": "text/plain; version=0.0.4; charset=utf-8",
@@ -525,13 +566,22 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
-    if (method === "GET" && url.pathname === "/") {
+    if ((method === "GET" || method === "HEAD") && url.pathname === "/") {
+      if (method === "HEAD") {
+        sendJsonHead(res, 200);
+        return;
+      }
       sendJson(res, 200, {
         service: "mimir-telegram-bot",
         health: "/health",
         live: "/health/live",
         metrics: "/metrics",
       });
+      return;
+    }
+
+    if (method === "HEAD") {
+      sendJsonHead(res, 404);
       return;
     }
 

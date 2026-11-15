@@ -21,12 +21,14 @@ function main() {
     process.exit(0);
   }
 
+  const useHead = process.argv.includes("--head") || process.env.HEALTHCHECK_METHOD?.toUpperCase() === "HEAD";
+
   const req = http.request(
     {
       host,
       port,
       path: "/health",
-      method: "GET",
+      method: useHead ? "HEAD" : "GET",
       timeout: 2000,
     },
     (res) => {

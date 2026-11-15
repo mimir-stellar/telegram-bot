@@ -38,10 +38,12 @@ counters. It contains no secrets, but it does confirm what is running.
 
 ## Health server — `HEALTH_PORT` (default 8787)
 
-### `GET /`
+### `GET /` and `HEAD /`
 
-Discovery index. Returns a JSON object mapping each route name to its path.
-Never returns a non-200.
+Discovery index. `GET` returns a JSON object mapping each route name to its
+path; `HEAD` returns the same `200` status and headers without a response body.
+Never returns a non-200 (unless `HEALTH_AUTH_TOKEN` rejects an unauthenticated
+caller with `401`).
 
 **Response — 200**
 
@@ -60,11 +62,15 @@ curl -s http://127.0.0.1:8787/
 
 ---
 
-### `GET /health` (alias: `GET /healthz`)
+### `GET /health` and `HEAD /health` (aliases: `/healthz`)
 
-Readiness probe. Returns the full `HealthReport` object. Use this for deploy
-smoke-tests, Kubernetes readiness probes, and dashboards. The HTTP status code
-is the machine-readable signal; the JSON body adds detail.
+Readiness probe. `GET` returns the full `HealthReport` object; `HEAD` evaluates
+readiness (`200` vs `503`) and returns the same `Content-Type` and
+`Cache-Control: no-store` headers with an empty body, skipping full report and
+config-provenance serialization. Use this for deploy smoke-tests, Kubernetes
+readiness probes, and dashboards (`node dist/healthcheck.js --head` or
+`HEALTHCHECK_METHOD=HEAD` uses `HEAD /health`). The HTTP status code is the
+machine-readable signal; the JSON body adds detail.
 
 | Condition | `status` | `ok` | HTTP |
 |---|---|---|---|
@@ -161,12 +167,12 @@ curl -s http://127.0.0.1:8787/health | jq .poller.deadLetter.depth
 
 ---
 
-### `GET /health/live` (alias: `GET /livez`)
+### `GET /health/live` and `HEAD /health/live` (aliases: `/livez`)
 
 Liveness probe. Always returns 200 as long as the HTTP server can accept
-connections. Does **not** reflect poller health. Use this for container
-restart policies — a 503 here means the Node process is deadlocked or
-OOM-killed, not that the poller is behind.
+connections (`HEAD` omits the JSON body). Does **not** reflect poller health.
+Use this for container restart policies — a 503 here means the Node process is
+deadlocked or OOM-killed, not that the poller is behind.
 
 **Response — always 200**
 
@@ -361,18 +367,18 @@ methods (`Allow: GET` header set).
 
 | Server | Method | Path | Status codes | Purpose |
 |---|---|---|---|---|
-| Health | GET | `/` | 200 | Route discovery index |
-| Health | GET | `/health` | 200, 503 | Full readiness + poller detail |
-| Health | GET | `/healthz` | 200, 503 | Alias for `/health` |
-| Health | GET | `/health/live` | 200 | Liveness only (no poller state) |
-| Health | GET | `/livez` | 200 | Alias for `/health/live` |
-| Health | GET | `/metrics` | 200 | Prometheus text (poller-level) |
+| Health | GET, HEAD | `/` | 200 | Route discovery index |
+| Health | GET, HEAD | `/health` | 200, 503 | Readiness (`HEAD` skips report serialization) |
+| Health | GET, HEAD | `/healthz` | 200, 503 | Alias for `/health` |
+| Health | GET, HEAD | `/health/live` | 200 | Liveness only (no poller state) |
+| Health | GET, HEAD | `/livez` | 200 | Alias for `/health/live` |
+| Health | GET, HEAD | `/metrics` | 200 | Prometheus text (poller-level) |
 | Health | POST | `/telegram-webhook` | 200, 401, 404 | Webhook updates (webhook mode only) |
-| Health | GET | `<other>` | 404 | — |
-| Metrics | GET | `/metrics` | 200 | Prometheus text (registry-level) |
-| Metrics | GET | `/health` | 200 | Plain-text liveness |
-| Metrics | GET | `<other>` | 404 | — |
-| Metrics | non-GET | `<any>` | 405 | — |
+| Health | GET, HEAD | `<other>` | 404 | — |
+| Metrics | GET, HEAD | `/metrics` | 200 | Prometheus text (registry-level) |
+| Metrics | GET, HEAD | `/health` | 200 | Plain-text liveness |
+| Metrics | GET, HEAD | `<other>` | 404 | — |
+| Metrics | non-GET/HEAD | `<any>` | 405 | — |
 
 ---
 
