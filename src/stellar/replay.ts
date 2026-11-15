@@ -115,6 +115,329 @@ export interface ReplayTargetResult {
   lastProcessedEventId?: string | null | undefined;
   /** Failed send attempts (counted under skipped, never sent). */
   failedSends?: number | undefined;
+  /** Bounded consistency error recorded when an RPC page violates ledger monotonicity. */
+  consistencyError?: {
+    problem: ReplayPageConsistencyProblem;
+    page: number;
+    message: string;
+  } | undefined;
+}
+
+// ── RPC Page Monotonicity Guard ──────────────────────────────────────────────
+
+export type ReplayPageConsistencyProblem =
+  | "invalid-page-bounds"
+  | "inverted-page-window"
+  | "latest-ledger-regressed"
+  | "oldest-ledger-regressed"
+  | "cursor-regressed"
+  | "cursor-after-latest"
+  | "event-ledger-invalid"
+  | "event-ledger-regressed"
+  | "event-outside-page-window";
+
+const MAX_CONSISTENCY_ERROR_CHARS = 200;
+const MAX_TOID_UINT64 = 18_446_744_073_709_551_615n;
+const MAX_CURSOR_INDEX_UINT32 = 4_294_967_295n;
+
+function boundedConsistencyMessage(text: string): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length <= MAX_CONSISTENCY_ERROR_CHARS
+    ? compact
+    : `${compact.slice(0, MAX_CONSISTENCY_ERROR_CHARS - 1)}…`;
+}
+
+/**
+ * Bounded, secret-free consistency error raised when a `getEvents` RPC page
+ * reports nonmonotonic or impossible ledger boundaries (for example, a
+ * load-balanced backend routing a follow-up page to a lagging replica).
+ */
+export class ReplayPageConsistencyError extends Error {
+  readonly problem: ReplayPageConsistencyProblem;
+  readonly source: ContractSource;
+  readonly pageNumber: number;
+
+  constructor(
+    problem: ReplayPageConsistencyProblem,
+    source: ContractSource,
+    pageNumber: number,
+    detail: string,
+  ) {
+    super(
+      boundedConsistencyMessage(
+        `nonmonotonic RPC page (${problem}) on ${source} page ${pageNumber}: ${detail}`,
+      ),
+    );
+    this.name = "ReplayPageConsistencyError";
+    this.problem = problem;
+    this.source = source;
+    this.pageNumber = pageNumber;
+  }
+}
+
+export interface ReplayPageBoundsState {
+  source: ContractSource;
+  pageNumber: number;
+  minLatestLedger: number;
+  minOldestLedger: number;
+  requestStartLedger: number | null;
+  previousCursor: string;
+  minEventLedger: number | null;
+}
+
+export interface ReplayPageBoundsValidated {
+  latestLedger: number;
+  oldestLedger: number;
+  maxEventLedger: number | null;
+}
+
+function parsePositiveSafeLedger(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 1 ? value : null;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    const parsed = Number(value.trim());
+    return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : null;
+  }
+  return null;
+}
+
+function parseToidCursor(
+  cursor: string,
+): { ledger: number; toid: bigint; index: bigint } | null {
+  const match = /^(\d+)-(\d+)$/.exec(cursor);
+  if (!match) return null;
+  const toidText = match[1];
+  const indexText = match[2];
+  if (toidText === undefined || indexText === undefined) return null;
+  if (toidText.length > 20 || indexText.length > 10) return null;
+  try {
+    const toid = BigInt(toidText);
+    const index = BigInt(indexText);
+    if (toid > MAX_TOID_UINT64 || index > MAX_CURSOR_INDEX_UINT32) return null;
+    const ledger = Number(toid >> 32n);
+    return { ledger, toid, index };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validate that a `getEvents` RPC page preserves monotonic ledger boundaries
+ * before any event on the page is decoded, dispatched, or committed to a
+ * checkpoint file.
+ */
+export function validateReplayPageBounds(
+  response: unknown,
+  state: ReplayPageBoundsState,
+): ReplayPageBoundsValidated {
+  const { source, pageNumber } = state;
+
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    throw new ReplayPageConsistencyError(
+      "invalid-page-bounds",
+      source,
+      pageNumber,
+      "RPC response is not an object",
+    );
+  }
+
+  const pageObj = response as Record<string, unknown>;
+  const pageLatest = parsePositiveSafeLedger(pageObj.latestLedger);
+  if (pageLatest === null) {
+    throw new ReplayPageConsistencyError(
+      "invalid-page-bounds",
+      source,
+      pageNumber,
+      "missing or invalid latestLedger",
+    );
+  }
+
+  let pageOldest = state.minOldestLedger;
+  if (pageObj.oldestLedger !== undefined && pageObj.oldestLedger !== null) {
+    const parsedOldest = parsePositiveSafeLedger(pageObj.oldestLedger);
+    if (parsedOldest === null) {
+      throw new ReplayPageConsistencyError(
+        "invalid-page-bounds",
+        source,
+        pageNumber,
+        "invalid oldestLedger",
+      );
+    }
+    if (parsedOldest > pageLatest) {
+      throw new ReplayPageConsistencyError(
+        "inverted-page-window",
+        source,
+        pageNumber,
+        `oldestLedger ${parsedOldest} exceeds latestLedger ${pageLatest}`,
+      );
+    }
+    if (parsedOldest < state.minOldestLedger) {
+      throw new ReplayPageConsistencyError(
+        "oldest-ledger-regressed",
+        source,
+        pageNumber,
+        `oldestLedger regressed from ${state.minOldestLedger} to ${parsedOldest}`,
+      );
+    }
+    pageOldest = parsedOldest;
+  }
+
+  if (pageLatest < state.minLatestLedger) {
+    throw new ReplayPageConsistencyError(
+      "latest-ledger-regressed",
+      source,
+      pageNumber,
+      `latestLedger regressed from ${state.minLatestLedger} to ${pageLatest}`,
+    );
+  }
+
+  if (pageObj.events !== undefined && !Array.isArray(pageObj.events)) {
+    throw new ReplayPageConsistencyError(
+      "invalid-page-bounds",
+      source,
+      pageNumber,
+      "events field is not an array",
+    );
+  }
+
+  const prevCursorParsed =
+    state.previousCursor !== "" ? parseToidCursor(state.previousCursor) : null;
+  const floorLedger = Math.max(
+    pageOldest,
+    state.requestStartLedger ?? 0,
+    prevCursorParsed?.ledger ?? 0,
+    state.minEventLedger ?? 0,
+  );
+
+  const rawEvents = Array.isArray(pageObj.events) ? pageObj.events : [];
+  let prevEventLedgerOnPage: number | null = null;
+  let maxEventLedgerOnPage: number | null = null;
+
+  for (let i = 0; i < rawEvents.length; i++) {
+    const raw = rawEvents[i];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ReplayPageConsistencyError(
+        "event-ledger-invalid",
+        source,
+        pageNumber,
+        `event[${i}] is not an object`,
+      );
+    }
+    const evLedger = parsePositiveSafeLedger((raw as { ledger?: unknown }).ledger);
+    if (evLedger === null) {
+      throw new ReplayPageConsistencyError(
+        "event-ledger-invalid",
+        source,
+        pageNumber,
+        `event[${i}] has missing or invalid ledger`,
+      );
+    }
+    if (prevEventLedgerOnPage !== null && evLedger < prevEventLedgerOnPage) {
+      throw new ReplayPageConsistencyError(
+        "event-ledger-regressed",
+        source,
+        pageNumber,
+        `event[${i}] ledger regressed from ${prevEventLedgerOnPage} to ${evLedger}`,
+      );
+    }
+    if (state.minEventLedger !== null && evLedger < state.minEventLedger) {
+      throw new ReplayPageConsistencyError(
+        "event-ledger-regressed",
+        source,
+        pageNumber,
+        `event[${i}] ledger ${evLedger} regressed below prior ledger ${state.minEventLedger}`,
+      );
+    }
+    if (prevCursorParsed !== null && evLedger < prevCursorParsed.ledger) {
+      throw new ReplayPageConsistencyError(
+        "event-ledger-regressed",
+        source,
+        pageNumber,
+        `event[${i}] ledger ${evLedger} regressed below cursor ledger ${prevCursorParsed.ledger}`,
+      );
+    }
+    if (evLedger < floorLedger || evLedger > pageLatest) {
+      throw new ReplayPageConsistencyError(
+        "event-outside-page-window",
+        source,
+        pageNumber,
+        `event[${i}] ledger ${evLedger} outside page window ${floorLedger}..${pageLatest}`,
+      );
+    }
+    prevEventLedgerOnPage = evLedger;
+    maxEventLedgerOnPage = evLedger;
+  }
+
+  if (
+    pageObj.cursor !== undefined &&
+    pageObj.cursor !== null &&
+    typeof pageObj.cursor !== "string"
+  ) {
+    throw new ReplayPageConsistencyError(
+      "invalid-page-bounds",
+      source,
+      pageNumber,
+      "cursor field is not a string",
+    );
+  }
+
+  const nextCursor = typeof pageObj.cursor === "string" ? pageObj.cursor : "";
+  if (nextCursor !== "") {
+    const nextParsed = parseToidCursor(nextCursor);
+    if (nextParsed !== null) {
+      if (nextParsed.ledger > pageLatest) {
+        throw new ReplayPageConsistencyError(
+          "cursor-after-latest",
+          source,
+          pageNumber,
+          `cursor ledger ${nextParsed.ledger} exceeds latestLedger ${pageLatest}`,
+        );
+      }
+      if (state.requestStartLedger !== null && nextParsed.ledger < state.requestStartLedger) {
+        throw new ReplayPageConsistencyError(
+          "cursor-regressed",
+          source,
+          pageNumber,
+          `cursor ledger ${nextParsed.ledger} regressed before startLedger ${state.requestStartLedger}`,
+        );
+      }
+      if (nextParsed.ledger < pageOldest) {
+        throw new ReplayPageConsistencyError(
+          "cursor-regressed",
+          source,
+          pageNumber,
+          `cursor ledger ${nextParsed.ledger} regressed below oldestLedger ${pageOldest}`,
+        );
+      }
+      if (
+        prevCursorParsed !== null &&
+        (nextParsed.toid < prevCursorParsed.toid ||
+          (nextParsed.toid === prevCursorParsed.toid && nextParsed.index < prevCursorParsed.index))
+      ) {
+        throw new ReplayPageConsistencyError(
+          "cursor-regressed",
+          source,
+          pageNumber,
+          `cursor regressed from ledger ${prevCursorParsed.ledger} to ${nextParsed.ledger}`,
+        );
+      }
+      if (maxEventLedgerOnPage !== null && nextParsed.ledger < maxEventLedgerOnPage) {
+        throw new ReplayPageConsistencyError(
+          "cursor-regressed",
+          source,
+          pageNumber,
+          `cursor ledger ${nextParsed.ledger} regressed behind page event ledger ${maxEventLedgerOnPage}`,
+        );
+      }
+    }
+  }
+
+  return {
+    latestLedger: pageLatest,
+    oldestLedger: pageOldest,
+    maxEventLedger: maxEventLedgerOnPage ?? state.minEventLedger,
+  };
 }
 
 export interface ReplayReport {
@@ -481,6 +804,8 @@ async function replayContract(
   let truncated = false;
   let stoppedByToLedger = false;
   let latestLedger = window.latestLedger;
+  let oldestLedger = window.oldestLedger;
+  let minObservedEventLedger: number | null = opts.targetProgress?.lastEventLedger ?? null;
   let cursor: string | undefined = startCursor;
   let usedStartLedger: number | null = null;
   let usedStartClamped = false;
@@ -514,6 +839,16 @@ async function replayContract(
       ? await (server.getEvents({ filters: [{ type: "contract", contractIds: [target.contractId] }], cursor, limit: pageLimit }))
       : await (server.getEvents({ filters: [{ type: "contract", contractIds: [target.contractId] }], startLedger: firstStartLedger, limit: pageLimit }));
 
+    const validatedBounds = validateReplayPageBounds(response, {
+      source: target.source,
+      pageNumber: totalPages,
+      minLatestLedger: latestLedger,
+      minOldestLedger: oldestLedger,
+      requestStartLedger: cursor ? null : firstStartLedger,
+      previousCursor,
+      minEventLedger: minObservedEventLedger,
+    });
+
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     const pageDecoded: DecodedEvent[] = [];
 
@@ -544,7 +879,9 @@ async function replayContract(
       usedStartLedger = startLedger;
       usedStartClamped = startClamped;
     }
-    latestLedger = response?.latestLedger ?? latestLedger;
+    latestLedger = validatedBounds.latestLedger;
+    oldestLedger = validatedBounds.oldestLedger;
+    minObservedEventLedger = validatedBounds.maxEventLedger;
 
     // Filter to the requested ledger range, deduplicate, and sort
     const filteredPage = sortEvents(
@@ -996,6 +1333,7 @@ export async function runReplayCli(opts: {
       const msg = safeErr(err);
       progress(`[replay] ${target.source}: scan failed: ${msg}`);
       fatalError = msg;
+      const committed = progressData?.targets?.[target.source] ?? targetProgress;
       targetResults.push({
         source: target.source,
         contractId: target.contractId,
@@ -1003,17 +1341,27 @@ export async function runReplayCli(opts: {
         toLedger: toLedger ?? null,
         startLedger: null,
         startClamped: false,
-        pages: 0,
-        events: 0,
-        sent: 0,
-        skipped: 0,
-        capped: 0,
-        adminLogged: 0,
-        duplicates: 0,
+        pages: committed?.pagesProcessed ?? 0,
+        events: committed?.eventsProcessed ?? 0,
+        sent: committed?.eventsSent ?? 0,
+        skipped: committed?.eventsSkipped ?? 0,
+        capped: committed?.eventsCapped ?? 0,
+        adminLogged: committed?.adminLogged ?? 0,
+        duplicates: committed?.duplicates ?? 0,
         truncated: false,
-        lastEventLedger: null,
-        cursor: null,
+        lastEventLedger: committed?.lastEventLedger ?? null,
+        cursor: committed?.cursor ?? null,
         eventLog: [],
+        lastProcessedEventId: committed?.lastProcessedEventId ?? null,
+        failedSends: committed?.failedSends ?? 0,
+        consistencyError:
+          err instanceof ReplayPageConsistencyError
+            ? {
+                problem: err.problem,
+                page: err.pageNumber,
+                message: err.message,
+              }
+            : undefined,
       });
     }
   }

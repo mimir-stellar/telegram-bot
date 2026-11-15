@@ -25,7 +25,17 @@
 
 import { pathToFileURL } from "node:url";
 
-import { runReplayCli } from "./stellar/replay.js";
+import {
+  ReplayPageConsistencyError,
+  runReplayCli,
+  validateReplayPageBounds,
+} from "./stellar/replay.js";
+
+export {
+  ReplayPageConsistencyError,
+  runReplayCli,
+  validateReplayPageBounds,
+};
 
 const invokedPath = process.argv[1];
 if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {
