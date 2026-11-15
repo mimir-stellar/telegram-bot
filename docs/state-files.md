@@ -64,3 +64,7 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Subscription Follow Store (`FollowStore`)
+- **Writer Module**: [`src/subscriptions/store.ts`](../src/subscriptions/store.ts) (`createFollowStore`)
+- **Quotas & Feedback**: Enforces both per-chat (`DEFAULT_MAX_PER_CHAT = 50`) and global (`DEFAULT_MAX_TOTAL = 5000`) subscription caps via typed `FollowQuotaError` (`scope: "per_chat" | "global"`). Rejected requests leave the on-disk JSON file untouched, and `formatFollowQuotaFeedback` / `applyFollowWithFeedback` in [`src/bot.ts`](../src/bot.ts) render distinct actionable chat guidance for per-chat vs global quota exhaustion.

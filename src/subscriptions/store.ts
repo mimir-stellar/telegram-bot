@@ -20,10 +20,30 @@ export const DEFAULT_MAX_PER_CHAT = 50;
 
 export const DEFAULT_MAX_TOTAL = 5000;
 
+export type FollowQuotaScope = "per_chat" | "global";
+
 export class FollowStoreError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "FollowStoreError";
+  }
+}
+
+export class FollowQuotaError extends FollowStoreError {
+  readonly scope: FollowQuotaScope;
+  readonly limit: number;
+  readonly current: number;
+
+  constructor(scope: FollowQuotaScope, limit: number, current: number) {
+    super(
+      scope === "per_chat"
+        ? `per-chat follow limit reached (${limit})`
+        : `total follow limit reached (${limit})`,
+    );
+    this.name = "FollowQuotaError";
+    this.scope = scope;
+    this.limit = limit;
+    this.current = current;
   }
 }
 
@@ -175,10 +195,11 @@ export class FollowStore {
       return false;
     }
     if (existing.length >= this.maxPerChat) {
-      throw new FollowStoreError(`per-chat follow limit reached (${this.maxPerChat})`);
+      throw new FollowQuotaError("per_chat", this.maxPerChat, existing.length);
     }
-    if (this.totalCount(data) >= this.maxTotal) {
-      throw new FollowStoreError(`total follow limit reached (${this.maxTotal})`);
+    const total = this.totalCount(data);
+    if (total >= this.maxTotal) {
+      throw new FollowQuotaError("global", this.maxTotal, total);
     }
     data.follows[chatId] = [...existing, ref];
     this.write(data);

@@ -17,7 +17,7 @@
 
 import { Bot, type CommandContext, type Context } from "grammy";
 
-import { safeErrorMessage } from "./notifications/format.js";
+import { escapeMd, safeErrorMessage } from "./notifications/format.js";
 import type { BotConfig } from "./config.js";
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 
@@ -25,15 +25,25 @@ import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
+  TELEGRAM_OPTIONS,
   chatAllowed,
   commandMetadata,
   isOperator,
   operatorAllowed,
   registeredCommands,
+  replyMarkdown,
   visibleCommandMetadata,
   type CommandDeps,
   type CommandModule,
 } from "./commands/index.js";
+import {
+  FollowQuotaError,
+  FollowStore,
+  FollowStoreError,
+  createFollowStore,
+  type FollowQuotaScope,
+  type FollowStoreOptions,
+} from "./subscriptions/store.js";
 import {
   handlePauseConfirmCallback,
   registerCallbackHandlers,
@@ -100,6 +110,82 @@ export {
   sendBroadcast,
 } from "./commands/broadcast.js";
 export { clearHintState } from "./commands/unknown.js";
+export {
+  FollowQuotaError,
+  FollowStore,
+  FollowStoreError,
+  createFollowStore,
+  type FollowQuotaScope,
+  type FollowStoreOptions,
+};
+
+/**
+ * Renders actionable chat feedback when a follow request is rejected due to
+ * per-chat or global subscription quota exhaustion.
+ *
+ * Distinguishes per-chat limits (actionable by unfollowing in the current chat)
+ * from global bot capacity limits (requiring operator capacity review) without
+ * leaking other chats' subscription counts or identifiers.
+ */
+export function formatFollowQuotaFeedback(
+  err: FollowQuotaError,
+  options: { markdownV2?: boolean | undefined } = {},
+): string {
+  const md = options.markdownV2 !== false;
+  if (err.scope === "per_chat") {
+    if (!md) {
+      return (
+        `Follow limit reached for this chat (${err.limit}/${err.limit}). ` +
+        `Run /following to inspect active subscriptions and /unfollow <market:id|squad:id> to free a slot.`
+      );
+    }
+    const limitEsc = escapeMd(String(err.limit));
+    return (
+      `*Follow limit reached for this chat* \\(${limitEsc}/${limitEsc}\\)\n` +
+      `Run \`/following\` to review this chat's subscriptions and \`/unfollow <market:id|squad:id>\` to free a slot\\.`
+    );
+  }
+
+  if (!md) {
+    return (
+      `Global bot follow capacity reached (${err.limit} total subscriptions). ` +
+      `Your subscription was not added. Remove unused follows in this chat with /unfollow <market:id|squad:id> or contact the bot operator.`
+    );
+  }
+  const totalEsc = escapeMd(String(err.limit));
+  return (
+    `*Global follow capacity reached* \\(${totalEsc} total subscriptions\\)\n` +
+    `Your subscription was not added\\. Remove unused follows in this chat with \`/unfollow <market:id|squad:id>\` or contact the bot operator\\.`
+  );
+}
+
+/**
+ * Attempts to persist a follow subscription for `chatId` and replies with
+ * actionable MarkdownV2 feedback if a per-chat or global quota limit is hit.
+ */
+export async function applyFollowWithFeedback(
+  ctx: CommandContext<Context>,
+  store: FollowStore,
+  chatId: string,
+  ref: string,
+): Promise<{ ok: boolean; added: boolean; quotaScope?: FollowQuotaScope | undefined }> {
+  try {
+    const added = store.follow(chatId, ref);
+    const refEsc = escapeMd(ref);
+    if (added) {
+      await replyMarkdown(ctx, `*Following* \`${refEsc}\``, TELEGRAM_OPTIONS);
+    } else {
+      await replyMarkdown(ctx, `Already following \`${refEsc}\`\\.`, TELEGRAM_OPTIONS);
+    }
+    return { ok: true, added };
+  } catch (err) {
+    if (err instanceof FollowQuotaError) {
+      await replyMarkdown(ctx, formatFollowQuotaFeedback(err), TELEGRAM_OPTIONS);
+      return { ok: false, added: false, quotaScope: err.scope };
+    }
+    throw err;
+  }
+}
 
 /** Older names for the pause-confirmation helpers, kept for existing imports. */
 export const validatePauseCallbackData = validatePauseConfirmData;
