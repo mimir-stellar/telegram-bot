@@ -71,6 +71,9 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--dry-run` | Boolean flag | Explicit dry-run flag accepted by CLI parser. Dry-run is active whenever `--send` is omitted. | `true` |
 | `--pages` | `<number>` | Maximum RPC pages to walk per contract. Must be $\ge 1$. | `20` (`EVENT_MAX_PAGES`) |
 | `--cap` | `<number>` | Maximum notifications to send/count per contract. | `config.maxNotificationsPerCycle` in `--send` mode; `20` in dry-run mode |
+| `--max-events` (`--event-budget`) | `<number>` | Explicit event-count budget across the replay invocation. Stops immediately after processing `<number>` decoded in-range events, checkpoints the exact last-committed event cursor when `--progress-file` is set, and reports `status: "budget_exhausted"` (`budgetExhausted: true`) rather than `"completed"`. | Unlimited |
+| `--progress-file` | `<path>` | Persist and resume replay checkpoints (`mimir-replay-progress-v1`). | None |
+| `--rpm` | `<number>` | Maximum Soroban RPC requests per minute across health and event queries. | Unlimited |
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
