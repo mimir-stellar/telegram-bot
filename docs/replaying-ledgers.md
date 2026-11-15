@@ -223,3 +223,12 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Hash-Chained Manifests for Exported Event Archives
+
+Exported event archives (`src/stellar/archive.ts`) and JSONL bundles (`src/stellar/scan-jsonl.ts`) support read-only, key-free SHA-256 hash-chained manifests (`archive-manifest.json`, format `mimir-archive-manifest-v1`):
+
+* **Bound Genesis & Record Chain:** `exportEventArchiveWithManifest`, `writeArchiveManifest`, and `exportVerifiableScanJsonl` seed `genesisHash` from canonical `{ format, network, ledgerBounds }`, advance `chainHash` over `(prevChainHash, globalIndex, recordDigest)` across every ordered event record, and commit `rootDigest` over all rotated segment boundaries.
+* **Tamper-Evident Verification:** `verifyArchiveManifest`, `readVerifiedArchive`, and `verifyScanJsonlManifest` reject missing segments (`MISSING_SEGMENT`), unrecorded segments (`UNEXPECTED_SEGMENT`), deleted or truncated lines (`RECORD_COUNT_MISMATCH`), reordered or modified records (`RECORD_HASH_MISMATCH` / `CHAIN_HASH_MISMATCH`), out-of-window ledgers (`LEDGER_OUT_OF_BOUNDS`), and altered network or ledger bounds (`GENESIS_DIGEST_MISMATCH` / `ROOT_DIGEST_MISMATCH`).
