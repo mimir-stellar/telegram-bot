@@ -28,8 +28,19 @@
  * or holding anything richer than the lines the bot already printed.
  */
 
+import {
+  appendFile as fsAppendFile,
+  mkdir as fsMkdir,
+  readdir as fsReaddir,
+  rename as fsRename,
+  stat as fsStat,
+  unlink as fsUnlink,
+} from "node:fs/promises";
+import path from "node:path";
+
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import { redactError } from "./redact.js";
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -232,14 +243,84 @@ export type LogSink = (level: LogLevel, line: string) => void;
 
 export const LOG_LEVEL_ENV = "LOG_LEVEL";
 export const LOG_FORMAT_ENV = "LOG_FORMAT";
+export const LOG_FILE_ENV = "LOG_FILE";
+export const LOG_FILE_MAX_BYTES_ENV = "LOG_FILE_MAX_BYTES";
+export const LOG_FILE_MAX_FILES_ENV = "LOG_FILE_MAX_FILES";
 export const DEFAULT_LOG_LEVEL: LogLevel = "info";
 export const DEFAULT_LOG_FORMAT: LogFormat = "text";
+/** Default size threshold (10 MiB) before rotating the active JSONL file. */
+export const DEFAULT_LOG_FILE_MAX_BYTES = 10 * 1024 * 1024;
+/** Default bounded count of local JSONL files kept (active + `.1`..`.N-1`). */
+export const DEFAULT_LOG_FILE_MAX_FILES = 5;
+/** Hard upper cap on retained local JSONL files so disk retention stays bounded. */
+export const MAX_LOG_FILE_COUNT = 50;
 /** Every accepted LOG_LEVEL value, lowest severity first. */
 export const LOG_LEVELS: readonly LogLevel[] = Object.freeze(["debug", "info", "warn", "error", "fatal"]);
 /** Every accepted LOG_FORMAT value. */
 export const LOG_FORMATS: readonly LogFormat[] = Object.freeze(["text", "json"]);
 /** Longest string any single field may carry into a JSON record. */
 export const MAX_LOG_FIELD_CHARS = 1_000;
+
+export type JsonlDiskFailureStage = "mkdir" | "stat" | "rotate" | "write" | "cleanup";
+export type JsonlDiskFailureReason =
+  | "disk_full"
+  | "permission_denied"
+  | "read_only_fs"
+  | "busy"
+  | "path_error"
+  | "io_error";
+
+export interface JsonlDiskFailure {
+  stage: JsonlDiskFailureStage;
+  reason: JsonlDiskFailureReason;
+  code: string | null;
+  targetPath: string;
+  message: string;
+  at: string;
+}
+
+export interface JsonlWriterStats {
+  filePath: string;
+  maxBytes: number;
+  maxFiles: number;
+  currentBytes: number;
+  writesSucceeded: number;
+  writesDropped: number;
+  rotations: number;
+  failuresByStage: Record<JsonlDiskFailureStage, number>;
+  failuresByReason: Record<JsonlDiskFailureReason, number>;
+  lastFailure: JsonlDiskFailure | null;
+}
+
+export interface JsonlFsOps {
+  mkdir(dirPath: string, options?: { recursive?: boolean }): Promise<unknown>;
+  stat(filePath: string): Promise<{ size: number }>;
+  readdir(dirPath: string): Promise<string[]>;
+  rename(oldPath: string, newPath: string): Promise<void>;
+  unlink(filePath: string): Promise<void>;
+  appendFile(filePath: string, data: string | Uint8Array): Promise<void>;
+}
+
+export interface RotatingJsonlWriterOptions {
+  filePath: string;
+  maxBytes?: number;
+  maxFiles?: number;
+  secrets?: readonly string[];
+  now?: () => Date;
+  onFailure?: (failure: JsonlDiskFailure) => void;
+  fsOps?: Partial<JsonlFsOps>;
+}
+
+export interface RotatingJsonlWriter {
+  /** Enqueue one JSONL record; resolves `true` if persisted, `false` on disk write failure. */
+  write(line: string): Promise<boolean>;
+  /** Wait for all queued writes and in-flight rotations to settle. */
+  flush(): Promise<void>;
+  /** Snapshot of bounded retention settings, write counts, rotations, and disk failures. */
+  stats(): JsonlWriterStats;
+  /** Update runtime secrets used to redact disk failure diagnostics. */
+  setSecrets(secrets: readonly string[]): void;
+}
 
 const LOG_REDACTED = "[REDACTED]";
 const MAX_FIELD_DEPTH = 4;
@@ -257,10 +338,358 @@ export function parseLogFormat(value: unknown): LogFormat {
   return value.trim().toLowerCase() === "json" ? "json" : DEFAULT_LOG_FORMAT;
 }
 
+export function parseLogFilePath(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function parsePositiveInt(value: unknown): number | null {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 1) return null;
+    return Math.floor(value);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!/^\d+$/.test(trimmed)) return null;
+    const parsed = Number.parseInt(trimmed, 10);
+    return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : null;
+  }
+  return null;
+}
+
+export function parseLogFileMaxBytes(value: unknown): number {
+  return parsePositiveInt(value) ?? DEFAULT_LOG_FILE_MAX_BYTES;
+}
+
+export function parseLogFileMaxFiles(value: unknown): number {
+  const parsed = parsePositiveInt(value);
+  if (parsed === null) return DEFAULT_LOG_FILE_MAX_FILES;
+  return Math.min(parsed, MAX_LOG_FILE_COUNT);
+}
+
+function isMissingFileError(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as NodeJS.ErrnoException).code === "ENOENT"
+  );
+}
+
+export function classifyJsonlDiskError(err: unknown): {
+  reason: JsonlDiskFailureReason;
+  code: string | null;
+} {
+  const code =
+    typeof err === "object" &&
+    err !== null &&
+    typeof (err as NodeJS.ErrnoException).code === "string"
+      ? (err as NodeJS.ErrnoException).code!
+      : null;
+
+  switch (code) {
+    case "ENOSPC":
+    case "EDQUOT":
+      return { reason: "disk_full", code };
+    case "EACCES":
+    case "EPERM":
+      return { reason: "permission_denied", code };
+    case "EROFS":
+      return { reason: "read_only_fs", code };
+    case "EBUSY":
+    case "ETXTBSY":
+      return { reason: "busy", code };
+    case "ENOENT":
+    case "ENOTDIR":
+    case "EISDIR":
+    case "ENAMETOOLONG":
+    case "ELOOP":
+    case "EXDEV":
+      return { reason: "path_error", code };
+    default:
+      return { reason: "io_error", code };
+  }
+}
+
+/**
+ * Create a size-rotating JSONL operational log writer.
+ *
+ * Guarantees:
+ * - Bounded local files: retains at most `maxFiles` total files (`filePath` plus
+ *   `${filePath}.1`..`${filePath}.${maxFiles - 1}`), pruning any stale higher-numbered
+ *   archives on init and after rotation.
+ * - Preserved writes during rotation: all writes and rotations execute sequentially
+ *   on an internal FIFO queue so concurrent log calls never race a rename/unlink.
+ *   If rotation (`rename`/`unlink`) fails on disk, the failure is reported under
+ *   `stage: "rotate"` and the writer still attempts `appendFile` on the active path
+ *   so operational log records are not silently discarded when the active file is writable.
+ * - Distinct failure reporting: classifies errors by stage (`mkdir`, `stat`, `rotate`,
+ *   `write`, `cleanup`) and reason (`disk_full`, `permission_denied`, `read_only_fs`,
+ *   `busy`, `path_error`, `io_error`) with redacted messages.
+ */
+export function createRotatingJsonlWriter(
+  options: RotatingJsonlWriterOptions,
+): RotatingJsonlWriter {
+  const configuredPath = options.filePath.trim();
+  if (!configuredPath) {
+    throw new Error("RotatingJsonlWriter requires a non-empty filePath");
+  }
+  const resolvedPath = path.resolve(configuredPath);
+  const dir = path.dirname(resolvedPath);
+  const base = path.basename(resolvedPath);
+  const maxBytes = parseLogFileMaxBytes(options.maxBytes);
+  const maxFiles = parseLogFileMaxFiles(options.maxFiles);
+  let secrets = [...(options.secrets ?? [])];
+  const now = options.now ?? (() => new Date());
+  const fs: JsonlFsOps = {
+    mkdir: fsMkdir,
+    stat: fsStat,
+    readdir: fsReaddir,
+    rename: fsRename,
+    unlink: fsUnlink,
+    appendFile: fsAppendFile,
+    ...options.fsOps,
+  };
+
+  let initialized = false;
+  let currentBytes = 0;
+  let writesSucceeded = 0;
+  let writesDropped = 0;
+  let rotations = 0;
+  const failuresByStage: Record<JsonlDiskFailureStage, number> = {
+    mkdir: 0,
+    stat: 0,
+    rotate: 0,
+    write: 0,
+    cleanup: 0,
+  };
+  const failuresByReason: Record<JsonlDiskFailureReason, number> = {
+    disk_full: 0,
+    permission_denied: 0,
+    read_only_fs: 0,
+    busy: 0,
+    path_error: 0,
+    io_error: 0,
+  };
+  let lastFailure: JsonlDiskFailure | null = null;
+  let queue: Promise<void> = Promise.resolve();
+
+  function reportFailure(
+    stage: JsonlDiskFailureStage,
+    targetPath: string,
+    err: unknown,
+  ): JsonlDiskFailure {
+    const { reason, code } = classifyJsonlDiskError(err);
+    const failure: JsonlDiskFailure = {
+      stage,
+      reason,
+      code,
+      targetPath: redactError(targetPath, { secrets }),
+      message: redactError(err, { secrets }),
+      at: now().toISOString(),
+    };
+    failuresByStage[stage] += 1;
+    failuresByReason[reason] += 1;
+    lastFailure = failure;
+    if (options.onFailure) {
+      try {
+        options.onFailure(failure);
+      } catch {
+        // Never allow an error observer to break the log queue.
+      }
+    }
+    return failure;
+  }
+
+  async function pruneExcessArchives(): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(dir);
+    } catch (err) {
+      if (!isMissingFileError(err)) {
+        reportFailure("cleanup", dir, err);
+      }
+      return;
+    }
+
+    const prefix = `${base}.`;
+    const staleIndices: number[] = [];
+    for (const entry of entries) {
+      if (!entry.startsWith(prefix)) continue;
+      const suffix = entry.slice(prefix.length);
+      if (!/^[1-9]\d*$/.test(suffix)) continue;
+      const idx = Number.parseInt(suffix, 10);
+      if (Number.isSafeInteger(idx) && idx >= maxFiles) {
+        staleIndices.push(idx);
+      }
+    }
+
+    staleIndices.sort((a, b) => a - b);
+    for (const idx of staleIndices) {
+      const stalePath = path.join(dir, `${base}.${idx}`);
+      try {
+        await fs.unlink(stalePath);
+      } catch (err) {
+        if (!isMissingFileError(err)) {
+          reportFailure("cleanup", stalePath, err);
+        }
+      }
+    }
+  }
+
+  async function ensureInitialized(): Promise<boolean> {
+    if (initialized) return true;
+
+    try {
+      await fs.mkdir(dir, { recursive: true });
+    } catch (err) {
+      reportFailure("mkdir", dir, err);
+      return false;
+    }
+
+    try {
+      const info = await fs.stat(resolvedPath);
+      currentBytes = Math.max(0, info.size);
+    } catch (err) {
+      if (isMissingFileError(err)) {
+        currentBytes = 0;
+      } else {
+        reportFailure("stat", resolvedPath, err);
+        return false;
+      }
+    }
+
+    await pruneExcessArchives();
+    initialized = true;
+    return true;
+  }
+
+  async function performRotation(): Promise<boolean> {
+    if (maxFiles <= 1) {
+      try {
+        await fs.unlink(resolvedPath);
+      } catch (err) {
+        if (!isMissingFileError(err)) {
+          reportFailure("rotate", resolvedPath, err);
+          return false;
+        }
+      }
+      currentBytes = 0;
+      rotations += 1;
+      await pruneExcessArchives();
+      return true;
+    }
+
+    const oldestArchive = `${resolvedPath}.${maxFiles - 1}`;
+    try {
+      await fs.unlink(oldestArchive);
+    } catch (err) {
+      if (!isMissingFileError(err)) {
+        reportFailure("rotate", oldestArchive, err);
+        return false;
+      }
+    }
+
+    for (let i = maxFiles - 2; i >= 1; i -= 1) {
+      const src = `${resolvedPath}.${i}`;
+      const dst = `${resolvedPath}.${i + 1}`;
+      try {
+        await fs.rename(src, dst);
+      } catch (err) {
+        if (!isMissingFileError(err)) {
+          reportFailure("rotate", src, err);
+          return false;
+        }
+      }
+    }
+
+    try {
+      await fs.rename(resolvedPath, `${resolvedPath}.1`);
+    } catch (err) {
+      if (isMissingFileError(err)) {
+        currentBytes = 0;
+        return true;
+      }
+      reportFailure("rotate", resolvedPath, err);
+      return false;
+    }
+
+    currentBytes = 0;
+    rotations += 1;
+    await pruneExcessArchives();
+    return true;
+  }
+
+  async function writeOne(rawLine: string): Promise<boolean> {
+    const cleanLine = rawLine.replace(/[\r\n]+$/g, "");
+    const payload = `${cleanLine}\n`;
+    const payloadBytes = Buffer.byteLength(payload, "utf8");
+
+    const ready = await ensureInitialized();
+    if (!ready) {
+      writesDropped += 1;
+      return false;
+    }
+
+    if (currentBytes > 0 && currentBytes + payloadBytes > maxBytes) {
+      await performRotation();
+    }
+
+    try {
+      await fs.appendFile(resolvedPath, payload);
+      currentBytes += payloadBytes;
+      writesSucceeded += 1;
+      return true;
+    } catch (err) {
+      reportFailure("write", resolvedPath, err);
+      writesDropped += 1;
+      return false;
+    }
+  }
+
+  return {
+    write(line: string): Promise<boolean> {
+      const writePromise = queue.then(() => writeOne(line));
+      queue = writePromise.then(
+        () => undefined,
+        () => undefined,
+      );
+      return writePromise;
+    },
+    flush(): Promise<void> {
+      return queue;
+    },
+    stats(): JsonlWriterStats {
+      return {
+        filePath: configuredPath,
+        maxBytes,
+        maxFiles,
+        currentBytes,
+        writesSucceeded,
+        writesDropped,
+        rotations,
+        failuresByStage: { ...failuresByStage },
+        failuresByReason: { ...failuresByReason },
+        lastFailure: lastFailure ? { ...lastFailure } : null,
+      };
+    },
+    setSecrets(nextSecrets: readonly string[]): void {
+      secrets = [...nextSecrets];
+    },
+  };
+}
+
 const consoleSink: LogSink = (level, line) => {
   if (level === "error" || level === "fatal") console.error(line);
   else if (level === "warn") console.warn(line);
   else console.log(line);
+};
+
+const defaultDiskFailureSink = (failure: JsonlDiskFailure): void => {
+  const codeSuffix = failure.code ? ` code=${failure.code}` : "";
+  console.error(
+    `[logger] jsonl disk failure stage=${failure.stage} reason=${failure.reason}${codeSuffix}: ${failure.message}`,
+  );
 };
 
 interface LoggerState {
@@ -269,6 +698,8 @@ interface LoggerState {
   sink: LogSink;
   secrets: string[];
   now: () => Date;
+  jsonlWriter: RotatingJsonlWriter | null;
+  onDiskFailure: (failure: JsonlDiskFailure) => void;
 }
 
 function defaultState(): LoggerState {
@@ -278,6 +709,8 @@ function defaultState(): LoggerState {
     sink: consoleSink,
     secrets: [],
     now: () => new Date(),
+    jsonlWriter: null,
+    onDiskFailure: defaultDiskFailureSink,
   };
 }
 
@@ -309,41 +742,84 @@ function sanitize(value: unknown, depth: number): unknown {
   return out;
 }
 
-function emit(level: LogLevel, component: string, message: string, fields?: LogFields): void {
-  if (LEVEL_RANK[level] < LEVEL_RANK[state.level]) return;
-  const msg = redactLogText(message);
-  if (state.format === "text") {
-    state.sink(level, msg);
-    return;
+function serializeJsonRecord(
+  level: LogLevel,
+  component: string,
+  msg: string,
+  fields?: LogFields,
+): { ok: true; json: string } | { ok: false; fallbackJson: string } {
+  let ts: string;
+  try {
+    ts = state.now().toISOString();
+  } catch {
+    ts = new Date(0).toISOString();
   }
-  let line: string;
   try {
     const safe: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(fields ?? {})) {
       if (item === undefined || typeof item === "function") continue;
       safe[key] = sanitize(item, 0);
     }
-    line = JSON.stringify({ ...safe, ts: state.now().toISOString(), level, component, msg });
+    return { ok: true, json: JSON.stringify({ ...safe, ts, level, component, msg }) };
   } catch {
     // Never let a hostile field take the log call (or the caller) down.
-    line = msg;
+    return { ok: false, fallbackJson: JSON.stringify({ ts, level, component, msg }) };
   }
-  state.sink(level, line);
+}
+
+function emit(level: LogLevel, component: string, message: string, fields?: LogFields): void {
+  if (LEVEL_RANK[level] < LEVEL_RANK[state.level]) return;
+  const msg = redactLogText(message);
+  if (state.format === "text") {
+    state.sink(level, msg);
+    if (state.jsonlWriter) {
+      const serialized = serializeJsonRecord(level, component, msg, fields);
+      void state.jsonlWriter.write(serialized.ok ? serialized.json : serialized.fallbackJson);
+    }
+    return;
+  }
+  const serialized = serializeJsonRecord(level, component, msg, fields);
+  state.sink(level, serialized.ok ? serialized.json : msg);
+  if (state.jsonlWriter) {
+    void state.jsonlWriter.write(serialized.ok ? serialized.json : serialized.fallbackJson);
+  }
 }
 
 export const Logger = {
   configure(options: Partial<LoggerState>): void {
     state = { ...state, ...options };
+    if (options.secrets !== undefined && state.jsonlWriter) {
+      state.jsonlWriter.setSecrets(state.secrets);
+    }
   },
   configureFromEnv(env: Record<string, string | undefined> = process.env): void {
+    const filePath = parseLogFilePath(env[LOG_FILE_ENV]);
+    const jsonlWriter =
+      filePath !== null
+        ? createRotatingJsonlWriter({
+            filePath,
+            maxBytes: parseLogFileMaxBytes(env[LOG_FILE_MAX_BYTES_ENV]),
+            maxFiles: parseLogFileMaxFiles(env[LOG_FILE_MAX_FILES_ENV]),
+            secrets: state.secrets,
+            now: () => state.now(),
+            onFailure: (failure) => state.onDiskFailure(failure),
+          })
+        : null;
     state = {
       ...state,
       level: parseLogLevel(env[LOG_LEVEL_ENV]),
       format: parseLogFormat(env[LOG_FORMAT_ENV]),
+      jsonlWriter,
     };
   },
   reset(): void {
     state = defaultState();
+  },
+  flush(): Promise<void> {
+    return state.jsonlWriter ? state.jsonlWriter.flush() : Promise.resolve();
+  },
+  getJsonlStats(): JsonlWriterStats | null {
+    return state.jsonlWriter ? state.jsonlWriter.stats() : null;
   },
   getLevel(): LogLevel {
     return state.level;

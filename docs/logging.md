@@ -6,12 +6,15 @@ This document describes the structured logging system implemented in `src/logger
 
 ## Overview & Configuration
 
-The bot supports two log formats configured via environment variables:
+The bot supports two log formats and an optional size-rotated JSONL file sink configured via environment variables:
 
 | Variable | Values / Format | Default | Description |
 |---|---|---|---|
 | `LOG_FORMAT` | `text`, `json` | `text` | When set to `json`, emits one self-contained, un-indented JSON object per log record on stdout/stderr. Case-insensitive; falls back to `text` if invalid. |
 | `LOG_LEVEL` | `debug`, `info`, `warn`, `error`, `fatal` | `info` | Minimum log severity to emit. Records with lower severity are suppressed. Case-insensitive; falls back to `info` if invalid. |
+| `LOG_FILE` | file path | *(unset — disabled)* | Optional path to a local JSONL operational log file. When set, every log record meeting `LOG_LEVEL` is redacted and appended as one JSON line, regardless of `LOG_FORMAT` on stdout/stderr. |
+| `LOG_FILE_MAX_BYTES` | positive integer | `10485760` (`10 MiB`) | Size threshold in bytes before rotating the active JSONL file (`<LOG_FILE>` -> `<LOG_FILE>.1`). Invalid or non-positive values fall back to the default. |
+| `LOG_FILE_MAX_FILES` | `1`–`50` | `5` | Maximum total local JSONL log files retained on disk (active file plus `.1` through `.N-1`). Values above `50` are clamped to `50`; `1` retains only the active file. |
 
 In addition, standard output streams follow severity conventions:
 - `error` and `fatal` are written to `stderr` (`console.error`).
@@ -141,6 +144,16 @@ Repetitive RPC errors or network disconnects can flood aggregators. The poller p
 2. Subsequent repeats for that key within the window are suppressed and counted.
 3. When the window expires, the first new occurrence prints with a notice indicating how many repeats were held back (e.g. `[+N identical lines suppressed in the last 300s]`).
 4. In JSON mode, sampled errors still emit structured logs with canonical `level: "error"` and scope `component: "poller"`.
+
+---
+
+## Size-Based JSONL Operational Log Rotation (`LOG_FILE`)
+
+When `LOG_FILE` is set (or `createRotatingJsonlWriter` is wired programmatically), operational logs are persisted as newline-delimited JSON with strict local retention and failure-isolation guarantees:
+
+- **Bounded local file count**: Total retained files never exceed `LOG_FILE_MAX_FILES` (default `5`, clamped to `MAX_LOG_FILE_COUNT = 50`). Rotation shifts `<LOG_FILE>.<k>` to `<LOG_FILE>.<k+1>`, moves `<LOG_FILE>` to `<LOG_FILE>.1`, and unlinks any archive index `>= LOG_FILE_MAX_FILES` (including stale archives left from an earlier higher limit). Setting `LOG_FILE_MAX_FILES=1` keeps only `<LOG_FILE>`.
+- **Preserved writes during rotation**: Writes and rotations run through a serialized FIFO queue so concurrent log calls during rotation are never lost or interleaved with `rename`. If a rotation step fails on disk (e.g. `EBUSY` or `EACCES` on rename), the rotation error is reported distinctly and the writer still attempts to append the pending record to `<LOG_FILE>`. Graceful shutdown awaits `Logger.flush()` before exiting.
+- **Distinct disk failure reporting**: Filesystem errors are classified by `stage` (`mkdir`, `stat`, `rotate`, `write`, `cleanup`) and `reason` (`disk_full`, `permission_denied`, `read_only_fs`, `busy`, `path_error`, `io_error`), redacted via `redactError`, tracked in `Logger.getJsonlStats()`, and emitted to `stderr` (`[logger] jsonl disk failure stage=... reason=...`) without recursing back into `Logger`.
 
 ---
 
