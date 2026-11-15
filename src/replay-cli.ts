@@ -12,6 +12,7 @@
  *   npm run replay -- --from 4226500 --json        # machine-readable report
  *   npm run replay -- --from 4226500 --mock        # local mock profile
  *   npm run replay -- --from 4226500 --progress-file progress.json # resumable
+ *   npm run replay -- --from 4226500 --certificate cert.json       # completeness cert
  *   npm run replay -- --from 4226500 --rpm 120     # rate-limited RPC budget
  *
  * Needs no Telegram credentials in dry-run mode (the default). Pass --send to
@@ -19,13 +20,31 @@
  *
  * Exit codes:
  *   0 — scan completed (even if some events were skipped or capped)
- *   1 — fatal runtime error (RPC failure, config error)
+ *   1 — fatal runtime error (RPC failure, config error, or --require-complete unmet)
  *   2 — usage error (bad flags)
  */
 
 import { pathToFileURL } from "node:url";
 
-import { runReplayCli } from "./stellar/replay.js";
+import {
+  buildReplayCompletenessCertificate,
+  buildTargetCompleteness,
+  computeCertificateDigest,
+  formatCompletenessCertificateJson,
+  runReplayCli,
+  verifyReplayCompletenessCertificate,
+  writeCompletenessCertificateAtomic,
+} from "./stellar/replay.js";
+
+export {
+  buildReplayCompletenessCertificate,
+  buildTargetCompleteness,
+  computeCertificateDigest,
+  formatCompletenessCertificateJson,
+  runReplayCli,
+  verifyReplayCompletenessCertificate,
+  writeCompletenessCertificateAtomic,
+};
 
 const invokedPath = process.argv[1];
 if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {

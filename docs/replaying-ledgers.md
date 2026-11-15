@@ -74,6 +74,8 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
+| `--certificate` | `<path>` | Atomically write a deterministic `mimir-replay-completeness-v1` JSON certificate recording requested vs observed ranges, unresolved gaps, and canonical SHA-256 `digest`. | None |
+| `--require-complete` | Boolean flag | Exit with code `1` if `completeness.complete` is `false` (any pruned, truncated, beyond-tip, or failed ledger gap). | `false` |
 
 ### Exit Codes
 
@@ -223,3 +225,17 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Deterministic Replay Completeness Certificates
+
+Every replay run attaches a deterministic `mimir-replay-completeness-v1` object at `report.completeness` and optionally writes it atomically via `--certificate <path>`:
+
+```bash
+npm run replay -- --from 4226500 --to 4226800 --certificate completeness.json --require-complete
+```
+
+* **Deterministic digest:** Certificates omit wall-clock timestamps and transient host metadata, canonicalizing object keys lexicographically before computing `digest` (`sha256:<64-hex>`). Re-running the same range against identical chain history yields byte-for-byte identical certificate output.
+* **Requested vs. observed coverage:** Each target records `requestedRange`, `retentionWindow`, `observedRange` (`{ from, to, count }`), and `unresolvedGaps`.
+* **Partial or pruned ranges are never marked complete:** `complete` is `false` whenever any requested ledger falls below `oldestLedger` (`pruned-before-retention-floor`), exceeds `latestLedger` (`beyond-chain-tip`), stops early on `--pages` (`truncated-page-budget`), starts mid-ledger or from an opaque cursor (`partial-cursor-start` / `opaque-cursor-start`), or encounters an RPC error (`scan-failed`).
