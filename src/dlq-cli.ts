@@ -24,9 +24,13 @@ import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import {
+  computeDeadLetterAge,
   createDeadLetterQueue,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
+  formatDeadLetterAge,
+  parseDeadLetterTimestampMs,
+  type DeadLetterAgeSummary,
   type DeadLetterEntry,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
@@ -46,6 +50,9 @@ export class DlqUsageError extends Error {
 
 export interface DlqEntryView extends DeadLetterEntry {
   chatId: string;
+  ageMs: number | null;
+  age: string;
+  timestampMissing: boolean;
 }
 
 export interface ListDlqOptions {
@@ -219,8 +226,9 @@ function resolveChatIdForSource(source: string, explicitChatId?: string): string
 
 function toEntryView(
   entry: DeadLetterEntry,
-  options: { chatId?: string; secrets?: readonly string[] },
+  options: { chatId?: string; secrets?: readonly string[]; now?: () => number },
 ): DlqEntryView {
+  const nowMs = (options.now ?? Date.now)();
   const chatIds = configuredChatIds(options.chatId);
   const secrets = configuredSecrets(options.secrets);
   const rawEntry = entry as DeadLetterEntry & { chatId?: string };
@@ -231,6 +239,11 @@ function toEntryView(
     typeof rawEntry.chatId === "string" && rawEntry.chatId.trim().length > 0
       ? redactChatId(rawEntry.chatId.trim())
       : resolveChatIdForSource(entry.source, options.chatId);
+
+  const failedAtMs = parseDeadLetterTimestampMs(entry.enqueuedAt);
+  const timestampMissing = failedAtMs === null;
+  const ageMs = failedAtMs === null ? null : Math.max(0, nowMs - failedAtMs);
+  const age = timestampMissing ? "unknown (missing timestamp)" : formatDeadLetterAge(ageMs);
 
   return {
     id: sanitizeDlqText(entry.id, chatIds, secrets),
@@ -243,6 +256,9 @@ function toEntryView(
     lastError:
       entry.lastError === null ? null : sanitizeDlqText(entry.lastError, chatIds, secrets),
     chatId: entryChat,
+    ageMs,
+    age,
+    timestampMissing,
   };
 }
 
@@ -266,6 +282,7 @@ function openQueue(options: ListDlqOptions) {
     maxAttempts,
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
 }
 
@@ -372,6 +389,7 @@ async function persistPurgedQueue(
     ),
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
 
   await queue.load();
@@ -480,21 +498,40 @@ function resolvePath(value: string): string {
 
 function formatListOutput(
   entries: DlqEntryView[],
+  age: DeadLetterAgeSummary,
   filePath: string,
   chatId: string,
   asJson: boolean,
 ): string {
   if (asJson) {
-    return `${JSON.stringify({ file: filePath, chatId, depth: entries.length, entries }, null, 2)}\n`;
+    return `${JSON.stringify(
+      {
+        file: filePath,
+        chatId,
+        depth: entries.length,
+        oldestFailedAt: age.oldestFailedAt,
+        oldestAgeMs: age.oldestAgeMs,
+        oldestAge: age.oldestAgeHuman,
+        missingTimestamps: age.missingTimestampCount,
+        entries,
+      },
+      null,
+      2,
+    )}\n`;
   }
   if (entries.length === 0) {
-    return `[dlq] 0 entries (chat=${chatId}) in ${filePath}`;
+    return `[dlq] 0 entries (oldestAge=none, chat=${chatId}) in ${filePath}`;
   }
+  const missingDetail =
+    age.missingTimestampCount > 0 && age.oldestAgeMs !== null
+      ? `, missingTimestamps=${age.missingTimestampCount}`
+      : "";
   const lines = [
-    `[dlq] ${entries.length} entry(s) (chat=${chatId}) in ${filePath}`,
+    `[dlq] ${entries.length} entry(s) (oldestAge=${age.oldestAgeHuman}${missingDetail}, chat=${chatId}) in ${filePath}`,
     ...entries.map(
       (e) =>
-        `  ${e.id}  enqueued=${e.enqueuedAt}  source=${e.source}  ledger=${e.ledger}  ` +
+        `  ${e.id}  enqueued=${e.timestampMissing ? "unknown (legacy)" : e.enqueuedAt}  ` +
+        `age=${e.age}  source=${e.source}  ledger=${e.ledger}  ` +
         `event=${e.eventName}  attempts=${e.attempts}  chat=${e.chatId}  ` +
         `lastError=${boundText(e.lastError ?? "none", 120)}`,
     ),
@@ -508,7 +545,8 @@ function formatShowOutput(entry: DlqEntryView, asJson: boolean): string {
   }
   return [
     `id:         ${entry.id}`,
-    `enqueuedAt: ${entry.enqueuedAt}`,
+    `enqueuedAt: ${entry.timestampMissing ? "unknown (missing legacy timestamp)" : entry.enqueuedAt}`,
+    `age:        ${entry.age}`,
     `source:     ${entry.source}`,
     `ledger:     ${entry.ledger}`,
     `eventName:  ${entry.eventName}`,
@@ -574,8 +612,12 @@ export async function runDlqCli(
   try {
     if (parsed.subcommand === "list") {
       const entries = await listDeadLetters(commonOptions);
+      const age = computeDeadLetterAge(
+        entries,
+        (options.now ?? Date.now)(),
+      );
       const chatId = resolveChatIdForSource("default", parsed.chatId);
-      out(formatListOutput(entries, filePath, chatId, parsed.json).trimEnd());
+      out(formatListOutput(entries, age, filePath, chatId, parsed.json).trimEnd());
       return { exitCode: 0 };
     }
 
@@ -604,7 +646,7 @@ export async function runDlqCli(
 }
 
 async function main(): Promise<void> {
-  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
+  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env", quiet: true });
   const { exitCode } = await runDlqCli();
   if (exitCode !== 0) {
     process.exit(exitCode);

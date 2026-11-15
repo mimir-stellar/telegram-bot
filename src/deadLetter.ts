@@ -53,6 +53,20 @@ export interface DeadLetterStats {
   enqueued: number;
   replayed: number;
   dropped: number;
+  /** Original failed-at ISO timestamp of the oldest retained entry, or null. */
+  oldestFailedAt?: string | null;
+  /** Age in milliseconds of the oldest retained failure, or null when unknown/empty. */
+  oldestAgeMs?: number | null;
+  /** Retained entries lacking a valid failed-at timestamp (legacy records). */
+  missingTimestamps?: number;
+}
+
+export interface DeadLetterAgeSummary {
+  depth: number;
+  oldestFailedAt: string | null;
+  oldestAgeMs: number | null;
+  oldestAgeHuman: string;
+  missingTimestampCount: number;
 }
 
 export interface DeadLetterQueueOptions {
@@ -75,6 +89,8 @@ export interface DeadLetterQueueOptions {
   secrets?: readonly string[];
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /** Suppress informational console output (used by machine-readable CLI modes). */
+  quiet?: boolean;
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
@@ -108,9 +124,84 @@ export function makeEntryId(
   return `${source}:${ledger}:${eventName}:${shortHash(text)}`;
 }
 
+/** Parse a persisted failure timestamp into epoch ms, returning `null` if absent or invalid. */
+export function parseDeadLetterTimestampMs(value: unknown): number | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Render a non-negative millisecond age as a compact human duration (`45s`, `12m`, `3h`, `2d`). */
+export function formatDeadLetterAge(ageMs: number | null | undefined): string {
+  if (ageMs === null || ageMs === undefined || !Number.isFinite(ageMs)) {
+    return "unknown";
+  }
+  const clamped = Math.max(0, Math.floor(ageMs));
+  if (clamped < 60_000) return `${Math.floor(clamped / 1_000)}s`;
+  if (clamped < 3_600_000) return `${Math.floor(clamped / 60_000)}m`;
+  if (clamped < 86_400_000) return `${Math.floor(clamped / 3_600_000)}h`;
+  return `${Math.floor(clamped / 86_400_000)}d`;
+}
+
+/**
+ * Compute queue age from the oldest retained entry's original failure timestamp
+ * (never from file `mtime` or `updatedAt`), accounting explicitly for legacy
+ * entries with missing or unparseable timestamps.
+ */
+export function computeDeadLetterAge(
+  entries: readonly DeadLetterEntry[],
+  nowMs: number = Date.now(),
+): DeadLetterAgeSummary {
+  if (entries.length === 0) {
+    return {
+      depth: 0,
+      oldestFailedAt: null,
+      oldestAgeMs: null,
+      oldestAgeHuman: "none",
+      missingTimestampCount: 0,
+    };
+  }
+
+  let oldestMs: number | null = null;
+  let oldestFailedAt: string | null = null;
+  let missingTimestampCount = 0;
+
+  for (const entry of entries) {
+    const ts = parseDeadLetterTimestampMs(entry.enqueuedAt);
+    if (ts === null) {
+      missingTimestampCount += 1;
+      continue;
+    }
+    if (oldestMs === null || ts < oldestMs) {
+      oldestMs = ts;
+      oldestFailedAt = entry.enqueuedAt;
+    }
+  }
+
+  if (oldestMs === null) {
+    return {
+      depth: entries.length,
+      oldestFailedAt: null,
+      oldestAgeMs: null,
+      oldestAgeHuman: "unknown (missing timestamp)",
+      missingTimestampCount,
+    };
+  }
+
+  const oldestAgeMs = Math.max(0, nowMs - oldestMs);
+  return {
+    depth: entries.length,
+    oldestFailedAt,
+    oldestAgeMs,
+    oldestAgeHuman: formatDeadLetterAge(oldestAgeMs),
+    missingTimestampCount,
+  };
+}
+
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
+  const quiet = options.quiet === true;
   let entries: DeadLetterEntry[] = [];
   const stats: DeadLetterStats = {
     depth: 0,
@@ -148,9 +239,11 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     try {
       const parsed = JSON.parse(raw) as DeadLetterFile;
       if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
-        console.warn(
-          `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
-        );
+        if (!quiet) {
+          console.warn(
+            `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
+          );
+        }
         entries = [];
       } else {
         entries = parsed.entries
@@ -161,17 +254,31 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
               typeof e.text === "string" &&
               typeof e.ledger === "number",
           )
-          .map((e) => ({
-            id: e.id,
-            enqueuedAt:
-              typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
-            source: typeof e.source === "string" ? e.source : "unknown",
-            ledger: e.ledger,
-            eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
-            text: truncate(e.text, TEXT_TRUNCATE),
-            attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
-            lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
-          }));
+          .map((e) => {
+            const rawRecord = e as unknown as Record<string, unknown>;
+            const legacyCandidate =
+              typeof rawRecord.firstFailedAt === "string"
+                ? rawRecord.firstFailedAt
+                : typeof rawRecord.failedAt === "string"
+                  ? rawRecord.failedAt
+                  : typeof e.enqueuedAt === "string"
+                    ? e.enqueuedAt
+                    : "";
+            const validTimestamp =
+              parseDeadLetterTimestampMs(legacyCandidate) !== null ? legacyCandidate : "";
+
+            return {
+              id: e.id,
+              enqueuedAt: validTimestamp,
+              source: typeof e.source === "string" ? e.source : "unknown",
+              ledger: e.ledger,
+              eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
+              text: truncate(e.text, TEXT_TRUNCATE),
+              attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
+              lastError:
+                typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
+            };
+          });
         // Bound on load too: the file may have been edited by hand.
         while (entries.length > options.maxEntries) {
           entries.shift();
@@ -179,13 +286,15 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         }
       }
     } catch (err) {
-      console.warn(
-        `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
-      );
+      if (!quiet) {
+        console.warn(
+          `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
+        );
+      }
       entries = [];
     }
     syncDepth();
-    if (entries.length > 0) {
+    if (entries.length > 0 && !quiet) {
       console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
   }
@@ -323,8 +432,18 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     load,
     enqueue,
     flush,
+    ageSummary(atMs?: number): DeadLetterAgeSummary {
+      return computeDeadLetterAge(entries, atMs ?? now());
+    },
     stats(): DeadLetterStats {
-      return { ...stats, depth: entries.length };
+      const age = computeDeadLetterAge(entries, now());
+      return {
+        ...stats,
+        depth: entries.length,
+        oldestFailedAt: age.oldestFailedAt,
+        oldestAgeMs: age.oldestAgeMs,
+        missingTimestamps: age.missingTimestampCount,
+      };
     },
     /** Test helper — snapshot of current entries. */
     snapshot(): DeadLetterEntry[] {

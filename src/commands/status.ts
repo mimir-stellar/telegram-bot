@@ -11,6 +11,7 @@ import {
   formatLastEvent,
 } from "../notifications/format.js";
 import { networkLabel, type BotConfig } from "../config.js";
+import { formatDeadLetterAge } from "../deadLetter.js";
 import { chainClockLabel } from "../health.js";
 import { formatFeatureFlags } from "../notifications/featureFlags.js";
 import type { PollerStatus } from "../poller.js";
@@ -68,9 +69,23 @@ export function statusMessage(
   // Only shown when the queue is holding or has replayed something, so an
   // ordinary /status is unchanged.
   if (status.deadLetter && (status.deadLetter.depth > 0 || status.deadLetter.replayed > 0)) {
+    let ageDetail = "";
+    if (status.deadLetter.depth > 0) {
+      const missingCount = status.deadLetter.missingTimestamps ?? 0;
+      if (typeof status.deadLetter.oldestAgeMs === "number") {
+        const ageLabel = escapeMd(formatDeadLetterAge(status.deadLetter.oldestAgeMs));
+        ageDetail =
+          missingCount > 0
+            ? ` \u00b7 oldest ${ageLabel} \\(${missingCount} legacy timestamp unknown\\)`
+            : ` \u00b7 oldest ${ageLabel}`;
+      } else if (missingCount > 0) {
+        ageDetail = " \u00b7 oldest age unknown \\(legacy\\)";
+      }
+    }
     lines.push(
       `Parked sends: ${status.deadLetter.depth} waiting \u00b7 ` +
-        `${status.deadLetter.replayed} replayed \u00b7 ${status.deadLetter.dropped} dropped`,
+        `${status.deadLetter.replayed} replayed \u00b7 ${status.deadLetter.dropped} dropped` +
+        ageDetail,
       "",
     );
   }

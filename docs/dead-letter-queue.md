@@ -46,7 +46,7 @@ The dead-letter file is written atomically (via a write-to-temporary-file and re
 Each entry in `entries` mirrors the `DeadLetterEntry` TypeScript interface defined in [`src/deadLetter.ts`](file:///c:/Users/HP/drips/work/telegram-bot/src/deadLetter.ts):
 
 * `id` (`string`): Stable unique identifier within the queue (see [Entry ID Generation](#entry-id-generation-makeentryid)).
-* `enqueuedAt` (`string`): ISO 8601 timestamp recording when the failure was first enqueued.
+* `enqueuedAt` (`string`): ISO 8601 timestamp recording when the failure was originally parked. Queue age (`oldestAge` / `oldestAgeMs` in `npm run dlq -- list` and `/status`) is always derived from the oldest retained entry's original `enqueuedAt` timestamp rather than file `mtime` or `updatedAt`. Legacy records missing or containing unparseable timestamps preserve an empty timestamp and are reported explicitly (`unknown (missing timestamp)` / `missingTimestamps`) rather than stamped with the current load time.
 * `source` (`string`): Originating contract source name (e.g. `market` or `squad`).
 * `ledger` (`number`): Stellar ledger sequence number where the event occurred.
 * `eventName` (`string`): Contract event topic/name (e.g. `MarketCreated`, `BetPlaced`, `Resolved`).
