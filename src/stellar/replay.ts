@@ -36,6 +36,7 @@
  * that was within the range.
  */
 
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -51,6 +52,12 @@ import {
 } from "../config.js";
 import { EventDedupWindow, eventKey } from "../dedup.js";
 import {
+  DEFAULT_FEATURE_FLAGS,
+  isNotificationAllowed,
+  type NotificationFeatureFlags,
+} from "../notifications/featureFlags.js";
+import {
+  eventAllowedByCategory,
   formatEvent,
   safeErrorMessage,
 } from "../notifications/format.js";
@@ -157,6 +164,17 @@ export interface ReplayProgressTarget {
   failedSends?: number | undefined;
 }
 
+export interface NormalizedReplayFilterSet {
+  contracts: ContractSource[];
+  eventNames: string[];
+  categories: string[];
+  featureFlags: {
+    enabled: boolean;
+    market: boolean;
+    squad: boolean;
+  };
+}
+
 export interface ReplayProgressFile {
   format: "mimir-replay-progress-v1";
   version: 1;
@@ -169,6 +187,10 @@ export interface ReplayProgressFile {
     to: number | null;
   };
   contracts: ContractSource[];
+  /** Canonicalized filter configuration active when this progress file was created. */
+  filters?: NormalizedReplayFilterSet | undefined;
+  /** Deterministic SHA-256 fingerprint of {@link filters}. */
+  filterFingerprint?: string | undefined;
   targets: Partial<Record<ContractSource, ReplayProgressTarget>>;
 }
 
@@ -217,6 +239,10 @@ export interface ReplayOptions {
   to?: number | undefined;
   /** Which contracts to scan. Defaults to both. */
   contracts?: ContractSource[] | undefined;
+  /** Optional allowlist of decoded event names (case-insensitive). Empty means all. */
+  eventNames?: readonly string[] | undefined;
+  /** Optional allowlist of claim categories (case-insensitive). Empty means all. */
+  categories?: readonly string[] | undefined;
   /** Walk at most this many pages per contract. Defaults to EVENT_MAX_PAGES. */
   maxPages?: number | undefined;
   /** Limit the walk to this many events returned per page. */
@@ -292,12 +318,110 @@ export function normalizeRangeTo(to?: number | null): number | null {
   return to !== undefined && to !== null ? to : null;
 }
 
+function normalizeStringList(values?: readonly string[] | null): string[] {
+  if (!values || values.length === 0) return [];
+  const out = new Set<string>();
+  for (const raw of values) {
+    if (typeof raw !== "string") continue;
+    for (const token of raw.split(/[\s,]+/)) {
+      const cleaned = token.trim().toLowerCase();
+      if (cleaned.length > 0) out.add(cleaned);
+    }
+  }
+  return [...out].sort();
+}
+
+function normalizeContractList(contracts?: readonly ContractSource[] | null): ContractSource[] {
+  if (!contracts || contracts.length === 0) return [];
+  const valid = new Set<ContractSource>();
+  for (const c of contracts) {
+    if (c === "market" || c === "squad") valid.add(c);
+  }
+  return [...valid].sort();
+}
+
+export function normalizeReplayFilterSet(input: {
+  contracts: readonly ContractSource[];
+  eventNames?: readonly string[] | undefined;
+  categories?: readonly string[] | undefined;
+  featureFlags?: Partial<NotificationFeatureFlags> | undefined;
+}): NormalizedReplayFilterSet {
+  const flags = input.featureFlags ?? DEFAULT_FEATURE_FLAGS;
+  return {
+    contracts: normalizeContractList(input.contracts),
+    eventNames: normalizeStringList(input.eventNames),
+    categories: normalizeStringList(input.categories),
+    featureFlags: {
+      enabled: flags.enabled ?? DEFAULT_FEATURE_FLAGS.enabled,
+      market: flags.market ?? DEFAULT_FEATURE_FLAGS.market,
+      squad: flags.squad ?? DEFAULT_FEATURE_FLAGS.squad,
+    },
+  };
+}
+
+export function computeReplayFilterFingerprint(filters: NormalizedReplayFilterSet): string {
+  const canonical = JSON.stringify({
+    version: 1,
+    contracts: normalizeContractList(filters.contracts),
+    eventNames: normalizeStringList(filters.eventNames),
+    categories: normalizeStringList(filters.categories),
+    featureFlags: {
+      enabled: Boolean(filters.featureFlags.enabled),
+      market: Boolean(filters.featureFlags.market),
+      squad: Boolean(filters.featureFlags.squad),
+    },
+  });
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
+function formatFilterSummary(filters: NormalizedReplayFilterSet): string {
+  const contracts = filters.contracts.join(",") || "none";
+  const events = filters.eventNames.length > 0 ? filters.eventNames.join(",") : "*";
+  const categories = filters.categories.length > 0 ? filters.categories.join(",") : "*";
+  const ff = filters.featureFlags;
+  return (
+    `contracts=[${contracts}] events=[${events}] categories=[${categories}] ` +
+    `flags=(enabled=${ff.enabled},market=${ff.market},squad=${ff.squad})`
+  );
+}
+
+function describeFilterDifferences(
+  saved: NormalizedReplayFilterSet,
+  expected: NormalizedReplayFilterSet,
+): string[] {
+  const diffs: string[] = [];
+  if (saved.contracts.join(",") !== expected.contracts.join(",")) {
+    diffs.push(`contracts (${saved.contracts.join(",") || "none"} vs ${expected.contracts.join(",") || "none"})`);
+  }
+  if (saved.eventNames.join(",") !== expected.eventNames.join(",")) {
+    diffs.push(
+      `events (${saved.eventNames.join(",") || "all"} vs ${expected.eventNames.join(",") || "all"})`,
+    );
+  }
+  if (saved.categories.join(",") !== expected.categories.join(",")) {
+    diffs.push(
+      `categories (${saved.categories.join(",") || "all"} vs ${expected.categories.join(",") || "all"})`,
+    );
+  }
+  const sff = saved.featureFlags;
+  const eff = expected.featureFlags;
+  if (sff.enabled !== eff.enabled || sff.market !== eff.market || sff.squad !== eff.squad) {
+    diffs.push(
+      `featureFlags (enabled=${sff.enabled},market=${sff.market},squad=${sff.squad} vs ` +
+        `enabled=${eff.enabled},market=${eff.market},squad=${eff.squad})`,
+    );
+  }
+  return diffs;
+}
+
 export async function loadAndValidateProgressFile(
   filePath: string,
   opts: {
     from: string | number;
     to?: number | undefined;
     contracts: ContractSource[];
+    eventNames?: readonly string[] | undefined;
+    categories?: readonly string[] | undefined;
     network: string;
     config: StellarConfig | BotConfig;
   },
@@ -346,11 +470,57 @@ export async function loadAndValidateProgressFile(
     throw new Error(`progress file network (${p.network}) does not match requested network (${opts.network})`);
   }
 
-  // Validate contracts
-  const fileContracts = (p.contracts ?? []).slice().sort().join(",");
-  const expectedContracts = opts.contracts.slice().sort().join(",");
-  if (fileContracts !== expectedContracts) {
-    throw new Error(`progress file contracts (${fileContracts}) do not match requested contracts (${expectedContracts})`);
+  // Validate normalized filter set and filter fingerprint
+  const configCategories = "notificationCategories" in opts.config ? opts.config.notificationCategories : undefined;
+  const configFeatureFlags = "featureFlags" in opts.config ? opts.config.featureFlags : undefined;
+  const expectedFilters = normalizeReplayFilterSet({
+    contracts: opts.contracts,
+    eventNames: opts.eventNames,
+    categories: opts.categories ?? configCategories,
+    featureFlags: configFeatureFlags,
+  });
+  const expectedFingerprint = computeReplayFilterFingerprint(expectedFilters);
+
+  const savedFilters = p.filters
+    ? normalizeReplayFilterSet({
+        contracts: p.filters.contracts ?? p.contracts ?? [],
+        eventNames: p.filters.eventNames,
+        categories: p.filters.categories,
+        featureFlags: p.filters.featureFlags,
+      })
+    : normalizeReplayFilterSet({
+        contracts: p.contracts ?? [],
+      });
+
+  const computedSavedFingerprint = computeReplayFilterFingerprint(savedFilters);
+  if (p.filterFingerprint !== undefined) {
+    if (typeof p.filterFingerprint !== "string" || !p.filterFingerprint.startsWith("sha256:")) {
+      throw new Error(
+        `progress file "${filePath}" has an invalid filterFingerprint; ` +
+          `delete the corrupt progress file or choose a new --progress-file path`,
+      );
+    }
+    if (p.filters !== undefined && p.filterFingerprint !== computedSavedFingerprint) {
+      throw new Error(
+        `progress file "${filePath}" filterFingerprint (${p.filterFingerprint}) does not match its recorded filters (${computedSavedFingerprint}); ` +
+          `refusing resume — use a fresh --progress-file path or restore the unmodified progress file`,
+      );
+    }
+  }
+
+  const effectiveFileFingerprint = p.filterFingerprint ?? computedSavedFingerprint;
+  if (effectiveFileFingerprint !== expectedFingerprint) {
+    const diffs = describeFilterDifferences(savedFilters, expectedFilters);
+    const diffText =
+      diffs.length > 0
+        ? diffs.join("; ")
+        : `fingerprint (${effectiveFileFingerprint} vs ${expectedFingerprint})`;
+    throw new Error(
+      `progress file "${filePath}" was created for a different filter set: ${diffText}. ` +
+        `Expected ${formatFilterSummary(savedFilters)} (${effectiveFileFingerprint}), ` +
+        `got ${formatFilterSummary(expectedFilters)} (${expectedFingerprint}). ` +
+        `Re-run with the original filter flags/environment or pass a new --progress-file path.`,
+    );
   }
 
   // Validate contract IDs
@@ -385,6 +555,14 @@ async function replayContract(
   const toLedger = opts.to ?? null;
   const cap = opts.cap ?? (isBotConfig(config) ? config.maxNotificationsPerCycle : 20);
   const showLog = (opts.show ?? 0) > 0 || opts.dryRun === true;
+  const activeEventNameSet = new Set(normalizeStringList(opts.eventNames));
+  const activeCategories = normalizeStringList(
+    opts.categories ?? ("notificationCategories" in config ? config.notificationCategories : undefined),
+  );
+  const activeFeatureFlags =
+    "featureFlags" in config && config.featureFlags !== undefined
+      ? config.featureFlags
+      : DEFAULT_FEATURE_FLAGS;
 
   // If this target was already marked completed in the progress file, skip RPC walk entirely.
   if (opts.targetProgress?.completed) {
@@ -595,6 +773,42 @@ async function replayContract(
         continue;
       }
 
+      if (activeEventNameSet.size > 0 && !activeEventNameSet.has(event.payload.name.toLowerCase())) {
+        skipped += 1;
+        entry.skipped = true;
+        entry.skipReason = "event-filter";
+        progress(
+          `[replay] ${target.source}: skipped "${event.payload.name}" at ledger ${event.ledger} (event filter)`,
+        );
+        if (showLog) eventLog.push(entry);
+        continue;
+      }
+
+      if (!isNotificationAllowed(activeFeatureFlags, event.source, event.payload.name)) {
+        skipped += 1;
+        entry.skipped = true;
+        entry.skipReason = "feature-flag";
+        progress(
+          `[replay] ${target.source}: skipped "${event.payload.name}" at ledger ${event.ledger} (feature flag)`,
+        );
+        if (showLog) eventLog.push(entry);
+        continue;
+      }
+
+      if (
+        activeCategories.length > 0 &&
+        !eventAllowedByCategory({ notificationCategories: activeCategories }, event)
+      ) {
+        skipped += 1;
+        entry.skipped = true;
+        entry.skipReason = "category-filter";
+        progress(
+          `[replay] ${target.source}: skipped "${event.payload.name}" at ledger ${event.ledger} (category filter)`,
+        );
+        if (showLog) eventLog.push(entry);
+        continue;
+      }
+
       if (sent >= cap) {
         capped += 1;
         entry.skipped = true;
@@ -784,6 +998,10 @@ export async function runReplayCli(opts: {
   const fromRaw = flag("from");
   const toRaw = flag("to");
   const contractFilter = flag("contract") as ContractSource | undefined;
+  const hasEventFlag = boolFlag("event") || boolFlag("events");
+  const eventRaw = flag("event") ?? flag("events");
+  const hasCategoryFlag = boolFlag("category") || boolFlag("categories");
+  const categoryRaw = flag("category") ?? flag("categories");
   const maxPages = flag("pages") ? Math.max(1, Number(flag("pages"))) : EVENT_MAX_PAGES;
   const cap = flag("cap") ? Math.max(1, Number(flag("cap"))) : undefined;
   const show = flag("show") ? Math.max(0, Number(flag("show"))) : 0;
@@ -796,9 +1014,21 @@ export async function runReplayCli(opts: {
 
   if (!fromRaw) {
     console.error("[replay] error: --from <ledger|cursor> is required");
-    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N]");
+    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--event <names>] [--category <names>] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N]");
     return { report: null, exitCode: 2 };
   }
+
+  if (hasEventFlag && (eventRaw === undefined || normalizeStringList([eventRaw]).length === 0)) {
+    console.error("[replay] error: --event requires at least one event name");
+    return { report: null, exitCode: 2 };
+  }
+  if (hasCategoryFlag && (categoryRaw === undefined || normalizeStringList([categoryRaw]).length === 0)) {
+    console.error("[replay] error: --category requires at least one category name");
+    return { report: null, exitCode: 2 };
+  }
+
+  const cliEventNames = eventRaw !== undefined ? normalizeStringList([eventRaw]) : undefined;
+  const cliCategories = categoryRaw !== undefined ? normalizeStringList([categoryRaw]) : undefined;
 
   // Validate --contract
   if (contractFilter && contractFilter !== "market" && contractFilter !== "squad") {
@@ -911,6 +1141,14 @@ export async function runReplayCli(opts: {
     ? [contractFilter]
     : ["market", "squad"];
 
+  const activeFilters = normalizeReplayFilterSet({
+    contracts: requestedContracts,
+    eventNames: cliEventNames,
+    categories: cliCategories ?? ("notificationCategories" in config ? config.notificationCategories : undefined),
+    featureFlags: "featureFlags" in config ? config.featureFlags : undefined,
+  });
+  const activeFilterFingerprint = computeReplayFilterFingerprint(activeFilters);
+
   // ── Rate limiter budget ───────────────────────────────────────────────────
 
   const sleep = overrideDeps.sleep ?? defaultSleep;
@@ -926,11 +1164,15 @@ export async function runReplayCli(opts: {
         from: fromRaw,
         to: toLedger,
         contracts: requestedContracts,
+        eventNames: cliEventNames,
+        categories: cliCategories,
         network,
         config,
       });
       if (progressData) {
-        progress(`[replay] loaded progress file "${progressFile}"`);
+        progressData.filters = activeFilters;
+        progressData.filterFingerprint = activeFilterFingerprint;
+        progress(`[replay] loaded progress file "${progressFile}" (${activeFilterFingerprint})`);
       } else {
         progressData = {
           format: "mimir-replay-progress-v1",
@@ -944,6 +1186,8 @@ export async function runReplayCli(opts: {
             to: normalizeRangeTo(toLedger),
           },
           contracts: requestedContracts,
+          filters: activeFilters,
+          filterFingerprint: activeFilterFingerprint,
           targets: {},
         };
       }
@@ -981,6 +1225,8 @@ export async function runReplayCli(opts: {
           show,
           dryRun,
           contracts: requestedContracts,
+          eventNames: cliEventNames,
+          categories: cliCategories,
           progressFile,
           rpm,
           targetProgress,

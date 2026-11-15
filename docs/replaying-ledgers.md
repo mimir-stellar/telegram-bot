@@ -67,6 +67,9 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--from` | `<ledger \| cursor>` | Starting ledger sequence or opaque cursor token (`<TOID>-<index>`). **Required.** | None |
 | `--to` | `<ledger>` | Ending ledger sequence (inclusive upper bound). | Chain tip (`window.latestLedger`) |
 | `--contract` | `market \| squad` | Restrict replay to a single contract. | Both contracts (`market` and `squad`) |
+| `--event` (`--events`) | `<name[,name...]>` | Restrict replay notifications to matching decoded event names (case-insensitive, comma-separated). | All event names |
+| `--category` (`--categories`) | `<name[,name...]>` | Restrict `claim_created` replay notifications to matching categories (overrides `NOTIFY_CATEGORIES`). | `config.notificationCategories` (all when empty) |
+| `--progress-file` | `<path>` | Persist and resume replay checkpoints (`mimir-replay-progress-v1`), bound to a normalized SHA-256 `filterFingerprint` covering contracts, event names, categories, and `NOTIFY_*` feature flags. | None |
 | `--send` | Boolean flag | Actually dispatch messages to Telegram. Requires valid Telegram credentials in `.env` or process environment. | `false` (dry-run mode is active by default) |
 | `--dry-run` | Boolean flag | Explicit dry-run flag accepted by CLI parser. Dry-run is active whenever `--send` is omitted. | `true` |
 | `--pages` | `<number>` | Maximum RPC pages to walk per contract. Must be $\ge 1$. | `20` (`EVENT_MAX_PAGES`) |
