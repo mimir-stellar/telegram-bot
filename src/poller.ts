@@ -1021,6 +1021,227 @@ export function buildCursorFile(
   };
 }
 
+/** Sentinel accepted by CLI CAS options when the destination cursor file must not exist yet. */
+export const CURSOR_CAS_MISSING_SENTINEL = "missing" as const;
+
+export type CursorCasCommand = "backup" | "restore";
+
+export type CursorCasConflictReason = "source_changed" | "live_changed";
+
+/** Safe per-target summary for CAS inspection (never exposes raw opaque cursor strings). */
+export interface CursorCasTargetSummary {
+  source: string;
+  hasCursor: boolean;
+  cursorLedger: number | null;
+  lastEventLedger: number | null;
+}
+
+/** Snapshot captured during recovery inspection for compare-and-swap verification. */
+export interface CursorCasInspection {
+  action: CursorCasCommand;
+  sourceFile: string;
+  destinationFile: string;
+  sourceDigest: string;
+  destinationDigest: string | null;
+  destinationExists: boolean;
+  schemaVersion: number;
+  schemaSource: CursorSchemaSource;
+  targets: CursorCasTargetSummary[];
+  inspectedAt: string;
+}
+
+/** Structured conflict result emitted when a CAS-guarded recovery write is refused. */
+export interface CursorCasConflictResult {
+  status: "conflict";
+  command: CursorCasCommand;
+  reason: CursorCasConflictReason;
+  conflictingFile: string;
+  sourceFile: string;
+  destinationFile: string;
+  expectedSourceDigest: string;
+  actualSourceDigest: string | null;
+  expectedDestinationDigest: string | null;
+  actualDestinationDigest: string | null;
+  liveCursorPreserved: true;
+  liveCursorExists: boolean;
+  message: string;
+}
+
+/** Structured success result emitted when a recovery write passes CAS checks and commits. */
+export interface CursorCasAppliedResult {
+  status: "applied";
+  command: CursorCasCommand;
+  sourceFile: string;
+  destinationFile: string;
+  sourceDigest: string;
+  previousDestinationDigest: string | null;
+  newDestinationDigest: string;
+  schemaVersion: number;
+  targetCount: number;
+}
+
+export type CursorCasResult = CursorCasAppliedResult | CursorCasConflictResult;
+
+export class CursorCasConflictError extends Error {
+  readonly code = "CURSOR_CAS_CONFLICT" as const;
+  readonly conflict: CursorCasConflictResult;
+
+  constructor(conflict: CursorCasConflictResult) {
+    super(formatCursorCasConflict(conflict));
+    this.name = "CursorCasConflictError";
+    this.conflict = conflict;
+  }
+}
+
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+
+/** Compute a deterministic SHA-256 hex digest over exact cursor file bytes. */
+export function computeCursorDigest(raw: string | Buffer): string {
+  const hash = createHash("sha256");
+  if (typeof raw === "string") {
+    hash.update(raw, "utf8");
+  } else {
+    hash.update(raw);
+  }
+  return hash.digest("hex");
+}
+
+/**
+ * Validate and normalize a caller-supplied SHA-256 hex digest (or `"missing"`
+ * when `allowMissing` is true for destination cursor state).
+ */
+export function parseExpectedCursorDigest(
+  value: string,
+  options: { allowMissing?: boolean; label?: string } = {},
+): string | null {
+  const trimmed = value.trim().toLowerCase();
+  const label = options.label ?? "expected digest";
+  if (options.allowMissing && trimmed === CURSOR_CAS_MISSING_SENTINEL) {
+    return null;
+  }
+  if (!SHA256_HEX_RE.test(trimmed)) {
+    const suffix = options.allowMissing
+      ? ` or "${CURSOR_CAS_MISSING_SENTINEL}"`
+      : "";
+    throw new Error(`${label} must be a 64-character hex SHA-256 digest${suffix}`);
+  }
+  return trimmed;
+}
+
+/** Read a cursor file's exact bytes and SHA-256 digest, returning `null` if absent (`ENOENT`). */
+export async function readCursorFileSnapshot(
+  filePath: string,
+): Promise<{ raw: string; digest: string } | null> {
+  try {
+    const bytes = await readFile(filePath);
+    return {
+      raw: bytes.toString("utf8"),
+      digest: computeCursorDigest(bytes),
+    };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/** Summarize cursor targets by ledger metadata without exposing raw cursor tokens. */
+export function summarizeCursorTargets(file: CursorFile): CursorCasTargetSummary[] {
+  return Object.entries(file.targets)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([source, entry]) => ({
+      source,
+      hasCursor: entry.cursor !== null && entry.cursor.length > 0,
+      cursorLedger: entry.cursor !== null ? eventCursorLedger(entry.cursor) : null,
+      lastEventLedger: entry.lastEventLedger,
+    }));
+}
+
+/** Format a human-readable operator conflict line without exposing opaque cursor contents. */
+export function formatCursorCasConflict(conflict: CursorCasConflictResult): string {
+  const expected =
+    conflict.reason === "source_changed"
+      ? conflict.expectedSourceDigest
+      : (conflict.expectedDestinationDigest ?? CURSOR_CAS_MISSING_SENTINEL);
+  const actual =
+    conflict.reason === "source_changed"
+      ? (conflict.actualSourceDigest ?? CURSOR_CAS_MISSING_SENTINEL)
+      : (conflict.actualDestinationDigest ?? CURSOR_CAS_MISSING_SENTINEL);
+  return (
+    `[cursor] conflict status=conflict command=${conflict.command} reason=${conflict.reason} ` +
+    `file=${conflict.conflictingFile} expected=${expected} actual=${actual} ` +
+    `live_cursor_preserved=${conflict.liveCursorPreserved} — ${conflict.message}`
+  );
+}
+
+/** Evaluate compare-and-swap preconditions and return a structured conflict if violated. */
+export function evaluateCursorCas(params: {
+  command: CursorCasCommand;
+  sourceFile: string;
+  destinationFile: string;
+  expectedSourceDigest: string;
+  actualSourceDigest: string | null;
+  checkDestinationDigest: boolean;
+  expectedDestinationDigest: string | null;
+  actualDestinationDigest: string | null;
+}): CursorCasConflictResult | null {
+  const liveCursorExists =
+    params.command === "restore"
+      ? params.actualDestinationDigest !== null
+      : params.actualSourceDigest !== null;
+
+  if (params.actualSourceDigest !== params.expectedSourceDigest) {
+    const message =
+      params.actualSourceDigest === null
+        ? `recovery write refused: source file ${params.sourceFile} was removed since inspection`
+        : `recovery write refused: source file ${params.sourceFile} changed since inspection`;
+    return {
+      status: "conflict",
+      command: params.command,
+      reason: "source_changed",
+      conflictingFile: params.sourceFile,
+      sourceFile: params.sourceFile,
+      destinationFile: params.destinationFile,
+      expectedSourceDigest: params.expectedSourceDigest,
+      actualSourceDigest: params.actualSourceDigest,
+      expectedDestinationDigest: params.expectedDestinationDigest,
+      actualDestinationDigest: params.actualDestinationDigest,
+      liveCursorPreserved: true,
+      liveCursorExists,
+      message,
+    };
+  }
+
+  if (
+    params.checkDestinationDigest &&
+    params.actualDestinationDigest !== params.expectedDestinationDigest
+  ) {
+    const targetRole = params.command === "restore" ? "live cursor" : "backup destination";
+    const message =
+      params.expectedDestinationDigest === null
+        ? `recovery write refused: ${targetRole} ${params.destinationFile} was created since inspection`
+        : params.actualDestinationDigest === null
+          ? `recovery write refused: ${targetRole} ${params.destinationFile} was removed since inspection`
+          : `recovery write refused: ${targetRole} ${params.destinationFile} changed since inspection`;
+    return {
+      status: "conflict",
+      command: params.command,
+      reason: "live_changed",
+      conflictingFile: params.destinationFile,
+      sourceFile: params.sourceFile,
+      destinationFile: params.destinationFile,
+      expectedSourceDigest: params.expectedSourceDigest,
+      actualSourceDigest: params.actualSourceDigest,
+      expectedDestinationDigest: params.expectedDestinationDigest,
+      actualDestinationDigest: params.actualDestinationDigest,
+      liveCursorPreserved: true,
+      liveCursorExists,
+      message,
+    };
+  }
+
+  return null;
+}
+
 function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }

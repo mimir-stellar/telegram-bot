@@ -19,11 +19,12 @@ Operational reference describing all on-disk state files maintained by the Mimir
 ## Detailed Component Behaviors
 
 ### 1. Cursor File (`CURSOR_FILE`)
-- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`, `loadCursors`, `quarantineCorruptCursorFile`)
+- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`, `loadCursors`, `quarantineCorruptCursorFile`) and [`src/cursor-cli.ts`](../src/cursor-cli.ts) (`inspectCursorRecovery`, `backupCursor`, `restoreCursor`)
 - **Default Path**: `./data/cursor.json` (configured via `DEFAULTS.cursorFile` in [`src/config.ts`](../src/config.ts))
 - **Write Pattern**: Atomic write-then-rename (`${cursorFile}.tmp` -> `${cursorFile}`) on every successful scan commit, graceful shutdown flush, or schema migration.
 - **Deleted**: Poller logs that no cursor was found and falls back to a cold start lookback `START_LOOKBACK_LEDGERS` (default: 60 ledgers) behind the chain tip.
 - **Corrupt**: If JSON is invalid or fails schema validation (or references an unsupported future schema version), `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>` and starts cold.
+- **Compare-and-Swap (CAS) Recovery Protection**: Offline recovery commands in [`src/cursor-cli.ts`](../src/cursor-cli.ts) support SHA-256 compare-and-swap inspection and verification. Operators can inspect digests without exposing opaque cursor values via `npm run cursor -- inspect --from PATH [--file PATH] [--json]` (or `--out PATH` for backups), then guard recovery writes with `--expected-source-digest <sha256>` and optional `--expected-live-digest <sha256|missing>`. Recovery commands also re-verify the source digest immediately before atomic replacement under `poller.lock`: if the source file (or pinned live cursor) changed since inspection, the write is refused, the current live cursor is preserved untouched on disk, and a structured conflict result (`CURSOR_CAS_CONFLICT`, exit code `2`) is reported.
 
 ### 2. Cursor Backup Copy
 - **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`)
