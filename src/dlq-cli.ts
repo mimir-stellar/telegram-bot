@@ -24,16 +24,22 @@ import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import {
+  clearRecoveryCheckpoint,
   createDeadLetterQueue,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
+  defaultRecoveryCheckpointPath,
+  loadRecoveryCheckpoint,
   type DeadLetterEntry,
+  type DeadLetterRecoveryCheckpoint,
+  type RecoverDeadLettersOptions,
+  type RecoverDeadLettersResult,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
 export const USAGE =
-  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
+  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]|checkpoint [--clear]> [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
   readonly exitCode = 2;
@@ -269,6 +275,38 @@ function openQueue(options: ListDlqOptions) {
   });
 }
 
+/**
+ * Run an interruptible, resumable recovery over a bounded selection of dead-letter
+ * entry IDs using the queue's persisted checkpoint (`*.recovery.json`).
+ */
+export async function recoverDeadLetterSelection(
+  options: ListDlqOptions & RecoverDeadLettersOptions,
+): Promise<RecoverDeadLettersResult> {
+  const queue = openQueue(options);
+  await queue.load();
+  return queue.recoverSelection(options);
+}
+
+/** Inspect or clear the bounded recovery checkpoint associated with a dead-letter file. */
+export async function inspectRecoveryCheckpoint(options: {
+  filePath: string;
+  checkpointFile?: string;
+  clear?: boolean;
+}): Promise<{
+  checkpointFile: string;
+  cleared: boolean;
+  checkpoint: DeadLetterRecoveryCheckpoint | null;
+}> {
+  const checkpointFile =
+    options.checkpointFile ?? defaultRecoveryCheckpointPath(options.filePath)!;
+  const existing = await loadRecoveryCheckpoint(checkpointFile);
+  if (options.clear) {
+    await clearRecoveryCheckpoint(checkpointFile);
+    return { checkpointFile, cleared: true, checkpoint: null };
+  }
+  return { checkpointFile, cleared: false, checkpoint: existing };
+}
+
 /** Load and return all dead-letter entries with redacted chat ids. */
 export async function listDeadLetters(options: ListDlqOptions): Promise<DlqEntryView[]> {
   const queue = openQueue(options);
@@ -392,24 +430,32 @@ async function persistPurgedQueue(
 }
 
 interface ParsedCliArgs {
-  subcommand: "list" | "show" | "purge";
+  subcommand: "list" | "show" | "purge" | "checkpoint";
   file?: string;
+  checkpointFile?: string;
   id?: string;
   olderThan?: string;
   yes: boolean;
+  clear: boolean;
   json: boolean;
   chatId?: string;
 }
 
 export function parseDlqArgs(argv: string[]): ParsedCliArgs {
   const [subcommand, ...rest] = argv;
-  if (subcommand !== "list" && subcommand !== "show" && subcommand !== "purge") {
+  if (
+    subcommand !== "list" &&
+    subcommand !== "show" &&
+    subcommand !== "purge" &&
+    subcommand !== "checkpoint"
+  ) {
     throw new DlqUsageError(USAGE);
   }
 
   const parsed: ParsedCliArgs = {
     subcommand,
     yes: false,
+    clear: false,
     json: false,
   };
   const seen = new Set<string>();
@@ -427,6 +473,16 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
+    if (arg === "--clear") {
+      if (subcommand !== "checkpoint") {
+        throw new DlqUsageError(`--clear is only valid with checkpoint\n${USAGE}`);
+      }
+      if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
+      seen.add(arg);
+      parsed.clear = true;
+      continue;
+    }
+
     if (arg === "--json") {
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
@@ -434,9 +490,17 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
-    if (arg === "--file" || arg === "--older-than" || arg === "--chat-id") {
+    if (
+      arg === "--file" ||
+      arg === "--checkpoint-file" ||
+      arg === "--older-than" ||
+      arg === "--chat-id"
+    ) {
       if (arg === "--older-than" && subcommand !== "purge") {
         throw new DlqUsageError(`--older-than is only valid with purge\n${USAGE}`);
+      }
+      if (arg === "--checkpoint-file" && subcommand !== "checkpoint") {
+        throw new DlqUsageError(`--checkpoint-file is only valid with checkpoint\n${USAGE}`);
       }
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
@@ -445,6 +509,7 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
         throw new DlqUsageError(`${arg} requires a value\n${USAGE}`);
       }
       if (arg === "--file") parsed.file = value;
+      else if (arg === "--checkpoint-file") parsed.checkpointFile = value;
       else if (arg === "--older-than") parsed.olderThan = value;
       else if (arg === "--chat-id") parsed.chatId = value;
       i += 1;
@@ -572,6 +637,28 @@ export async function runDlqCli(
   };
 
   try {
+    if (parsed.subcommand === "checkpoint") {
+      const cpRes = await inspectRecoveryCheckpoint({
+        filePath,
+        ...(parsed.checkpointFile ? { checkpointFile: resolvePath(parsed.checkpointFile) } : {}),
+        clear: parsed.clear,
+      });
+      if (parsed.json) {
+        out(JSON.stringify(cpRes, null, 2));
+      } else if (cpRes.cleared) {
+        out(`[dlq] cleared recovery checkpoint ${cpRes.checkpointFile}`);
+      } else if (!cpRes.checkpoint) {
+        out(`[dlq] no active recovery checkpoint at ${cpRes.checkpointFile}`);
+      } else {
+        out(
+          `[dlq] checkpoint selected=${cpRes.checkpoint.selectedIds.length} ` +
+            `acknowledged=${cpRes.checkpoint.acknowledgedIds.length} ` +
+            `interrupted=${cpRes.checkpoint.interrupted} in ${cpRes.checkpointFile}`,
+        );
+      }
+      return { exitCode: 0 };
+    }
+
     if (parsed.subcommand === "list") {
       const entries = await listDeadLetters(commonOptions);
       const chatId = resolveChatIdForSource("default", parsed.chatId);

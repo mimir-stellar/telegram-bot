@@ -24,7 +24,7 @@
  * metadata. It never holds signing keys or bot tokens.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { safeErrorMessage } from "./notifications/format.js";
@@ -79,6 +79,49 @@ export interface DeadLetterQueueOptions {
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
+export const DEAD_LETTER_CHECKPOINT_VERSION = 1 as const;
+export const DEAD_LETTER_MAX_CHECKPOINT_IDS = 500;
+
+export interface DeadLetterRecoveryCheckpoint {
+  version: typeof DEAD_LETTER_CHECKPOINT_VERSION;
+  updatedAt: string;
+  selectedIds: string[];
+  acknowledgedIds: string[];
+  lastProcessedId: string | null;
+  interrupted: boolean;
+}
+
+export interface RecoverDeadLettersOptions {
+  /** Optional explicit entry IDs to recover (defaults to resumed selection or current queue IDs). */
+  ids?: readonly string[];
+  /** Checkpoint file path; defaults to `${filePath}.recovery.json` when `filePath` is set. */
+  checkpointFile?: string | null;
+  /** Maximum entry IDs retained in checkpoint arrays (defaults to 500). */
+  maxCheckpointIds?: number;
+  /** Resume from an existing checkpoint file when present (defaults to true). */
+  resume?: boolean;
+  /** Maximum sends in a single pass before pausing recovery (defaults to maxEntries). */
+  budget?: number;
+  /** Cooperative interruption check evaluated before each entry. */
+  shouldStop?: () => boolean;
+  /** Optional AbortSignal for cooperative cancellation. */
+  signal?: AbortSignal;
+  /** Transport callback invoked for each selected, unacknowledged entry. */
+  send: (text: string, entry: DeadLetterEntry) => Promise<void>;
+}
+
+export interface RecoverDeadLettersResult {
+  resumed: boolean;
+  interrupted: boolean;
+  acknowledged: number;
+  failed: number;
+  skippedAcknowledged: number;
+  remainingSelected: number;
+  remainingQueue: number;
+  acknowledgedIds: string[];
+  pendingSelectedIds: string[];
+  checkpointFile: string | null;
+}
 
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
@@ -106,6 +149,96 @@ export function makeEntryId(
   text: string,
 ): string {
   return `${source}:${ledger}:${eventName}:${shortHash(text)}`;
+}
+
+function boundIdList(ids: readonly unknown[], maxIds: number): string[] {
+  const limit = Math.max(1, maxIds);
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of ids) {
+    if (typeof raw !== "string") continue;
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.length > 256 || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    unique.push(trimmed);
+  }
+  if (unique.length <= limit) return unique;
+  return unique.slice(unique.length - limit);
+}
+
+/** Resolve the default recovery checkpoint path for a dead-letter file. */
+export function defaultRecoveryCheckpointPath(filePath: string | null): string | null {
+  if (typeof filePath !== "string" || filePath.trim() === "") return null;
+  return `${filePath}.recovery.json`;
+}
+
+/** Load and validate a bounded recovery checkpoint from disk, returning null if absent or invalid. */
+export async function loadRecoveryCheckpoint(
+  checkpointFile: string | null,
+  maxCheckpointIds = DEAD_LETTER_MAX_CHECKPOINT_IDS,
+): Promise<DeadLetterRecoveryCheckpoint | null> {
+  if (checkpointFile === null || checkpointFile.trim() === "") return null;
+  let raw: string;
+  try {
+    raw = await readFile(checkpointFile, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<DeadLetterRecoveryCheckpoint>;
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      parsed.version !== DEAD_LETTER_CHECKPOINT_VERSION ||
+      !Array.isArray(parsed.selectedIds) ||
+      !Array.isArray(parsed.acknowledgedIds)
+    ) {
+      return null;
+    }
+    return {
+      version: DEAD_LETTER_CHECKPOINT_VERSION,
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
+      selectedIds: boundIdList(parsed.selectedIds, maxCheckpointIds),
+      acknowledgedIds: boundIdList(parsed.acknowledgedIds, maxCheckpointIds),
+      lastProcessedId:
+        typeof parsed.lastProcessedId === "string" && parsed.lastProcessedId.length <= 256
+          ? parsed.lastProcessedId
+          : null,
+      interrupted: parsed.interrupted === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Atomically write a bounded recovery checkpoint via write-then-rename. */
+export async function saveRecoveryCheckpoint(
+  checkpointFile: string | null,
+  checkpoint: DeadLetterRecoveryCheckpoint,
+  maxCheckpointIds = DEAD_LETTER_MAX_CHECKPOINT_IDS,
+): Promise<void> {
+  if (checkpointFile === null || checkpointFile.trim() === "") return;
+  const bounded: DeadLetterRecoveryCheckpoint = {
+    version: DEAD_LETTER_CHECKPOINT_VERSION,
+    updatedAt: checkpoint.updatedAt,
+    selectedIds: boundIdList(checkpoint.selectedIds, maxCheckpointIds),
+    acknowledgedIds: boundIdList(checkpoint.acknowledgedIds, maxCheckpointIds),
+    lastProcessedId:
+      typeof checkpoint.lastProcessedId === "string"
+        ? checkpoint.lastProcessedId.slice(0, 256)
+        : null,
+    interrupted: checkpoint.interrupted,
+  };
+  await mkdir(path.dirname(checkpointFile), { recursive: true });
+  const tmp = `${checkpointFile}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(bounded, null, 2)}\n`, "utf8");
+  await rename(tmp, checkpointFile);
+}
+
+/** Delete a completed recovery checkpoint if present. */
+export async function clearRecoveryCheckpoint(checkpointFile: string | null): Promise<void> {
+  if (checkpointFile === null || checkpointFile.trim() === "") return;
+  await rm(checkpointFile, { force: true }).catch(() => {});
 }
 
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
@@ -319,10 +452,152 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     return { sent, remaining: entries.length };
   }
 
+  /**
+   * Interruptible, resumable recovery over a bounded selection of dead-letter IDs.
+   * Persists acknowledged IDs in a bounded checkpoint so interrupted runs resume
+   * cleanly without reprocessing entries that already succeeded.
+   */
+  async function recoverSelection(
+    recoverOptions: RecoverDeadLettersOptions,
+  ): Promise<RecoverDeadLettersResult> {
+    const maxCheckpointIds = Math.max(
+      1,
+      recoverOptions.maxCheckpointIds ?? DEAD_LETTER_MAX_CHECKPOINT_IDS,
+    );
+    const checkpointFile =
+      recoverOptions.checkpointFile !== undefined
+        ? recoverOptions.checkpointFile
+        : defaultRecoveryCheckpointPath(filePath);
+    const existingCheckpoint =
+      recoverOptions.resume !== false
+        ? await loadRecoveryCheckpoint(checkpointFile, maxCheckpointIds)
+        : null;
+    const resumed = existingCheckpoint !== null;
+
+    const selectedIds =
+      recoverOptions.ids !== undefined
+        ? boundIdList(recoverOptions.ids, maxCheckpointIds)
+        : existingCheckpoint
+          ? existingCheckpoint.selectedIds
+          : boundIdList(
+              entries.map((e) => e.id),
+              maxCheckpointIds,
+            );
+    const selectedSet = new Set(selectedIds);
+    const acknowledgedList = existingCheckpoint ? [...existingCheckpoint.acknowledgedIds] : [];
+    const acknowledgedSet = new Set(acknowledgedList);
+
+    const budget =
+      recoverOptions.budget !== undefined
+        ? Math.max(0, recoverOptions.budget)
+        : Math.max(1, options.maxEntries);
+
+    let acknowledgedThisRun = 0;
+    let failedThisRun = 0;
+    let skippedAcknowledged = 0;
+    let interrupted = false;
+    let lastProcessedId = existingCheckpoint?.lastProcessedId ?? null;
+
+    const isStopped = (): boolean =>
+      Boolean(recoverOptions.signal?.aborted) || Boolean(recoverOptions.shouldStop?.());
+
+    const persistCheckpointState = async (isInterrupted: boolean): Promise<void> => {
+      try {
+        await saveRecoveryCheckpoint(
+          checkpointFile,
+          {
+            version: DEAD_LETTER_CHECKPOINT_VERSION,
+            updatedAt: new Date(now()).toISOString(),
+            selectedIds,
+            acknowledgedIds: boundIdList(acknowledgedList, maxCheckpointIds),
+            lastProcessedId,
+            interrupted: isInterrupted,
+          },
+          maxCheckpointIds,
+        );
+      } catch (err) {
+        console.error(`[dead-letter] could not persist recovery checkpoint: ${safeError(err)}`);
+      }
+    };
+
+    const kept: DeadLetterEntry[] = [];
+
+    for (let idx = 0; idx < entries.length; idx += 1) {
+      const entry = entries[idx]!;
+      if (!selectedSet.has(entry.id)) {
+        kept.push(entry);
+        continue;
+      }
+
+      if (acknowledgedSet.has(entry.id)) {
+        skippedAcknowledged += 1;
+        continue;
+      }
+
+      if (interrupted || isStopped() || acknowledgedThisRun >= budget) {
+        interrupted = true;
+        kept.push(entry);
+        continue;
+      }
+
+      try {
+        await recoverOptions.send(entry.text, entry);
+        acknowledgedThisRun += 1;
+        stats.replayed += 1;
+        acknowledgedSet.add(entry.id);
+        acknowledgedList.push(entry.id);
+        lastProcessedId = entry.id;
+        await persistCheckpointState(false);
+      } catch (err) {
+        failedThisRun += 1;
+        lastProcessedId = entry.id;
+        entry.attempts += 1;
+        entry.lastError = safeError(err);
+        if (entry.attempts >= options.maxAttempts) {
+          stats.dropped += 1;
+        } else {
+          kept.push(entry);
+        }
+        if (isStopped()) {
+          interrupted = true;
+        }
+      }
+    }
+
+    entries = kept;
+    syncDepth();
+    await persist();
+
+    const remainingIdsInQueue = new Set(entries.map((e) => e.id));
+    const pendingSelectedIds = selectedIds.filter(
+      (id) => remainingIdsInQueue.has(id) && !acknowledgedSet.has(id),
+    );
+
+    if (pendingSelectedIds.length > 0 || interrupted) {
+      await persistCheckpointState(interrupted);
+    } else {
+      await clearRecoveryCheckpoint(checkpointFile);
+    }
+
+    return {
+      resumed,
+      interrupted,
+      acknowledged: acknowledgedThisRun,
+      failed: failedThisRun,
+      skippedAcknowledged,
+      remainingSelected: pendingSelectedIds.length,
+      remainingQueue: entries.length,
+      acknowledgedIds: boundIdList(acknowledgedList, maxCheckpointIds),
+      pendingSelectedIds,
+      checkpointFile,
+    };
+  }
+
   return {
     load,
     enqueue,
     flush,
+    recoverSelection,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
     },

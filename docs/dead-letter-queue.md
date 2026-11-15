@@ -80,6 +80,14 @@ Format:
 * Flushes are rate-budgeted: at most `MAX_NOTIFICATIONS_PER_CYCLE` (default `20`) messages are replayed per cycle. This prevents recovery bursts from flooding Telegram channels or triggering Telegram rate limits.
 * Replays use `sendWithRetry` with exponential backoff and redaction.
 
+### Interruptible Recovery & Resumable Selections (`recoverSelection`)
+
+Targeted recovery runs (`queue.recoverSelection` / `recoverDeadLetterSelection`) persist a bounded checkpoint sidecar (`<DEAD_LETTER_FILE>.recovery.json`, capped at `DEAD_LETTER_MAX_CHECKPOINT_IDS = 500` IDs) via atomic write-then-rename:
+
+* **Cooperative Interruption**: Recovery checks `signal?.aborted`, `shouldStop()`, and `budget` before sending each entry. When interrupted mid-selection, remaining entries stay queued and the checkpoint records `selectedIds`, `acknowledgedIds`, `lastProcessedId`, and `interrupted: true`.
+* **Idempotent Resume**: Resuming loads the persisted checkpoint, reuses `selectedIds`, and skips any ID already present in `acknowledgedIds` (`skippedAcknowledged`) so acknowledged notifications are never reprocessed. Once all selected entries finish, the checkpoint file is removed automatically.
+* **Offline Checkpoint CLI**: Inspect or clear an active recovery checkpoint with `npm run dlq -- checkpoint [--clear] [--json]`.
+
 ### Bounds and Poison Entry Drops
 
 The queue is strictly bounded across every dimension:
