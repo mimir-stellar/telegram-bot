@@ -76,6 +76,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     description: "Preview Telegram channel notification formatting and verify link preview settings for market or squad contracts.",
     examples: ["/preview", "/preview market", "/preview squad"],
   },
+  filters: {
+    usage: "/filters",
+    arguments: "None",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Display active global notification filters (feature flags, event types, categories, silent events) and redacted route-specific chat settings.",
+    examples: ["/filters"],
+  },
   pause: {
     usage: "/pause",
     arguments: "None",

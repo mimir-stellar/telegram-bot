@@ -74,9 +74,9 @@ test("operator-only commands are exactly audit, pause, and resume", () => {
   assert.deepEqual(operatorCommands.sort(), ["audit", "pause", "resume"].sort());
 });
 
-test("allowlist-gated commands are exactly status, contracts, health, and preview", () => {
+test("allowlist-gated commands are exactly status, contracts, health, preview, and filters", () => {
   const gatedCommands = COMMANDS.filter(isAllowlistGated).map((c) => c.command);
-  assert.deepEqual(gatedCommands.sort(), ["contracts", "health", "preview", "status"].sort());
+  assert.deepEqual(gatedCommands.sort(), ["contracts", "filters", "health", "preview", "status"].sort());
 });
 
 test("--check exits non-zero when the target file does not exist", () => {

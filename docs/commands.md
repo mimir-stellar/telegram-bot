@@ -12,6 +12,7 @@
 | `/contracts` | Contract ids and explorer links | No | Yes |
 | `/health` | Health assessment and operational readiness | No | Yes |
 | `/preview` | Preview channel notification formatting | No | Yes |
+| `/filters` | Active notification filters and chat routing | No | Yes |
 | `/pause` | Operator only: pause new scans | Yes | No |
 | `/resume` | Operator only: resume polling now | Yes | No |
 

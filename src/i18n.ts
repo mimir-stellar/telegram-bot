@@ -122,6 +122,7 @@ export const COMMAND_NAMES = [
   "contracts",
   "health",
   "preview",
+  "filters",
   "pause",
   "resume",
 ] as const;
@@ -139,6 +140,7 @@ export const COMMAND_DESCRIPTIONS: Readonly<Record<CommandName, string>> = {
   contracts: "Contract ids and explorer links",
   health: "Health assessment and operational readiness",
   preview: "Preview channel notification formatting",
+  filters: "Active notification filters and chat routing",
   pause: "Operator only: pause new scans",
   resume: "Operator only: resume polling now",
 } as const;
@@ -615,6 +617,7 @@ const ES_COMMAND_DESCRIPTIONS: Readonly<Record<CommandName, string>> = {
   contracts: "Ids de contratos y enlaces al explorador",
   health: "Evaluación de salud y preparación operativa",
   preview: "Previsualizar el formato de las notificaciones del canal",
+  filters: "Filtros activos de notificaciones y enrutamiento de chats",
   pause: "Solo operadores: pausar nuevos escaneos",
   resume: "Solo operadores: reanudar el sondeo ahora",
 };

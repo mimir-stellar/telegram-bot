@@ -68,6 +68,7 @@ export {
   aboutMessage,
   helpMessage,
   contractsMessage,
+  filtersMessage,
   healthMessage,
   lastEventMessage,
   pauseMessage,
