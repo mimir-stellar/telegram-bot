@@ -136,3 +136,203 @@ export function formatRpcTiming(summary: RpcTimingSummary): string {
     `health=${operations.health.requests} events=${operations.events.requests}`
   );
 }
+
+// ── Fixed-bucket pending delivery queue age histogram ────────────────────────
+
+/** Bounded, low-cardinality destination classes (never chat IDs or event IDs). */
+export const DELIVERY_DESTINATION_CLASSES = ["market", "squad", "default"] as const;
+
+export type DeliveryDestinationClass = (typeof DELIVERY_DESTINATION_CLASSES)[number];
+
+/**
+ * Default finite upper bounds (in milliseconds) for pending delivery queue age:
+ * 1s, 5s, 15s, 1m, 5m, 15m, 1h.
+ */
+export const DEFAULT_PENDING_QUEUE_AGE_BUCKETS_MS = [
+  1_000,
+  5_000,
+  15_000,
+  60_000,
+  300_000,
+  900_000,
+  3_600_000,
+] as const;
+
+/**
+ * Map any raw destination hint to a bounded {@link DeliveryDestinationClass}.
+ * Raw Telegram chat IDs (`-100...`), `@channel` handles, event IDs (`1000-1`),
+ * and contract addresses collapse deterministically to `"default"`.
+ */
+export function classifyDeliveryDestination(raw: unknown): DeliveryDestinationClass {
+  if (typeof raw !== "string") return "default";
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "market") return "market";
+  if (normalized === "squad") return "squad";
+  return "default";
+}
+
+/**
+ * Validate that histogram bucket upper bounds are a non-empty, strictly
+ * increasing sequence of positive finite integers.
+ */
+export function validateFiniteBucketsMs(bucketsMs: readonly number[]): number[] {
+  if (!Array.isArray(bucketsMs) || bucketsMs.length === 0) {
+    throw new RangeError("Histogram bucketsMs must be a non-empty array of finite positive numbers");
+  }
+  const out: number[] = [];
+  let prev = 0;
+  for (const raw of bucketsMs) {
+    if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
+      throw new RangeError(`Histogram bucket bound must be a finite positive number; got ${String(raw)}`);
+    }
+    const bound = Math.round(raw);
+    if (bound <= 0 || bound <= prev) {
+      throw new RangeError(
+        `Histogram bucket bounds must be strictly increasing positive integers; got ${String(raw)} after ${prev}`,
+      );
+    }
+    out.push(bound);
+    prev = bound;
+  }
+  return out;
+}
+
+export interface DestinationAgeHistogramSnapshot {
+  destination: DeliveryDestinationClass;
+  /** Cumulative counts keyed by finite upper bound (same length as `bucketsMs`). */
+  bucketCounts: number[];
+  /** Total observations (`+Inf` bucket). */
+  count: number;
+  /** Sum of observed integer millisecond ages. */
+  sumMs: number;
+}
+
+export interface PendingDeliveryAgeSnapshot {
+  bucketsMs: number[];
+  destinations: Record<DeliveryDestinationClass, DestinationAgeHistogramSnapshot>;
+}
+
+/**
+ * Fixed-bucket queue age histogram partitioned strictly by bounded
+ * {@link DeliveryDestinationClass} (`market`, `squad`, `default`).
+ */
+export class PendingDeliveryAgeHistogram {
+  readonly bucketsMs: readonly number[];
+  private readonly states: Record<
+    DeliveryDestinationClass,
+    { cumulativeBuckets: number[]; count: number; sumMs: number }
+  >;
+
+  constructor(bucketsMs: readonly number[] = DEFAULT_PENDING_QUEUE_AGE_BUCKETS_MS) {
+    const validated = validateFiniteBucketsMs(bucketsMs);
+    this.bucketsMs = validated;
+    this.states = {
+      market: { cumulativeBuckets: new Array<number>(validated.length).fill(0), count: 0, sumMs: 0 },
+      squad: { cumulativeBuckets: new Array<number>(validated.length).fill(0), count: 0, sumMs: 0 },
+      default: { cumulativeBuckets: new Array<number>(validated.length).fill(0), count: 0, sumMs: 0 },
+    };
+  }
+
+  /**
+   * Record one pending delivery's queue age in milliseconds. Non-finite values
+   * are ignored; negative skew is clamped to `0`.
+   */
+  observe(destinationInput: unknown, ageMs: number): void {
+    if (typeof ageMs !== "number" || !Number.isFinite(ageMs)) return;
+    const normalizedAgeMs = ageMs > 0 ? Math.round(ageMs) : 0;
+    const dest = classifyDeliveryDestination(destinationInput);
+    const state = this.states[dest];
+    state.count += 1;
+    state.sumMs += normalizedAgeMs;
+    for (let i = 0; i < this.bucketsMs.length; i += 1) {
+      if (normalizedAgeMs <= this.bucketsMs[i]!) {
+        state.cumulativeBuckets[i]! += 1;
+      }
+    }
+  }
+
+  snapshot(): PendingDeliveryAgeSnapshot {
+    const destinations = {} as Record<DeliveryDestinationClass, DestinationAgeHistogramSnapshot>;
+    for (const dest of DELIVERY_DESTINATION_CLASSES) {
+      const s = this.states[dest];
+      destinations[dest] = {
+        destination: dest,
+        bucketCounts: [...s.cumulativeBuckets],
+        count: s.count,
+        sumMs: s.sumMs,
+      };
+    }
+    return {
+      bucketsMs: [...this.bucketsMs],
+      destinations,
+    };
+  }
+
+  /**
+   * Render Prometheus v0.0.4 histogram lines (`_bucket`, `_sum`, `_count`) for
+   * `metricName`, optionally including validated static labels (such as `network`).
+   */
+  renderPrometheusLines(
+    metricName: string,
+    help: string,
+    staticLabels: Readonly<Record<string, string>> = {},
+  ): string[] {
+    return renderPendingAgeSnapshotLines(this.snapshot(), metricName, help, staticLabels);
+  }
+}
+
+/**
+ * Render Prometheus v0.0.4 histogram lines (`_bucket`, `_sum`, `_count`) from a
+ * {@link PendingDeliveryAgeSnapshot} without retaining raw message or destination IDs.
+ */
+export function renderPendingAgeSnapshotLines(
+  snapshot: PendingDeliveryAgeSnapshot,
+  metricName: string,
+  help: string,
+  staticLabels: Readonly<Record<string, string>> = {},
+): string[] {
+  const lines: string[] = [
+    `# HELP ${metricName} ${help}`,
+    `# TYPE ${metricName} histogram`,
+  ];
+  const staticPairs = Object.entries(staticLabels).map(([k, v]) => `${k}="${v}"`);
+
+  for (const dest of DELIVERY_DESTINATION_CLASSES) {
+    const state = snapshot.destinations[dest];
+    const basePairs = [...staticPairs, `destination="${dest}"`];
+    for (let i = 0; i < snapshot.bucketsMs.length; i += 1) {
+      const bound = snapshot.bucketsMs[i]!;
+      const labelBlock = `{${[...basePairs, `le="${bound}"`].join(",")}}`;
+      lines.push(`${metricName}_bucket${labelBlock} ${state.bucketCounts[i] ?? 0}`);
+    }
+    const infLabelBlock = `{${[...basePairs, `le="+Inf"`].join(",")}}`;
+    lines.push(`${metricName}_bucket${infLabelBlock} ${state.count}`);
+    const seriesLabelBlock = `{${basePairs.join(",")}}`;
+    lines.push(`${metricName}_sum${seriesLabelBlock} ${state.sumMs}`);
+    lines.push(`${metricName}_count${seriesLabelBlock} ${state.count}`);
+  }
+
+  return lines;
+}
+
+/**
+ * Compute a point-in-time fixed-bucket age snapshot over currently queued items
+ * using only `source` and `enqueuedAt` (never reading message bodies, chat IDs,
+ * or event IDs).
+ */
+export function buildPendingQueueAgeSnapshot(
+  items: ReadonlyArray<{ source?: unknown; enqueuedAt: string | number }>,
+  nowMs: number = Date.now(),
+  bucketsMs: readonly number[] = DEFAULT_PENDING_QUEUE_AGE_BUCKETS_MS,
+): PendingDeliveryAgeSnapshot {
+  const hist = new PendingDeliveryAgeHistogram(bucketsMs);
+  const currentMs = Number.isFinite(nowMs) ? nowMs : 0;
+  for (const item of items) {
+    const rawTs =
+      typeof item.enqueuedAt === "number" ? item.enqueuedAt : Date.parse(String(item.enqueuedAt));
+    if (!Number.isFinite(rawTs)) continue;
+    const ageMs = Math.max(0, currentMs - rawTs);
+    hist.observe(item.source, ageMs);
+  }
+  return hist.snapshot();
+}

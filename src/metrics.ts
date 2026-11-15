@@ -25,6 +25,11 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import {
+  PendingDeliveryAgeHistogram,
+  type PendingDeliveryAgeSnapshot,
+} from "./stellar/metrics.js";
+
 // ── Metric types ──────────────────────────────────────────────────────────────
 
 export interface Counter {
@@ -39,6 +44,18 @@ export interface Gauge {
   set(value: number): void;
   /** Current value. */
   value(): number;
+}
+
+export interface CreateMetricsOptions {
+  /** Optional custom finite upper bounds (in ms) for pending delivery queue age histogram. */
+  pendingQueueAgeBucketsMs?: readonly number[];
+}
+
+export interface PendingDeliveryAgeMetrics {
+  /** Record a pending delivery's queue age in ms for a bounded destination class. */
+  observe(destination: unknown, ageMs: number): void;
+  /** Read a structured snapshot of all fixed-bucket counts by destination class. */
+  snapshot(): PendingDeliveryAgeSnapshot;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -89,6 +106,8 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** Fixed-bucket queue age histogram for pending deliveries by destination class. */
+  pendingDeliveryAge: PendingDeliveryAgeMetrics;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -146,7 +165,8 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
-export function createMetrics(): MetricsRegistry {
+export function createMetrics(options: CreateMetricsOptions = {}): MetricsRegistry {
+  const pendingAgeHistogram = new PendingDeliveryAgeHistogram(options.pendingQueueAgeBucketsMs);
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -223,6 +243,13 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`# TYPE ${g._name} gauge`);
       lines.push(`${g._name} ${g.value()}`);
     }
+
+    lines.push(
+      ...pendingAgeHistogram.renderPrometheusLines(
+        `${METRICS_PREFIX}pending_delivery_queue_age_ms`,
+        "Queue age in milliseconds of pending deliveries across fixed buckets by destination class.",
+      ),
+    );
 
     // Prometheus text format requires a trailing newline.
     return lines.join("\n") + "\n";
@@ -306,6 +333,10 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    pendingDeliveryAge: {
+      observe: (destination, ageMs) => pendingAgeHistogram.observe(destination, ageMs),
+      snapshot: () => pendingAgeHistogram.snapshot(),
+    },
     render,
     startServer,
   };

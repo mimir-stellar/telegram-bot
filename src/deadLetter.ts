@@ -28,6 +28,11 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { safeErrorMessage } from "./notifications/format.js";
+import {
+  buildPendingQueueAgeSnapshot,
+  DEFAULT_PENDING_QUEUE_AGE_BUCKETS_MS,
+  type PendingDeliveryAgeSnapshot,
+} from "./stellar/metrics.js";
 
 export interface DeadLetterEntry {
   /** Stable id within the queue (source + ledger + event + short text hash). */
@@ -325,6 +330,16 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     flush,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
+    },
+    /**
+     * Fixed-bucket queue age snapshot across currently parked pending deliveries,
+     * partitioned solely by bounded destination class (`market`, `squad`, `default`).
+     */
+    pendingAgeSnapshot(
+      nowMs: number = now(),
+      bucketsMs: readonly number[] = DEFAULT_PENDING_QUEUE_AGE_BUCKETS_MS,
+    ): PendingDeliveryAgeSnapshot {
+      return buildPendingQueueAgeSnapshot(entries, nowMs, bucketsMs);
     },
     /** Test helper — snapshot of current entries. */
     snapshot(): DeadLetterEntry[] {

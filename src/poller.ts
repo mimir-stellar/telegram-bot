@@ -96,6 +96,7 @@ import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
+import type { PendingDeliveryAgeSnapshot } from "./stellar/metrics.js";
 import {
   eventCursorLedger,
   readContractEvents,
@@ -344,6 +345,8 @@ export interface PollerStatus {
   suppressedLogs: number;
   /** Dead-letter queue counters (see src/deadLetter.ts). */
   deadLetter: DeadLetterStats;
+  /** Fixed-bucket queue age snapshot across pending dead-letter deliveries. */
+  pendingDeliveryAge?: PendingDeliveryAgeSnapshot;
   /** Telegram sends abandoned by the per-send timeout, when tracked. */
   sendTimeouts?: number;
   /** Bounded description of the most recent send timeout, when tracked. */
@@ -1472,6 +1475,7 @@ export function createPoller(deps: PollerDeps) {
   /** Mirror the queue's counters into the status this poller reports. */
   function refreshDeadLetterStatus(): void {
     status.deadLetter = deadLetter.stats();
+    status.pendingDeliveryAge = deadLetter.pendingAgeSnapshot(now());
   }
 
   const sinceStartCounters: PollerCounters = {
@@ -1510,6 +1514,7 @@ export function createPoller(deps: PollerDeps) {
     lastCyclePages: 0,
     notificationsDropped: 0,
     deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0 },
+    pendingDeliveryAge: deadLetter.pendingAgeSnapshot(now()),
     eventsDeduplicated: 0,
     cursorRewinds: 0,
     restartGaps: 0,
@@ -1998,6 +2003,7 @@ export function createPoller(deps: PollerDeps) {
     events: DecodedEvent[],
     correlationId: string,
   ): Promise<NotificationResult> {
+    const batchQueuedAtMs = now();
     let sentThisCycle = 0;
     let failed = 0;
     let skipped = 0;
@@ -2191,6 +2197,7 @@ export function createPoller(deps: PollerDeps) {
         }
       }
 
+      metrics?.pendingDeliveryAge.observe(event.source, Math.max(0, now() - batchQueuedAtMs));
       try {
         // Use bounded retry for Telegram sends to handle transient failures
         await sendWithRetry(
@@ -2271,6 +2278,9 @@ export function createPoller(deps: PollerDeps) {
     if (!deadLetterEnabled || status.stopping) return;
     try {
       const flushed = await deadLetter.flush(async (text, entry) => {
+        const enqueuedMs = Date.parse(entry.enqueuedAt);
+        const parkedAgeMs = Number.isFinite(enqueuedMs) ? Math.max(0, now() - enqueuedMs) : 0;
+        metrics?.pendingDeliveryAge.observe(entry.source, parkedAgeMs);
         await sendWithRetry(
           (message) => send(message, entry.source as ContractSource),
           text,

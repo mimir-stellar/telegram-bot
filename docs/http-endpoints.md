@@ -238,6 +238,15 @@ The `mimir_telegram_latest_ledger` and `mimir_telegram_target_last_event_ledger`
 lines are omitted when no ledger has been observed yet (cold start or no
 events seen).
 
+`GET /metrics` on the health server also emits
+`mimir_telegram_pending_delivery_queue_age_ms` (`_bucket`, `_sum`, `_count`),
+a Prometheus histogram reporting the point-in-time queue age (in milliseconds)
+of pending dead-letter deliveries across fixed finite buckets
+(`1000`, `5000`, `15000`, `60000`, `300000`, `900000`, `3600000` ms, plus
+`+Inf`), partitioned strictly by `network` and bounded `destination` class
+(`market`, `squad`, `default`). Raw Telegram chat IDs and on-chain event IDs
+are never emitted as metric labels.
+
 ```bash
 curl -s http://127.0.0.1:8787/metrics
 
@@ -317,6 +326,7 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_pending_delivery_queue_age_ms` | histogram | Pending delivery queue wait age in ms across fixed finite buckets (`1000`..`3600000` ms + `+Inf`) by bounded `destination` class (`market`, `squad`, `default`); omits chat IDs and event IDs |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment

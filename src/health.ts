@@ -21,6 +21,10 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import {
+  PendingDeliveryAgeHistogram,
+  renderPendingAgeSnapshotLines,
+} from "./stellar/metrics.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -442,6 +446,17 @@ export function buildMetricsReport(
       );
     }
   }
+
+  const pendingAge = poller.pendingDeliveryAge ?? new PendingDeliveryAgeHistogram().snapshot();
+  lines.push(
+    ``,
+    ...renderPendingAgeSnapshotLines(
+      pendingAge,
+      `mimir_telegram_pending_delivery_queue_age_ms`,
+      `Queue age in milliseconds of pending deliveries across fixed buckets by destination class`,
+      { network },
+    ),
+  );
 
   return lines.join("\\n") + "\\n";
 }
