@@ -10,6 +10,7 @@
 
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { BotConfig } from "../config.js";
+import { messagesFor } from "../i18n.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
@@ -90,13 +91,26 @@ export interface PendingBroadcast {
   confirmed: boolean;
 }
 
+const MAX_PROCESSED_BROADCAST_IDS = 512;
+
 export class BroadcastStore {
   private readonly items = new Map<string, PendingBroadcast>();
+  private readonly processedIds = new Set<string>();
   private readonly defaultTtlMs: number;
   private counter = 0;
 
   constructor(defaultTtlMs: number = DEFAULT_BROADCAST_EXPIRY_MS) {
     this.defaultTtlMs = defaultTtlMs;
+  }
+
+  private rememberProcessed(id: string): void {
+    if (this.processedIds.size >= MAX_PROCESSED_BROADCAST_IDS) {
+      const oldest = this.processedIds.values().next().value;
+      if (oldest !== undefined) {
+        this.processedIds.delete(oldest);
+      }
+    }
+    this.processedIds.add(id);
   }
 
   create(
@@ -122,6 +136,19 @@ export class BroadcastStore {
     return item;
   }
 
+  peek(id: string): PendingBroadcast | undefined {
+    return this.items.get(id);
+  }
+
+  markProcessed(id: string): void {
+    this.rememberProcessed(id);
+    this.items.delete(id);
+  }
+
+  wasProcessed(id: string): boolean {
+    return this.processedIds.has(id);
+  }
+
   get(id: string, now: number = Date.now()): PendingBroadcast | undefined {
     this.cleanup(now);
     return this.items.get(id);
@@ -141,6 +168,7 @@ export class BroadcastStore {
 
   clear(): void {
     this.items.clear();
+    this.processedIds.clear();
   }
 
   size(): number {
@@ -288,11 +316,13 @@ export async function handleBroadcastCommand(
  */
 export async function handleBroadcastCallback(
   ctx: Context,
-  deps: BotDeps & {
-    broadcastStore?: BroadcastStore;
-    sleep?: (ms: number) => Promise<void>;
-  },
+  deps: Pick<BotDeps, "config"> &
+    Partial<BotDeps> & {
+      broadcastStore?: BroadcastStore;
+      sleep?: (ms: number) => Promise<void>;
+    },
   rawAction: string,
+  nowMs: number = Date.now(),
 ): Promise<void> {
   const { config } = deps;
   const chatType = ctx.chat?.type ?? (ctx.callbackQuery?.message as any)?.chat?.type;
@@ -319,32 +349,18 @@ export async function handleBroadcastCallback(
   }
 
   const store = deps.broadcastStore ?? defaultBroadcastStore;
-  const pending = store.get(broadcastId);
+  const expiredMessages = messagesFor(config.locale).expiredCallbackMessages;
+  const rawPending = store.peek(broadcastId);
 
-  if (!pending) {
-    await safeAnswerCallback(ctx, config, {
-      text: "Broadcast expired or already processed",
-      show_alert: true,
-    });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("⚠️ Broadcast confirmation expired or already processed.");
-      } catch {
-        // ignore edit failure
-      }
-    }
-    return;
-  }
-
-  if (Date.now() > pending.expiresAt) {
+  if (rawPending && nowMs >= rawPending.expiresAt) {
     store.delete(broadcastId);
     await safeAnswerCallback(ctx, config, {
-      text: "Broadcast confirmation expired",
+      text: expiredMessages.broadcastAlert,
       show_alert: true,
     });
     if (ctx.callbackQuery?.message) {
       try {
-        await ctx.editMessageText("⚠️ Broadcast confirmation expired.");
+        await ctx.editMessageText(expiredMessages.broadcastMessagePlain);
       } catch {
         // ignore
       }
@@ -352,8 +368,40 @@ export async function handleBroadcastCallback(
     return;
   }
 
+  const pending = store.get(broadcastId, nowMs);
+
+  if (!pending) {
+    if (store.wasProcessed(broadcastId)) {
+      await safeAnswerCallback(ctx, config, {
+        text: "Broadcast already in progress or sent",
+        show_alert: true,
+      });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText("⚠️ Broadcast confirmation expired or already processed.");
+        } catch {
+          // ignore edit failure
+        }
+      }
+      return;
+    }
+
+    await safeAnswerCallback(ctx, config, {
+      text: expiredMessages.broadcastAlert,
+      show_alert: true,
+    });
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText(expiredMessages.broadcastMessagePlain);
+      } catch {
+        // ignore edit failure
+      }
+    }
+    return;
+  }
+
   if (subAction === "cancel") {
-    store.delete(broadcastId);
+    store.markProcessed(broadcastId);
     await safeAnswerCallback(ctx, config, { text: "Broadcast cancelled" });
     if (ctx.callbackQuery?.message) {
       try {
@@ -375,7 +423,7 @@ export async function handleBroadcastCallback(
     return;
   }
   pending.confirmed = true;
-  store.delete(broadcastId);
+  store.markProcessed(broadcastId);
 
   await safeAnswerCallback(ctx, config, { text: "Broadcasting message..." });
 

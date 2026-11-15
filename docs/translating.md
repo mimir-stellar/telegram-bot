@@ -37,6 +37,7 @@ All user-facing localization templates live in [`src/i18n.ts`](../src/i18n.ts). 
 | `HELP_INTRO` | **Plain text** | Intro paragraph under `HELP_TITLE`. Stored unescaped; `helpMessage()` in [`src/bot.ts`](../src/bot.ts) runs `escapeMd(HELP_INTRO)` before combining it into the MarkdownV2 `/help` reply. |
 | `PAUSE_MESSAGES` | **MarkdownV2** | Operator `/pause` replies (`paused`, `alreadyPaused`, `stopped`). Sent directly with `parse_mode: "MarkdownV2"`. |
 | `RESUME_MESSAGES` | **MarkdownV2** | Operator `/resume` replies (`resumed`, `alreadyRunning`, `stopped`). Sent directly with `parse_mode: "MarkdownV2"`. |
+| `EXPIRED_CALLBACK_MESSAGES` | **Mixed** | Localized recovery hints for expired confirmation buttons: `pauseAlert` and `broadcastAlert` are plain-text callback alerts (`≤ 200` chars, no `parse_mode`); `pauseMessageMd` is **MarkdownV2**; `broadcastMessagePlain` is **plain text**. |
 | `AUDIT_CLI_HINT` | **Plain text** | Footer hint appended to `/audit` replies. Sent **without** a `parse_mode` because audit logs contain arbitrary redacted text. Backticks in this string render literally. |
 | `COMMAND_DESCRIPTIONS` | **Plain text** | Descriptions registered with Telegram's `setMyCommands` autocomplete menu and interpolated into `/help` (via `escapeMd`). |
 | `NOTIFICATION_MD` | **MarkdownV2** | Primary event notification templates (`claimCreated`, `claimChallenged`, etc.), fallback template (`fallbackEvent`), and preview headers (`previewModePrefix`, `channelPreviewMarket`, `channelPreviewSquad`). |

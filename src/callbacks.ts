@@ -16,6 +16,7 @@
 
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
+import { messagesFor } from "./i18n.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { handleBroadcastCallback } from "./commands/broadcast.js";
 import {
@@ -31,7 +32,12 @@ import { pauseMessage } from "./commands/pause.js";
 import { resumeMessage } from "./commands/resume.js";
 import { statusMessage } from "./commands/status.js";
 import type { CommandDeps } from "./commands/registry.js";
-import { TELEGRAM_OPTIONS, isOperator, safeAnswerCallback } from "./commands/runtime.js";
+import {
+  TELEGRAM_OPTIONS,
+  acknowledgeCallbackOnce,
+  isOperator,
+  safeAnswerCallback,
+} from "./commands/runtime.js";
 
 // ── Callback payload validation ──────────────────────────────────────────────
 
@@ -379,7 +385,12 @@ export async function handlePauseConfirmCallback(
 
   // Only the operator may act on these buttons.
   if (!isOperator(ctx, config)) {
-    await ctx.answerCallbackQuery({ text: "Only the operator can do that.", show_alert: true });
+    await acknowledgeCallbackOnce(
+      ctx,
+      config,
+      { text: "Only the operator can do that.", show_alert: true },
+      { requireQueryId: false },
+    );
     return;
   }
 
@@ -387,22 +398,38 @@ export async function handlePauseConfirmCallback(
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
   const ageMs = nowMs - messageDate * 1000;
   if (ageMs > PAUSE_CONFIRM_TTL_MS) {
-    await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
-    await ctx.editMessageText(
-      "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
-      TELEGRAM_OPTIONS,
+    const expired = messagesFor(config.locale).expiredCallbackMessages;
+    await acknowledgeCallbackOnce(
+      ctx,
+      config,
+      { text: expired.pauseAlert, show_alert: true },
+      { requireQueryId: false },
     );
+    try {
+      await ctx.editMessageText(expired.pauseMessageMd, TELEGRAM_OPTIONS);
+    } catch (err) {
+      if (!isMessageNotModified(err)) {
+        console.warn(
+          `[bot] pause expiry editMessageText failed: ${safeErrorMessage(err, [config.botToken])}`,
+        );
+      }
+    }
     return;
   }
 
   if (action === CALLBACK_PAUSE_CONFIRM) {
     const result = pause();
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
+    await acknowledgeCallbackOnce(ctx, config, undefined, { requireQueryId: false });
+    await ctx.editMessageText(pauseMessage(result, config.locale), TELEGRAM_OPTIONS);
     return;
   }
 
-  await ctx.answerCallbackQuery({ text: "Cancelled." });
+  await acknowledgeCallbackOnce(
+    ctx,
+    config,
+    { text: "Cancelled." },
+    { requireQueryId: false },
+  );
   await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
 }
 

@@ -91,6 +91,45 @@ export function operatorAllowed(
   return false;
 }
 
+const acknowledgedCallbackContexts = new WeakSet<object>();
+
+/**
+ * Acknowledge a callback query at most once per update context, tolerating
+ * rate-limit or timeout failures: the button's spinner is cosmetic, the action
+ * is not, and Telegram rejects duplicate `answerCallbackQuery` calls.
+ */
+export async function acknowledgeCallbackOnce(
+  ctx: Context,
+  config: BotConfig,
+  params?: { text?: string; show_alert?: boolean },
+  opts: { requireQueryId?: boolean } = {},
+): Promise<boolean> {
+  const requireQueryId = opts.requireQueryId ?? true;
+  if (requireQueryId && !ctx.callbackQuery?.id) {
+    return false;
+  }
+  if (typeof ctx.answerCallbackQuery !== "function") {
+    return false;
+  }
+  if (acknowledgedCallbackContexts.has(ctx)) {
+    return false;
+  }
+  acknowledgedCallbackContexts.add(ctx);
+  try {
+    if (params === undefined) {
+      await ctx.answerCallbackQuery();
+    } else {
+      await ctx.answerCallbackQuery(params);
+    }
+    return true;
+  } catch (err) {
+    console.warn(
+      `[bot] answerCallbackQuery failed: ${safeErrorMessage(err, [config.botToken])}`,
+    );
+    return false;
+  }
+}
+
 /**
  * Answer a callback query, tolerating a missing query id and rate-limit or
  * timeout failures: the button's spinner is cosmetic, the action is not.
@@ -100,15 +139,7 @@ export async function safeAnswerCallback(
   config: BotConfig,
   params: { text?: string; show_alert?: boolean } = {},
 ): Promise<void> {
-  if (ctx.callbackQuery?.id) {
-    try {
-      await ctx.answerCallbackQuery(params);
-    } catch (err) {
-      console.warn(
-        `[bot] answerCallbackQuery failed: ${safeErrorMessage(err, [config.botToken])}`,
-      );
-    }
-  }
+  await acknowledgeCallbackOnce(ctx, config, params, { requireQueryId: true });
 }
 
 /**

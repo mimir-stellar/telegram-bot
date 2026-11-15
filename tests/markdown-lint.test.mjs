@@ -734,6 +734,10 @@ test("i18n export: every locale's MarkdownV2 strings are valid", () => {
     for (const [key, value] of Object.entries(messages.resumeMessages)) {
       assertValidMarkdownV2(value, `${locale}.RESUME_MESSAGES.${key}`);
     }
+    assertValidMarkdownV2(
+      messages.expiredCallbackMessages.pauseMessageMd,
+      `${locale}.EXPIRED_CALLBACK_MESSAGES.pauseMessageMd`,
+    );
 
     for (const [key, value] of Object.entries(messages.notificationMd)) {
       if (typeof value === "string") {

@@ -101,6 +101,15 @@ export const RESUME_MESSAGES = {
   stopped: "*Polling cannot resume* — the process is stopping\\.",
 } as const;
 
+export const EXPIRED_CALLBACK_MESSAGES: ExpiredCallbackMessages = {
+  pauseAlert: "Confirmation expired. Run /pause again to recreate it.",
+  pauseMessageMd: "⏱ *Pause confirmation expired*\\. Run /pause again to recreate it\\.",
+  broadcastAlert:
+    "Broadcast confirmation expired. Run /broadcast <message> again to recreate it.",
+  broadcastMessagePlain:
+    "⚠️ Broadcast confirmation expired. Run /broadcast <message> again to recreate the preview.",
+};
+
 // ── Bot: audit command ───────────────────────────────────────────────────────
 
 /**
@@ -316,12 +325,25 @@ export interface ResumeMessages {
   stopped: string;
 }
 
+/** Operator recovery hints for expired confirmation callbacks. */
+export interface ExpiredCallbackMessages {
+  /** Plain-text callback alert (<= 200 chars, no MarkdownV2) for an expired /pause prompt. */
+  pauseAlert: string;
+  /** MarkdownV2 replacement message for an expired /pause prompt. */
+  pauseMessageMd: string;
+  /** Plain-text callback alert (<= 200 chars, no MarkdownV2) for an expired /broadcast preview. */
+  broadcastAlert: string;
+  /** Plain-text replacement message for an expired /broadcast preview. */
+  broadcastMessagePlain: string;
+}
+
 /** Every localized string the bot can render. */
 export interface Messages {
   helpTitle: string;
   helpIntro: string;
   pauseMessages: PauseMessages;
   resumeMessages: ResumeMessages;
+  expiredCallbackMessages: ExpiredCallbackMessages;
   auditCliHint: string;
   commandDescriptions: Readonly<Record<CommandName, string>>;
   notificationMd: NotificationMarkdownTemplates;
@@ -606,6 +628,16 @@ const ES_RESUME_MESSAGES: ResumeMessages = {
   stopped: "*El sondeo no puede reanudarse* — el proceso se está deteniendo\\.",
 };
 
+const ES_EXPIRED_CALLBACK_MESSAGES: ExpiredCallbackMessages = {
+  pauseAlert: "La confirmación expiró. Ejecuta /pause de nuevo para recrearla.",
+  pauseMessageMd:
+    "⏱ *La confirmación de pausa expiró*\\. Ejecuta /pause de nuevo para recrearla\\.",
+  broadcastAlert:
+    "La confirmación de difusión expiró. Ejecuta /broadcast <mensaje> de nuevo para recrearla.",
+  broadcastMessagePlain:
+    "⚠️ La confirmación de difusión expiró. Ejecuta /broadcast <mensaje> de nuevo para recrear la vista previa.",
+};
+
 const ES_COMMAND_DESCRIPTIONS: Readonly<Record<CommandName, string>> = {
   start: "Qué hace este bot",
   help: "Mostrar ayuda",
@@ -866,6 +898,7 @@ export const EN_MESSAGES: Messages = {
   helpIntro: HELP_INTRO,
   pauseMessages: PAUSE_MESSAGES,
   resumeMessages: RESUME_MESSAGES,
+  expiredCallbackMessages: EXPIRED_CALLBACK_MESSAGES,
   auditCliHint: AUDIT_CLI_HINT,
   commandDescriptions: COMMAND_DESCRIPTIONS,
   notificationMd: NOTIFICATION_MD,
@@ -881,6 +914,7 @@ export const ES_MESSAGES: Messages = {
     "Vigilo los dos contratos Soroban de Mimir en Stellar y publico aquí cada nuevo evento en cadena: reclamaciones abiertas, apuestas de impugnación, resoluciones del oráculo, liquidaciones y pagos.",
   pauseMessages: ES_PAUSE_MESSAGES,
   resumeMessages: ES_RESUME_MESSAGES,
+  expiredCallbackMessages: ES_EXPIRED_CALLBACK_MESSAGES,
   auditCliHint:
     "Consulta `npm run audit -- --help` para la herramienta de informe independiente.",
   commandDescriptions: ES_COMMAND_DESCRIPTIONS,
