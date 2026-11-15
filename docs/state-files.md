@@ -24,6 +24,7 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Atomic write-then-rename (`${cursorFile}.tmp` -> `${cursorFile}`) on every successful scan commit, graceful shutdown flush, or schema migration.
 - **Deleted**: Poller logs that no cursor was found and falls back to a cold start lookback `START_LOOKBACK_LEDGERS` (default: 60 ledgers) behind the chain tip.
 - **Corrupt**: If JSON is invalid or fails schema validation (or references an unsupported future schema version), `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>` and starts cold.
+- **Duplicate Target Definitions**: If a cursor file defines duplicate targets (repeated JSON keys inside `targets` or a flat legacy map, Unicode-escaped duplicate keys, case/whitespace-equivalent target names, duplicate inner `contractId`/`source` claims, or duplicate root `targets` maps), `DuplicateCursorTargetError` (`DUPLICATE_CURSOR_TARGET`) is thrown before mutating in-memory state. Both poller startup and `cursor` CLI (`backup` / `restore`) preserve the original file untouched on disk without renaming or overwriting it and return the specific validation error.
 
 ### 2. Cursor Backup Copy
 - **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`)

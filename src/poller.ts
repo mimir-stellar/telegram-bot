@@ -755,6 +755,274 @@ export function isValidCursorFile(value: unknown): value is CursorFile {
   return true;
 }
 
+export type DuplicateCursorTargetReason =
+  | "duplicate_key"
+  | "normalized_alias"
+  | "duplicate_contract"
+  | "duplicate_targets_field";
+
+/**
+ * Specific validation error thrown when a cursor file defines the same target
+ * more than once (duplicate JSON object keys, case/whitespace-equivalent target
+ * names, or duplicate inner contract/source bindings).
+ */
+export class DuplicateCursorTargetError extends Error {
+  readonly code = "DUPLICATE_CURSOR_TARGET" as const;
+  readonly duplicateTargets: readonly string[];
+  readonly reason: DuplicateCursorTargetReason;
+
+  constructor(
+    duplicateTargets: readonly string[],
+    reason: DuplicateCursorTargetReason,
+    detail?: string,
+  ) {
+    const unique = [...new Set(duplicateTargets)];
+    const suffix = detail ? ` (${detail})` : "";
+    super(
+      `cursor file contains duplicate target definition for ${unique.map((t) => `"${t}"`).join(", ")}${suffix}`,
+    );
+    this.name = "DuplicateCursorTargetError";
+    this.duplicateTargets = unique;
+    this.reason = reason;
+  }
+}
+
+type RawJsonAstNode =
+  | { kind: "object"; entries: Array<{ key: string; value: RawJsonAstNode }> }
+  | { kind: "array"; items: RawJsonAstNode[] }
+  | { kind: "string"; value: string }
+  | { kind: "primitive" };
+
+function parseJsonPreservingObjectKeys(raw: string): RawJsonAstNode {
+  let index = 0;
+  const len = raw.length;
+
+  const skipWs = (): void => {
+    while (index < len) {
+      const ch = raw.charCodeAt(index);
+      if (ch === 0x20 || ch === 0x09 || ch === 0x0a || ch === 0x0d) {
+        index += 1;
+      } else {
+        break;
+      }
+    }
+  };
+
+  const parseString = (): string => {
+    const start = index;
+    index += 1; // opening quote
+    while (index < len) {
+      const ch = raw.charCodeAt(index);
+      if (ch === 0x5c) {
+        index += 2;
+        continue;
+      }
+      if (ch === 0x22) {
+        index += 1;
+        return JSON.parse(raw.slice(start, index)) as string;
+      }
+      index += 1;
+    }
+    throw new Error("unterminated JSON string");
+  };
+
+  const parseValue = (): RawJsonAstNode => {
+    skipWs();
+    const ch = raw[index];
+    if (ch === "{") {
+      index += 1;
+      skipWs();
+      const entries: Array<{ key: string; value: RawJsonAstNode }> = [];
+      if (raw[index] === "}") {
+        index += 1;
+        return { kind: "object", entries };
+      }
+      while (index < len) {
+        skipWs();
+        const key = parseString();
+        skipWs();
+        if (raw[index] !== ":") throw new Error("expected ':' in JSON object");
+        index += 1;
+        const value = parseValue();
+        entries.push({ key, value });
+        skipWs();
+        if (raw[index] === ",") {
+          index += 1;
+          continue;
+        }
+        if (raw[index] === "}") {
+          index += 1;
+          break;
+        }
+        throw new Error("expected ',' or '}' in JSON object");
+      }
+      return { kind: "object", entries };
+    }
+    if (ch === "[") {
+      index += 1;
+      skipWs();
+      const items: RawJsonAstNode[] = [];
+      if (raw[index] === "]") {
+        index += 1;
+        return { kind: "array", items };
+      }
+      while (index < len) {
+        items.push(parseValue());
+        skipWs();
+        if (raw[index] === ",") {
+          index += 1;
+          continue;
+        }
+        if (raw[index] === "]") {
+          index += 1;
+          break;
+        }
+        throw new Error("expected ',' or ']' in JSON array");
+      }
+      return { kind: "array", items };
+    }
+    if (ch === '"') {
+      return { kind: "string", value: parseString() };
+    }
+    while (index < len) {
+      const code = raw.charCodeAt(index);
+      if (
+        code === 0x20 ||
+        code === 0x09 ||
+        code === 0x0a ||
+        code === 0x0d ||
+        code === 0x2c ||
+        code === 0x5d ||
+        code === 0x7d
+      ) {
+        break;
+      }
+      index += 1;
+    }
+    return { kind: "primitive" };
+  };
+
+  return parseValue();
+}
+
+function checkTargetEntriesForDuplicates(
+  entries: ReadonlyArray<{ key: string; value: RawJsonAstNode }>,
+): void {
+  const exactSeen = new Set<string>();
+  const normalizedSeen = new Map<string, string>();
+  const contractSeen = new Map<string, string>();
+  const innerSourceSeen = new Map<string, string>();
+
+  const duplicateExact: string[] = [];
+  const duplicateAlias: string[] = [];
+  const duplicateAliasDetails: string[] = [];
+  const duplicateContract: string[] = [];
+  const duplicateContractDetails: string[] = [];
+
+  for (const { key, value } of entries) {
+    if (exactSeen.has(key)) {
+      duplicateExact.push(key);
+      continue;
+    }
+    exactSeen.add(key);
+
+    const normalized = key.trim().toLowerCase();
+    const priorKey = normalizedSeen.get(normalized);
+    if (priorKey !== undefined && priorKey !== key) {
+      duplicateAlias.push(normalized);
+      duplicateAliasDetails.push(`"${priorKey}" vs "${key}"`);
+    } else {
+      normalizedSeen.set(normalized, key);
+    }
+
+    if (value.kind === "object") {
+      // Also guard against duplicate inner keys on a single target object (e.g. two `cursor` fields).
+      const innerKeys = new Set<string>();
+      for (const prop of value.entries) {
+        if (innerKeys.has(prop.key)) {
+          duplicateExact.push(`${key}.${prop.key}`);
+        }
+        innerKeys.add(prop.key);
+
+        if (prop.key === "contractId" && prop.value.kind === "string" && prop.value.value.trim().length > 0) {
+          const cid = prop.value.value.trim();
+          const owner = contractSeen.get(cid);
+          if (owner !== undefined && owner !== key) {
+            duplicateContract.push(key);
+            duplicateContractDetails.push(`contractId ${cid} claimed by "${owner}" and "${key}"`);
+          } else {
+            contractSeen.set(cid, key);
+          }
+        }
+
+        if (prop.key === "source" && prop.value.kind === "string" && prop.value.value.trim().length > 0) {
+          const src = prop.value.value.trim().toLowerCase();
+          const owner = innerSourceSeen.get(src);
+          if (owner !== undefined && owner !== key) {
+            duplicateAlias.push(src);
+            duplicateAliasDetails.push(`inner source "${src}" claimed by "${owner}" and "${key}"`);
+          } else {
+            innerSourceSeen.set(src, key);
+          }
+        }
+      }
+    }
+  }
+
+  if (duplicateExact.length > 0) {
+    throw new DuplicateCursorTargetError(duplicateExact, "duplicate_key", "duplicate JSON key");
+  }
+  if (duplicateAlias.length > 0) {
+    throw new DuplicateCursorTargetError(
+      duplicateAlias,
+      "normalized_alias",
+      duplicateAliasDetails.join("; "),
+    );
+  }
+  if (duplicateContract.length > 0) {
+    throw new DuplicateCursorTargetError(
+      duplicateContract,
+      "duplicate_contract",
+      duplicateContractDetails.join("; "),
+    );
+  }
+}
+
+/**
+ * Inspect raw valid JSON cursor text for duplicate target definitions before
+ * `JSON.parse` collapses repeated object keys or mutates in-memory state.
+ */
+export function assertNoDuplicateCursorTargets(raw: string): void {
+  const ast = parseJsonPreservingObjectKeys(raw);
+  if (ast.kind !== "object") return;
+
+  const targetEnvelopeEntries = ast.entries.filter((e) => e.key === "targets");
+  if (targetEnvelopeEntries.length > 1) {
+    throw new DuplicateCursorTargetError(
+      ["targets"],
+      "duplicate_targets_field",
+      'duplicate root "targets" key',
+    );
+  }
+
+  const singleTargetsEntry = targetEnvelopeEntries[0];
+  if (singleTargetsEntry !== undefined) {
+    const targetsNode = singleTargetsEntry.value;
+    if (targetsNode.kind === "object") {
+      checkTargetEntriesForDuplicates(targetsNode.entries);
+    }
+    return;
+  }
+
+  const hasVersion = ast.entries.some((e) => e.key === "version");
+  if (!hasVersion) {
+    const flatEntries = ast.entries.filter((e) => e.key !== "updatedAt");
+    if (flatEntries.length > 0) {
+      checkTargetEntriesForDuplicates(flatEntries);
+    }
+  }
+}
+
 /** Parse + validate a cursor file body; throws on JSON or schema failure. */
 export function parseCursorFile(raw: string): CursorFile {
   let parsed: unknown;
@@ -763,6 +1031,7 @@ export function parseCursorFile(raw: string): CursorFile {
   } catch (err) {
     throw new Error(`invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
   }
+  assertNoDuplicateCursorTargets(raw);
   if (!isValidCursorFile(parsed)) {
     throw new Error("failed schema validation (expected version 1 with targets map)");
   }
@@ -929,6 +1198,7 @@ export function parseAndMigrateCursorFile(
   options: { now?: () => Date } = {},
 ): CursorMigrateResult {
   const parsedUnknown: unknown = JSON.parse(raw);
+  assertNoDuplicateCursorTargets(raw);
   if (!isPlainObject(parsedUnknown)) {
     throw new Error("cursor file root must be a JSON object");
   }
@@ -999,12 +1269,32 @@ export function buildCursorFile(
   updatedAt: string,
   chainClockAt?: number | null,
 ): CursorFile {
+  const list = [...targets];
+  const seenSources = new Map<string, string>();
+  const duplicates: string[] = [];
+  for (const t of list) {
+    const normalized = t.source.trim().toLowerCase();
+    const prior = seenSources.get(normalized);
+    if (prior !== undefined) {
+      duplicates.push(prior === t.source ? t.source : normalized);
+    } else {
+      seenSources.set(normalized, t.source);
+    }
+  }
+  if (duplicates.length > 0) {
+    throw new DuplicateCursorTargetError(
+      duplicates,
+      "duplicate_key",
+      "duplicate target source in buildCursorFile",
+    );
+  }
+
   return {
     version: CURSOR_SCHEMA_VERSION,
     updatedAt,
     ...(chainClockAt !== undefined ? { chainClockAt } : {}),
     targets: Object.fromEntries(
-      [...targets].map((t) => [
+      list.map((t) => [
         t.source,
         {
           cursor: t.cursor,
@@ -1729,19 +2019,37 @@ export function createPoller(deps: PollerDeps) {
     try {
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
       const parsed = result.file;
+      const stagedUpdates: Array<{
+        key: ContractSource;
+        target: TargetState;
+        cursor: string | null;
+        lastEventLedger: number | null;
+        rewindFromLedger: number | null;
+        dedupWindow: EventDedupWindow;
+      }> = [];
       for (const [source, saved] of Object.entries(parsed.targets)) {
         const key = source as ContractSource;
         const target = state.get(key);
         if (!target) continue;
-        target.cursor = saved.cursor ?? null;
-        target.lastEventLedger = saved.lastEventLedger ?? null;
+        stagedUpdates.push({
+          key,
+          target,
+          cursor: saved.cursor ?? null,
+          lastEventLedger: saved.lastEventLedger ?? null,
+          rewindFromLedger: saved.rewindFromLedger ?? null,
+          dedupWindow: EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow),
+        });
+      }
+      for (const update of stagedUpdates) {
+        update.target.cursor = update.cursor;
+        update.target.lastEventLedger = update.lastEventLedger;
         // A rewind that was still pending when the process stopped resumes from
         // the same floor instead of falling back to a lookback cold start.
-        target.rewindFromLedger = saved.rewindFromLedger ?? null;
-        target.cursorStale = target.rewindFromLedger !== null;
+        update.target.rewindFromLedger = update.rewindFromLedger;
+        update.target.cursorStale = update.rewindFromLedger !== null;
         // Restore the redelivery window too. Without this a restart would
         // re-notify the last event the inclusive cursor hands back.
-        dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
+        dedup.set(update.key, update.dedupWindow);
       }
       // Memory now equals the file; nothing is waiting to be flushed — unless
       // the file was a legacy shape, which start() rewrites before any cycle.
@@ -1781,6 +2089,22 @@ export function createPoller(deps: PollerDeps) {
         },
       );
     } catch (err) {
+      if (err instanceof DuplicateCursorTargetError) {
+        Logger.error(
+          "poller",
+          `[poller] rejected cursor file at ${config.cursorFile} (preserved untouched): ${err.message}`,
+          {
+            action: "cursor_duplicate_target_rejected",
+            cursorFile: config.cursorFile,
+            code: err.code,
+            reason: err.reason,
+            duplicateTargets: [...err.duplicateTargets],
+            error: err.message,
+          },
+        );
+        audit.recordError(err, "boot");
+        throw err;
+      }
       // Quarantine then cold-start: never wedge on a corrupt state file, and
       // keep the bad bytes for operators instead of overwriting them on save.
       const reason = errorMessage(err);
@@ -2986,7 +3310,12 @@ export function createPoller(deps: PollerDeps) {
         console.warn(`[poller] could not take instance lock at ${lockFile}: ${errorMessage(err)}`);
       }
 
-      await loadCursors();
+      try {
+        await loadCursors();
+      } catch (err) {
+        await releaseInstanceLock();
+        throw err;
+      }
       await loadCounters();
       // Parked sends from the previous run are part of this run's work.
       await deadLetter.load();
