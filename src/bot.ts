@@ -27,6 +27,7 @@ import {
   CALLBACK_PAUSE_CONFIRM,
   chatAllowed,
   commandMetadata,
+  evaluateCommandAvailability,
   isOperator,
   operatorAllowed,
   registeredCommands,
@@ -66,13 +67,19 @@ export {
 export { TELEGRAM_OPTIONS, isChatAllowed, isOperator } from "./commands/runtime.js";
 export {
   aboutMessage,
-  helpMessage,
+  commandAvailabilityReport,
   contractsMessage,
+  evaluateCommandAvailability,
+  formatCommandAvailabilityReport,
   healthMessage,
+  helpMessage,
   lastEventMessage,
   pauseMessage,
   resumeMessage,
   statusMessage,
+  type CommandAvailabilityCheck,
+  type CommandAvailabilityContext,
+  type CommandAvailabilityEntry,
 } from "./commands/index.js";
 export {
   CALLBACK_FALLBACK_FEEDBACK,
@@ -279,6 +286,15 @@ function dispatch(
   if (module.chatAllowlist === true && !chatAllowed(ctx, deps.config, module.command)) {
     return Promise.resolve();
   }
+  const availability = evaluateCommandAvailability(module, { config: deps.config, deps });
+  if (!availability.available) {
+    return ctx
+      .reply(
+        `/${module.command} is currently disabled: ${availability.reason ?? "data source absent"}.`,
+        { link_preview_options: { is_disabled: true } },
+      )
+      .then(() => undefined);
+  }
   return module.handler(ctx, deps);
 }
 
@@ -374,10 +390,17 @@ export {
 } from "./notifications/notifier.js";
 
 /** Registers the command list so Telegram's UI offers autocompletion. */
-export async function registerCommands(bot: Bot, config?: BotConfig): Promise<void> {
+export async function registerCommands(
+  bot: Bot,
+  config?: BotConfig,
+  deps?: Partial<BotDeps>,
+): Promise<void> {
   try {
     await bot.api.setMyCommands(
-      visibleCommandMetadata(config).map(({ command, description }) => ({ command, description })),
+      visibleCommandMetadata(config, deps).map(({ command, description }) => ({
+        command,
+        description,
+      })),
     );
   } catch (err) {
     // Cosmetic. Never worth failing a boot over, and never log an unbounded API error.

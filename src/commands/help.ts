@@ -12,18 +12,18 @@ import { escapeMd } from "../notifications/format.js";
 import { messagesFor } from "../i18n.js";
 import type { BotConfig } from "../config.js";
 import { helpDetailMessage } from "./help-detail.js";
-import { defineCommand, visibleCommandMetadata } from "./registry.js";
+import { defineCommand, visibleCommandMetadata, type CommandDeps } from "./registry.js";
 import { commandArgument, replyMarkdown } from "./runtime.js";
 
 /** The help overview: title, intro, and one line per advertised command. */
-export function helpMessage(config?: BotConfig): string {
+export function helpMessage(config?: BotConfig, deps?: Partial<CommandDeps>): string {
   const messages = messagesFor(config?.locale);
   return [
     messages.helpTitle,
     "",
     escapeMd(messages.helpIntro),
     "",
-    ...visibleCommandMetadata(config).map(({ command, description }) =>
+    ...visibleCommandMetadata(config, deps).map(({ command, description }) =>
       escapeMd(`/${command} — ${description}`),
     ),
   ].join("\n");
@@ -32,7 +32,7 @@ export function helpMessage(config?: BotConfig): string {
 export const startCommand = defineCommand({
   command: "start",
   handler: async (ctx, deps) => {
-    await replyMarkdown(ctx, helpMessage(deps.config));
+    await replyMarkdown(ctx, helpMessage(deps.config, deps));
   },
 });
 
@@ -42,7 +42,7 @@ export const helpCommand = defineCommand({
     const arg = commandArgument(ctx);
     await replyMarkdown(
       ctx,
-      arg ? helpDetailMessage(arg, deps.config) : helpMessage(deps.config),
+      arg ? helpDetailMessage(arg, deps.config) : helpMessage(deps.config, deps),
     );
   },
 });

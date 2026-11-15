@@ -28,11 +28,17 @@ import "./resume.js";
 import "./log-export.js"; // hidden: operator log export
 
 export {
+  commandAvailabilityReport,
   commandMetadata,
   commandModule,
   defineCommand,
+  evaluateCommandAvailability,
+  formatCommandAvailabilityReport,
   registeredCommands,
   visibleCommandMetadata,
+  type CommandAvailabilityCheck,
+  type CommandAvailabilityContext,
+  type CommandAvailabilityEntry,
   type CommandDeps,
   type CommandHandler,
   type CommandMetadata,

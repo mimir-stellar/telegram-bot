@@ -13,6 +13,21 @@ export const logExportCommand = defineCommand({
   command: "export",
   hidden: true,
   operatorOnly: true,
+  availability: ({ config, deps }) => {
+    if (deps !== undefined && "logs" in deps && (!deps.logs || deps.logs.capacity() === 0)) {
+      return {
+        available: false,
+        reason: "Log capture buffer is disabled (LOG_BUFFER_LINES=0 or log buffer absent)",
+      };
+    }
+    if (typeof config?.logBufferLines === "number" && config.logBufferLines <= 0) {
+      return {
+        available: false,
+        reason: "Log capture buffer is disabled (LOG_BUFFER_LINES=0)",
+      };
+    }
+    return { available: true };
+  },
   handler: async (ctx, deps) => {
     const { config, logs } = deps;
     if (!logs || logs.capacity() === 0) {

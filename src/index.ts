@@ -24,7 +24,13 @@ import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
 import { attachConsole, createLogCapture, Logger, secretsFor } from "./logger.js";
-import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
+import {
+  commandAvailabilityReport,
+  createBot,
+  createNotifier,
+  registerCommands,
+  type SendExtra,
+} from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
@@ -264,15 +270,31 @@ async function main(): Promise<void> {
     audit,
     metrics,
   });
-  const bot = createBot({
+  const botDeps = {
     config,
     status: () => poller.status(),
     audit,
     pause: () => poller.pause(),
     resume: () => poller.resume(),
     logs: logCapture,
-  });
+  };
+  const bot = createBot(botDeps);
   notify = createNotifier(bot, config);
+
+  const disabledCommands = commandAvailabilityReport(config, botDeps).filter(
+    (entry) => !entry.available,
+  );
+  if (disabledCommands.length > 0) {
+    Logger.info(
+      "boot",
+      `[boot] commands     ${disabledCommands
+        .map((entry) => `/${entry.command} disabled (${entry.reason})`)
+        .join("; ")}`,
+      {
+        disabledCommands: disabledCommands.map(({ command, reason }) => ({ command, reason })),
+      },
+    );
+  }
 
   // Webhook mode only accepts updates carrying this per-process secret, so a
   // reachable health port cannot be used to inject fake Telegram updates.
@@ -290,7 +312,7 @@ async function main(): Promise<void> {
         : undefined,
   });
 
-  await registerCommands(bot, config);
+  await registerCommands(bot, config, botDeps);
 
   // Lock first: refuse a second live instance before Telegram long-polling starts.
   // That keeps a duplicate process from racing the cursor or fighting getUpdates.

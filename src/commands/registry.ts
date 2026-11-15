@@ -53,6 +53,28 @@ export type CommandHandler = (
   deps: CommandDeps,
 ) => Promise<void>;
 
+/** Context inspected when evaluating whether a command's runtime dependencies are available. */
+export interface CommandAvailabilityContext {
+  readonly config?: Partial<BotConfig> | undefined;
+  readonly deps?: Partial<CommandDeps> | undefined;
+}
+
+/** Result returned by {@link CommandModule.availability}. */
+export interface CommandAvailabilityCheck {
+  readonly available: boolean;
+  readonly reason?: string | null | undefined;
+}
+
+/** Per-command availability status produced by {@link commandAvailabilityReport}. */
+export interface CommandAvailabilityEntry {
+  readonly command: string;
+  readonly hidden: boolean;
+  readonly operatorOnly: boolean;
+  readonly available: boolean;
+  readonly menuVisible: boolean;
+  readonly reason: string | null;
+}
+
 /** One self-contained slash command. */
 export interface CommandModule {
   /**
@@ -77,6 +99,12 @@ export interface CommandModule {
    * `/help` (e.g. `/export`, an operator recovery tool).
    */
   readonly hidden?: boolean;
+  /**
+   * Optional runtime dependency check. Returning `{ available: false, reason }`
+   * marks the command disabled in {@link commandAvailabilityReport}, excludes it
+   * from the public menu, and surfaces `reason` when explaining why it is off.
+   */
+  readonly availability?: (context: CommandAvailabilityContext) => CommandAvailabilityCheck;
   readonly handler: CommandHandler;
 }
 
@@ -141,16 +169,157 @@ export function commandMetadata(): CommandMetadata[] {
 }
 
 /**
- * Commands to advertise to this deployment: localized descriptions, and
- * operator-only entries only when an operator is configured (there is no one
- * to run them otherwise).
+ * Evaluate whether one registered command module has its required runtime
+ * configuration and optional data sources available.
  */
-export function visibleCommandMetadata(config?: BotConfig): CommandMetadata[] {
+export function evaluateCommandAvailability(
+  module: CommandModule,
+  context: CommandAvailabilityContext = {},
+): CommandAvailabilityEntry {
+  const config = context.config ?? context.deps?.config;
+  const deps = context.deps;
+  const hidden = module.hidden === true;
+  const operatorOnly = module.operatorOnly === true;
+
+  if (operatorOnly && config !== undefined && config.operatorTelegramUserId === null) {
+    return {
+      command: module.command,
+      hidden,
+      operatorOnly,
+      available: false,
+      menuVisible: false,
+      reason: "OPERATOR_TELEGRAM_USER_ID is not configured",
+    };
+  }
+
+  if (
+    (module.command === "status" || module.command === "health") &&
+    deps !== undefined &&
+    "status" in deps &&
+    typeof deps.status !== "function"
+  ) {
+    return {
+      command: module.command,
+      hidden,
+      operatorOnly,
+      available: false,
+      menuVisible: false,
+      reason: "Poller status provider is absent",
+    };
+  }
+
+  if (
+    module.command === "pause" &&
+    deps !== undefined &&
+    "pause" in deps &&
+    typeof deps.pause !== "function"
+  ) {
+    return {
+      command: module.command,
+      hidden,
+      operatorOnly,
+      available: false,
+      menuVisible: false,
+      reason: "Poller pause control is absent",
+    };
+  }
+
+  if (
+    module.command === "resume" &&
+    deps !== undefined &&
+    "resume" in deps &&
+    typeof deps.resume !== "function"
+  ) {
+    return {
+      command: module.command,
+      hidden,
+      operatorOnly,
+      available: false,
+      menuVisible: false,
+      reason: "Poller resume control is absent",
+    };
+  }
+
+  if (typeof module.availability === "function") {
+    const check = module.availability({ config, deps });
+    if (!check.available) {
+      const reasonText = typeof check.reason === "string" ? check.reason.trim() : "";
+      return {
+        command: module.command,
+        hidden,
+        operatorOnly,
+        available: false,
+        menuVisible: false,
+        reason: reasonText || `Optional runtime dependency for /${module.command} is absent`,
+      };
+    }
+  }
+
+  return {
+    command: module.command,
+    hidden,
+    operatorOnly,
+    available: true,
+    menuVisible: !hidden,
+    reason: null,
+  };
+}
+
+/**
+ * Inspect every registered command and report whether its runtime dependencies
+ * are available, whether it belongs in the public menu, and why any disabled
+ * command is unavailable.
+ */
+export function commandAvailabilityReport(
+  config?: Partial<BotConfig>,
+  deps?: Partial<CommandDeps>,
+): CommandAvailabilityEntry[] {
+  return registeredCommands().map((module) =>
+    evaluateCommandAvailability(module, { config, deps }),
+  );
+}
+
+/**
+ * Render a concise, secret-free summary of command availability and disabled
+ * data-source explanations for startup diagnostics or operator tooling.
+ */
+export function formatCommandAvailabilityReport(
+  entries: readonly CommandAvailabilityEntry[],
+): string {
+  if (entries.length === 0) {
+    return "No commands registered.";
+  }
+  const availableCount = entries.filter((entry) => entry.available).length;
+  const lines = [`Command availability (${availableCount}/${entries.length} available):`];
+  for (const entry of entries) {
+    const scope = entry.hidden
+      ? " [hidden]"
+      : entry.menuVisible
+        ? " [menu]"
+        : " [excluded from menu]";
+    if (entry.available) {
+      lines.push(`- /${entry.command}: available${scope}`);
+    } else {
+      lines.push(
+        `- /${entry.command}: disabled — ${entry.reason ?? "data source absent"}${scope}`,
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Commands to advertise to this deployment: localized descriptions, operator-only
+ * entries only when an operator is configured, and optional-dependency commands
+ * only when their backing data source is available.
+ */
+export function visibleCommandMetadata(
+  config?: BotConfig,
+  deps?: Partial<CommandDeps>,
+): CommandMetadata[] {
   const descriptions = messagesFor(config?.locale).commandDescriptions;
-  const operatorConfigured = config === undefined || config.operatorTelegramUserId !== null;
   return registeredCommands()
-    .filter((module) => module.hidden !== true)
-    .filter((module) => operatorConfigured || module.operatorOnly !== true)
+    .filter((module) => evaluateCommandAvailability(module, { config, deps }).menuVisible)
     .map((module) => ({
       command: module.command,
       description:

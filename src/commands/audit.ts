@@ -12,10 +12,27 @@ import {
 } from "../audit.js";
 import { messagesFor, type Locale } from "../i18n.js";
 import { safeErrorMessage } from "../notifications/format.js";
-import { defineCommand } from "./registry.js";
+import { defineCommand, type CommandAvailabilityContext } from "./registry.js";
 
 /** How many recent audit lines `/audit` renders. A chat message is not a file. */
 const AUDIT_TAIL = 10;
+
+function auditUnavailableReason({ config, deps }: CommandAvailabilityContext): string | null {
+  const hasLiveAudit = deps?.audit !== undefined && deps.audit !== null;
+  if (hasLiveAudit) {
+    return null;
+  }
+  const explicitDepsFile =
+    deps !== undefined && "auditFile" in deps ? deps.auditFile : undefined;
+  const file = explicitDepsFile !== undefined ? explicitDepsFile : config?.auditFile;
+  if (typeof file === "string" && file.trim() === "") {
+    return "Audit trail is disabled (AUDIT_FILE is empty and no in-memory audit log is attached)";
+  }
+  if (deps !== undefined && "audit" in deps && "auditFile" in deps && !file) {
+    return "Audit trail is disabled (no in-memory audit log or audit file configured)";
+  }
+  return null;
+}
 
 /**
  * Render the audit report for Telegram. The report is plain text — audit lines
@@ -36,8 +53,19 @@ export function renderAuditForTelegram(
 export const auditCommand = defineCommand({
   command: "audit",
   operatorOnly: true,
+  availability: (context) => {
+    const reason = auditUnavailableReason(context);
+    return reason === null ? { available: true } : { available: false, reason };
+  },
   handler: async (ctx, deps) => {
     const { config } = deps;
+    const unavailableReason = auditUnavailableReason({ config, deps });
+    if (unavailableReason !== null) {
+      await ctx.reply(`Audit report is disabled: ${unavailableReason}.`, {
+        link_preview_options: { is_disabled: true },
+      });
+      return;
+    }
     try {
       const file = deps.auditFile ?? config.auditFile;
       const summary = await readAuditFile(file);

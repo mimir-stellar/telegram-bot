@@ -65,6 +65,13 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - Operational outputs are structured and actionable.
 - **Redaction**: Bot tokens and private payloads are never logged.
 
+### Command Availability & Optional Runtime Dependencies
+- Commands backed by optional runtime data sources report an explicit availability state and disabled reason through `commandAvailabilityReport(config, deps)` (and `formatCommandAvailabilityReport(...)`):
+  - Operator-only commands (`/audit`, `/pause`, `/resume`, `/export`) report disabled when `OPERATOR_TELEGRAM_USER_ID` is unset.
+  - `/audit` reports disabled when `AUDIT_FILE` is empty and no in-memory `AuditLog` instance is attached.
+  - `/export` reports disabled when `LOG_BUFFER_LINES=0` or no `LogCapture` buffer is supplied.
+- Any command whose runtime dependency is absent is automatically excluded from `visibleCommandMetadata`, `/help`, and Telegram's public `setMyCommands` menu while preserving authorization gates on direct command invocations.
+
 ## Deployment & Rollback
 
 ### Assumptions
