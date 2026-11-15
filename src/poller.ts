@@ -94,7 +94,11 @@ import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
-import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
+import {
+  DEFAULT_HALF_OPEN_PROBE_TIMEOUT_MS,
+  validateLedgerWindow,
+  type LedgerWindow,
+} from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
 import {
   eventCursorLedger,
@@ -579,6 +583,8 @@ export interface CircuitBreakerOptions {
   failureThreshold?: number;
   /** Milliseconds to wait before attempting to close the circuit */
   cooldownMs?: number;
+  /** Maximum duration in milliseconds allowed for a half-open recovery probe */
+  probeTimeoutMs?: number;
 }
 
 /** Default maximum backoff in milliseconds for per-target RPC backoff. */
@@ -1353,6 +1359,8 @@ export function createPoller(deps: PollerDeps) {
   const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
   const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
   const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
+  const circuitProbeTimeout =
+    deps.circuitBreakerOptions?.probeTimeoutMs ?? DEFAULT_HALF_OPEN_PROBE_TIMEOUT_MS;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
 
   // One key per failure source: a broken market contract must not silence the
@@ -2459,18 +2467,19 @@ export function createPoller(deps: PollerDeps) {
     ledgerCache.reset();
 
     // ── Circuit breaker check ─────────────────────────────────────────────────────
+    let halfOpenProbeCycle = false;
+    let halfOpenProbeAttempted = false;
     if (status.circuitBreaker.open) {
       const nowMs = now();
       const timeSinceOpen = status.circuitBreaker.openedAt ? nowMs - status.circuitBreaker.openedAt : Infinity;
       
       if (timeSinceOpen >= circuitCooldown) {
-        // Cooldown elapsed, attempt to close the circuit
+        // Cooldown elapsed: enter half-open mode and admit ONE bounded recovery probe
+        // rather than exposing the recovering endpoint to the full poller load.
+        halfOpenProbeCycle = true;
         console.log(
-          `[poller] circuit breaker cooldown elapsed (${timeSinceOpen}ms >= ${circuitCooldown}ms), attempting recovery`,
+          `[poller] circuit breaker cooldown elapsed (${timeSinceOpen}ms >= ${circuitCooldown}ms), running single half-open recovery probe`,
         );
-        status.circuitBreaker.open = false;
-        status.circuitBreaker.openedAt = null;
-        status.circuitBreaker.failureCount = 0;
       } else {
         // Still in cooldown, skip RPC calls
         console.log(
@@ -2554,7 +2563,9 @@ export function createPoller(deps: PollerDeps) {
           // it. A failed fetch is not cached, so this target fails on its own
           // and a later target still retries. Bounded by the same scan budget,
           // so a wedged `getHealth()` cannot stall the cycle.
-          const tip = await withTimeout(ledgerCache.get(server), SCAN_TIMEOUT_MS, "RPC health");
+          const scanBudgetMs = halfOpenProbeCycle ? circuitProbeTimeout : SCAN_TIMEOUT_MS;
+          halfOpenProbeAttempted = true;
+          const tip = await withTimeout(ledgerCache.get(server), scanBudgetMs, "RPC health");
           const scan = await withTimeout(
             readContractEvents(server, target, {
               ledgerTip: tip,
@@ -2567,9 +2578,10 @@ export function createPoller(deps: PollerDeps) {
                 !rewinding && current.cursor === null ? config.startLookbackLedgers : undefined,
               seenEventIds: dedupWindow.toJSON(),
               dedupWindow: config.dedupWindow,
+              maxPages: halfOpenProbeCycle ? 1 : undefined,
               shouldDecode: (name) => isNotificationAllowed(config.featureFlags, target.source, name),
             }),
-            SCAN_TIMEOUT_MS,
+            scanBudgetMs,
             "RPC scan",
           );
 
@@ -2651,10 +2663,12 @@ export function createPoller(deps: PollerDeps) {
           }
 
           // Reset circuit breaker on success
-          if (status.circuitBreaker.failureCount > 0) {
+          if (status.circuitBreaker.failureCount > 0 || status.circuitBreaker.open) {
             console.log(
               `[poller] RPC succeeded, resetting circuit breaker (was at ${status.circuitBreaker.failureCount} failures)`,
             );
+            status.circuitBreaker.open = false;
+            status.circuitBreaker.openedAt = null;
             status.circuitBreaker.failureCount = 0;
             status.circuitBreaker.lastFailureAt = null;
           }
@@ -2791,6 +2805,35 @@ export function createPoller(deps: PollerDeps) {
           current.lastCycleMs = elapsed;
           current.maxCycleMs = Math.max(current.maxCycleMs, elapsed);
         }
+
+        if (halfOpenProbeCycle) {
+          // Half-open recovery allows at most ONE target probe per cooldown window
+          // so a recovering endpoint never receives the full poller load.
+          break;
+        }
+      }
+
+      if (halfOpenProbeCycle && !halfOpenProbeAttempted) {
+        // Every target was still in per-target backoff when cooldown elapsed:
+        // execute a single bounded getHealth() recovery probe.
+        try {
+          const health = await withTimeout(
+            server.getHealth(),
+            circuitProbeTimeout,
+            "RPC half-open probe",
+          );
+          validateLedgerWindow(health);
+          anyOk = true;
+          status.circuitBreaker.open = false;
+          status.circuitBreaker.openedAt = null;
+          status.circuitBreaker.failureCount = 0;
+          status.circuitBreaker.lastFailureAt = null;
+        } catch (probeErr) {
+          cycleFailures += 1;
+          metrics?.rpcErrors.inc();
+          const msg = errorMessage(probeErr);
+          status.lastError = { at: now(), message: `half-open probe: ${msg}` };
+        }
       }
 
       // Per-cycle page telemetry for /status (all targets in this cycle).
@@ -2802,7 +2845,13 @@ export function createPoller(deps: PollerDeps) {
         status.circuitBreaker.failureCount += cycleFailures;
         status.circuitBreaker.lastFailureAt = now();
 
-        if (status.circuitBreaker.failureCount >= circuitThreshold && !status.circuitBreaker.open) {
+        if (halfOpenProbeCycle) {
+          status.circuitBreaker.open = true;
+          status.circuitBreaker.openedAt = now();
+          console.error(
+            `[poller] half-open recovery probe failed; re-opening circuit breaker for ${circuitCooldown}ms`,
+          );
+        } else if (status.circuitBreaker.failureCount >= circuitThreshold && !status.circuitBreaker.open) {
           status.circuitBreaker.open = true;
           status.circuitBreaker.openedAt = now();
           console.error(

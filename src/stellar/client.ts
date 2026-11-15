@@ -15,6 +15,39 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  canonicalRpcEndpointKey,
+  DEFAULT_ENDPOINT_COOLDOWN_MS,
+  DEFAULT_ENDPOINT_FAILURE_THRESHOLD,
+  DEFAULT_HALF_OPEN_PROBE_TIMEOUT_MS,
+  DEFAULT_MAX_TRACKED_BREAKER_ENDPOINTS,
+  EndpointCircuitBreaker,
+  EndpointCircuitBreakerRegistry,
+  RpcCircuitOpenError,
+  type EndpointCircuitBreakerOptions,
+  type EndpointCircuitBreakerRegistryOptions,
+  type EndpointCircuitSnapshot,
+  type EndpointCircuitState,
+  type EndpointCircuitTicket,
+  type RpcCircuitOpenReason,
+} from "./rpc-guard.js";
+
+export {
+  canonicalRpcEndpointKey,
+  DEFAULT_ENDPOINT_COOLDOWN_MS,
+  DEFAULT_ENDPOINT_FAILURE_THRESHOLD,
+  DEFAULT_HALF_OPEN_PROBE_TIMEOUT_MS,
+  DEFAULT_MAX_TRACKED_BREAKER_ENDPOINTS,
+  EndpointCircuitBreaker,
+  EndpointCircuitBreakerRegistry,
+  RpcCircuitOpenError,
+  type EndpointCircuitBreakerOptions,
+  type EndpointCircuitBreakerRegistryOptions,
+  type EndpointCircuitSnapshot,
+  type EndpointCircuitState,
+  type EndpointCircuitTicket,
+  type RpcCircuitOpenReason,
+};
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -364,6 +397,81 @@ export function clampStartLedger(
     return { startLedger: window.oldestLedger, clamped: true };
   }
   return { startLedger: requested, clamped: false };
+}
+
+// ── Endpoint circuit-breaker client wrapper ──────────────────────────────────
+
+/** Default event limit cap applied when a `getEvents` call acts as a half-open probe. */
+export const DEFAULT_HALF_OPEN_EVENTS_LIMIT = 10;
+
+export interface GuardedRpcServerOptions extends EndpointCircuitBreakerOptions {
+  /** Optional shared registry so callers watching the same endpoint share one breaker. */
+  registry?: EndpointCircuitBreakerRegistry | undefined;
+  /** Maximum `limit` sent on a half-open `getEvents` recovery probe (default `10`). */
+  halfOpenEventsLimit?: number | undefined;
+}
+
+export interface GuardedRpcServer {
+  readonly endpoint: string;
+  readonly breaker: EndpointCircuitBreaker;
+  getHealth(): Promise<rpc.Api.GetHealthResponse>;
+  getEvents(request: rpc.Api.GetEventsRequest): Promise<rpc.Api.GetEventsResponse>;
+  getNetwork(): Promise<rpc.Api.GetNetworkResponse>;
+}
+
+/**
+ * Wrap a read-only Soroban RPC server with an endpoint-specific circuit breaker
+ * that admits at most one bounded recovery probe after cooldown while rejecting
+ * concurrent load until recovery succeeds.
+ */
+export function wrapRpcServerWithCircuitBreaker(
+  server: Pick<rpc.Server, "getHealth" | "getEvents"> &
+    Partial<Pick<rpc.Server, "getNetwork">>,
+  endpoint: string,
+  options: GuardedRpcServerOptions = {},
+): GuardedRpcServer {
+  const breaker = options.registry
+    ? options.registry.forEndpoint(endpoint)
+    : new EndpointCircuitBreaker(endpoint, options);
+  const halfOpenLimit =
+    typeof options.halfOpenEventsLimit === "number" &&
+    Number.isFinite(options.halfOpenEventsLimit) &&
+    options.halfOpenEventsLimit >= 1
+      ? Math.floor(options.halfOpenEventsLimit)
+      : DEFAULT_HALF_OPEN_EVENTS_LIMIT;
+
+  return {
+    endpoint: breaker.endpoint,
+    breaker,
+    getHealth(): Promise<rpc.Api.GetHealthResponse> {
+      return breaker.execute(async () => {
+        const health = await server.getHealth();
+        validateLedgerWindow(health);
+        return health;
+      });
+    },
+    getEvents(request: rpc.Api.GetEventsRequest): Promise<rpc.Api.GetEventsResponse> {
+      return breaker.execute(({ probe }) => {
+        const effectiveRequest: rpc.Api.GetEventsRequest = probe
+          ? {
+              ...request,
+              limit:
+                typeof request.limit === "number" && request.limit > 0
+                  ? Math.min(request.limit, halfOpenLimit)
+                  : halfOpenLimit,
+            }
+          : request;
+        return server.getEvents(effectiveRequest);
+      });
+    },
+    getNetwork(): Promise<rpc.Api.GetNetworkResponse> {
+      if (typeof server.getNetwork !== "function") {
+        return Promise.reject(new Error("RPC server does not implement getNetwork"));
+      }
+      const getNet = server.getNetwork.bind(server);
+      return breaker.execute(() => getNet());
+    },
+  };
 }
 
 /**
