@@ -10,7 +10,27 @@ import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import {
+  buildCursorBinding,
+  buildCursorFile,
+  computeTargetBindingFingerprint,
+  CursorBindingMismatchError,
+  type CursorBindingMismatchReason,
+  type CursorTargetBinding,
+  parseAndMigrateCursorFile,
+  parseCursorBinding,
+  verifyCursorBinding,
+} from "./poller.js";
+
+export {
+  buildCursorBinding,
+  computeTargetBindingFingerprint,
+  CursorBindingMismatchError,
+  type CursorBindingMismatchReason,
+  type CursorTargetBinding,
+  parseCursorBinding,
+  verifyCursorBinding,
+};
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -20,6 +40,28 @@ export interface BackupCursorOptions {
 
 export interface RestoreCursorOptions extends BackupCursorOptions {
   lockFile: string;
+}
+
+export interface MigrateCursorBindingOptions {
+  cursorFile: string;
+  lockFile: string;
+  networkPassphrase: string;
+  contracts: Record<string, string>;
+  backupFile?: string;
+  resetAll?: boolean;
+  dryRun?: boolean;
+  now?: () => Date;
+}
+
+export interface MigrateCursorBindingResult {
+  cursorFile: string;
+  previousFingerprint: string | null;
+  newFingerprint: string;
+  networkChanged: boolean;
+  preservedTargets: string[];
+  resetTargets: string[];
+  removedTargets: string[];
+  dryRun: boolean;
 }
 
 async function exists(filePath: string): Promise<boolean> {
@@ -97,33 +139,180 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
   }
 }
 
+/**
+ * Explicitly migrate a persisted cursor file to a new network and/or contract
+ * fingerprint binding. Unchanged targets on the same network retain their
+ * cursor position; changed contracts or network transitions reset affected
+ * targets cleanly under the exclusive poller lock.
+ */
+export async function migrateCursorBinding(
+  options: MigrateCursorBindingOptions,
+): Promise<MigrateCursorBindingResult> {
+  if (typeof options.networkPassphrase !== "string" || options.networkPassphrase.trim().length === 0) {
+    throw new Error("migrateCursorBinding requires a non-empty networkPassphrase");
+  }
+  const nextBinding = buildCursorBinding({
+    networkPassphrase: options.networkPassphrase,
+    contracts: options.contracts,
+  });
+  if (Object.keys(nextBinding.contracts).length === 0) {
+    throw new Error("migrateCursorBinding requires at least one target contract");
+  }
+
+  const nowFn = options.now ?? (() => new Date());
+  const lock = options.dryRun ? null : await acquireInstanceLock(options.lockFile);
+  try {
+    const raw = await readFile(options.cursorFile, "utf8");
+    const parsed = validateCursor(raw);
+    const persistedBinding = parsed.file.binding;
+
+    if (persistedBinding !== undefined && !options.resetAll) {
+      const recomputed = buildCursorBinding({
+        networkPassphrase: persistedBinding.networkPassphrase,
+        contracts: persistedBinding.contracts,
+      });
+      if (persistedBinding.fingerprint !== recomputed.fingerprint) {
+        throw new CursorBindingMismatchError({
+          reason: "fingerprint_tampered",
+          changedTargets: Object.keys(nextBinding.contracts),
+          persistedFingerprint: persistedBinding.fingerprint,
+          expectedFingerprint: nextBinding.fingerprint,
+          detail: "persisted cursor binding digest is internally inconsistent; pass --reset-all to cold-start all targets",
+        });
+      }
+    }
+
+    const networkChanged =
+      persistedBinding !== undefined &&
+      persistedBinding.networkPassphrase !== nextBinding.networkPassphrase;
+
+    const preservedTargets: string[] = [];
+    const resetTargets: string[] = [];
+    const migratedTargetsList: Array<{
+      source: string;
+      cursor: string | null;
+      lastEventLedger: number | null;
+      recentEventIds?: string[];
+      rewindFromLedger?: number | null;
+    }> = [];
+
+    for (const source of Object.keys(nextBinding.contracts)) {
+      const existing = parsed.file.targets[source];
+      const sameTargetFingerprint =
+        existing !== undefined &&
+        !options.resetAll &&
+        !networkChanged &&
+        (persistedBinding === undefined ||
+          persistedBinding.targetFingerprints[source] === nextBinding.targetFingerprints[source]);
+
+      if (sameTargetFingerprint && existing !== undefined) {
+        preservedTargets.push(source);
+        migratedTargetsList.push({
+          source,
+          cursor: existing.cursor,
+          lastEventLedger: existing.lastEventLedger,
+          ...(existing.recentEventIds !== undefined
+            ? { recentEventIds: existing.recentEventIds }
+            : {}),
+          ...(existing.rewindFromLedger !== undefined
+            ? { rewindFromLedger: existing.rewindFromLedger }
+            : {}),
+        });
+      } else {
+        resetTargets.push(source);
+        migratedTargetsList.push({
+          source,
+          cursor: null,
+          lastEventLedger: null,
+        });
+      }
+    }
+
+    const removedTargets = Object.keys(parsed.file.targets).filter(
+      (source) => !(source in nextBinding.contracts),
+    );
+
+    const nextChainClock =
+      !options.resetAll && !networkChanged && parsed.file.chainClockAt !== undefined
+        ? parsed.file.chainClockAt
+        : undefined;
+
+    const migratedFile = buildCursorFile(
+      migratedTargetsList,
+      nowFn().toISOString(),
+      nextChainClock,
+      nextBinding,
+    );
+
+    if (!options.dryRun) {
+      if (options.backupFile) {
+        assertDifferentPaths(options.cursorFile, options.backupFile);
+        await writeAtomic(options.backupFile, raw, true);
+      }
+      await writeAtomic(options.cursorFile, `${JSON.stringify(migratedFile, null, 2)}\n`, true);
+    }
+
+    return {
+      cursorFile: options.cursorFile,
+      previousFingerprint: persistedBinding?.fingerprint ?? null,
+      newFingerprint: nextBinding.fingerprint,
+      networkChanged,
+      preservedTargets,
+      resetTargets,
+      removedTargets,
+      dryRun: Boolean(options.dryRun),
+    };
+  } finally {
+    if (lock) await lock.release();
+  }
+}
+
 interface CliOptions {
   file?: string;
   out?: string;
   from?: string;
+  marketContract?: string;
+  squadContract?: string;
+  networkPassphrase?: string;
   force: boolean;
+  resetAll: boolean;
+  dryRun: boolean;
+  json: boolean;
 }
 
 function parseOptions(args: string[]): CliOptions {
-  const options: CliOptions = { force: false };
+  const options: CliOptions = { force: false, resetAll: false, dryRun: false, json: false };
   const seen = new Set<string>();
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg === "--force") {
-      if (seen.has(arg)) throw new Error("duplicate --force option");
+    if (arg === "--force" || arg === "--reset-all" || arg === "--dry-run" || arg === "--json") {
+      if (seen.has(arg)) throw new Error(`duplicate ${arg} option`);
       seen.add(arg);
-      options.force = true;
+      if (arg === "--force") options.force = true;
+      if (arg === "--reset-all") options.resetAll = true;
+      if (arg === "--dry-run") options.dryRun = true;
+      if (arg === "--json") options.json = true;
       continue;
     }
-    if (arg !== "--file" && arg !== "--out" && arg !== "--from") {
+    if (
+      arg !== "--file" &&
+      arg !== "--out" &&
+      arg !== "--from" &&
+      arg !== "--market-contract" &&
+      arg !== "--squad-contract" &&
+      arg !== "--network-passphrase"
+    ) {
       throw new Error(`unknown option: ${arg}`);
     }
     if (seen.has(arg)) throw new Error(`duplicate ${arg} option`);
     seen.add(arg);
     const value = args[index + 1];
-    if (value === undefined || value.startsWith("--")) throw new Error(`${arg} requires a path`);
-    options[arg.slice(2) as "file" | "out" | "from"] = value;
+    if (value === undefined || value.startsWith("--")) throw new Error(`${arg} requires a value`);
+    if (arg === "--market-contract") options.marketContract = value;
+    else if (arg === "--squad-contract") options.squadContract = value;
+    else if (arg === "--network-passphrase") options.networkPassphrase = value;
+    else options[arg.slice(2) as "file" | "out" | "from"] = value;
     index += 1;
   }
 
@@ -145,8 +334,11 @@ function assertDifferentPaths(left: string, right: string): void {
 async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
-  if (action !== "backup" && action !== "restore") {
-    throw new Error("usage: npm run cursor -- <backup|restore> [--file PATH] [--out PATH|--from PATH] [--force]");
+  if (action !== "backup" && action !== "restore" && action !== "migrate") {
+    throw new Error(
+      "usage: npm run cursor -- <backup|restore|migrate> [--file PATH] [--out PATH|--from PATH] " +
+        "[--network-passphrase PASS] [--market-contract ID] [--squad-contract ID] [--reset-all] [--dry-run] [--json] [--force]",
+    );
   }
 
   const options = parseOptions(args);
@@ -160,10 +352,39 @@ async function main(): Promise<void> {
     return;
   }
 
+  const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
+  if (action === "migrate") {
+    const networkPassphrase =
+      options.networkPassphrase ?? process.env.STELLAR_NETWORK_PASSPHRASE ?? "";
+    const marketContract = options.marketContract ?? process.env.MARKET_CONTRACT_ID ?? "";
+    const squadContract = options.squadContract ?? process.env.SQUAD_CONTRACT_ID ?? "";
+    const contracts: Record<string, string> = {};
+    if (marketContract) contracts.market = marketContract;
+    if (squadContract) contracts.squad = squadContract;
+
+    const result = await migrateCursorBinding({
+      cursorFile,
+      lockFile,
+      networkPassphrase,
+      contracts,
+      backupFile: options.out ? resolvePath(options.out) : undefined,
+      resetAll: options.resetAll,
+      dryRun: options.dryRun,
+    });
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(
+        `[cursor] ${result.dryRun ? "dry-run " : ""}migrated binding fingerprint=${result.newFingerprint.slice(0, 12)}… ` +
+          `preserved=[${result.preservedTargets.join(",")}] reset=[${result.resetTargets.join(",")}]`,
+      );
+    }
+    return;
+  }
+
   if (!options.from) throw new Error("restore requires --from PATH");
   const backupFile = resolvePath(options.from);
   assertDifferentPaths(cursorFile, backupFile);
-  const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
   await restoreCursor({
     cursorFile,
     backupFile,

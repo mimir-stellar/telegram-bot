@@ -19,11 +19,12 @@ Operational reference describing all on-disk state files maintained by the Mimir
 ## Detailed Component Behaviors
 
 ### 1. Cursor File (`CURSOR_FILE`)
-- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`, `loadCursors`, `quarantineCorruptCursorFile`)
+- **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`, `loadCursors`, `quarantineCorruptCursorFile`) and [`src/cursor-cli.ts`](../src/cursor-cli.ts) (`migrateCursorBinding`)
 - **Default Path**: `./data/cursor.json` (configured via `DEFAULTS.cursorFile` in [`src/config.ts`](../src/config.ts))
 - **Write Pattern**: Atomic write-then-rename (`${cursorFile}.tmp` -> `${cursorFile}`) on every successful scan commit, graceful shutdown flush, or schema migration.
 - **Deleted**: Poller logs that no cursor was found and falls back to a cold start lookback `START_LOOKBACK_LEDGERS` (default: 60 ledgers) behind the chain tip.
 - **Corrupt**: If JSON is invalid or fails schema validation (or references an unsupported future schema version), `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>` and starts cold.
+- **Network & Contract Fingerprint Binding**: `saveCursors` stamps a deterministic SHA-256 `binding` (`fingerprint`, `networkPassphrase`, `contracts`, and per-target `targetFingerprints`). Legacy unbound cursor files load compatibly and acquire a binding on the next save. If a bound cursor file mismatches the active network or contract configuration on startup, `CursorBindingMismatchError` (`CURSOR_BINDING_MISMATCH`) is thrown while preserving the cursor file untouched on disk. Operators migrate explicitly via `npm run cursor -- migrate [--file PATH] [--network-passphrase PASS] [--market-contract ID] [--squad-contract ID] [--reset-all] [--dry-run]`, which preserves unchanged targets on the same network and resets changed-contract or changed-network targets cleanly under lock.
 
 ### 2. Cursor Backup Copy
 - **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`)

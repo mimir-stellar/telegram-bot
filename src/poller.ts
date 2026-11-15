@@ -363,6 +363,45 @@ export interface PollerStatus {
   };
 }
 
+export interface CursorTargetBinding {
+  fingerprint: string;
+  networkPassphrase: string;
+  contracts: Record<string, string>;
+  targetFingerprints: Record<string, string>;
+}
+
+export type CursorBindingMismatchReason =
+  | "network_changed"
+  | "contract_changed"
+  | "targets_changed"
+  | "fingerprint_tampered";
+
+export class CursorBindingMismatchError extends Error {
+  readonly code = "CURSOR_BINDING_MISMATCH" as const;
+  readonly reason: CursorBindingMismatchReason;
+  readonly changedTargets: readonly string[];
+  readonly persistedFingerprint: string;
+  readonly expectedFingerprint: string;
+
+  constructor(params: {
+    reason: CursorBindingMismatchReason;
+    changedTargets: readonly string[];
+    persistedFingerprint: string;
+    expectedFingerprint: string;
+    detail: string;
+  }) {
+    super(
+      `cursor binding mismatch (${params.reason}): ${params.detail}. ` +
+        `Run explicit migration via "npm run cursor -- migrate" instead of reusing incompatible cursors`,
+    );
+    this.name = "CursorBindingMismatchError";
+    this.reason = params.reason;
+    this.changedTargets = [...params.changedTargets];
+    this.persistedFingerprint = params.persistedFingerprint;
+    this.expectedFingerprint = params.expectedFingerprint;
+  }
+}
+
 /** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
 export const CURSOR_SCHEMA_VERSION = 1 as const;
 
@@ -375,6 +414,12 @@ export interface CursorFile {
    * it, so the on-disk format stays version 1 either way.
    */
   chainClockAt?: number | null;
+  /**
+   * Additive network + contract fingerprint binding. Legacy files without it
+   * load compatibly and acquire a binding on the next save; bound files that
+   * mismatch active configuration are rejected until explicitly migrated.
+   */
+  binding?: CursorTargetBinding;
   targets: Record<string, CursorTarget>;
 }
 
@@ -755,6 +800,181 @@ export function isValidCursorFile(value: unknown): value is CursorFile {
   return true;
 }
 
+/** Compute a deterministic SHA-256 fingerprint for one (network, target, contract) tuple. */
+export function computeTargetBindingFingerprint(
+  networkPassphrase: string,
+  source: string,
+  contractId: string,
+): string {
+  return createHash("sha256")
+    .update(`mimir-cursor-target-v1\n${networkPassphrase.trim()}\n${source.trim()}\n${contractId.trim()}`, "utf8")
+    .digest("hex");
+}
+
+/** Build a deterministic overall + per-target network/contract binding. */
+export function buildCursorBinding(params: {
+  networkPassphrase: string;
+  contracts: Record<string, string>;
+}): CursorTargetBinding {
+  const networkPassphrase = params.networkPassphrase.trim();
+  const sortedEntries = Object.entries(params.contracts)
+    .map(([source, contractId]) => [source.trim(), contractId.trim()] as const)
+    .filter(([source, contractId]) => source.length > 0 && contractId.length > 0)
+    .sort(([a], [b]) => a.localeCompare(b));
+
+  const contracts: Record<string, string> = {};
+  const targetFingerprints: Record<string, string> = {};
+  const hash = createHash("sha256");
+  hash.update(`mimir-cursor-binding-v1\nnetwork=${networkPassphrase}\n`, "utf8");
+
+  for (const [source, contractId] of sortedEntries) {
+    contracts[source] = contractId;
+    const tfp = computeTargetBindingFingerprint(networkPassphrase, source, contractId);
+    targetFingerprints[source] = tfp;
+    hash.update(`target=${source}:${contractId}:${tfp}\n`, "utf8");
+  }
+
+  return {
+    fingerprint: hash.digest("hex"),
+    networkPassphrase,
+    contracts,
+    targetFingerprints,
+  };
+}
+
+export function parseCursorBinding(value: unknown): CursorTargetBinding | undefined {
+  if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const obj = value as Record<string, unknown>;
+  if (typeof obj.fingerprint !== "string" || obj.fingerprint.trim().length === 0) {
+    throw new Error("cursor file binding: fingerprint must be a non-empty string");
+  }
+  if (typeof obj.networkPassphrase !== "string" || obj.networkPassphrase.trim().length === 0) {
+    throw new Error("cursor file binding: networkPassphrase must be a non-empty string");
+  }
+  if (obj.contracts === null || typeof obj.contracts !== "object" || Array.isArray(obj.contracts)) {
+    throw new Error("cursor file binding: contracts must be an object");
+  }
+
+  const contracts: Record<string, string> = {};
+  for (const [source, contractId] of Object.entries(obj.contracts as Record<string, unknown>)) {
+    if (typeof contractId !== "string" || contractId.trim().length === 0) {
+      throw new Error(`cursor file binding: contractId for "${source}" must be a non-empty string`);
+    }
+    contracts[source] = contractId.trim();
+  }
+
+  const targetFingerprints: Record<string, string> = {};
+  if (
+    obj.targetFingerprints !== undefined &&
+    obj.targetFingerprints !== null &&
+    typeof obj.targetFingerprints === "object" &&
+    !Array.isArray(obj.targetFingerprints)
+  ) {
+    for (const [source, fp] of Object.entries(
+      obj.targetFingerprints as Record<string, unknown>,
+    )) {
+      if (typeof fp === "string" && fp.trim().length > 0) {
+        targetFingerprints[source] = fp.trim();
+      }
+    }
+  } else {
+    for (const [source, contractId] of Object.entries(contracts)) {
+      targetFingerprints[source] = computeTargetBindingFingerprint(
+        obj.networkPassphrase,
+        source,
+        contractId,
+      );
+    }
+  }
+
+  return {
+    fingerprint: obj.fingerprint.trim(),
+    networkPassphrase: obj.networkPassphrase.trim(),
+    contracts,
+    targetFingerprints,
+  };
+}
+
+/**
+ * Verify a persisted cursor binding against the active network and contract
+ * configuration. Throws `CursorBindingMismatchError` if tampered or changed.
+ */
+export function verifyCursorBinding(
+  persisted: CursorTargetBinding,
+  expected: CursorTargetBinding,
+): void {
+  const recomputedPersisted = buildCursorBinding({
+    networkPassphrase: persisted.networkPassphrase,
+    contracts: persisted.contracts,
+  });
+
+  if (
+    persisted.fingerprint !== recomputedPersisted.fingerprint ||
+    Object.entries(recomputedPersisted.targetFingerprints).some(
+      ([source, fp]) => persisted.targetFingerprints[source] !== fp,
+    )
+  ) {
+    throw new CursorBindingMismatchError({
+      reason: "fingerprint_tampered",
+      changedTargets: Object.keys(expected.contracts),
+      persistedFingerprint: persisted.fingerprint,
+      expectedFingerprint: expected.fingerprint,
+      detail: `persisted binding digest ${persisted.fingerprint.slice(0, 12)}… does not match its declared network/contracts`,
+    });
+  }
+
+  if (persisted.networkPassphrase !== expected.networkPassphrase) {
+    throw new CursorBindingMismatchError({
+      reason: "network_changed",
+      changedTargets: Object.keys(expected.contracts),
+      persistedFingerprint: persisted.fingerprint,
+      expectedFingerprint: expected.fingerprint,
+      detail: `persisted network "${persisted.networkPassphrase}" differs from configured "${expected.networkPassphrase}"`,
+    });
+  }
+
+  const persistedKeys = Object.keys(persisted.contracts).sort();
+  const expectedKeys = Object.keys(expected.contracts).sort();
+  if (
+    persistedKeys.length !== expectedKeys.length ||
+    persistedKeys.some((key, idx) => key !== expectedKeys[idx])
+  ) {
+    const diff = [
+      ...new Set([
+        ...persistedKeys.filter((k) => !expectedKeys.includes(k)),
+        ...expectedKeys.filter((k) => !persistedKeys.includes(k)),
+      ]),
+    ];
+    throw new CursorBindingMismatchError({
+      reason: "targets_changed",
+      changedTargets: diff,
+      persistedFingerprint: persisted.fingerprint,
+      expectedFingerprint: expected.fingerprint,
+      detail: `persisted target set [${persistedKeys.join(", ")}] differs from configured [${expectedKeys.join(", ")}]`,
+    });
+  }
+
+  const changedContracts = expectedKeys.filter(
+    (source) => persisted.contracts[source] !== expected.contracts[source],
+  );
+  if (changedContracts.length > 0 || persisted.fingerprint !== expected.fingerprint) {
+    throw new CursorBindingMismatchError({
+      reason: "contract_changed",
+      changedTargets: changedContracts.length > 0 ? changedContracts : expectedKeys,
+      persistedFingerprint: persisted.fingerprint,
+      expectedFingerprint: expected.fingerprint,
+      detail: changedContracts
+        .map(
+          (source) =>
+            `${source}: persisted ${persisted.contracts[source]} != configured ${expected.contracts[source]}`,
+        )
+        .join("; "),
+    });
+  }
+}
+
 /** Parse + validate a cursor file body; throws on JSON or schema failure. */
 export function parseCursorFile(raw: string): CursorFile {
   let parsed: unknown;
@@ -797,11 +1017,14 @@ export function parseCursorFile(raw: string): CursorFile {
     };
   }
 
+  const binding = parseCursorBinding((parsed as unknown as Record<string, unknown>).binding);
+
   return {
     version: 1,
     updatedAt: parsed.updatedAt ?? "",
     // Additive field: only present when the file carried it.
     ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
+    ...(binding !== undefined ? { binding } : {}),
     targets,
   };
 }
@@ -907,7 +1130,7 @@ function normalizeTargets(
  * rather than the versioned `{ version, targets }` envelope.
  */
 function looksLikeFlatLegacyTargets(parsed: Record<string, unknown>): boolean {
-  if ("targets" in parsed || "version" in parsed) return false;
+  if ("targets" in parsed || "version" in parsed || "binding" in parsed) return false;
   const keys = Object.keys(parsed);
   if (keys.length === 0) return false;
   // Ignore purely metadata-looking keys if somehow present alone.
@@ -934,6 +1157,7 @@ export function parseAndMigrateCursorFile(
   }
   const parsed = parsedUnknown;
   const nowIso = (options.now ?? (() => new Date()))().toISOString();
+  const binding = parseCursorBinding(parsed.binding);
 
   // ── Current versioned schema ───────────────────────────────────────────────
   if (parsed.version === CURSOR_SCHEMA_VERSION) {
@@ -947,6 +1171,7 @@ export function parseAndMigrateCursorFile(
         : nowIso;
     const file: CursorFile = { version: CURSOR_SCHEMA_VERSION, updatedAt, targets };
     if (parsed.chainClockAt !== undefined) file.chainClockAt = parseChainClock(parsed.chainClockAt);
+    if (binding !== undefined) file.binding = binding;
     return {
       file,
       migrated: typeof parsed.updatedAt !== "string" || parsed.updatedAt.length === 0,
@@ -966,7 +1191,12 @@ export function parseAndMigrateCursorFile(
   if (isPlainObject(parsed.targets)) {
     const targets = normalizeTargets(parsed.targets, "legacy-unversioned");
     return {
-      file: { version: CURSOR_SCHEMA_VERSION, updatedAt: nowIso, targets },
+      file: {
+        version: CURSOR_SCHEMA_VERSION,
+        updatedAt: nowIso,
+        ...(binding !== undefined ? { binding } : {}),
+        targets,
+      },
       migrated: true,
       source: "legacy-unversioned",
     };
@@ -998,11 +1228,14 @@ export function buildCursorFile(
   }>,
   updatedAt: string,
   chainClockAt?: number | null,
+  binding?: CursorTargetBinding,
 ): CursorFile {
+  const parsedBinding = parseCursorBinding(binding);
   return {
     version: CURSOR_SCHEMA_VERSION,
     updatedAt,
     ...(chainClockAt !== undefined ? { chainClockAt } : {}),
+    ...(parsedBinding !== undefined ? { binding: parsedBinding } : {}),
     targets: Object.fromEntries(
       [...targets].map((t) => [
         t.source,
@@ -1714,6 +1947,16 @@ export function createPoller(deps: PollerDeps) {
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
 
+  const activeBinding: CursorTargetBinding | undefined =
+    typeof config.networkPassphrase === "string" &&
+    config.networkPassphrase.trim().length > 0 &&
+    targets.every((t) => typeof t.contractId === "string" && t.contractId.trim().length > 0)
+      ? buildCursorBinding({
+          networkPassphrase: config.networkPassphrase,
+          contracts: Object.fromEntries(targets.map((t) => [t.source, t.contractId])),
+        })
+      : undefined;
+
   async function loadCursors(): Promise<void> {
     let raw: string;
     try {
@@ -1729,6 +1972,9 @@ export function createPoller(deps: PollerDeps) {
     try {
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
       const parsed = result.file;
+      if (parsed.binding !== undefined && activeBinding !== undefined) {
+        verifyCursorBinding(parsed.binding, activeBinding);
+      }
       for (const [source, saved] of Object.entries(parsed.targets)) {
         const key = source as ContractSource;
         const target = state.get(key);
@@ -1781,6 +2027,22 @@ export function createPoller(deps: PollerDeps) {
         },
       );
     } catch (err) {
+      if (err instanceof CursorBindingMismatchError) {
+        Logger.error(
+          "poller",
+          `[poller] cursor binding mismatch at ${config.cursorFile} (file preserved; explicit migration required): ${err.message}`,
+          {
+            action: "cursor_binding_mismatch",
+            cursorFile: config.cursorFile,
+            reason: err.reason,
+            changedTargets: [...err.changedTargets],
+            persistedFingerprint: err.persistedFingerprint,
+            expectedFingerprint: err.expectedFingerprint,
+          },
+        );
+        audit.recordError(err, "boot");
+        throw err;
+      }
       // Quarantine then cold-start: never wedge on a corrupt state file, and
       // keep the bad bytes for operators instead of overwriting them on save.
       const reason = errorMessage(err);
@@ -1808,6 +2070,7 @@ export function createPoller(deps: PollerDeps) {
       })),
       new Date(now()).toISOString(),
       status.chainClockAt,
+      activeBinding,
     );
 
     try {
@@ -2986,7 +3249,12 @@ export function createPoller(deps: PollerDeps) {
         console.warn(`[poller] could not take instance lock at ${lockFile}: ${errorMessage(err)}`);
       }
 
-      await loadCursors();
+      try {
+        await loadCursors();
+      } catch (err) {
+        await releaseInstanceLock();
+        throw err;
+      }
       await loadCounters();
       // Parked sends from the previous run are part of this run's work.
       await deadLetter.load();
