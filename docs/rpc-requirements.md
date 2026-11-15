@@ -139,3 +139,11 @@ STELLAR_NETWORK=testnet
 STELLAR_RPC_URL=http://localhost:8000/rpc
 STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 ```
+
+### Operator RPC Egress Allowlist (`STELLAR_RPC_ALLOWLIST`)
+
+Operators can restrict outbound Soroban RPC traffic to approved origins by setting `STELLAR_RPC_ALLOWLIST` (comma-separated origins or `host[:port]` entries). When configured:
+
+- Both initial RPC URLs and every HTTP `301`/`302`/`303`/`307`/`308` redirect `Location` destination are validated via `assertRpcEgressAllowed` (`src/stellar/rpc-guard.ts`, `src/stellar/client.ts`) before any request is sent to the target host.
+- Redirect chains exceeding `DEFAULT_MAX_RPC_REDIRECTS` (`3`) or redirecting to unapproved hosts fail with a bounded `RpcEgressError`.
+- `MIMIR_PROFILE=mock` retains a credential-free loopback exception (`127.0.0.1`, `localhost`, `[::1]`), while rejecting any URL carrying embedded credentials even on loopback.

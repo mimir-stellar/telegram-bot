@@ -58,6 +58,11 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import {
+  RpcEgressError,
+  assertRpcEgressAllowed,
+  parseRpcAllowlist,
+} from "./stellar/rpc-guard.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -183,6 +188,10 @@ export interface StellarConfig {
   networkPassphrase: string;
   /** Optional override for stellar.expert (or compatible) explorer origin. */
   explorerBaseUrl: string;
+  /** Optional operator-configured allowlist of permitted Soroban RPC origins. */
+  rpcAllowlist?: readonly string[];
+  /** True when running under `MIMIR_PROFILE=mock` (retains credential-free loopback exception). */
+  mockMode?: boolean;
 }
 
 export interface TelegramRoute {
@@ -836,6 +845,34 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     passphrase: DEFAULTS.networkPassphrase,
   };
 
+  const rpcUrl = c.url("STELLAR_RPC_URL", namedDefaults.rpcUrl);
+  const mockMode = activeProfileName() === MOCK_PROFILE_NAME;
+
+  let rpcAllowlist: string[] = [];
+  const rawAllowlist = read("STELLAR_RPC_ALLOWLIST");
+  if (rawAllowlist !== undefined) {
+    try {
+      rpcAllowlist = parseRpcAllowlist(rawAllowlist);
+    } catch (err) {
+      const msg = err instanceof RpcEgressError ? err.message : "invalid allowlist";
+      c.problems.push(`STELLAR_RPC_ALLOWLIST is invalid: ${msg}`);
+    }
+  }
+
+  if (rpcAllowlist.length > 0) {
+    try {
+      assertRpcEgressAllowed(rpcUrl, {
+        allowlist: rpcAllowlist,
+        mockMode,
+        phase: "initial",
+      });
+    } catch (err) {
+      if (err instanceof RpcEgressError) {
+        c.problems.push(`STELLAR_RPC_URL rejected by egress policy: ${err.message}`);
+      }
+    }
+  }
+
   return {
     // Left unset when only a passphrase was given, so labels infer from it.
     ...(namedNetwork !== undefined ? { network: namedNetwork } : {}),
@@ -843,13 +880,15 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     squadContractId: c.contractId("SQUAD_CONTRACT_ID"),
     marketContractVersion: c.contractVersion("MARKET_CONTRACT_VERSION", "v1"),
     squadContractVersion: c.contractVersion("SQUAD_CONTRACT_VERSION", "v1"),
-    rpcUrl: c.url("STELLAR_RPC_URL", namedDefaults.rpcUrl),
+    rpcUrl,
     horizonUrl: c.url("STELLAR_HORIZON_URL", namedDefaults.horizonUrl),
     networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? namedDefaults.passphrase,
     explorerBaseUrl: c.url(
       "STELLAR_EXPLORER_BASE_URL",
       "https://stellar.expert/explorer",
     ),
+    rpcAllowlist,
+    mockMode,
   };
 }
 
@@ -1102,6 +1141,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "STELLAR_HORIZON_URL", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK_PASSPHRASE", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_EXPLORER_BASE_URL", secret: false, hasBuiltInDefault: true },
+  { key: "STELLAR_RPC_ALLOWLIST", secret: false },
   // Credentials and destinations: identifiers for a Telegram account, so they
   // are treated as secrets here even though a contract id is public.
   { key: "BOT_TOKEN", secret: true },

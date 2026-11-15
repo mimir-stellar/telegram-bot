@@ -24,6 +24,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - `STELLAR_RPC_URL`: The Soroban RPC endpoint used to poll for events. (e.g., `https://soroban-testnet.stellar.org`).
 - `STELLAR_HORIZON_URL`: Used for generating transaction links.
 - `STELLAR_NETWORK_PASSPHRASE`: Must match the RPC network's passphrase.
+- `STELLAR_RPC_ALLOWLIST`: Optional comma-separated egress allowlist of permitted Soroban RPC origins or `host[:port]` entries (e.g., `https://soroban-testnet.stellar.org,soroban-fallback.stellar.org`). Validated at startup and across every HTTP redirect (`Location`) hop; `MIMIR_PROFILE=mock` retains a credential-free loopback exception (`127.0.0.1`, `localhost`, `[::1]`).
 
 ### Poller Tuning & Safeguards
 - `POLL_INTERVAL_MS`: How often to query the RPC for new events. Minimum is 5000ms. Testnet ledgers close roughly every 5 seconds.

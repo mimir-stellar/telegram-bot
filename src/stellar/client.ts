@@ -15,6 +15,30 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import { MOCK_NETWORK_PASSPHRASE } from "./mock-constants.js";
+import {
+  DEFAULT_MAX_RPC_REDIRECTS,
+  RpcEgressError,
+  assertRpcEgressAllowed,
+  isLoopbackHostname,
+  normalizeRpcAllowlistEntry,
+  parseRpcAllowlist,
+  type AssertRpcEgressOptions,
+  type RpcEgressPhase,
+  type RpcEgressProblem,
+} from "./rpc-guard.js";
+
+export {
+  DEFAULT_MAX_RPC_REDIRECTS,
+  RpcEgressError,
+  assertRpcEgressAllowed,
+  isLoopbackHostname,
+  normalizeRpcAllowlistEntry,
+  parseRpcAllowlist,
+  type AssertRpcEgressOptions,
+  type RpcEgressPhase,
+  type RpcEgressProblem,
+};
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -26,16 +50,275 @@ export class RpcPassphraseError extends Error {
   }
 }
 
+export interface RpcServerGuardOptions {
+  /** Override egress allowlist entries (defaults to `config.rpcAllowlist`). */
+  allowlist?: readonly string[] | undefined;
+  /** Override mock-mode loopback exception flag (defaults to `config.mockMode` or mock passphrase). */
+  mockMode?: boolean | undefined;
+  /** Maximum HTTP redirect hops permitted (defaults to {@link DEFAULT_MAX_RPC_REDIRECTS}). */
+  maxRedirects?: number | undefined;
+  /** Injectable fetch implementation for hermetic tests. */
+  fetchImpl?: typeof globalThis.fetch | undefined;
+}
+
+interface SdkHttpAdapterConfig {
+  url?: string;
+  baseURL?: string;
+  method?: string;
+  headers?: RequestInit["headers"];
+  params?: Record<string, string>;
+  data?: unknown;
+  timeout?: number;
+  signal?: AbortSignal;
+  fetchOptions?: RequestInit;
+}
+
+interface SdkHttpAdapterResponse {
+  data: unknown;
+  headers: Headers;
+  config: SdkHttpAdapterConfig;
+  status: number;
+  statusText: string;
+}
+
+function buildAdapterUrl(config: SdkHttpAdapterConfig, fallbackUrl: string): string {
+  let url = config.url || fallbackUrl;
+  if (config.baseURL && url && !/^https?:\/\//i.test(url)) {
+    url = url.replace(/^\/?/, `${config.baseURL.replace(/\/$/, "")}/`);
+  }
+  if (config.params && Object.keys(config.params).length > 0) {
+    const qs = new URLSearchParams(config.params).toString();
+    url += (url.includes("?") ? "&" : "?") + qs;
+  }
+  return url;
+}
+
+function encodeAdapterBody(data: unknown, headers: Headers): RequestInit["body"] {
+  if (data === undefined || data === null) return undefined;
+  if (typeof data === "string") return data;
+  if (data instanceof URLSearchParams) {
+    if (!headers.has("content-type")) {
+      headers.set("content-type", "application/x-www-form-urlencoded");
+    }
+    return data;
+  }
+  if (!headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  return JSON.stringify(data);
+}
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 /**
- * Create an RPC server. Construction is offline; the network passphrase is
- * verified separately at boot by {@link validateNetworkPassphrase}.
+ * Create a `@stellar/stellar-sdk` HTTP client adapter that enforces operator
+ * RPC egress allowlists across both initial URLs and manual HTTP redirect hops.
  */
-export function createRpcServer(config: StellarConfig): rpc.Server {
-  return new rpc.Server(config.rpcUrl, {
+export function createEgressGuardedRpcAdapter(options: {
+  rpcUrl: string;
+  allowlist?: readonly string[] | undefined;
+  mockMode?: boolean | undefined;
+  maxRedirects?: number | undefined;
+  defaultTimeoutMs?: number | undefined;
+  fetchImpl?: typeof globalThis.fetch | undefined;
+}): (reqConfig: SdkHttpAdapterConfig) => Promise<SdkHttpAdapterResponse> {
+  const fetchFn = options.fetchImpl ?? globalThis.fetch;
+  const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_RPC_REDIRECTS;
+  const defaultTimeoutMs = options.defaultTimeoutMs ?? 15_000;
+  if (!Number.isSafeInteger(maxRedirects) || maxRedirects < 0 || maxRedirects > 10) {
+    throw new RangeError(`maxRedirects must be an integer between 0 and 10; got ${maxRedirects}`);
+  }
+
+  return async (reqConfig: SdkHttpAdapterConfig): Promise<SdkHttpAdapterResponse> => {
+    let currentUrl = buildAdapterUrl(reqConfig, options.rpcUrl);
+    assertRpcEgressAllowed(currentUrl, {
+      allowlist: options.allowlist,
+      mockMode: options.mockMode,
+      phase: "initial",
+    });
+
+    let currentHeaders = new Headers(reqConfig.headers ?? {});
+    let currentMethod = (reqConfig.method ?? "POST").toUpperCase();
+    let currentBody = encodeAdapterBody(reqConfig.data, currentHeaders);
+
+    const signals: AbortSignal[] = [];
+    const effectiveTimeout = reqConfig.timeout ?? defaultTimeoutMs;
+    if (effectiveTimeout > 0) {
+      signals.push(AbortSignal.timeout(effectiveTimeout));
+    }
+    if (reqConfig.signal) {
+      signals.push(reqConfig.signal);
+    }
+    const signal =
+      signals.length === 0
+        ? undefined
+        : signals.length === 1
+          ? signals[0]!
+          : AbortSignal.any(signals);
+
+    let hops = 0;
+    let response: Response;
+
+    while (true) {
+      try {
+        response = await fetchFn(currentUrl, {
+          ...reqConfig.fetchOptions,
+          method: currentMethod,
+          headers: currentHeaders,
+          body: currentBody,
+          redirect: "manual",
+          ...(signal ? { signal } : {}),
+        });
+      } catch (err) {
+        if (err instanceof RpcEgressError) throw err;
+        if ((err as { name?: string } | null)?.name === "TimeoutError") {
+          throw new Error(`timeout of ${effectiveTimeout}ms exceeded`);
+        }
+        throw err;
+      }
+
+      if (!REDIRECT_STATUSES.has(response.status)) {
+        break;
+      }
+
+      if (response.body) {
+        await response.body.cancel().catch(() => {});
+      }
+
+      if (hops >= maxRedirects) {
+        throw new RpcEgressError(
+          "too-many-redirects",
+          "redirect",
+          `RPC redirect chain exceeded maximum of ${maxRedirects} hop(s)`,
+        );
+      }
+
+      const location = response.headers.get("location");
+      if (!location || location.trim() === "") {
+        throw new RpcEgressError(
+          "redirect-missing-location",
+          "redirect",
+          `RPC HTTP ${response.status} redirect omitted Location header`,
+        );
+      }
+
+      let resolvedNextUrl: string;
+      try {
+        resolvedNextUrl = new URL(location.trim(), currentUrl).toString();
+      } catch {
+        throw new RpcEgressError(
+          "invalid-url",
+          "redirect",
+          "RPC redirect Location header is not a valid URL",
+        );
+      }
+
+      const validatedNext = assertRpcEgressAllowed(resolvedNextUrl, {
+        allowlist: options.allowlist,
+        mockMode: options.mockMode,
+        phase: "redirect",
+      });
+
+      const prevOrigin = new URL(currentUrl).origin.toLowerCase();
+      if (validatedNext.origin.toLowerCase() !== prevOrigin) {
+        currentHeaders = new Headers(currentHeaders);
+        currentHeaders.delete("authorization");
+        currentHeaders.delete("proxy-authorization");
+        currentHeaders.delete("cookie");
+      }
+
+      if (response.status !== 307 && response.status !== 308) {
+        currentMethod = "GET";
+        currentBody = undefined;
+        currentHeaders = new Headers(currentHeaders);
+        currentHeaders.delete("content-type");
+        currentHeaders.delete("content-length");
+        currentHeaders.delete("transfer-encoding");
+      }
+
+      currentUrl = validatedNext.toString();
+      hops += 1;
+    }
+
+    const text = await response.text();
+    let data: unknown = text;
+    if (text.length > 0) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = text;
+      }
+    }
+
+    if (!response.ok) {
+      const httpErr = new Error(`Request failed with status code ${response.status}`) as Error & {
+        response?: SdkHttpAdapterResponse;
+      };
+      httpErr.response = {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+        data,
+        config: reqConfig,
+      };
+      throw httpErr;
+    }
+
+    return {
+      data,
+      headers: response.headers,
+      config: reqConfig,
+      status: response.status,
+      statusText: response.statusText,
+    };
+  };
+}
+
+/**
+ * Create an RPC server. Construction validates egress policy offline; the
+ * network passphrase is verified separately at boot by {@link validateNetworkPassphrase}.
+ */
+export function createRpcServer(
+  config: StellarConfig,
+  options: RpcServerGuardOptions = {},
+): rpc.Server {
+  const allowlist = options.allowlist ?? config.rpcAllowlist;
+  const mockMode =
+    options.mockMode ??
+    config.mockMode ??
+    config.networkPassphrase === MOCK_NETWORK_PASSPHRASE;
+
+  const validatedInitial = assertRpcEgressAllowed(config.rpcUrl, {
+    allowlist,
+    mockMode,
+    phase: "initial",
+  });
+
+  const server = new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
-    allowHttp: new URL(config.rpcUrl).protocol === "http:",
+    allowHttp: validatedInitial.protocol === "http:",
     timeout: 15000,
   });
+
+  const clientDefaults = (
+    server as unknown as {
+      httpClient?: { defaults?: { adapter?: unknown; timeout?: number } };
+    }
+  ).httpClient?.defaults;
+
+  if (clientDefaults) {
+    clientDefaults.timeout = 15_000;
+    clientDefaults.adapter = createEgressGuardedRpcAdapter({
+      rpcUrl: config.rpcUrl,
+      allowlist,
+      mockMode,
+      maxRedirects: options.maxRedirects,
+      defaultTimeoutMs: 15_000,
+      fetchImpl: options.fetchImpl,
+    });
+  }
+
+  return server;
 }
 
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */

@@ -139,3 +139,243 @@ export function assertEventsResponse(
 
   return value as unknown as rpc.Api.GetEventsResponse;
 }
+
+// ── Operator-configured RPC egress allowlists & redirect validation ──────────
+//
+// Outbound Soroban RPC calls must honour operator-configured egress allowlists
+// (`STELLAR_RPC_ALLOWLIST`) across both initial endpoint URLs and HTTP redirect
+// hops (`Location`), while retaining a credential-free loopback exception for
+// local `MIMIR_PROFILE=mock` operation.
+
+/** Default maximum HTTP redirect hops followed when egress validation is active. */
+export const DEFAULT_MAX_RPC_REDIRECTS = 3;
+
+export type RpcEgressProblem =
+  | "disallowed-origin"
+  | "embedded-credentials"
+  | "unsupported-protocol"
+  | "invalid-url"
+  | "redirect-missing-location"
+  | "too-many-redirects";
+
+export type RpcEgressPhase = "initial" | "redirect";
+
+/**
+ * Bounded, secret-free error thrown when an outbound RPC request or redirect
+ * destination violates the operator's RPC egress policy.
+ */
+export class RpcEgressError extends Error {
+  readonly problem: RpcEgressProblem;
+  readonly phase: RpcEgressPhase;
+
+  constructor(problem: RpcEgressProblem, phase: RpcEgressPhase, message: string) {
+    super(message);
+    this.name = "RpcEgressError";
+    this.problem = problem;
+    this.phase = phase;
+  }
+}
+
+/**
+ * True when `hostname` (from `URL.hostname`) is a local loopback address:
+ * `localhost`, `127.0.0.0/8`, or IPv6 `[::1]` / `::1`.
+ */
+export function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (normalized === "localhost" || normalized === "::1") return true;
+  if (/^127(?:\.\d{1,3}){3}$/.test(normalized)) {
+    const octets = normalized.split(".").map(Number);
+    return octets.every((n) => Number.isInteger(n) && n >= 0 && n <= 255);
+  }
+  return false;
+}
+
+/**
+ * Normalize one allowlist token into a canonical origin (`scheme://host[:port]`).
+ *
+ * Accepts either:
+ * - Full HTTP(S) origin without path/query/fragment/credentials (`https://soroban-testnet.stellar.org`, `http://127.0.0.1:8000`)
+ * - Bare `host` or `host:port` (normalized to `https://host[:port]`)
+ *
+ * Rejects wildcards, credentials, paths, query strings, and non-HTTP(S) schemes.
+ */
+export function normalizeRpcAllowlistEntry(rawEntry: string): string {
+  if (typeof rawEntry !== "string") {
+    throw new RpcEgressError(
+      "invalid-url",
+      "initial",
+      "RPC allowlist entry must be a non-empty string",
+    );
+  }
+  const trimmed = rawEntry.trim();
+  if (trimmed.length === 0) {
+    throw new RpcEgressError(
+      "invalid-url",
+      "initial",
+      "RPC allowlist entry cannot be empty",
+    );
+  }
+  if (trimmed.includes("*")) {
+    throw new RpcEgressError(
+      "invalid-url",
+      "initial",
+      "RPC allowlist entry cannot contain wildcards",
+    );
+  }
+
+  const hasExplicitScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed);
+  const candidate = hasExplicitScheme ? trimmed : `https://${trimmed}`;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new RpcEgressError(
+      "invalid-url",
+      "initial",
+      "RPC allowlist entry is not a valid origin or host",
+    );
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new RpcEgressError(
+      "unsupported-protocol",
+      "initial",
+      `RPC allowlist entry must use http:// or https://; got ${parsed.protocol}`,
+    );
+  }
+  if (parsed.username !== "" || parsed.password !== "" || candidate.includes("@")) {
+    throw new RpcEgressError(
+      "embedded-credentials",
+      "initial",
+      "RPC allowlist entry must not contain embedded credentials",
+    );
+  }
+  if (
+    (parsed.pathname !== "/" && parsed.pathname !== "") ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
+  ) {
+    throw new RpcEgressError(
+      "invalid-url",
+      "initial",
+      "RPC allowlist entry must be an origin or host[:port] without path, query, or fragment",
+    );
+  }
+  if (!parsed.hostname || parsed.origin === "null") {
+    throw new RpcEgressError(
+      "invalid-url",
+      "initial",
+      "RPC allowlist entry is missing a valid hostname",
+    );
+  }
+
+  return parsed.origin.toLowerCase();
+}
+
+/**
+ * Parse a comma-separated `STELLAR_RPC_ALLOWLIST` string into deduplicated
+ * canonical origin strings. Empty/whitespace input returns `[]`.
+ */
+export function parseRpcAllowlist(raw: string | undefined | null): string[] {
+  if (raw === undefined || raw === null || raw.trim() === "") return [];
+  const seen = new Set<string>();
+  for (const part of raw.split(",")) {
+    const trimmed = part.trim();
+    if (trimmed === "") continue;
+    seen.add(normalizeRpcAllowlistEntry(trimmed));
+  }
+  return [...seen];
+}
+
+export interface AssertRpcEgressOptions {
+  /** Normalized or raw allowlist entries. Empty/omitted disables allowlist restriction. */
+  allowlist?: readonly string[] | undefined;
+  /**
+   * When true (`MIMIR_PROFILE=mock`), credential-free loopback destinations
+   * (`localhost`, `127.0.0.0/8`, `[::1]`) are permitted even when absent from `allowlist`.
+   */
+  mockMode?: boolean | undefined;
+  /** Whether validating the initial request URL or an HTTP redirect `Location`. */
+  phase?: RpcEgressPhase | undefined;
+}
+
+function hasRawUserinfoBeforeHost(rawUrl: string): boolean {
+  const schemeMatch = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]*)/.exec(rawUrl.trim());
+  return schemeMatch !== null && (schemeMatch[1] ?? "").includes("@");
+}
+
+/**
+ * Validate a target RPC URL (initial request or redirect hop) against protocol,
+ * credential-free, and operator egress allowlist rules.
+ */
+export function assertRpcEgressAllowed(
+  targetUrl: string,
+  options: AssertRpcEgressOptions = {},
+): URL {
+  const phase: RpcEgressPhase = options.phase ?? "initial";
+  if (typeof targetUrl !== "string" || targetUrl.trim() === "") {
+    throw new RpcEgressError(
+      "invalid-url",
+      phase,
+      `RPC ${phase} URL is missing or invalid`,
+    );
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(targetUrl.trim());
+  } catch {
+    throw new RpcEgressError(
+      "invalid-url",
+      phase,
+      `RPC ${phase} URL could not be parsed`,
+    );
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new RpcEgressError(
+      "unsupported-protocol",
+      phase,
+      `RPC ${phase} URL uses unsupported protocol "${parsed.protocol}"`,
+    );
+  }
+
+  if (
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    hasRawUserinfoBeforeHost(targetUrl)
+  ) {
+    throw new RpcEgressError(
+      "embedded-credentials",
+      phase,
+      `RPC ${phase} URL must not contain embedded credentials`,
+    );
+  }
+
+  const canonicalOrigin = parsed.origin.toLowerCase();
+  const rawAllowlist = options.allowlist ?? [];
+  if (rawAllowlist.length === 0) {
+    return parsed;
+  }
+
+  // Credential-free loopback exception for mock mode (already verified credential-free above).
+  if (options.mockMode === true && isLoopbackHostname(parsed.hostname)) {
+    return parsed;
+  }
+
+  const normalizedAllowed = new Set<string>();
+  for (const entry of rawAllowlist) {
+    normalizedAllowed.add(normalizeRpcAllowlistEntry(entry));
+  }
+
+  if (!normalizedAllowed.has(canonicalOrigin)) {
+    throw new RpcEgressError(
+      "disallowed-origin",
+      phase,
+      `RPC ${phase} destination "${canonicalOrigin}" is not in STELLAR_RPC_ALLOWLIST`,
+    );
+  }
+
+  return parsed;
+}
