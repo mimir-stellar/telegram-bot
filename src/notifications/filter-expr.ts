@@ -175,9 +175,20 @@ export type ComparisonOp = "==" | "!=" | "<" | "<=" | ">" | ">=";
 /** Value literals supported by the AST. */
 export type LiteralValue =
   | { kind: "string"; value: string }
-  | { kind: "number"; value: number }
+  | {
+      kind: "number";
+      value: number;
+      rawDecimal?: string;
+      canonicalDecimal?: string;
+      atomicUsdc?: bigint;
+    }
   | { kind: "boolean"; value: boolean }
-  | { kind: "usdc"; atomic: bigint; rawDecimal: string };
+  | {
+      kind: "usdc";
+      atomic: bigint;
+      rawDecimal: string;
+      canonicalDecimal: string;
+    };
 
 export type ExprNode =
   | { type: "logical"; op: "and" | "or"; left: ExprNode; right: ExprNode }
@@ -317,7 +328,7 @@ class Lexer {
         type: "USDC",
         text: "$" + numStr,
         pos: start,
-        value: parseUsdcStringToUnits(numStr, start),
+        value: normalizeUsdcDecimal(numStr, start),
       };
     }
 
@@ -333,7 +344,7 @@ class Lexer {
           type: "USDC",
           text: numStr + " USDC",
           pos: start,
-          value: parseUsdcStringToUnits(numStr, start),
+          value: normalizeUsdcDecimal(numStr, start),
         };
       }
       // Revert if not USDC
@@ -428,22 +439,71 @@ class Lexer {
   }
 }
 
-/** Convert a decimal string to 7-decimal atomic bigint. */
-export function parseUsdcStringToUnits(numStr: string, pos = 0): bigint {
-  const parts = numStr.split(".");
+export interface NormalizedUsdcLiteral {
+  canonical: string;
+  atomic: bigint;
+}
+
+function formatCanonicalUsdcUnits(atomic: bigint): string {
+  const whole = atomic / USDC_SCALE;
+  const frac = atomic % USDC_SCALE;
+  if (frac === 0n) {
+    return whole.toString();
+  }
+  const fracTrimmed = frac.toString().padStart(7, "0").replace(/0+$/, "");
+  return `${whole.toString()}.${fracTrimmed}`;
+}
+
+/**
+ * Normalizes a decimal USDC string into canonical decimal text and 7-decimal
+ * atomic `bigint` units. Rejects negative, malformed, or >7 fractional digit inputs.
+ */
+export function normalizeUsdcDecimal(numStr: string, pos = 0): NormalizedUsdcLiteral {
+  if (typeof numStr !== "string") {
+    throw new FilterParseError("USDC amount must be a string", pos);
+  }
+  const trimmed = numStr.trim();
+  if (trimmed === "") {
+    throw new FilterParseError("USDC amount cannot be empty", pos);
+  }
+  if (trimmed.startsWith("-")) {
+    throw new FilterParseError(`USDC amount "${trimmed}" cannot be negative`, pos);
+  }
+  if (trimmed.startsWith("+")) {
+    throw new FilterParseError(`USDC amount "${trimmed}" cannot have leading '+'`, pos);
+  }
+
+  const parts = trimmed.split(".");
+  if (parts.length > 2) {
+    throw new FilterParseError(`Malformed USDC amount "${trimmed}"`, pos);
+  }
+
   const wholeStr = parts[0] ?? "";
-  const fracStr = parts[1] ?? "";
+  const fracStr = parts.length === 2 ? (parts[1] ?? "") : "";
+  if (!/^\d+$/.test(wholeStr) || (parts.length === 2 && (fracStr.length === 0 || !/^\d+$/.test(fracStr)))) {
+    throw new FilterParseError(`Malformed USDC amount "${trimmed}"`, pos);
+  }
 
   if (fracStr.length > 7) {
     throw new FilterParseError(
-      `USDC amount "${numStr}" exceeds maximum precision of 7 decimals`,
+      `USDC amount "${trimmed}" exceeds maximum precision of 7 decimals`,
       pos,
     );
   }
 
   const whole = BigInt(wholeStr);
   const frac = BigInt(fracStr.padEnd(7, "0"));
-  return whole * USDC_SCALE + frac;
+  const atomic = whole * USDC_SCALE + frac;
+
+  return {
+    canonical: formatCanonicalUsdcUnits(atomic),
+    atomic,
+  };
+}
+
+/** Convert a decimal string to 7-decimal atomic bigint. */
+export function parseUsdcStringToUnits(numStr: string, pos = 0): bigint {
+  return normalizeUsdcDecimal(numStr, pos).atomic;
 }
 
 // ----------------------------------------------------
@@ -509,6 +569,8 @@ export class FilterParser {
     // Validate fields against schema if eventName is specified
     if (condition && eventName) {
       validateConditionAgainstSchema(condition, eventName);
+    } else if (condition) {
+      normalizeUnscopedUsdcComparisons(condition);
     }
 
     return {
@@ -606,12 +668,22 @@ export class FilterParser {
 
     if (tok.type === "USDC") {
       this.advance();
-      return { kind: "usdc", atomic: tok.value as bigint, rawDecimal: tok.text };
+      const normalized = tok.value as NormalizedUsdcLiteral;
+      return {
+        kind: "usdc",
+        atomic: normalized.atomic,
+        rawDecimal: tok.text,
+        canonicalDecimal: normalized.canonical,
+      };
     }
 
     if (tok.type === "NUMBER") {
       this.advance();
-      return { kind: "number", value: tok.value as number };
+      return {
+        kind: "number",
+        value: tok.value as number,
+        rawDecimal: tok.text,
+      };
     }
 
     if (tok.type === "IDENTIFIER") {
@@ -626,6 +698,36 @@ export class FilterParser {
       `Expected literal value (string, number, USDC amount, or boolean), got "${tok.text || "EOF"}"`,
       tok.pos,
     );
+  }
+}
+
+function isExclusivelyUsdcField(field: string): boolean {
+  let matchedAny = false;
+  for (const schema of Object.values(EVENT_PAYLOAD_SCHEMAS)) {
+    const def = schema[field];
+    if (!def) continue;
+    matchedAny = true;
+    if (!def.isUsdcAmount) {
+      return false;
+    }
+  }
+  return matchedAny;
+}
+
+function normalizeUnscopedUsdcComparisons(condition: ExprNode): void {
+  if (condition.type === "logical") {
+    normalizeUnscopedUsdcComparisons(condition.left);
+    normalizeUnscopedUsdcComparisons(condition.right);
+    return;
+  }
+
+  if (condition.value.kind === "number" && isExclusivelyUsdcField(condition.field)) {
+    const normalized = normalizeUsdcDecimal(
+      condition.value.rawDecimal ?? String(condition.value.value),
+      condition.valuePos,
+    );
+    condition.value.canonicalDecimal = normalized.canonical;
+    condition.value.atomicUsdc = normalized.atomic;
   }
 }
 
@@ -689,6 +791,14 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
             `Field "${node.field}" is a numeric/USDC amount, but got ${node.value.kind} literal`,
             node.valuePos,
           );
+        }
+        if (node.value.kind === "number" && fieldDef.isUsdcAmount) {
+          const normalized = normalizeUsdcDecimal(
+            node.value.rawDecimal ?? String(node.value.value),
+            node.valuePos,
+          );
+          node.value.canonicalDecimal = normalized.canonical;
+          node.value.atomicUsdc = normalized.atomic;
         }
         break;
 
@@ -780,7 +890,17 @@ function compareValues(
     if (literal.kind === "usdc") {
       targetBigInt = literal.atomic;
     } else if (literal.kind === "number") {
-      targetBigInt = BigInt(Math.floor(literal.value)) * USDC_SCALE;
+      if (literal.atomicUsdc !== undefined) {
+        targetBigInt = literal.atomicUsdc;
+      } else {
+        try {
+          targetBigInt = parseUsdcStringToUnits(
+            literal.rawDecimal ?? String(literal.value),
+          );
+        } catch {
+          return false;
+        }
+      }
     } else {
       return false;
     }
