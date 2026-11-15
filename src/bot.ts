@@ -72,6 +72,7 @@ export {
   lastEventMessage,
   pauseMessage,
   resumeMessage,
+  statsMessage,
   statusMessage,
 } from "./commands/index.js";
 export {

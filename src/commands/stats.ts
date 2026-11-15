@@ -1,4 +1,6 @@
 import { escapeMd } from "../notifications/format.js";
+import { defineCommand, type CommandDeps } from "./registry.js";
+import { replyMarkdown } from "./runtime.js";
 
 export interface StatsSnapshot {
   notificationsSent?: number;
@@ -51,3 +53,49 @@ export function statsMessage(snapshot: StatsSnapshot, nowMs: number): string {
 
   return lines.join("\n");
 }
+
+/**
+ * Build a {@link StatsSnapshot} from live command dependencies.
+ *
+ * Prefers the live in-process {@link CommandDeps.metrics} registry so RPC call
+ * and error counters reflect real `getEvents` traffic; falls back to poller
+ * status counters when `metrics` is omitted (e.g. in minimal test harnesses).
+ * Before the poller has started (`startedAt <= 0`), `startedAtMs` defaults to
+ * `nowMs` so uptime renders as `0s` rather than epoch elapsed time.
+ */
+export function statsSnapshotFromDeps(deps: CommandDeps, nowMs: number): StatsSnapshot {
+  const status = deps.status();
+  const startedAtMs =
+    typeof status?.startedAt === "number" && Number.isFinite(status.startedAt) && status.startedAt > 0
+      ? status.startedAt
+      : nowMs;
+
+  if (deps.metrics !== undefined) {
+    return {
+      notificationsSent: deps.metrics.notificationsSent.value(),
+      notificationsFailed: deps.metrics.notificationsFailed.value(),
+      notificationsSkipped: deps.metrics.eventsSkipped.value(),
+      rpcCalls: deps.metrics.rpcRequests.value(),
+      rpcErrors: deps.metrics.rpcErrors.value(),
+      startedAtMs,
+    };
+  }
+
+  return {
+    notificationsSent: status?.sinceStart?.notificationsSent ?? status?.notificationsSent ?? 0,
+    notificationsFailed: status?.sinceStart?.notificationsFailed ?? status?.notificationsFailed ?? 0,
+    notificationsSkipped: status?.sinceStart?.eventsSkipped ?? status?.eventsSkipped ?? 0,
+    rpcCalls: 0,
+    rpcErrors: 0,
+    startedAtMs,
+  };
+}
+
+export const statsCommand = defineCommand({
+  command: "stats",
+  chatAllowlist: true,
+  handler: async (ctx, deps) => {
+    const nowMs = deps.now ? deps.now() : Date.now();
+    await replyMarkdown(ctx, statsMessage(statsSnapshotFromDeps(deps, nowMs), nowMs));
+  },
+});
