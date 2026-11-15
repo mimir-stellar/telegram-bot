@@ -184,6 +184,13 @@ Thin wrapper around Stellar SDK's `rpc.Server` with explorer URL helpers.
 - **Unauthenticated**: Public Testnet RPC requires no keys
 - **HTTP-aware**: Allows HTTP for local quickstart containers
 
+### Feed and App Link Base URL Validation (`src/stellar/feed.ts`, `src/notifications/app-links.ts`)
+
+Validates syndication and deep-link origins before rendering:
+
+- **Pre-render validation**: `validateSafeHttpsBaseUrl` and `validateFeedBaseUrls` enforce an `https:` scheme, reject any userinfo or `@` authority (`https://user:pass@host`, `https://@host`), and validate DNS/IP host syntax on `selfUrl`, `explorerBaseUrl`, and `mimirAppUrl` before emitting feed `<id>` or `<link>` elements.
+- **Credential-free diagnostics & safe link retention**: `FeedBaseUrlError` reports the offending field and reason without echoing embedded credentials, while valid HTTPS Mimir app and Stellar explorer links continue to render normally.
+
 ## Data Flow
 
 ### Event Processing Pipeline

@@ -12,8 +12,32 @@
  */
 
 import { formatPlainTextEvent, eventExplorerUrl } from "../notifications/format.js";
+import {
+  appUrlFor,
+  validateSafeHttpsBaseUrl,
+  type UnsafeHttpsUrlReason,
+} from "../notifications/app-links.js";
 import type { DecodedEvent } from "./decode.js";
 import type { StellarConfig } from "../config.js";
+
+/**
+ * Raised before feed rendering when a configured feed base URL (`selfUrl`,
+ * `explorerBaseUrl`, or `mimirAppUrl`) uses a non-HTTPS scheme, embeds
+ * userinfo/credentials, or has an invalid host.
+ *
+ * Raw URL credentials are never echoed into the error message.
+ */
+export class FeedBaseUrlError extends Error {
+  readonly field: string;
+  readonly reason: UnsafeHttpsUrlReason;
+
+  constructor(field: string, reason: UnsafeHttpsUrlReason) {
+    super(`Rejected unsafe feed base URL in "${field}": ${reason}`);
+    this.name = "FeedBaseUrlError";
+    this.field = field;
+    this.reason = reason;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // XML escaping
@@ -65,17 +89,42 @@ export function xmlText(text: string, max: number): string {
 }
 
 /**
- * Return `url` as-is if it is a valid `https:` URL string, otherwise return
- * `null`.  Only `https:` is allowed: `http:` and other schemes are not safe to
- * embed as Atom `href` / `uri` values without a trusted origin.
+ * Return `url` as-is if it is a valid `https:` URL string with no userinfo and
+ * a valid host, otherwise return `null`.
  */
 export function safeHttpsUrl(url: string): string | null {
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:") return null;
-    return url;
-  } catch {
-    return null;
+  const validated = validateSafeHttpsBaseUrl(url);
+  if (!validated.ok) return null;
+  return url;
+}
+
+/**
+ * Validate feed base URLs (`selfUrl`, optional `config.explorerBaseUrl`, and
+ * optional `mimirAppUrl`) before rendering so credential-bearing or malformed
+ * origins fail closed prior to generating `<id>` or `<link>` elements.
+ */
+export function validateFeedBaseUrls(options: AtomFeedOptions): void {
+  const selfCheck = validateSafeHttpsBaseUrl(options.selfUrl);
+  if (!selfCheck.ok) {
+    throw new FeedBaseUrlError("selfUrl", selfCheck.reason);
+  }
+
+  const explorerBase = options.config?.explorerBaseUrl;
+  if (typeof explorerBase === "string" && explorerBase.length > 0) {
+    const explorerCheck = validateSafeHttpsBaseUrl(explorerBase);
+    if (!explorerCheck.ok) {
+      throw new FeedBaseUrlError("config.explorerBaseUrl", explorerCheck.reason);
+    }
+  }
+
+  const appBase =
+    options.mimirAppUrl ??
+    (options.config as { mimirAppUrl?: string | null } | undefined)?.mimirAppUrl;
+  if (typeof appBase === "string" && appBase.length > 0) {
+    const appCheck = validateSafeHttpsBaseUrl(appBase);
+    if (!appCheck.ok) {
+      throw new FeedBaseUrlError("mimirAppUrl", appCheck.reason);
+    }
   }
 }
 
@@ -94,6 +143,8 @@ export interface AtomEntry {
   content: string | null;
   /** RFC 4287 §4.2.7: alternate link (explorer URL), or null when absent. */
   link: string | null;
+  /** Optional validated HTTPS Mimir web-app deep link, or null when absent/rejected. */
+  appLink?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,19 +166,15 @@ export interface AtomFeedOptions {
   updatedAt?: string;
   /** Optional subtitle / description for the feed. */
   subtitle?: string;
+  /** Optional Mimir web-app origin (`MIMIR_APP_URL`) validated before rendering. */
+  mimirAppUrl?: string | null;
 }
 
-/**
- * Build one `<entry>` element from a decoded event.
- *
- * The entry id is a stable tag URI derived from the event id so it is both
- * unique and dereferenceable: `tag:mimir,event:<eventId>`.
- * The title is the event name (payload.name).
- * The content is the plain-text rendering, bounded to {@link FEED_CONTENT_MAX_CHARS}.
- * The link is the explorer URL when one exists.
- * The updated timestamp comes from `event.at` (ledger close time).
- */
-export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): AtomEntry {
+export function buildAtomEntry(
+  event: DecodedEvent,
+  config: StellarConfig,
+  mimirAppUrl?: string | null,
+): AtomEntry {
   const eventName =
     event.payload.name === "unknown"
       ? (event.payload.eventName ?? "unknown")
@@ -149,16 +196,29 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
       ? Array.from(rawContent).slice(0, FEED_CONTENT_MAX_CHARS).join("")
       : null;
 
-  const explorerUrl = eventExplorerUrl(config, event);
+  const hasUnsafeExplorerBase =
+    typeof config.explorerBaseUrl === "string" &&
+    config.explorerBaseUrl.length > 0 &&
+    !validateSafeHttpsBaseUrl(config.explorerBaseUrl).ok;
+  const explorerUrl = hasUnsafeExplorerBase ? null : eventExplorerUrl(config, event);
   const link = explorerUrl ? safeHttpsUrl(explorerUrl) : null;
 
-  return {
+  const resolvedAppBase =
+    mimirAppUrl ?? (config as { mimirAppUrl?: string | null }).mimirAppUrl ?? null;
+  const rawAppUrl = appUrlFor(event, resolvedAppBase);
+  const appLink = rawAppUrl ? safeHttpsUrl(rawAppUrl) : null;
+
+  const entry: AtomEntry = {
     id: `tag:mimir,event:${event.eventId}`,
     title,
     updated,
     content,
     link,
   };
+  if (appLink !== null) {
+    entry.appLink = appLink;
+  }
+  return entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +235,11 @@ function renderEntry(entry: AtomEntry): string {
       ? `    <link rel="alternate" type="text/html" href="${escapeXml(entry.link)}"/>`
       : "";
 
+  const appLinkEl =
+    entry.appLink
+      ? `    <link rel="related" type="text/html" href="${escapeXml(entry.appLink)}"/>`
+      : "";
+
   const contentEl =
     entry.content !== null
       ? `    <content type="text">${xmlText(entry.content, FEED_CONTENT_MAX_CHARS)}</content>`
@@ -186,6 +251,7 @@ function renderEntry(entry: AtomEntry): string {
     idEl,
     updatedEl,
     linkEl,
+    appLinkEl,
     contentEl,
     "  </entry>",
   ]
@@ -209,6 +275,8 @@ export function buildAtomFeed(
   events: readonly DecodedEvent[],
   options: AtomFeedOptions,
 ): string {
+  validateFeedBaseUrls(options);
+
   const { title, selfUrl, config, subtitle } = options;
 
   // Feed <updated>: caller override → latest event.at → now.
@@ -222,7 +290,10 @@ export function buildAtomFeed(
     feedUpdated = new Date().toISOString();
   }
 
-  const validSelfUrl = safeHttpsUrl(selfUrl) ?? "";
+  const validSelfUrl = safeHttpsUrl(selfUrl);
+  if (validSelfUrl === null) {
+    throw new FeedBaseUrlError("selfUrl", "invalid_url");
+  }
 
   const lines: string[] = [
     '<?xml version="1.0" encoding="UTF-8"?>',
@@ -235,18 +306,13 @@ export function buildAtomFeed(
   }
 
   lines.push(
-    `  <id>${escapeXml(validSelfUrl || selfUrl)}</id>`,
+    `  <id>${escapeXml(validSelfUrl)}</id>`,
     `  <updated>${escapeXml(feedUpdated)}</updated>`,
+    `  <link rel="self" type="application/atom+xml" href="${escapeXml(validSelfUrl)}"/>`,
   );
 
-  if (validSelfUrl) {
-    lines.push(
-      `  <link rel="self" type="application/atom+xml" href="${escapeXml(validSelfUrl)}"/>`,
-    );
-  }
-
   for (const event of events) {
-    const entry = buildAtomEntry(event, config);
+    const entry = buildAtomEntry(event, config, options.mimirAppUrl);
     lines.push(renderEntry(entry));
   }
 

@@ -81,13 +81,155 @@ export function appTargetFor(event: DecodedEvent): AppTarget | null {
   }
 }
 
+export type UnsafeHttpsUrlReason =
+  | "empty"
+  | "control_chars"
+  | "non_https_scheme"
+  | "userinfo_present"
+  | "invalid_host"
+  | "invalid_url";
+
+export type SafeHttpsUrlValidation =
+  | { ok: true; url: URL }
+  | { ok: false; reason: UnsafeHttpsUrlReason };
+
+const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+const IPV4_RE = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+
+function isValidParsedHostname(hostname: string, rawHostBeforePort: string): boolean {
+  if (!hostname || hostname.length > 253) return false;
+
+  // Reject single-integer IPv4 encodings such as https://2130706433
+  if (/^\d+$/.test(rawHostBeforePort)) return false;
+
+  // IPv6 literal validated by WHATWG URL parser
+  if (hostname.startsWith("[") && hostname.endsWith("]")) {
+    return hostname.length > 2;
+  }
+
+  // Dotted-quad IPv4 literal
+  if (IPV4_RE.test(hostname)) {
+    return hostname.split(".").every((part) => {
+      const n = Number(part);
+      return Number.isInteger(n) && n >= 0 && n <= 255;
+    });
+  }
+
+  if (hostname.startsWith(".") || hostname.endsWith(".") || hostname.includes("%")) {
+    return false;
+  }
+
+  const labels = hostname.split(".");
+  if (labels.some((label) => !DNS_LABEL_RE.test(label))) {
+    return false;
+  }
+
+  // Multi-label DNS names cannot end in an all-numeric TLD
+  const lastLabel = labels[labels.length - 1] ?? "";
+  if (labels.length > 1 && /^\d+$/.test(lastLabel)) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Validate scheme (`https:`), absence of userinfo/credentials (including empty
+ * `@` authorities such as `https://@example.com`), and host syntax before a
+ * base URL is used to construct app or feed links.
+ */
+export function validateSafeHttpsBaseUrl(
+  rawUrl: string | null | undefined,
+): SafeHttpsUrlValidation {
+  if (typeof rawUrl !== "string" || rawUrl.length === 0) {
+    return { ok: false, reason: "empty" };
+  }
+
+  // Reject C0/DEL control bytes anywhere in the raw string
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1F\x7F]/.test(rawUrl)) {
+    return { ok: false, reason: "control_chars" };
+  }
+
+  if (!/^https:\/\//i.test(rawUrl)) {
+    let probe: URL | null = null;
+    try {
+      probe = new URL(rawUrl);
+    } catch {
+      return { ok: false, reason: "invalid_url" };
+    }
+    return {
+      ok: false,
+      reason: probe.protocol === "https:" ? "invalid_host" : "non_https_scheme",
+    };
+  }
+
+  // Reject scheme-relative / triple-slash or backslash authority confusion (https:///x, https://\x)
+  const afterScheme = rawUrl.slice("https://".length);
+  if (afterScheme.length === 0 || afterScheme.startsWith("/") || afterScheme.startsWith("\\")) {
+    return { ok: false, reason: "invalid_host" };
+  }
+
+  const authorityEnd = afterScheme.search(/[/\\?#]/);
+  const rawAuthority =
+    authorityEnd === -1 ? afterScheme : afterScheme.slice(0, authorityEnd);
+
+  // If the delimiter that ended authority was a backslash before `/`, `?`, `#`, reject it
+  if (authorityEnd !== -1 && afterScheme[authorityEnd] === "\\") {
+    return { ok: false, reason: "invalid_host" };
+  }
+
+  // Reject any userinfo separator (`@`), including empty credentials `https://@host`
+  if (rawAuthority.includes("@")) {
+    return { ok: false, reason: "userinfo_present" };
+  }
+
+  if (rawAuthority.length === 0 || /\s/.test(rawAuthority)) {
+    return { ok: false, reason: "invalid_host" };
+  }
+
+  let rawHostBeforePort = rawAuthority;
+  if (rawAuthority.startsWith("[")) {
+    const closeBracket = rawAuthority.indexOf("]");
+    if (closeBracket === -1) return { ok: false, reason: "invalid_host" };
+    rawHostBeforePort = rawAuthority.slice(0, closeBracket + 1);
+  } else {
+    const colonIdx = rawAuthority.indexOf(":");
+    if (colonIdx !== -1) {
+      rawHostBeforePort = rawAuthority.slice(0, colonIdx);
+    }
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return { ok: false, reason: "invalid_url" };
+  }
+
+  if (parsed.protocol !== "https:") {
+    return { ok: false, reason: "non_https_scheme" };
+  }
+
+  if (parsed.username !== "" || parsed.password !== "") {
+    return { ok: false, reason: "userinfo_present" };
+  }
+
+  if (!isValidParsedHostname(parsed.hostname, rawHostBeforePort)) {
+    return { ok: false, reason: "invalid_host" };
+  }
+
+  return { ok: true, url: parsed };
+}
+
 /**
  * The Mimir web-app URL for an event, or null when there is nothing to open.
  *
- * Trailing slashes on the base are collapsed so `https://app.example/` and
- * `https://app.example` produce the same link, and the id goes through
- * `encodeURIComponent` so an unexpected payload value cannot inject a query,
- * fragment or extra path segment.
+ * Validates scheme, userinfo, and host on `baseUrl` so credential-bearing or
+ * malformed base URLs never generate links. Trailing slashes on the base are
+ * collapsed so `https://app.example/` and `https://app.example` produce the
+ * same link, and the id goes through `encodeURIComponent` so an unexpected
+ * payload value cannot inject a query, fragment or extra path segment.
  */
 export function appUrlFor(
   event: DecodedEvent,
@@ -97,14 +239,10 @@ export function appUrlFor(
   const target = appTargetFor(event);
   if (target === null) return null;
 
-  let base: URL;
-  try {
-    base = new URL(baseUrl);
-  } catch {
-    return null;
-  }
-  if (base.protocol !== "https:") return null;
+  const validated = validateSafeHttpsBaseUrl(baseUrl);
+  if (!validated.ok) return null;
 
+  const base = validated.url;
   base.search = "";
   base.hash = "";
   const prefix = base.pathname.replace(/\/+$/, "");

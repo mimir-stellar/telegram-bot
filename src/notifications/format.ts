@@ -246,9 +246,17 @@ export function eventExplorerUrl(config: StellarConfig, event: DecodedEvent): st
   const txHash = raw.trim();
   if (!TX_HASH_RE.test(txHash)) return null;
   try {
+    if (
+      typeof config.explorerBaseUrl === "string" &&
+      config.explorerBaseUrl.length > 0 &&
+      config.explorerBaseUrl.includes("@")
+    ) {
+      return null;
+    }
     const url = txExplorerUrl(config, txHash);
     const parsed = new URL(url);
     if (parsed.protocol !== "https:") return null;
+    if (parsed.username !== "" || parsed.password !== "") return null;
     return url;
   } catch {
     return null;
