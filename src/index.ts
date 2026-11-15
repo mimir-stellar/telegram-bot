@@ -24,7 +24,14 @@ import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
 import { attachConsole, createLogCapture, Logger, secretsFor } from "./logger.js";
-import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
+import {
+  createBot,
+  createNotifier,
+  hasConfiguredForumTopics,
+  registerCommands,
+  verifyNotificationRoutes,
+  type SendExtra,
+} from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
@@ -272,7 +279,10 @@ async function main(): Promise<void> {
     resume: () => poller.resume(),
     logs: logCapture,
   });
-  notify = createNotifier(bot, config);
+  const notifierConfig = hasConfiguredForumTopics(config)
+    ? (await verifyNotificationRoutes(bot, config)).config
+    : config;
+  notify = createNotifier(bot, notifierConfig);
 
   // Webhook mode only accepts updates carrying this per-process secret, so a
   // reachable health port cannot be used to inject fake Telegram updates.

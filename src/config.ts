@@ -187,7 +187,58 @@ export interface StellarConfig {
 
 export interface TelegramRoute {
   chatId: string;
+  /** Optional forum topic id (`message_thread_id`) within a forum-enabled supergroup. */
+  topicId?: number | undefined;
+  /** Whether the route is enabled for notification delivery (default true). */
+  enabled?: boolean | undefined;
   channelPreviewMode: boolean;
+}
+
+const CHAT_ID_PART_RE = /^(?:-?\d+|@[A-Za-z0-9_]{4,})$/;
+
+/**
+ * Parses a single Telegram destination string (`chatId` or `chatId:topicId` /
+ * `chatId#topicId`) into a structured route target. Returns `null` when
+ * malformed.
+ */
+export function parseTelegramRoute(
+  raw: string,
+  channelPreviewMode = false,
+): TelegramRoute | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  // Never treat a bot token shape (`<digits>:<35+ chars>`) as chat:topic.
+  if (/^\d+:[A-Za-z0-9_-]{20,}$/.test(trimmed)) return null;
+
+  const sepMatch = /^([^:#\s]+)[:#]([^:#\s]*)$/.exec(trimmed);
+  if (sepMatch) {
+    const chatPart = sepMatch[1]!;
+    const topicPart = sepMatch[2]!;
+    if (!CHAT_ID_PART_RE.test(chatPart)) return null;
+    if (!/^[1-9]\d*$/.test(topicPart)) return null;
+    const topicNum = Number(topicPart);
+    if (!Number.isSafeInteger(topicNum) || topicNum < 1) return null;
+    return {
+      chatId: chatPart,
+      topicId: topicNum,
+      enabled: true,
+      channelPreviewMode,
+    };
+  }
+
+  if (trimmed.includes(":") || trimmed.includes("#")) return null;
+  if (!CHAT_ID_PART_RE.test(trimmed)) return null;
+  return {
+    chatId: trimmed,
+    enabled: true,
+    channelPreviewMode,
+  };
+}
+
+export function formatTelegramRoute(
+  route: Pick<TelegramRoute, "chatId" | "topicId">,
+): string {
+  return route.topicId !== undefined ? `${route.chatId}:${route.topicId}` : route.chatId;
 }
 
 export interface BotConfig extends StellarConfig {
@@ -653,23 +704,29 @@ function collector(profile: Record<string, string>) {
       return fallback;
     },
 
-    chatIds(name: string): string[] {
+    chatIds(name: string, channelPreviewMode = false): { ids: string[]; routes: TelegramRoute[] } {
       const value = this.required(name);
-      if (value === "") return [];
-      
-      const ids = value.split(",").map(s => s.trim()).filter(s => s !== "");
-      if (ids.length === 0) {
+      if (value === "") return { ids: [], routes: [] };
+
+      const entries = value.split(",").map((s) => s.trim()).filter((s) => s !== "");
+      if (entries.length === 0) {
         problems.push(`${name} is required but not set`);
-        return [];
+        return { ids: [], routes: [] };
       }
-      for (const id of ids) {
-        if (!/^-?\d+$/.test(id) && !/^@[A-Za-z0-9_]{4,}$/.test(id)) {
+      const routes: TelegramRoute[] = [];
+      const ids: string[] = [];
+      for (const entry of entries) {
+        const parsed = parseTelegramRoute(entry, channelPreviewMode);
+        if (!parsed) {
           problems.push(
-            `${name} must contain numeric chat ids or @channelusernames; got "${id}"`,
+            `${name} must contain numeric chat ids or @channelusernames (with optional :topicId); got "${entry.slice(0, 48)}"`,
           );
+        } else {
+          routes.push(parsed);
+          ids.push(formatTelegramRoute(parsed));
         }
       }
-      return ids;
+      return { ids, routes };
     },
 
     /**
@@ -692,14 +749,17 @@ function collector(profile: Record<string, string>) {
     },
 
     optionalChatId(name: string, fallback: string): string {
-      const value = read(name) ?? fallback;
-      if (value === "") return value;
-      if (!/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
+      const raw = read(name);
+      if (raw === undefined) return fallback;
+      if (raw === "") return "";
+      const parsed = parseTelegramRoute(raw, false);
+      if (!parsed) {
         problems.push(
-          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
+          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername (with optional :topicId); got "${raw.slice(0, 48)}"`,
         );
+        return fallback;
       }
-      return value;
+      return formatTelegramRoute(parsed);
     },
 
     /**
@@ -881,7 +941,9 @@ export function loadConfig(): BotConfig {
     NOTIFY_SQUAD: read("NOTIFY_SQUAD"),
   });
   for (const problem of featureFlagsParsed.problems) c.problems.push(problem);
-  const chatIds = c.chatIds("TELEGRAM_CHAT_ID");
+  const channelPreviewMode = c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode);
+  const { ids: chatIds, routes } = c.chatIds("TELEGRAM_CHAT_ID", channelPreviewMode);
+  const primaryChatId = chatIds[0] ?? "";
 
   const localeInput = read("MIMIR_LOCALE");
   const locale = localeInput === undefined ? DEFAULT_LOCALE : normalizeLocale(localeInput);
@@ -896,10 +958,11 @@ export function loadConfig(): BotConfig {
     locale: locale ?? DEFAULT_LOCALE,
     version: APP_VERSION,
     botToken: c.botToken("BOT_TOKEN"),
-    chatId: chatIds[0] ?? "",
+    chatId: primaryChatId,
     chatIds,
-    marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
-    squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
+    routes,
+    marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", primaryChatId),
+    squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", primaryChatId),
     allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
@@ -959,7 +1022,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.telegramSendTimeoutMs,
       0,
     ),
-    channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
+    channelPreviewMode,
     linkPreviewMarket: c.bool("LINK_PREVIEW_MARKET", DEFAULTS.linkPreviewMarket),
     linkPreviewSquad: c.bool("LINK_PREVIEW_SQUAD", DEFAULTS.linkPreviewSquad),
     logSampleMaxPerWindow: c.int(

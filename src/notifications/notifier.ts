@@ -13,7 +13,13 @@
 
 import type { Bot } from "grammy";
 
-import type { BotConfig } from "../config.js";
+import {
+  formatTelegramRoute,
+  parseTelegramRoute,
+  type BotConfig,
+  type TelegramRoute,
+} from "../config.js";
+import { redactChatId } from "../status.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
   safeErrorMessage,
@@ -21,6 +27,185 @@ import {
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+
+export interface DisabledNotificationRoute {
+  chatId: string;
+  topicId?: number | undefined;
+  key: string;
+  reason: string;
+}
+
+export interface RouteVerificationResult<TConfig extends NotifierConfigInput> {
+  config: TConfig & {
+    routes: TelegramRoute[];
+    disabledRouteKeys: ReadonlySet<string>;
+  };
+  activeRoutes: TelegramRoute[];
+  disabledRoutes: DisabledNotificationRoute[];
+}
+
+export type NotifierConfigInput = Pick<BotConfig, "chatId"> &
+  Partial<
+    Pick<
+      BotConfig,
+      | "marketChatId"
+      | "squadChatId"
+      | "botToken"
+      | "chatIds"
+      | "routes"
+      | "channelPreviewMode"
+      | "linkPreviewMarket"
+      | "linkPreviewSquad"
+      | "silentEvents"
+    >
+  > & {
+    disabledRouteKeys?: ReadonlySet<string> | undefined;
+  };
+
+export function routeIdentityKey(route: Pick<TelegramRoute, "chatId" | "topicId">): string {
+  return route.topicId !== undefined ? `${route.chatId}#${route.topicId}` : `${route.chatId}#root`;
+}
+
+function coerceRouteTarget(
+  raw: string,
+  channelPreviewMode = false,
+): TelegramRoute | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const parsed = parseTelegramRoute(trimmed, channelPreviewMode);
+  if (parsed) return parsed;
+  const sep = /^([^:#\s]+)[:#]([1-9]\d*)$/.exec(trimmed);
+  if (sep) {
+    return {
+      chatId: sep[1]!,
+      topicId: Number(sep[2]!),
+      enabled: true,
+      channelPreviewMode,
+    };
+  }
+  return {
+    chatId: trimmed,
+    enabled: true,
+    channelPreviewMode,
+  };
+}
+
+/** True when any configured route targets a Telegram forum topic (`topicId`). */
+export function hasConfiguredForumTopics(config: NotifierConfigInput): boolean {
+  if (config.routes?.some((r) => r.topicId !== undefined)) return true;
+  for (const raw of [
+    ...(config.chatIds ?? []),
+    config.chatId,
+    config.marketChatId,
+    config.squadChatId,
+  ]) {
+    if (typeof raw === "string" && coerceRouteTarget(raw)?.topicId !== undefined) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Verifies configured Telegram chat and forum-topic routes against the Bot API
+ * before enabling them for delivery.
+ *
+ * Invalid chats or unreachable/closed/non-forum topics are disabled
+ * individually with bounded redacted warnings so working chats keep receiving
+ * notifications.
+ */
+export async function verifyNotificationRoutes<TConfig extends NotifierConfigInput>(
+  bot: Pick<Bot, "api">,
+  config: TConfig,
+): Promise<RouteVerificationResult<TConfig>> {
+  const secrets =
+    typeof config.botToken === "string" && config.botToken !== ""
+      ? [config.botToken]
+      : [];
+  const preview = config.channelPreviewMode ?? false;
+
+  const baseRoutes: TelegramRoute[] =
+    config.routes && config.routes.length > 0
+      ? config.routes.map((r) => ({ ...r, enabled: r.enabled ?? true }))
+      : (config.chatIds && config.chatIds.length > 0
+          ? config.chatIds
+          : [config.chatId]
+        )
+          .map((raw) => coerceRouteTarget(raw, preview))
+          .filter((r): r is TelegramRoute => r !== null);
+
+  // Collect every unique (chatId, topicId) route referenced by primary, fan-out,
+  // or per-contract overrides so each is verified at most once.
+  const candidates = new Map<string, TelegramRoute>();
+  for (const route of baseRoutes) {
+    candidates.set(routeIdentityKey(route), route);
+  }
+  for (const overrideRaw of [config.marketChatId, config.squadChatId]) {
+    if (typeof overrideRaw === "string" && overrideRaw.trim() !== "") {
+      const parsed = coerceRouteTarget(overrideRaw, preview);
+      if (parsed) {
+        const key = routeIdentityKey(parsed);
+        if (!candidates.has(key)) candidates.set(key, parsed);
+      }
+    }
+  }
+
+  const disabledRouteKeys = new Set<string>(config.disabledRouteKeys ?? []);
+  const disabledRoutes: DisabledNotificationRoute[] = [];
+
+  for (const [key, route] of candidates.entries()) {
+    if (route.enabled === false || disabledRouteKeys.has(key)) {
+      disabledRouteKeys.add(key);
+      continue;
+    }
+
+    try {
+      const chatInfo = (await bot.api.getChat(route.chatId)) as {
+        is_forum?: boolean;
+        type?: string;
+      };
+
+      if (route.topicId !== undefined) {
+        if (chatInfo?.is_forum !== true) {
+          throw new Error("target chat does not have forum topics enabled (is_forum=false)");
+        }
+        await bot.api.sendChatAction(route.chatId, "typing", {
+          message_thread_id: route.topicId,
+        });
+      }
+    } catch (err) {
+      const reason = safeErrorMessage(err, secrets);
+      disabledRouteKeys.add(key);
+      disabledRoutes.push({
+        chatId: route.chatId,
+        ...(route.topicId !== undefined ? { topicId: route.topicId } : {}),
+        key,
+        reason,
+      });
+      const safeChat = redactChatId(route.chatId);
+      const topicLabel = route.topicId !== undefined ? ` topic=${route.topicId}` : "";
+      console.warn(
+        `[notifier] disabled invalid notification route (${safeChat}${topicLabel}): ${reason}`,
+      );
+    }
+  }
+
+  const verifiedRoutes = baseRoutes.map((route) => ({
+    ...route,
+    enabled: route.enabled !== false && !disabledRouteKeys.has(routeIdentityKey(route)),
+  }));
+  const activeRoutes = verifiedRoutes.filter((route) => route.enabled !== false);
+
+  return {
+    config: {
+      ...config,
+      routes: verifiedRoutes,
+      disabledRouteKeys,
+    },
+    activeRoutes,
+    disabledRoutes,
+  };
+}
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
 
@@ -94,7 +279,7 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
  * Sends suppressed by the empty-message guard, counted so callers (and the
  * empty-text tests) can prove a blank render never reached the Telegram API.
  */
-export const notifierSkips = { emptyText: 0 };
+export const notifierSkips = { emptyText: 0, disabledRoute: 0 };
 
 // ── createNotifier ───────────────────────────────────────────────────────────
 
@@ -118,9 +303,49 @@ export const notifierSkips = { emptyText: 0 };
  */
 export function createNotifier(
   bot: Pick<Bot, "api">,
-  config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
-    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  config: NotifierConfigInput,
 ) {
+  const resolveDestinations = (source?: ContractSource): TelegramRoute[] => {
+    const preview = config.channelPreviewMode ?? false;
+    const disabledKeys = config.disabledRouteKeys;
+    const defaultTargetStr =
+      config.chatId ||
+      config.chatIds?.[0] ||
+      (config.routes?.[0] ? formatTelegramRoute(config.routes[0]) : "");
+
+    const explicitSourceStr =
+      source === "market"
+        ? config.marketChatId
+        : source === "squad"
+          ? config.squadChatId
+          : undefined;
+
+    // Explicit per-contract destination override (different from primary default).
+    if (
+      typeof explicitSourceStr === "string" &&
+      explicitSourceStr.trim() !== "" &&
+      explicitSourceStr.trim() !== defaultTargetStr
+    ) {
+      const parsed = coerceRouteTarget(explicitSourceStr, preview);
+      if (!parsed) return [];
+      if (disabledKeys?.has(routeIdentityKey(parsed))) return [];
+      return [parsed];
+    }
+
+    if (config.routes && config.routes.length > 0) {
+      return config.routes.filter(
+        (route) =>
+          route.enabled !== false && !disabledKeys?.has(routeIdentityKey(route)),
+      );
+    }
+
+    const singleRaw = explicitSourceStr || defaultTargetStr;
+    const single = coerceRouteTarget(singleRaw, preview);
+    if (!single) return [];
+    if (disabledKeys?.has(routeIdentityKey(single))) return [];
+    return [single];
+  };
+
   return async (
     text: string | null,
     source?: ContractSource,
@@ -138,12 +363,11 @@ export function createNotifier(
       return;
     }
 
-    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
-    const chatId = source === "market"
-      ? config.marketChatId || defaultChat
-      : source === "squad"
-        ? config.squadChatId || defaultChat
-        : defaultChat;
+    const destinations = resolveDestinations(source);
+    if (destinations.length === 0) {
+      notifierSkips.disabledRoute += 1;
+      return;
+    }
 
     // Select link preview settings based on the contract source.
     // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
@@ -156,66 +380,74 @@ export function createNotifier(
     const silentOption = extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS)
       ? { disable_notification: true }
       : {};
-    const notificationOptions = {
-      parse_mode: "MarkdownV2" as const,
-      link_preview_options: { is_disabled: linkPreviewDisabled },
-      ...silentOption,
-    };
 
     // Oversized payloads go out as ordered chunks under Telegram's limit. The
     // thread reply rides on the first chunk and the explorer button on the
     // last, so the message reads exactly like the unsplit one.
     const parts = splitTelegramMessage(text);
-    if (parts.length > 1) {
-      for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
+
+    for (const dest of destinations) {
+      const chatId = dest.chatId;
+      const threadOption =
+        dest.topicId !== undefined ? { message_thread_id: dest.topicId } : {};
+      const notificationOptions = {
+        parse_mode: "MarkdownV2" as const,
+        link_preview_options: { is_disabled: linkPreviewDisabled },
+        ...silentOption,
+        ...threadOption,
+      };
+
+      if (parts.length > 1) {
+        for (const [index, part] of parts.entries()) {
+          await bot.api.sendMessage(chatId, part, {
+            ...notificationOptions,
+            ...(index === parts.length - 1 && extra?.reply_markup
+              ? { reply_markup: extra.reply_markup }
+              : {}),
+            ...(index === 0 && extra?.replyToMessageId !== undefined
+              ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+              : {}),
+          });
+        }
+        continue;
+      }
+
+      try {
+        await bot.api.sendMessage(chatId, text, {
           ...notificationOptions,
-          ...(index === parts.length - 1 && extra?.reply_markup
-            ? { reply_markup: extra.reply_markup }
+          ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+          ...(extra?.replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
             : {}),
-          ...(index === 0 && extra?.replyToMessageId !== undefined
+        });
+      } catch (err) {
+        // A blank fallback is no fallback: sending whitespace-only text would
+        // just draw the same 400, so the original parse error propagates.
+        const fallback = extra?.plainText;
+        if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
+          throw err;
+        }
+        // Only bounded metadata is logged: the fallback outcome, the safe error
+        // category, and the caller-supplied event reference — never message
+        // text, tokens, or remote payloads.
+        console.warn(
+          `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
+            `retrying as plain text: ${safeErrorMessage(
+              err,
+              typeof config.botToken === "string" ? [config.botToken] : [],
+            )}`,
+        );
+        // Plain text (no parse mode), same per-source link preview setting.
+        await bot.api.sendMessage(chatId, fallback, {
+          link_preview_options: notificationOptions.link_preview_options,
+          ...silentOption,
+          ...threadOption,
+          ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+          ...(extra?.replyToMessageId !== undefined
             ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
             : {}),
         });
       }
-      return;
-    }
-
-    try {
-      await bot.api.sendMessage(chatId, text, {
-        ...notificationOptions,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(extra?.replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-          : {}),
-      });
-      return;
-    } catch (err) {
-      // A blank fallback is no fallback: sending whitespace-only text would
-      // just draw the same 400, so the original parse error propagates.
-      const fallback = extra?.plainText;
-      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
-        throw err;
-      }
-      // Only bounded metadata is logged: the fallback outcome, the safe error
-      // category, and the caller-supplied event reference — never message
-      // text, tokens, or remote payloads.
-      console.warn(
-        `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
-          `retrying as plain text: ${safeErrorMessage(
-            err,
-            typeof config.botToken === "string" ? [config.botToken] : [],
-          )}`,
-      );
-      // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
-        link_preview_options: notificationOptions.link_preview_options,
-        ...silentOption,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(extra?.replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-          : {}),
-      });
     }
   };
 }
