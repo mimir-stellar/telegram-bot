@@ -17,6 +17,9 @@ import { safeErrorMessage } from "../notifications/format.js";
 /** Telegram Bot API maximum message length limit. */
 export const MAX_BROADCAST_LENGTH = 4096;
 
+/** Upper bound for fallback chat replies when a confirmation message was deleted or cannot be edited. */
+export const MAX_CONFIRMATION_FALLBACK_CHARS = 1024;
+
 /** Default expiration timeout for pending broadcast confirmations (5 minutes). */
 export const DEFAULT_BROADCAST_EXPIRY_MS = 5 * 60 * 1000;
 
@@ -283,6 +286,75 @@ export async function handleBroadcastCommand(
   });
 }
 
+export function clampConfirmationFallbackText(
+  text: string,
+  maxChars: number = MAX_CONFIRMATION_FALLBACK_CHARS,
+): string {
+  const limit = Math.max(16, Math.trunc(maxChars));
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit - 1)}…`;
+}
+
+function isBroadcastMessageNotModified(err: unknown): boolean {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /message is not modified/i.test(msg);
+}
+
+/**
+ * True when Telegram rejected `editMessageText` because the target message was
+ * deleted, expired from the edit window, or has an invalid message identifier.
+ */
+export function isDeletedOrUneditableMessageError(err: unknown): boolean {
+  if (!err || isBroadcastMessageNotModified(err)) return false;
+  const record = typeof err === "object" ? (err as { description?: unknown; message?: unknown }) : null;
+  const raw =
+    typeof record?.description === "string"
+      ? record.description
+      : err instanceof Error
+        ? err.message
+        : typeof record?.message === "string"
+          ? record.message
+          : String(err);
+  return /message to edit not found|message can't be edited|message_id_invalid|message identifier is not specified|message to delete not found/i.test(
+    raw,
+  );
+}
+
+async function sendBoundedBroadcastFallback(ctx: Context, text: string): Promise<void> {
+  const bounded = clampConfirmationFallbackText(text, MAX_CONFIRMATION_FALLBACK_CHARS);
+  const options = { link_preview_options: { is_disabled: true } };
+
+  try {
+    if (typeof ctx.reply === "function") {
+      await ctx.reply(bounded, options);
+      return;
+    }
+    const targetChatId =
+      ctx.chat?.id ?? (ctx.callbackQuery?.message as { chat?: { id?: number | string } } | undefined)?.chat?.id;
+    if (targetChatId !== undefined && typeof ctx.api?.sendMessage === "function") {
+      await ctx.api.sendMessage(targetChatId, bounded, options);
+    }
+  } catch (err) {
+    console.warn(`[bot] broadcast fallback reply failed: ${safeErrorMessage(err)}`);
+  }
+}
+
+async function editBroadcastMessageOrFallback(ctx: Context, text: string): Promise<void> {
+  if (ctx.callbackQuery?.message) {
+    try {
+      await ctx.editMessageText(text);
+      return;
+    } catch (err) {
+      if (isBroadcastMessageNotModified(err)) {
+        return;
+      }
+      // Message was deleted or can no longer be edited — fall through to bounded reply.
+    }
+  }
+  await sendBoundedBroadcastFallback(ctx, text);
+}
+
 /**
  * Handle confirmation or cancellation callback queries for broadcast.
  */
@@ -326,13 +398,10 @@ export async function handleBroadcastCallback(
       text: "Broadcast expired or already processed",
       show_alert: true,
     });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("⚠️ Broadcast confirmation expired or already processed.");
-      } catch {
-        // ignore edit failure
-      }
-    }
+    await editBroadcastMessageOrFallback(
+      ctx,
+      "⚠️ Broadcast confirmation expired or already processed.",
+    );
     return;
   }
 
@@ -342,26 +411,14 @@ export async function handleBroadcastCallback(
       text: "Broadcast confirmation expired",
       show_alert: true,
     });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("⚠️ Broadcast confirmation expired.");
-      } catch {
-        // ignore
-      }
-    }
+    await editBroadcastMessageOrFallback(ctx, "⚠️ Broadcast confirmation expired.");
     return;
   }
 
   if (subAction === "cancel") {
     store.delete(broadcastId);
     await safeAnswerCallback(ctx, config, { text: "Broadcast cancelled" });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("❌ Broadcast cancelled.");
-      } catch {
-        // ignore
-      }
-    }
+    await editBroadcastMessageOrFallback(ctx, "❌ Broadcast cancelled.");
     return;
   }
 
@@ -383,7 +440,8 @@ export async function handleBroadcastCallback(
     try {
       await ctx.editMessageText(`⏳ Broadcasting to ${pending.chats.length} chat(s)...`);
     } catch {
-      // ignore
+      // If the preview message was deleted, skip the transient progress edit and
+      // emit a single bounded fallback reply once delivery completes below.
     }
   }
 
@@ -397,15 +455,7 @@ export async function handleBroadcastCallback(
   });
 
   const report = formatBroadcastReport(results);
-  if (ctx.callbackQuery?.message) {
-    try {
-      await ctx.editMessageText(report);
-      return;
-    } catch {
-      // fallback to reply
-    }
-  }
-  await ctx.reply(report);
+  await editBroadcastMessageOrFallback(ctx, report);
 }
 
 /**

@@ -17,7 +17,18 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
 import { safeErrorMessage } from "./notifications/format.js";
-import { handleBroadcastCallback } from "./commands/broadcast.js";
+import {
+  MAX_CONFIRMATION_FALLBACK_CHARS,
+  clampConfirmationFallbackText,
+  handleBroadcastCallback,
+  isDeletedOrUneditableMessageError,
+} from "./commands/broadcast.js";
+
+export {
+  MAX_CONFIRMATION_FALLBACK_CHARS,
+  clampConfirmationFallbackText,
+  isDeletedOrUneditableMessageError,
+};
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
@@ -175,6 +186,7 @@ export async function updateOrReplyMessage(
   ctx: Context,
   text: string,
   replyMarkup?: InlineKeyboard,
+  fallbackChatId?: string | number,
 ): Promise<void> {
   const options = {
     ...TELEGRAM_OPTIONS,
@@ -193,14 +205,18 @@ export async function updateOrReplyMessage(
     }
   }
 
-  if (ctx.chat) {
+  if (ctx.chat && typeof ctx.reply === "function") {
     await ctx.reply(text, options);
     return;
   }
 
-  // no-op: callers that need to target the configured chat should call
-  // `ctx.api.sendMessage(config.chatId, ...)` directly when `ctx.chat` is
-  // unavailable. handleCallbackQuery does this.
+  const targetChatId =
+    ctx.chat?.id ??
+    (ctx.callbackQuery?.message as { chat?: { id?: number | string } } | undefined)?.chat?.id ??
+    fallbackChatId;
+  if (targetChatId !== undefined && typeof ctx.api?.sendMessage === "function") {
+    await ctx.api.sendMessage(targetChatId, text, options);
+  }
 }
 
 // ── Action callbacks ─────────────────────────────────────────────────────────
@@ -296,28 +312,28 @@ export async function handleCallbackQuery(
       case "pause": {
         const result = pause();
         const text = pauseMessage(result, config.locale);
-        if (ctx.callbackQuery?.message) {
-          await updateOrReplyMessage(ctx, text, operatorKeyboard());
-        } else {
-          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
-        }
         await safeAnswerCallback(ctx, config, {
           text: result === "paused" ? "Polling paused" : result === "already-paused" ? "Already paused" : "Cannot pause",
         });
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text, operatorKeyboard(), config.chatId);
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+        }
         break;
       }
 
       case "resume": {
         const result = resume();
         const text = resumeMessage(result, config.locale);
-        if (ctx.callbackQuery?.message) {
-          await updateOrReplyMessage(ctx, text, operatorKeyboard());
-        } else {
-          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
-        }
         await safeAnswerCallback(ctx, config, {
           text: result === "resumed" ? "Polling resumed" : result === "already-running" ? "Already running" : "Cannot resume",
         });
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text, operatorKeyboard(), config.chatId);
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+        }
         break;
       }
     }
@@ -356,6 +372,140 @@ export function validatePauseConfirmData(
   return null;
 }
 
+const MAX_TRACKED_PAUSE_CONFIRMATIONS = 256;
+const consumedPauseConfirmations = new WeakMap<object, Map<string, number>>();
+const fallbackConsumedPauseConfirmations = new Map<string, number>();
+
+function getConsumedPauseMap(config: object | undefined): Map<string, number> {
+  if (config && typeof config === "object") {
+    let map = consumedPauseConfirmations.get(config);
+    if (!map) {
+      map = new Map<string, number>();
+      consumedPauseConfirmations.set(config, map);
+    }
+    return map;
+  }
+  return fallbackConsumedPauseConfirmations;
+}
+
+function pauseConfirmMessageKey(ctx: Context): string | null {
+  const msg = ctx.callbackQuery?.message as
+    | { message_id?: unknown; chat?: { id?: unknown } }
+    | undefined;
+  if (msg && typeof msg.message_id === "number" && Number.isSafeInteger(msg.message_id)) {
+    const chatId = msg.chat?.id ?? ctx.chat?.id ?? "chat";
+    return `${String(chatId)}:${msg.message_id}`;
+  }
+  return null;
+}
+
+function isPauseConfirmConsumed(
+  config: object | undefined,
+  key: string | null,
+  nowMs: number,
+): boolean {
+  if (key === null) return false;
+  const map = getConsumedPauseMap(config);
+  for (const [k, expiresAt] of map) {
+    if (expiresAt <= nowMs) {
+      map.delete(k);
+    }
+  }
+  return map.has(key);
+}
+
+function markPauseConfirmConsumed(
+  config: object | undefined,
+  key: string | null,
+  nowMs: number,
+): void {
+  if (key === null) return;
+  const map = getConsumedPauseMap(config);
+  map.delete(key);
+  map.set(key, nowMs + Math.max(PAUSE_CONFIRM_TTL_MS * 2, 120_000));
+  while (map.size > MAX_TRACKED_PAUSE_CONFIRMATIONS) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) {
+      map.delete(oldest);
+    } else {
+      break;
+    }
+  }
+}
+
+async function safeAnswerPauseConfirm(
+  ctx: Context,
+  config: CommandDeps["config"],
+  params?: { text?: string; show_alert?: boolean },
+): Promise<void> {
+  if (typeof ctx.answerCallbackQuery !== "function") return;
+  try {
+    if (params === undefined) {
+      await ctx.answerCallbackQuery();
+    } else {
+      await ctx.answerCallbackQuery(params);
+    }
+  } catch (err) {
+    console.warn(
+      `[bot] answerCallbackQuery failed: ${safeErrorMessage(err, [config.botToken])}`,
+    );
+  }
+}
+
+async function sendBoundedPauseConfirmFallback(
+  ctx: Context,
+  config: CommandDeps["config"],
+  markdownText: string,
+): Promise<void> {
+  const fitsMarkdown = markdownText.length <= MAX_CONFIRMATION_FALLBACK_CHARS;
+  const payload = fitsMarkdown
+    ? markdownText
+    : clampConfirmationFallbackText(
+        markdownText.replace(/\\([_*[\]()~`>#+\-=|{}.!\\])/g, "$1"),
+        MAX_CONFIRMATION_FALLBACK_CHARS,
+      );
+  const options = fitsMarkdown
+    ? TELEGRAM_OPTIONS
+    : { link_preview_options: { is_disabled: true } };
+
+  try {
+    if (typeof ctx.reply === "function") {
+      await ctx.reply(payload, options);
+      return;
+    }
+    const targetChatId =
+      ctx.chat?.id ??
+      (ctx.callbackQuery?.message as { chat?: { id?: number | string } } | undefined)?.chat?.id ??
+      config.chatId;
+    if (targetChatId !== undefined && typeof ctx.api?.sendMessage === "function") {
+      await ctx.api.sendMessage(targetChatId, payload, options);
+    }
+  } catch (err) {
+    console.warn(
+      `[bot] pause confirmation fallback reply failed: ${safeErrorMessage(err, [config.botToken])}`,
+    );
+  }
+}
+
+async function editPauseConfirmOrFallback(
+  ctx: Context,
+  config: CommandDeps["config"],
+  markdownText: string,
+): Promise<void> {
+  if (ctx.callbackQuery?.message && typeof ctx.editMessageText === "function") {
+    try {
+      await ctx.editMessageText(markdownText, TELEGRAM_OPTIONS);
+      return;
+    } catch (err) {
+      if (isMessageNotModified(err)) {
+        return;
+      }
+      // Confirmation prompt was deleted or is no longer editable — emit bounded fallback reply.
+    }
+  }
+  await sendBoundedPauseConfirmFallback(ctx, config, markdownText);
+}
+
 /**
  * Shared handler for pause inline-keyboard callbacks.
  *
@@ -379,7 +529,24 @@ export async function handlePauseConfirmCallback(
 
   // Only the operator may act on these buttons.
   if (!isOperator(ctx, config)) {
-    await ctx.answerCallbackQuery({ text: "Only the operator can do that.", show_alert: true });
+    await safeAnswerPauseConfirm(ctx, config, {
+      text: "Only the operator can do that.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const msgKey = pauseConfirmMessageKey(ctx);
+  if (isPauseConfirmConsumed(config, msgKey, nowMs)) {
+    await safeAnswerPauseConfirm(ctx, config, {
+      text: "Confirmation already processed.",
+      show_alert: true,
+    });
+    await editPauseConfirmOrFallback(
+      ctx,
+      config,
+      "⏱ *Pause confirmation already processed\\.*",
+    );
     return;
   }
 
@@ -387,23 +554,34 @@ export async function handlePauseConfirmCallback(
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
   const ageMs = nowMs - messageDate * 1000;
   if (ageMs > PAUSE_CONFIRM_TTL_MS) {
-    await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
-    await ctx.editMessageText(
+    markPauseConfirmConsumed(config, msgKey, nowMs);
+    await safeAnswerPauseConfirm(ctx, config, {
+      text: "Confirmation expired.",
+      show_alert: true,
+    });
+    await editPauseConfirmOrFallback(
+      ctx,
+      config,
       "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
-      TELEGRAM_OPTIONS,
     );
     return;
   }
 
+  markPauseConfirmConsumed(config, msgKey, nowMs);
+
   if (action === CALLBACK_PAUSE_CONFIRM) {
     const result = pause();
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
+    await safeAnswerPauseConfirm(ctx, config);
+    await editPauseConfirmOrFallback(ctx, config, pauseMessage(result, config.locale));
     return;
   }
 
-  await ctx.answerCallbackQuery({ text: "Cancelled." });
-  await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
+  await safeAnswerPauseConfirm(ctx, config, { text: "Cancelled." });
+  await editPauseConfirmOrFallback(
+    ctx,
+    config,
+    "*Pause cancelled\\.* Polling continues\\.",
+  );
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────

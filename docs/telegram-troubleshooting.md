@@ -21,6 +21,7 @@ Every fix here is safe to perform without access to production secrets.
 | `BOT_TOKEN is wrapped in quotes` / `BOT_TOKEN contains whitespace` | startup | The token value was pasted with surrounding quotes or trailing whitespace. | Remove the quotes or whitespace from the environment variable. See `validateBotTokenShape` in `src/bot.ts` for all validated shapes. |
 | `getUpdates … conflict: terminated by other getUpdates request` | 409 | Two bot processes are running with the same token. | Stop all but one instance. If using long-polling (the default), only a single process may poll at a time. See [ADR-0004](adr/0004-long-polling-with-optional-webhook.md). |
 | `Forbidden: bot is not a member of the channel chat` | 403 | A channel ID is configured but the bot was never added as an administrator. | Add the bot to the channel as an admin with the "Post Messages" right, then restart. |
+| `Bad Request: message to edit not found` / `Bad Request: message can't be edited` | 400 | An operator tapped an inline confirmation or navigation button after the originating Telegram message was deleted or aged past Telegram's edit window. | No manual recovery needed: the bot acknowledges the callback query, emits a bounded fallback reply (`≤ 1024` chars) to the chat, and ensures the underlying state transition (`/pause` or `/broadcast`) runs at most once. |
 
 ---
 
