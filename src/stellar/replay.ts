@@ -36,6 +36,7 @@
  * that was within the range.
  */
 
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -49,6 +50,7 @@ import {
   type BotConfig,
   type StellarConfig,
 } from "../config.js";
+import { MOCK_CHAT_ID, MOCK_PROFILE_NAME } from "./mock-constants.js";
 import { EventDedupWindow, eventKey } from "../dedup.js";
 import {
   formatEvent,
@@ -117,6 +119,39 @@ export interface ReplayTargetResult {
   failedSends?: number | undefined;
 }
 
+export interface ReplayTargetDestination {
+  source: ContractSource;
+  contractId: string;
+  destinationChatId: string | null;
+}
+
+export interface ReplayPlanSpec {
+  network: string;
+  networkPassphrase: string;
+  range: {
+    from: string;
+    to: number | null;
+  };
+  cap: number | null;
+  targets: ReplayTargetDestination[];
+}
+
+export interface ReplayManifest {
+  format: "mimir-replay-manifest-v1";
+  version: 1;
+  createdAt: string;
+  planDigest: string;
+  plan: ReplayPlanSpec;
+  preview: {
+    events: number;
+    wouldSend: number;
+    skipped: number;
+    capped: number;
+    adminLogged: number;
+    duplicates: number;
+  };
+}
+
 export interface ReplayReport {
   format: "mimir-replay-v1";
   network: string;
@@ -124,6 +159,8 @@ export interface ReplayReport {
   fromLedger: number;
   toLedger: number | null;
   dryRun: boolean;
+  /** Deterministic SHA-256 digest of the replay range and target destinations. */
+  planDigest: string;
   targets: ReplayTargetResult[];
   /** Total across all targets. */
   totals: {
@@ -266,6 +303,8 @@ export interface ReplayDeps {
   sleep?: ((ms: number) => Promise<void>) | undefined;
   /** Timestamp provider for deterministic rate-limit / delay tests. */
   now?: (() => number) | undefined;
+  /** Enforce signed-off manifest / plan digest even when `send` is injected in tests. */
+  requireManifest?: boolean | undefined;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -284,12 +323,203 @@ export async function writeProgressFileAtomic(filePath: string, data: ReplayProg
   }
 }
 
+export async function writeManifestFileAtomic(filePath: string, data: ReplayManifest): Promise<void> {
+  const dir = path.dirname(filePath);
+  await mkdir(dir, { recursive: true });
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+    await rename(tmp, filePath);
+  } catch (err) {
+    try { await unlink(tmp); } catch {}
+    throw err;
+  }
+}
+
 export function normalizeRangeFrom(from: string | number): string {
   return String(from).trim();
 }
 
 export function normalizeRangeTo(to?: number | null): number | null {
   return to !== undefined && to !== null ? to : null;
+}
+
+export function normalizeReplayPlanSpec(plan: ReplayPlanSpec): ReplayPlanSpec {
+  const seen = new Map<ContractSource, ReplayTargetDestination>();
+  for (const t of plan.targets ?? []) {
+    if (!t || (t.source !== "market" && t.source !== "squad")) continue;
+    const cleanedDest =
+      typeof t.destinationChatId === "string" && t.destinationChatId.trim().length > 0
+        ? t.destinationChatId.trim()
+        : null;
+    seen.set(t.source, {
+      source: t.source,
+      contractId: String(t.contractId ?? "").trim(),
+      destinationChatId: cleanedDest,
+    });
+  }
+  const sortedTargets = [...seen.values()].sort((a, b) => a.source.localeCompare(b.source));
+  return {
+    network: String(plan.network ?? "").trim(),
+    networkPassphrase: String(plan.networkPassphrase ?? "").trim(),
+    range: {
+      from: normalizeRangeFrom(plan.range?.from ?? ""),
+      to: normalizeRangeTo(plan.range?.to),
+    },
+    cap:
+      plan.cap !== undefined && plan.cap !== null && Number.isFinite(Number(plan.cap))
+        ? Number(plan.cap)
+        : null,
+    targets: sortedTargets,
+  };
+}
+
+export function computeReplayPlanDigest(plan: ReplayPlanSpec): string {
+  const normalized = normalizeReplayPlanSpec(plan);
+  const canonical = JSON.stringify({
+    version: 1,
+    network: normalized.network,
+    networkPassphrase: normalized.networkPassphrase,
+    range: {
+      from: normalized.range.from,
+      to: normalized.range.to,
+    },
+    cap: normalized.cap,
+    targets: normalized.targets.map((t) => ({
+      source: t.source,
+      contractId: t.contractId,
+      destinationChatId: t.destinationChatId,
+    })),
+  });
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
+export function buildReplayPlanSpec(opts: {
+  config: StellarConfig | BotConfig;
+  network: string;
+  from: string | number;
+  to?: number | undefined;
+  cap?: number | undefined;
+  contracts: readonly ContractSource[];
+  allowEnvFallback: boolean;
+}): ReplayPlanSpec {
+  const cfg = opts.config as Partial<BotConfig> & { telegramChatId?: string };
+  const envDefaultChat = opts.allowEnvFallback
+    ? process.env.TELEGRAM_CHAT_ID?.split(",")[0]?.trim() ||
+      (process.env.MIMIR_PROFILE?.trim() === MOCK_PROFILE_NAME ? MOCK_CHAT_ID : "")
+    : "";
+
+  const defaultChat =
+    cfg.chatId?.trim() ||
+    cfg.telegramChatId?.trim() ||
+    cfg.chatIds?.[0]?.trim() ||
+    envDefaultChat ||
+    "";
+
+  const marketChat =
+    (cfg.marketChatId?.trim() ||
+      (opts.allowEnvFallback ? process.env.TELEGRAM_MARKET_CHAT_ID?.trim() : "") ||
+      defaultChat) ||
+    null;
+
+  const squadChat =
+    (cfg.squadChatId?.trim() ||
+      (opts.allowEnvFallback ? process.env.TELEGRAM_SQUAD_CHAT_ID?.trim() : "") ||
+      defaultChat) ||
+    null;
+
+  const uniqueSources = [...new Set(opts.contracts)].sort();
+  const targets: ReplayTargetDestination[] = uniqueSources.map((source) => ({
+    source,
+    contractId: source === "market" ? opts.config.marketContractId : opts.config.squadContractId,
+    destinationChatId: source === "market" ? marketChat : squadChat,
+  }));
+
+  return normalizeReplayPlanSpec({
+    network: opts.network,
+    networkPassphrase: opts.config.networkPassphrase,
+    range: {
+      from: normalizeRangeFrom(opts.from),
+      to: normalizeRangeTo(opts.to),
+    },
+    cap: opts.cap ?? null,
+    targets,
+  });
+}
+
+function describePlanDifferences(saved: ReplayPlanSpec, current: ReplayPlanSpec): string[] {
+  const s = normalizeReplayPlanSpec(saved);
+  const c = normalizeReplayPlanSpec(current);
+  const diffs: string[] = [];
+
+  if (s.network !== c.network || s.networkPassphrase !== c.networkPassphrase) {
+    diffs.push(`network (${s.network} vs ${c.network})`);
+  }
+  if (s.range.from !== c.range.from || s.range.to !== c.range.to) {
+    diffs.push(
+      `range (${s.range.from}..${s.range.to ?? "tip"} vs ${c.range.from}..${c.range.to ?? "tip"})`,
+    );
+  }
+  if (s.cap !== c.cap) {
+    diffs.push(`cap (${s.cap ?? "default"} vs ${c.cap ?? "default"})`);
+  }
+
+  const formatTargets = (ts: readonly ReplayTargetDestination[]): string =>
+    ts.map((t) => `${t.source}:${t.contractId}->${t.destinationChatId ?? "unconfigured"}`).join(",");
+  if (formatTargets(s.targets) !== formatTargets(c.targets)) {
+    diffs.push(`destinations/targets ([${formatTargets(s.targets)}] vs [${formatTargets(c.targets)}])`);
+  }
+
+  return diffs;
+}
+
+export async function loadAndValidateManifestFile(filePath: string): Promise<ReplayManifest> {
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (err: unknown) {
+    throw new Error(
+      `cannot read replay manifest "${filePath}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err: unknown) {
+    throw new Error(
+      `malformed JSON in replay manifest "${filePath}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error(`replay manifest "${filePath}" does not contain a JSON object`);
+  }
+
+  const m = parsed as Partial<ReplayManifest>;
+  if (m.format !== "mimir-replay-manifest-v1" || m.version !== 1) {
+    throw new Error(
+      `incompatible replay manifest format or version in "${filePath}" (expected mimir-replay-manifest-v1 v1)`,
+    );
+  }
+
+  if (typeof m.planDigest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(m.planDigest)) {
+    throw new Error(`replay manifest "${filePath}" has a missing or malformed planDigest`);
+  }
+
+  if (!m.plan || typeof m.plan !== "object" || !Array.isArray(m.plan.targets)) {
+    throw new Error(`replay manifest "${filePath}" is missing its plan specification`);
+  }
+
+  const recomputed = computeReplayPlanDigest(m.plan);
+  if (recomputed !== m.planDigest) {
+    throw new Error(
+      `replay manifest "${filePath}" failed integrity check: recorded planDigest (${m.planDigest}) ` +
+        `does not match its plan contents (${recomputed})`,
+    );
+  }
+
+  return m as ReplayManifest;
 }
 
 export async function loadAndValidateProgressFile(
@@ -790,13 +1020,42 @@ export async function runReplayCli(opts: {
   const dryRun = !boolFlag("send"); // Default is dry-run; --send enables actual sending.
   const asJson = boolFlag("json");
   const progressFile = flag("progress-file");
+  const hasManifestOutFlag = boolFlag("manifest-out");
+  const manifestOutFile = flag("manifest-out");
+  const hasManifestFlag = boolFlag("manifest");
+  const manifestFile = flag("manifest");
+  const hasApprovePlanFlag = boolFlag("approve-plan") || boolFlag("plan-digest");
+  const approvedPlanDigest = flag("approve-plan") ?? flag("plan-digest");
   const rpmRaw = flag("rpm");
   const progress = overrideDeps.progress ?? (asJson ? console.error.bind(console) : console.log.bind(console));
   const safeErr = (err: unknown): string => safeErrorMessage(err, []);
 
   if (!fromRaw) {
     console.error("[replay] error: --from <ledger|cursor> is required");
-    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N]");
+    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--manifest-out <path>] [--send --manifest <path> | --approve-plan <sha256:...>] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N]");
+    return { report: null, exitCode: 2 };
+  }
+
+  if (hasManifestOutFlag && (!manifestOutFile || manifestOutFile.trim().length === 0)) {
+    console.error("[replay] error: --manifest-out requires a file path");
+    return { report: null, exitCode: 2 };
+  }
+  if (hasManifestFlag && (!manifestFile || manifestFile.trim().length === 0)) {
+    console.error("[replay] error: --manifest requires a file path");
+    return { report: null, exitCode: 2 };
+  }
+  if (hasApprovePlanFlag && (!approvedPlanDigest || approvedPlanDigest.trim().length === 0)) {
+    console.error("[replay] error: --approve-plan requires a sha256:<hex> plan digest");
+    return { report: null, exitCode: 2 };
+  }
+  if (!dryRun && manifestOutFile) {
+    console.error(
+      "[replay] error: --manifest-out can only be used in preview (dry-run) mode; generate and review the manifest before running --send",
+    );
+    return { report: null, exitCode: 2 };
+  }
+  if (manifestOutFile && progressFile && path.resolve(manifestOutFile) === path.resolve(progressFile)) {
+    console.error("[replay] error: --manifest-out and --progress-file must not point to the same file");
     return { report: null, exitCode: 2 };
   }
 
@@ -855,23 +1114,14 @@ export async function runReplayCli(opts: {
   }
 
   let config: StellarConfig | BotConfig;
-  let send: ((text: string, source?: ContractSource) => Promise<void>) | undefined;
+  let botConfigForSend: BotConfig | undefined;
 
   try {
     if (!dryRun) {
       // --send mode needs full bot config for Telegram credentials — unless the
       // caller injected a config (test harness) in which case we trust that.
-      const botConfig = (overrideDeps.config as BotConfig | undefined) ?? loadConfig();
-      config = botConfig;
-      if (overrideDeps.send) {
-        send = overrideDeps.send;
-      } else {
-        // Import grammy only when actually sending.
-        const { Bot } = await import("grammy");
-        const { createNotifier } = await import("../bot.js");
-        const bot = new Bot(botConfig.botToken);
-        send = createNotifier(bot, botConfig);
-      }
+      botConfigForSend = (overrideDeps.config as BotConfig | undefined) ?? loadConfig();
+      config = botConfigForSend;
     } else {
       config = overrideDeps.config ?? loadStellarConfig();
     }
@@ -880,18 +1130,129 @@ export async function runReplayCli(opts: {
     return { report: null, exitCode: 1 };
   }
 
-  const server = overrideDeps.server ?? createRpcServer(config);
   const network = networkLabel(config);
+  const requestedContracts: ContractSource[] = contractFilter
+    ? [contractFilter]
+    : ["market", "squad"];
+
+  const planSpec = buildReplayPlanSpec({
+    config,
+    network,
+    from: fromRaw,
+    to: toLedger,
+    cap,
+    contracts: requestedContracts,
+    allowEnvFallback: overrideDeps.config === undefined,
+  });
+  const planDigest = computeReplayPlanDigest(planSpec);
+
+  if (dryRun && manifestOutFile) {
+    const missingDestinations = planSpec.targets.filter((t) => t.destinationChatId === null);
+    if (missingDestinations.length > 0) {
+      console.error(
+        `[replay] error: --manifest-out requires configured Telegram destination chat IDs for [${missingDestinations.map((t) => t.source).join(", ")}] ` +
+          `(set TELEGRAM_CHAT_ID) so preview and --send share the same plan digest`,
+      );
+      return { report: null, exitCode: 2 };
+    }
+  }
+
+  // ── Enforce signed-off manifest / plan digest before sending ───────────────
+
+  let send: ((text: string, source?: ContractSource) => Promise<void>) | undefined;
+  if (!dryRun) {
+    const enforceManifest =
+      overrideDeps.requireManifest === true ||
+      boolFlag("require-manifest") ||
+      manifestFile !== undefined ||
+      approvedPlanDigest !== undefined ||
+      overrideDeps.send === undefined;
+
+    if (enforceManifest) {
+      if (!manifestFile && !approvedPlanDigest) {
+        console.error(
+          `[replay] error: --send requires a signed-off replay manifest (--manifest <path> or --approve-plan <digest>). ` +
+            `Run a dry-run preview first with --manifest-out <path> to review and sign off plan digest ${planDigest}.`,
+        );
+        return { report: null, exitCode: 2 };
+      }
+
+      if (manifestFile) {
+        let manifest: ReplayManifest;
+        try {
+          manifest = await loadAndValidateManifestFile(manifestFile);
+        } catch (err: unknown) {
+          console.error(`[replay] error: ${err instanceof Error ? err.message : String(err)}`);
+          return { report: null, exitCode: 2 };
+        }
+
+        if (manifest.planDigest !== planDigest) {
+          const diffs = describePlanDifferences(manifest.plan, planSpec);
+          const diffSummary =
+            diffs.length > 0
+              ? diffs.join("; ")
+              : `digest (${manifest.planDigest} vs ${planDigest})`;
+          console.error(
+            `[replay] error: replay manifest "${manifestFile}" planDigest (${manifest.planDigest}) ` +
+              `does not match current delivery plan (${planDigest}): ${diffSummary}. ` +
+              `Generate a new preview manifest for the updated range/destinations before sending.`,
+          );
+          return { report: null, exitCode: 2 };
+        }
+
+        if (approvedPlanDigest && approvedPlanDigest.trim() !== manifest.planDigest) {
+          console.error(
+            `[replay] error: --approve-plan (${approvedPlanDigest.trim()}) does not match manifest planDigest (${manifest.planDigest})`,
+          );
+          return { report: null, exitCode: 2 };
+        }
+      }
+
+      if (approvedPlanDigest) {
+        const trimmedDigest = approvedPlanDigest.trim();
+        if (!/^sha256:[0-9a-f]{64}$/.test(trimmedDigest)) {
+          console.error(
+            `[replay] error: invalid plan digest "${trimmedDigest}" (expected sha256:<64 lowercase hex chars>)`,
+          );
+          return { report: null, exitCode: 2 };
+        }
+        if (trimmedDigest !== planDigest) {
+          console.error(
+            `[replay] error: approved plan digest (${trimmedDigest}) does not match current delivery plan (${planDigest}). ` +
+              `Re-run preview to verify range and destinations before sending.`,
+          );
+          return { report: null, exitCode: 2 };
+        }
+      }
+    }
+
+    try {
+      if (overrideDeps.send) {
+        send = overrideDeps.send;
+      } else if (botConfigForSend) {
+        const { Bot } = await import("grammy");
+        const { createNotifier } = await import("../bot.js");
+        const bot = new Bot(botConfigForSend.botToken);
+        send = createNotifier(bot, botConfigForSend);
+      }
+    } catch (err) {
+      console.error(`[replay] config error: ${safeErr(err)}`);
+      return { report: null, exitCode: 1 };
+    }
+  }
+
+  const server = overrideDeps.server ?? createRpcServer(config);
 
   if (!asJson) {
     progress(`[replay] network   ${network} · rpc ${config.rpcUrl}`);
     progress(`[replay] from      ${fromRaw}${toLedger !== undefined ? `  to ${toLedger}` : "  (to chain tip)"}`);
     progress(`[replay] mode      ${dryRun ? "dry-run (use --send to deliver to Telegram)" : "SEND"}`);
+    progress(`[replay] plan      ${planDigest}`);
     if (progressFile) progress(`[replay] progress  ${progressFile}`);
     if (rpm !== undefined) progress(`[replay] rpm       ${rpm}`);
   } else {
     progress(
-      `replay ${network} from=${fromRaw} to=${toLedger ?? "tip"} mode=${dryRun ? "dry-run" : "send"}` +
+      `replay ${network} from=${fromRaw} to=${toLedger ?? "tip"} mode=${dryRun ? "dry-run" : "send"} plan=${planDigest}` +
         (progressFile ? ` progress=${progressFile}` : "") +
         (rpm !== undefined ? ` rpm=${rpm}` : ""),
     );
@@ -906,10 +1267,6 @@ export async function runReplayCli(opts: {
   const targets = contractFilter
     ? allTargets.filter((t) => t.source === contractFilter)
     : allTargets;
-
-  const requestedContracts: ContractSource[] = contractFilter
-    ? [contractFilter]
-    : ["market", "squad"];
 
   // ── Rate limiter budget ───────────────────────────────────────────────────
 
@@ -1043,6 +1400,32 @@ export async function runReplayCli(opts: {
     },
   );
 
+  if (dryRun && manifestOutFile && !fatalError) {
+    try {
+      const manifest: ReplayManifest = {
+        format: "mimir-replay-manifest-v1",
+        version: 1,
+        createdAt: new Date().toISOString(),
+        planDigest,
+        plan: planSpec,
+        preview: {
+          events: totals.events,
+          wouldSend: totals.sent,
+          skipped: totals.skipped,
+          capped: totals.capped,
+          adminLogged: totals.adminLogged,
+          duplicates: totals.duplicates,
+        },
+      };
+      await writeManifestFileAtomic(manifestOutFile, manifest);
+      progress(`[replay] manifest  wrote ${manifestOutFile} (${planDigest})`);
+    } catch (err) {
+      const msg = safeErr(err);
+      progress(`[replay] manifest write failed: ${msg}`);
+      fatalError = msg;
+    }
+  }
+
   const report: ReplayReport = {
     format: "mimir-replay-v1",
     network,
@@ -1050,6 +1433,7 @@ export async function runReplayCli(opts: {
     fromLedger: fromLedger ?? 0,
     toLedger: toLedger ?? null,
     dryRun,
+    planDigest,
     targets: targetResults,
     totals,
   };

@@ -67,7 +67,10 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--from` | `<ledger \| cursor>` | Starting ledger sequence or opaque cursor token (`<TOID>-<index>`). **Required.** | None |
 | `--to` | `<ledger>` | Ending ledger sequence (inclusive upper bound). | Chain tip (`window.latestLedger`) |
 | `--contract` | `market \| squad` | Restrict replay to a single contract. | Both contracts (`market` and `squad`) |
-| `--send` | Boolean flag | Actually dispatch messages to Telegram. Requires valid Telegram credentials in `.env` or process environment. | `false` (dry-run mode is active by default) |
+| `--manifest-out` | `<path>` | Write a preview replay manifest (`mimir-replay-manifest-v1`) recording the deterministic SHA-256 `planDigest` for the requested range, contracts, and Telegram destination chat IDs. Preview-only. | None |
+| `--manifest` | `<path>` | Require and verify a signed-off preview manifest before `--send` dispatches notifications. Refuses delivery when range, contracts, or destinations changed. | Required for CLI `--send` (unless `--approve-plan` is supplied) |
+| `--approve-plan` (`--plan-digest`) | `<sha256:...>` | Explicitly approve a deterministic `planDigest` generated during dry-run preview before `--send` dispatches notifications. | None |
+| `--send` | Boolean flag | Actually dispatch messages to Telegram after verifying `--manifest` or `--approve-plan`. Requires valid Telegram credentials in `.env` or process environment. | `false` (dry-run mode is active by default) |
 | `--dry-run` | Boolean flag | Explicit dry-run flag accepted by CLI parser. Dry-run is active whenever `--send` is omitted. | `true` |
 | `--pages` | `<number>` | Maximum RPC pages to walk per contract. Must be $\ge 1$. | `20` (`EVENT_MAX_PAGES`) |
 | `--cap` | `<number>` | Maximum notifications to send/count per contract. | `config.maxNotificationsPerCycle` in `--send` mode; `20` in dry-run mode |
@@ -135,22 +138,25 @@ Examine the progress output on `stderr` (or human logs on `stdout`):
 
 ### Step 3: Execute the Live Replay
 
-Once the dry-run confirms the event counts and targets, execute live delivery by adding `--send`:
+Once the dry-run confirms the event counts and destination chat IDs, generate a signed-off manifest in preview mode and pass that manifest (or its `planDigest`) when switching to `--send`:
 
 ```bash
-npm run replay -- --from 4226500 --to 4226800 --send
+npm run replay -- --from 4226500 --to 4226800 --manifest-out replay-manifest.json
+npm run replay -- --from 4226500 --to 4226800 --send --manifest replay-manifest.json
 ```
 
-If only one contract had missed events, restrict the replay with `--contract`:
+If only one contract had missed events, restrict both preview and live replay with `--contract` so their plan digests match:
 
 ```bash
-npm run replay -- --from 4226500 --to 4226800 --contract market --send
+npm run replay -- --from 4226500 --to 4226800 --contract market --manifest-out market-manifest.json
+npm run replay -- --from 4226500 --to 4226800 --contract market --send --manifest market-manifest.json
 ```
 
-For wider ranges spanning many pages, expand the page budget:
+For wider ranges spanning many pages, expand the page budget (and include `--cap` in both preview and delivery so the plan digest matches):
 
 ```bash
-npm run replay -- --from 4226500 --to 4230000 --pages 100 --cap 100 --send
+npm run replay -- --from 4226500 --to 4230000 --pages 100 --cap 100 --manifest-out wide-manifest.json
+npm run replay -- --from 4226500 --to 4230000 --pages 100 --cap 100 --send --manifest wide-manifest.json
 ```
 
 ### Step 4: Verify Delivery & Confirm Poller Cursor

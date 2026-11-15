@@ -7,8 +7,8 @@
  * state, and exits after the range is exhausted.
  *
  *   npm run replay -- --from 4226500
- *   npm run replay -- --from 4226500 --to 4226800
- *   npm run replay -- --from 4226500 --send        # actually post to Telegram
+ *   npm run replay -- --from 4226500 --to 4226800 --manifest-out plan.json
+ *   npm run replay -- --from 4226500 --to 4226800 --send --manifest plan.json
  *   npm run replay -- --from 4226500 --json        # machine-readable report
  *   npm run replay -- --from 4226500 --mock        # local mock profile
  *   npm run replay -- --from 4226500 --progress-file progress.json # resumable
