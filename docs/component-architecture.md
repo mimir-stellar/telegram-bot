@@ -139,7 +139,7 @@ The bot uses grammy for Telegram integration with a thin command layer and a sin
 - `/status`: Poller state, chain clock skew, cursors, counters, last error
 - `/health`: Health assessment and operational readiness
 - `/contracts`: Contract IDs and explorer links
-- `/preview`: Preview notification formatting
+- `/preview`: Preview notification formatting (plus operator-gated `/preview digest` and hidden `/digest_preview` to inspect the live pending digest window without consuming events)
 - `/pause`, `/resume`: Operator-only controls (requires `OPERATOR_TELEGRAM_USER_ID`)
 
 **Send path:**

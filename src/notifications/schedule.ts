@@ -111,6 +111,37 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+export interface PendingScheduleWindowInfo {
+  kind: ScheduleKind;
+  windowStartUtc: string | null;
+  nextFlushMs: number;
+  nextFlushUtc: string;
+}
+
+/**
+ * Describe the active pending schedule window in canonical UTC timestamps
+ * without mutating scheduler state.
+ */
+export function describePendingScheduleWindow(
+  scheduleInput: Schedule | string,
+  nowMs: number = Date.now(),
+  windowStartedAtMs?: number | null,
+): PendingScheduleWindowInfo {
+  const schedule =
+    typeof scheduleInput === "string" ? parseSchedule(scheduleInput) : scheduleInput;
+  const nextFlushMs = nextRun(schedule, nowMs);
+  const windowStartUtc =
+    typeof windowStartedAtMs === "number" && Number.isFinite(windowStartedAtMs)
+      ? new Date(windowStartedAtMs).toISOString()
+      : null;
+  return {
+    kind: schedule.kind,
+    windowStartUtc,
+    nextFlushMs,
+    nextFlushUtc: new Date(nextFlushMs).toISOString(),
+  };
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;

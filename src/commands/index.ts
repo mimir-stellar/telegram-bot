@@ -26,6 +26,7 @@ import "./preview.js";
 import "./pause.js";
 import "./resume.js";
 import "./log-export.js"; // hidden: operator log export
+import "./digest-preview.js"; // hidden: operator pending digest preview
 
 export {
   commandMetadata,
@@ -65,3 +66,7 @@ export { previewCommand } from "./preview.js";
 export { resumeCommand, resumeMessage } from "./resume.js";
 export { lastEventMessage, statusCommand, statusMessage } from "./status.js";
 export { logExportCommand } from "./log-export.js";
+export {
+  digestPreviewCommand,
+  renderPendingDigestForCommand,
+} from "./digest-preview.js";

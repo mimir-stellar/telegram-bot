@@ -10,6 +10,8 @@
  */
 
 import { compareEvents, sortEvents, type DecodedEvent } from "../stellar/decode.js";
+import { escapeMd, formatDigest, type FormatDigestOptions } from "./format.js";
+import { describePendingScheduleWindow, type Schedule } from "./schedule.js";
 
 export interface DigestGroup {
   /**
@@ -75,4 +77,140 @@ export function groupDigestEvents(events: readonly DecodedEvent[]): DigestGroup[
     groups.push({ key, events: sortEvents(raw) });
   }
   return groups;
+}
+
+export const DEFAULT_PENDING_DIGEST_CAP = 500;
+
+export interface PendingDigestSnapshot {
+  /** Snapshot of queued events in the current pending digest window. */
+  events: readonly DecodedEvent[];
+  /** Optional UTC millisecond timestamp when the current window opened. */
+  windowStartedAtMs?: number | null;
+  /** Optional active schedule spec or parsed schedule. */
+  schedule?: Schedule | string;
+  /** Count of overflow events dropped if the pending cap was reached. */
+  droppedCount?: number;
+}
+
+export interface PendingDigestWindow {
+  append(events: DecodedEvent | readonly DecodedEvent[]): void;
+  /** Non-destructive snapshot of the pending digest window (does not consume events). */
+  peek(): PendingDigestSnapshot;
+  /** Consume and reset the pending digest window for scheduled delivery. */
+  drain(nowMs?: number): PendingDigestSnapshot;
+  size(): number;
+}
+
+export interface PendingDigestWindowOptions {
+  schedule?: Schedule | string;
+  maxEvents?: number;
+  now?: () => number;
+}
+
+export function createPendingDigestWindow(
+  options: PendingDigestWindowOptions = {},
+): PendingDigestWindow {
+  const maxEvents = Math.max(1, options.maxEvents ?? DEFAULT_PENDING_DIGEST_CAP);
+  const now = options.now ?? Date.now;
+  let buffer: DecodedEvent[] = [];
+  let windowStartedAtMs: number | null = null;
+  let droppedCount = 0;
+
+  return {
+    append(input) {
+      const items = Array.isArray(input) ? input : [input];
+      if (items.length === 0) return;
+      if (windowStartedAtMs === null) {
+        windowStartedAtMs = now();
+      }
+      for (const item of items) {
+        if (buffer.length < maxEvents) {
+          buffer.push(item);
+        } else {
+          droppedCount += 1;
+        }
+      }
+    },
+    peek() {
+      return {
+        events: [...buffer],
+        windowStartedAtMs,
+        schedule: options.schedule,
+        droppedCount,
+      };
+    },
+    drain(nowMs = now()) {
+      const snapshot: PendingDigestSnapshot = {
+        events: [...buffer],
+        windowStartedAtMs,
+        schedule: options.schedule,
+        droppedCount,
+      };
+      buffer = [];
+      windowStartedAtMs = nowMs;
+      droppedCount = 0;
+      return snapshot;
+    },
+    size() {
+      return buffer.length;
+    },
+  };
+}
+
+export interface OperatorDigestPreviewOptions {
+  grouped?: boolean;
+  nowMs?: number;
+}
+
+function isPendingDigestWindow(
+  source: PendingDigestWindow | PendingDigestSnapshot,
+): source is PendingDigestWindow {
+  return typeof (source as PendingDigestWindow).peek === "function";
+}
+
+/**
+ * Render an operator-facing MarkdownV2 preview of the current pending digest
+ * window using the live {@link formatDigest} / {@link groupDigestEvents}
+ * pipeline without consuming or mutating queued events.
+ */
+export function renderOperatorDigestPreview(
+  source: PendingDigestWindow | PendingDigestSnapshot,
+  options: OperatorDigestPreviewOptions = {},
+): string {
+  const snapshot = isPendingDigestWindow(source) ? source.peek() : source;
+  const events = [...snapshot.events];
+  const grouped = options.grouped ?? true;
+  const formatOpts: FormatDigestOptions = { grouped };
+  const groupCount = groupDigestEvents(events).length;
+  const headerLines = [
+    `*${escapeMd("[PREVIEW MODE]")}* — Pending Digest Window`,
+    escapeMd(
+      `Pending events: ${events.length} (${groupCount} ${groupCount === 1 ? "group" : "groups"})`,
+    ),
+  ];
+
+  if (snapshot.schedule !== undefined) {
+    const windowInfo = describePendingScheduleWindow(
+      snapshot.schedule,
+      options.nowMs ?? Date.now(),
+      snapshot.windowStartedAtMs,
+    );
+    if (windowInfo.windowStartUtc) {
+      headerLines.push(escapeMd(`Window start (UTC): ${windowInfo.windowStartUtc}`));
+    }
+    headerLines.push(escapeMd(`Next scheduled flush (UTC): ${windowInfo.nextFlushUtc}`));
+  }
+
+  if ((snapshot.droppedCount ?? 0) > 0) {
+    headerLines.push(
+      escapeMd(`Overflow omitted from pending window: ${snapshot.droppedCount}`),
+    );
+  }
+
+  const liveDigest = formatDigest(events, formatOpts);
+  if (liveDigest === null) {
+    return [...headerLines, "", `_${escapeMd("No pending events in the current digest window.")}_`].join("\n");
+  }
+
+  return [...headerLines, "", liveDigest].join("\n");
 }
