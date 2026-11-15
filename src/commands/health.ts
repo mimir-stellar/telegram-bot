@@ -27,10 +27,16 @@ export function healthMessage(
   const report = buildHealthReport(config, status, nowMs);
   const statusLabel = report.status.toUpperCase();
 
+  const statusNote = report.ok
+    ? "ok"
+    : report.status === "draining"
+      ? "draining"
+      : "action required";
+
   const lines: string[] = [
     `*Health* — ${escapeMd(statusLabel)} on Stellar ${networkLabel(config)}`,
     "",
-    `Status: \`${report.status}\` \\(${report.ok ? "ok" : "action required"}\\)`,
+    `Status: \`${report.status}\` \\(${statusNote}\\)`,
     `Poller: ${report.poller.running ? "running" : "stopped"}`,
     `Uptime: ${report.uptimeMs > 0 ? ago(nowMs - report.uptimeMs, nowMs) : "0s"}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,

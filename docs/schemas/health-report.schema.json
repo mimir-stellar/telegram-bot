@@ -8,8 +8,8 @@
   "properties": {
     "ok": { "type": "boolean", "description": "True exactly when status is \"ok\"." },
     "status": {
-      "enum": ["ok", "degraded", "stopped"],
-      "description": "\"ok\" while running, including an operator pause or a graceful drain; \"degraded\" when polls are stale, failing, or a cursor is stale or stalled; \"stopped\" when the poller is not running."
+      "enum": ["ok", "draining", "degraded", "stopped"],
+      "description": "\"ok\" while running and ready, including an operator pause; \"draining\" while a graceful shutdown readiness transition or poller drain is active (readiness false, liveness still true); \"degraded\" when polls are stale, failing, or a cursor is stale or stalled; \"stopped\" when the poller is not running."
     },
     "service": { "enum": ["mimir-telegram-bot"] },
     "version": { "type": "string", "description": "Semver from package.json, or \"unknown\"." },

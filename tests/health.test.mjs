@@ -266,7 +266,7 @@ test("GET /health boundary: first boot before any success stays ok", () => {
 
 test("buildHealthReport surfaces a draining shutdown without calling it degraded", () => {
   // Stale success + repeated failures would be degraded for a running poller;
-  // a deliberate drain is doing what it was told to do.
+  // a deliberate drain marks readiness false ("draining") rather than "degraded".
   const report = buildHealthReport(
     baseConfig({ healthStaleMs: 1 }),
     baseStatus({
@@ -280,8 +280,8 @@ test("buildHealthReport surfaces a draining shutdown without calling it degraded
     5_500,
   );
 
-  assert.equal(report.ok, true);
-  assert.equal(report.status, "ok");
+  assert.equal(report.ok, false);
+  assert.equal(report.status, "draining");
   assert.equal(report.poller.stopping, true);
   assert.equal(report.poller.pendingFlush, true);
   assert.equal(report.poller.notificationsDropped, 3);

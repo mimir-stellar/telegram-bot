@@ -43,13 +43,26 @@ export interface HealthServer {
   url: string | null;
   /** Port actually bound (0 when disabled). */
   port: number;
+  /** True once {@link beginShutdown} has marked readiness false during drain. */
+  readonly draining: boolean;
+  /**
+   * Transition readiness (`/health`, `/healthz`) to false (`status: "draining"`,
+   * HTTP 503) and stop accepting operational HTTP work (such as webhook updates)
+   * while keeping liveness (`/health/live`, `/livez`) true (HTTP 200).
+   */
+  beginShutdown(): void;
   close(): Promise<void>;
+}
+
+export interface BuildHealthReportOptions {
+  /** Explicit server-level drain flag set before polling stops. */
+  draining?: boolean;
 }
 
 /** Safe, redacted snapshot for HTTP clients. Never includes secrets. */
 export interface HealthReport {
   ok: boolean;
-  status: "ok" | "degraded" | "stopped";
+  status: "ok" | "draining" | "degraded" | "stopped";
   service: "mimir-telegram-bot";
   /** Semver string from `package.json`, or `"unknown"` if unavailable. */
   version: string;
@@ -241,6 +254,9 @@ export function chainClockLabel(chainClockAt: number | null | undefined, nowMs: 
  * - `ok` / HTTP 200 when the poller is running and has not exceeded the
  *   consecutive-failure budget (and, once it has succeeded at least once,
  *   a successful poll happened within `healthStaleMs`).
+ * - `draining` / HTTP 503 when a graceful shutdown readiness transition is
+ *   active (`options.draining` or `poller.stopping`), so supervisors stop
+ *   routing traffic without treating the process as degraded or dead.
  * - `degraded` / HTTP 503 when running but stale or failing repeatedly.
  * - `stopped` / HTTP 503 when the poller is not running.
  */
@@ -249,6 +265,7 @@ export function buildHealthReport(
   poller: PollerStatus,
   nowMs: number = Date.now(),
   provenance: ConfigProvenance = configProvenance(),
+  options: BuildHealthReportOptions = {},
 ): HealthReport {
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
   // Tolerate a status snapshot that never learned about the chain clock (and
@@ -261,11 +278,9 @@ export function buildHealthReport(
   let status: HealthReport["status"];
   if (!poller.running) {
     status = "stopped";
-  } else if (poller.stopping === true) {
-    // A deliberate drain is doing exactly what it was asked to do. It is not a
-    // stale or failing poller, and `poller.stopping` is how clients tell the
-    // difference from an operator pause.
-    status = "ok";
+  } else if (options.draining === true || poller.stopping === true) {
+    // Readiness becomes false during drain without reporting a fault ("degraded").
+    status = "draining";
   } else if (poller.paused) {
     // A deliberate operator pause is healthy, not a stale or failing poller.
     status = "ok";
@@ -469,6 +484,64 @@ function sendUnauthorized(res: http.ServerResponse): void {
   res.end();
 }
 
+export interface GracefulShutdownHooks {
+  healthServer: Pick<HealthServer, "beginShutdown" | "close">;
+  drainPoller: () => Promise<void>;
+  stopBot?: () => Promise<void>;
+  closeMetrics?: () => Promise<void>;
+  flushAudit?: () => Promise<void>;
+  onError?: (stage: "poller" | "bot" | "health" | "metrics" | "audit", err: unknown) => void;
+}
+
+/**
+ * Execute the ordered shutdown sequence:
+ * 1. Mark readiness false and stop accepting HTTP operational work (`beginShutdown`)
+ *    BEFORE stopping polling.
+ * 2. Drain polling and flush cursor state (`drainPoller`).
+ * 3. Stop Telegram update intake (`stopBot`) before closing the HTTP server.
+ * 4. Close the health HTTP listener (`healthServer.close`), metrics listener,
+ *    and flush buffered audit entries.
+ */
+export async function runGracefulShutdownSequence(hooks: GracefulShutdownHooks): Promise<void> {
+  hooks.healthServer.beginShutdown();
+
+  try {
+    await hooks.drainPoller();
+  } catch (err: unknown) {
+    hooks.onError?.("poller", err);
+  }
+
+  if (hooks.stopBot) {
+    try {
+      await hooks.stopBot();
+    } catch (err: unknown) {
+      hooks.onError?.("bot", err);
+    }
+  }
+
+  try {
+    await hooks.healthServer.close();
+  } catch (err: unknown) {
+    hooks.onError?.("health", err);
+  }
+
+  if (hooks.closeMetrics) {
+    try {
+      await hooks.closeMetrics();
+    } catch (err: unknown) {
+      hooks.onError?.("metrics", err);
+    }
+  }
+
+  if (hooks.flushAudit) {
+    try {
+      await hooks.flushAudit();
+    } catch (err: unknown) {
+      hooks.onError?.("audit", err);
+    }
+  }
+}
+
 /**
  * Start the local health HTTP server.
  *
@@ -476,18 +549,42 @@ function sendUnauthorized(res: http.ServerResponse): void {
  * useful for unit tests and one-shot CLI runs that must not bind a port.
  */
 export function startHealthServer(deps: HealthDeps): HealthServer {
-  const { config, status, logs } = deps;
+  const { config, status, logs, webhookHandler } = deps;
   const now = deps.now ?? Date.now;
   const provenance = deps.provenance ?? configProvenance;
+  let draining = false;
 
   if (config.healthPort === 0) {
     console.log("[health] disabled (HEALTH_PORT=0)");
-    return { url: null, port: 0, close: async () => undefined };
+    return {
+      url: null,
+      port: 0,
+      get draining() {
+        return draining;
+      },
+      beginShutdown() {
+        draining = true;
+      },
+      close: async () => undefined,
+    };
   }
 
   const server = http.createServer((req, res) => {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
+
+    // Telegram webhook route uses X-Telegram-Bot-Api-Secret-Token (validated by
+    // webhookHandler) rather than HEALTH_AUTH_TOKEN. Reject operational webhook
+    // updates immediately once shutdown draining begins.
+    if (method === "POST" && url.pathname === "/telegram-webhook" && webhookHandler !== undefined) {
+      const current = status();
+      if (draining || current.stopping === true || !current.running) {
+        sendJson(res, 503, { ok: false, error: "shutting_down" });
+        return;
+      }
+      webhookHandler(req, res);
+      return;
+    }
 
     // Check authentication for all routes when token is configured
     if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
@@ -496,14 +593,15 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     }
 
     if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
-      const report = buildHealthReport(config, status(), now(), provenance());
+      const report = buildHealthReport(config, status(), now(), provenance(), { draining });
       sendJson(res, report.ok ? 200 : 503, report);
       return;
     }
 
     if (method === "GET" && (url.pathname === "/health/live" || url.pathname === "/livez")) {
       // Liveness: the process is up and the HTTP server can answer. Do not
-      // reflect poller degradation here — supervisors use /health for that.
+      // reflect poller degradation or drain readiness here — supervisors use
+      // /health for readiness and /health/live for restart decisions.
       sendJson(res, 200, {
         ok: true,
         status: "live",
@@ -556,6 +654,12 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   return {
     url,
     port,
+    get draining() {
+      return draining;
+    },
+    beginShutdown() {
+      draining = true;
+    },
     close: () =>
       new Promise((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));

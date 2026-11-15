@@ -70,7 +70,7 @@ is the machine-readable signal; the JSON body adds detail.
 |---|---|---|---|
 | Poller running, recent successful poll | `"ok"` | `true` | 200 |
 | Poller running but paused by operator | `"ok"` | `true` | 200 |
-| Poller draining (graceful shutdown) | `"ok"` | `true` | 200 |
+| Shutdown readiness transition / poller draining | `"draining"` | `false` | 503 |
 | Too many consecutive failures, stale, stale/stalled cursor | `"degraded"` | `false` | 503 |
 | Poller not running | `"stopped"` | `false` | 503 |
 
@@ -79,7 +79,7 @@ is the machine-readable signal; the JSON body adds detail.
 ```jsonc
 {
   "ok": true,                          // true only when status === "ok"
-  "status": "ok",                      // "ok" | "degraded" | "stopped"
+  "status": "ok",                      // "ok" | "draining" | "degraded" | "stopped"
   "service": "mimir-telegram-bot",
   "version": "0.1.0",
   "network": "testnet",
@@ -264,6 +264,7 @@ processing the update. A missing or wrong header returns 401.
 | Update processed | 200 |
 | Wrong or missing secret | 401 |
 | Long-polling mode active (no webhook handler) | 404 |
+| Shutdown drain in progress (`{ "ok": false, "error": "shutting_down" }`) | 503 |
 
 The secret is regenerated on every process start and never written to disk or
 logged. Do not configure a static secret at the proxy layer — forward the
@@ -367,7 +368,7 @@ methods (`Allow: GET` header set).
 | Health | GET | `/health/live` | 200 | Liveness only (no poller state) |
 | Health | GET | `/livez` | 200 | Alias for `/health/live` |
 | Health | GET | `/metrics` | 200 | Prometheus text (poller-level) |
-| Health | POST | `/telegram-webhook` | 200, 401, 404 | Webhook updates (webhook mode only) |
+| Health | POST | `/telegram-webhook` | 200, 401, 404, 503 | Webhook updates (webhook mode; 503 while draining) |
 | Health | GET | `<other>` | 404 | — |
 | Metrics | GET | `/metrics` | 200 | Prometheus text (registry-level) |
 | Metrics | GET | `/health` | 200 | Plain-text liveness |

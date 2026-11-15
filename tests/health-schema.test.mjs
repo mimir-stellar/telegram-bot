@@ -268,7 +268,8 @@ test("stopped, paused, draining and channel-preview reports match the schema", (
     served({ ...healthyStatus(), stopping: true }, provenanceDerivedAndEmpty),
     served(healthyStatus(), provenanceDerivedAndEmpty, config({ channelPreviewMode: true })),
   ];
-  assert.deepEqual(reports.map((r) => r.status), ["stopped", "ok", "ok", "ok"]);
+  assert.deepEqual(reports.map((r) => r.status), ["stopped", "ok", "draining", "ok"]);
+  assert.deepEqual(reports.map((r) => r.ok), [false, true, false, true]);
   assert.equal(reports[3].poller.channelPreviewMode, true);
   for (const report of reports) assert.deepEqual(validate(schema, report), []);
 });
@@ -333,7 +334,7 @@ test("removing, renaming or retyping a field fails validation", () => {
   const unknownStatus = structuredClone(base);
   unknownStatus.status = "warning";
   assert.deepEqual(validate(schema, unknownStatus), [
-    '$.status: "warning" is not one of "ok", "degraded", "stopped"',
+    '$.status: "warning" is not one of "ok", "draining", "degraded", "stopped"',
   ]);
 });
 

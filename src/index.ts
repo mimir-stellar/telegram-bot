@@ -25,7 +25,7 @@ import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
 import { attachConsole, createLogCapture, Logger, secretsFor } from "./logger.js";
 import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
-import { startHealthServer } from "./health.js";
+import { runGracefulShutdownSequence, startHealthServer } from "./health.js";
 import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
 import { safeErrorMessage } from "./notifications/format.js";
@@ -367,61 +367,61 @@ async function main(): Promise<void> {
     }, teardownBudgetMs);
     watchdog.unref();
 
+    // Mark readiness false and reject incoming operational HTTP work immediately,
+    // before polling stops or the HTTP listener closes.
+    healthServer.beginShutdown();
+
     void (async () => {
-      try {
-        const result = await poller.shutdown();
-        Logger.info(
-          "shutdown",
-          `[shutdown] poller ${result.drained ? "drained" : "hit the drain deadline"}; ` +
-            `cursor ${result.flushed ? "flushed" : "flush failed"} after ${result.waitedMs}ms`,
-          {
-            drained: result.drained,
-            cursorFlushed: result.flushed,
-            waitedMs: result.waitedMs,
-          },
-        );
-      } catch (err: unknown) {
-        Logger.error(
-          "shutdown",
-          `[shutdown] poller drain failed: ${safeErrorMessage(err)}`,
-          { action: "drain_failed" },
-        );
-      }
-
-      try {
-        await healthServer.close();
-      } catch (err: unknown) {
-        Logger.error(
-          "shutdown",
-          `[shutdown] health server close failed: ${safeErrorMessage(err)}`,
-          { action: "health_close_failed" },
-        );
-      }
-
-      try {
-        await bot.stop();
-      } catch (err: unknown) {
-        Logger.error(
-          "shutdown",
-          `[shutdown] telegram stop failed: ${safeErrorMessage(err, [config.botToken])}`,
-          { action: "telegram_stop_failed" },
-        );
-      }
-
-      if (metricsServer) {
-        try {
-          await metricsServer.close();
-        } catch (err: unknown) {
-          Logger.error(
+      await runGracefulShutdownSequence({
+        healthServer,
+        drainPoller: async () => {
+          const result = await poller.shutdown();
+          Logger.info(
             "shutdown",
-            `[shutdown] metrics server close failed: ${safeErrorMessage(err)}`,
-            { action: "metrics_close_failed" },
+            `[shutdown] poller ${result.drained ? "drained" : "hit the drain deadline"}; ` +
+              `cursor ${result.flushed ? "flushed" : "flush failed"} after ${result.waitedMs}ms`,
+            {
+              drained: result.drained,
+              cursorFlushed: result.flushed,
+              waitedMs: result.waitedMs,
+            },
           );
-        }
-      }
-
-      // Flush last so entries recorded while stopping are persisted.
-      await poller.flushAuditFile().catch(() => undefined);
+        },
+        stopBot: async () => {
+          await bot.stop();
+        },
+        closeMetrics: metricsServer ? async () => metricsServer.close() : undefined,
+        flushAudit: async () => {
+          await poller.flushAuditFile();
+        },
+        onError: (stage, err) => {
+          if (stage === "poller") {
+            Logger.error(
+              "shutdown",
+              `[shutdown] poller drain failed: ${safeErrorMessage(err)}`,
+              { action: "drain_failed" },
+            );
+          } else if (stage === "bot") {
+            Logger.error(
+              "shutdown",
+              `[shutdown] telegram stop failed: ${safeErrorMessage(err, [config.botToken])}`,
+              { action: "telegram_stop_failed" },
+            );
+          } else if (stage === "health") {
+            Logger.error(
+              "shutdown",
+              `[shutdown] health server close failed: ${safeErrorMessage(err)}`,
+              { action: "health_close_failed" },
+            );
+          } else if (stage === "metrics") {
+            Logger.error(
+              "shutdown",
+              `[shutdown] metrics server close failed: ${safeErrorMessage(err)}`,
+              { action: "metrics_close_failed" },
+            );
+          }
+        },
+      });
       process.exit(0);
     })();
   };
