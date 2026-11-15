@@ -27,7 +27,7 @@ import {
 import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
 import { iconForCategory } from "./category-icons.js";
-import { groupDigestEvents } from "./digest-grouping.js";
+import { groupDigestEvents, sortDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
@@ -376,7 +376,7 @@ export function formatDigest(
 ): string | null {
   if (events.length === 0) return null;
   if (options.grouped) return renderGroupedDigest(events);
-  const lines = events.map(flatLine);
+  const lines = sortDigestEvents(events).map(flatLine);
   return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
 }
 
