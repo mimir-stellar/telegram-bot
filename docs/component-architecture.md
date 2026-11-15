@@ -130,6 +130,15 @@ Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's
 - **Explorer links**: Includes transaction links to stellar.expert
 - **Preview mode**: Optional `[PREVIEW MODE]` badge for testing
 
+### Atom Feed Builder (`src/stellar/feed.ts`)
+
+Renders decoded contract events into RFC 4287 Atom 1.0 XML documents (`buildAtomFeed`, `buildAtomEntry`, `buildAtomEntryId`).
+
+**Key properties:**
+- **Presentation-independent entry IDs**: Each `<entry><id>` (`tag:mimir,event:<network>:<contract>:<chainEventId>`) is derived strictly from the Stellar network (`testnet`, `mainnet`, `futurenet`, or hashed custom passphrase), contract ID, and chain event identity (`eventId` / `eventKey` / ledger-transaction coordinates) — never from wording templates, locale, explorer/app URLs, or rendered copy
+- **XML safety**: Strips XML-illegal C0 controls and escapes all five predefined XML entities
+- **Verified HTTPS links**: Embeds sanitized `https:` explorer links (`rel="alternate"`) and optional Mimir web-app deep links (`rel="related"` via `src/notifications/app-links.ts`)
+
 ### Telegram Integration (`src/bot.ts`)
 
 The bot uses grammy for Telegram integration with a thin command layer and a single send path for the poller.

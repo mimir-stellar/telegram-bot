@@ -11,9 +11,12 @@
  *   https://www.rfc-editor.org/rfc/rfc4287
  */
 
+import { createHash } from "node:crypto";
+import { eventKey, type DedupableEvent } from "../dedup.js";
+import { NETWORK_PASSPHRASES, type StellarConfig } from "../config.js";
+import { appUrlFor } from "../notifications/app-links.js";
 import { formatPlainTextEvent, eventExplorerUrl } from "../notifications/format.js";
 import type { DecodedEvent } from "./decode.js";
-import type { StellarConfig } from "../config.js";
 
 // ---------------------------------------------------------------------------
 // XML escaping
@@ -80,6 +83,124 @@ export function safeHttpsUrl(url: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Stable chain-derived entry identifiers (independent of presentation text)
+// ---------------------------------------------------------------------------
+
+function sanitizeTagSegment(raw: string): string {
+  // Keep standard URI unreserved + colon characters intact; percent-encode anything else.
+  return raw.replace(/[^A-Za-z0-9._~:-]/g, (ch) => encodeURIComponent(ch));
+}
+
+function positionSegment(value: unknown): string {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value).toString();
+  }
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
+    return value.trim();
+  }
+  return "na";
+}
+
+/**
+ * Derive a canonical, presentation-independent network token from Stellar config.
+ * Named networks map to `testnet`, `mainnet`, or `futurenet`; custom passphrases
+ * map to `custom-<sha256_12>` so distinct private networks never collide.
+ */
+export function canonicalFeedNetworkId(config: StellarConfig): string {
+  const passphrase = (config.networkPassphrase ?? "").trim();
+  if (passphrase === NETWORK_PASSPHRASES.testnet) return "testnet";
+  if (passphrase === NETWORK_PASSPHRASES.mainnet) return "mainnet";
+  if (passphrase === NETWORK_PASSPHRASES.futurenet) return "futurenet";
+  if (passphrase.length > 0) {
+    const digest = createHash("sha256").update(passphrase, "utf8").digest("hex").slice(0, 12);
+    return `custom-${digest}`;
+  }
+  if (
+    config.network === "testnet" ||
+    config.network === "mainnet" ||
+    config.network === "futurenet"
+  ) {
+    return config.network;
+  }
+  return "unknown";
+}
+
+/**
+ * Derive a canonical contract token from the decoded event (falling back to the
+ * configured contract for `event.source` when absent).
+ */
+export function canonicalFeedContractId(event: DecodedEvent, config: StellarConfig): string {
+  const direct = (event.contractId ?? "").trim();
+  if (direct.length > 0) {
+    const normalized = /^[GC][A-Z2-7]{55}$/i.test(direct) ? direct.toUpperCase() : direct;
+    return sanitizeTagSegment(normalized);
+  }
+  const fallback =
+    event.source === "market"
+      ? (config.marketContractId ?? "").trim()
+      : event.source === "squad"
+        ? (config.squadContractId ?? "").trim()
+        : "";
+  if (fallback.length > 0) {
+    const normalized = /^[GC][A-Z2-7]{55}$/i.test(fallback) ? fallback.toUpperCase() : fallback;
+    return sanitizeTagSegment(normalized);
+  }
+  return sanitizeTagSegment((event.source || "unknown").trim());
+}
+
+/**
+ * Derive the chain-level event identity without consulting any presentation
+ * fields (`payload` text, locale, explorer URL, app URL, or wording templates).
+ */
+export function canonicalChainEventIdentity(
+  event: DecodedEvent & Partial<Pick<DedupableEvent, "id" | "topic">>,
+): string {
+  const trimmedEventId = typeof event.eventId === "string" ? event.eventId.trim() : "";
+  const trimmedRawId = typeof event.id === "string" ? event.id.trim() : undefined;
+
+  const key = eventKey({
+    id: trimmedRawId,
+    eventId: trimmedEventId,
+    ledger: event.ledger,
+    txHash: event.txHash,
+    transactionIndex: event.transactionIndex,
+    operationIndex: event.operationIndex,
+    topic: event.topic,
+  });
+  if (key !== null) {
+    return sanitizeTagSegment(key);
+  }
+
+  const ledgerSeg = positionSegment(event.ledger);
+  const txSeg =
+    typeof event.txHash === "string" && event.txHash.trim().length > 0
+      ? sanitizeTagSegment(event.txHash.trim().toLowerCase())
+      : "none";
+  const txIdxSeg = positionSegment(event.transactionIndex);
+  const opIdxSeg = positionSegment(event.operationIndex);
+  return `coord:${ledgerSeg}:${txSeg}:${txIdxSeg}:${opIdxSeg}`;
+}
+
+/**
+ * Build a permanent Atom `<id>` tag URI anchored exclusively to:
+ *   1. Stellar network identity (`testnet` / `mainnet` / `futurenet` / `custom-<hash>`)
+ *   2. Emitting contract identity (`contractId`)
+ *   3. Chain event identity (`eventId` / `eventKey` / chain coordinates)
+ *
+ * Presentation changes (locale, wording templates, titles, explorer/app URLs,
+ * or decoded payload copy) never alter the returned `<id>`.
+ */
+export function buildAtomEntryId(event: DecodedEvent, config: StellarConfig): string {
+  const networkId = canonicalFeedNetworkId(config);
+  const contractId = canonicalFeedContractId(event, config);
+  const chainEventId = canonicalChainEventIdentity(event);
+  return `tag:mimir,event:${networkId}:${contractId}:${chainEventId}`;
+}
+
+// ---------------------------------------------------------------------------
 // Feed entry
 // ---------------------------------------------------------------------------
 
@@ -94,13 +215,24 @@ export interface AtomEntry {
   content: string | null;
   /** RFC 4287 §4.2.7: alternate link (explorer URL), or null when absent. */
   link: string | null;
+  /** Optional sanitized HTTPS Mimir web-app deep link when configured. */
+  appLink?: string | null;
+}
+
+export interface AtomEntryRenderOptions {
+  /** Optional Mimir web-app base URL (`MIMIR_APP_URL`) for `rel="related"` deep links. */
+  mimirAppUrl?: string | null;
+  /** Optional custom title wording template (does not affect `entry.id`). */
+  formatTitle?: (event: DecodedEvent, config: StellarConfig) => string;
+  /** Optional custom plain-text body wording template (does not affect `entry.id`). */
+  formatContent?: (config: StellarConfig, event: DecodedEvent) => string | null;
 }
 
 // ---------------------------------------------------------------------------
 // Feed document
 // ---------------------------------------------------------------------------
 
-export interface AtomFeedOptions {
+export interface AtomFeedOptions extends AtomEntryRenderOptions {
   /** `<title>` for the feed (e.g. "Mimir Events"). */
   title: string;
   /** Canonical URL of this feed document, used as `<id>` and `<link rel="self">`. */
@@ -120,20 +252,23 @@ export interface AtomFeedOptions {
 /**
  * Build one `<entry>` element from a decoded event.
  *
- * The entry id is a stable tag URI derived from the event id so it is both
- * unique and dereferenceable: `tag:mimir,event:<eventId>`.
- * The title is the event name (payload.name).
- * The content is the plain-text rendering, bounded to {@link FEED_CONTENT_MAX_CHARS}.
- * The link is the explorer URL when one exists.
- * The updated timestamp comes from `event.at` (ledger close time).
+ * The entry id is a stable tag URI derived strictly from network, contract, and
+ * chain event identity (`tag:mimir,event:<network>:<contract>:<chainEventId>`),
+ * independent of wording templates or presentation text.
  */
-export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): AtomEntry {
+export function buildAtomEntry(
+  event: DecodedEvent,
+  config: StellarConfig,
+  renderOptions?: AtomEntryRenderOptions,
+): AtomEntry {
   const eventName =
     event.payload.name === "unknown"
       ? (event.payload.eventName ?? "unknown")
       : event.payload.name;
 
-  const title = `mimir-${event.source}: ${eventName}`;
+  const title = renderOptions?.formatTitle
+    ? renderOptions.formatTitle(event, config)
+    : `mimir-${event.source}: ${eventName}`;
 
   // Use ledger close time if available and looks reasonable (> Unix epoch start),
   // otherwise fall back to a synthetic epoch-based value.
@@ -143,7 +278,8 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
       : new Date(0);
   const updated = updatedDate.toISOString();
 
-  const rawContent = formatPlainTextEvent(config, event);
+  const contentRenderer = renderOptions?.formatContent ?? formatPlainTextEvent;
+  const rawContent = contentRenderer(config, event);
   const content =
     rawContent !== null
       ? Array.from(rawContent).slice(0, FEED_CONTENT_MAX_CHARS).join("")
@@ -152,13 +288,24 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
   const explorerUrl = eventExplorerUrl(config, event);
   const link = explorerUrl ? safeHttpsUrl(explorerUrl) : null;
 
-  return {
-    id: `tag:mimir,event:${event.eventId}`,
+  const resolvedAppBase =
+    renderOptions?.mimirAppUrl ??
+    (config as { mimirAppUrl?: string | null }).mimirAppUrl ??
+    null;
+  const rawAppUrl = appUrlFor(event, resolvedAppBase);
+  const appLink = rawAppUrl ? safeHttpsUrl(rawAppUrl) : null;
+
+  const entry: AtomEntry = {
+    id: buildAtomEntryId(event, config),
     title,
     updated,
     content,
     link,
   };
+  if (appLink !== null) {
+    entry.appLink = appLink;
+  }
+  return entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +322,10 @@ function renderEntry(entry: AtomEntry): string {
       ? `    <link rel="alternate" type="text/html" href="${escapeXml(entry.link)}"/>`
       : "";
 
+  const appLinkEl = entry.appLink
+    ? `    <link rel="related" type="text/html" href="${escapeXml(entry.appLink)}"/>`
+    : "";
+
   const contentEl =
     entry.content !== null
       ? `    <content type="text">${xmlText(entry.content, FEED_CONTENT_MAX_CHARS)}</content>`
@@ -186,6 +337,7 @@ function renderEntry(entry: AtomEntry): string {
     idEl,
     updatedEl,
     linkEl,
+    appLinkEl,
     contentEl,
     "  </entry>",
   ]
@@ -246,7 +398,7 @@ export function buildAtomFeed(
   }
 
   for (const event of events) {
-    const entry = buildAtomEntry(event, config);
+    const entry = buildAtomEntry(event, config, options);
     lines.push(renderEntry(entry));
   }
 
