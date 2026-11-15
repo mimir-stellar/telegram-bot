@@ -53,6 +53,8 @@ export interface DeadLetterStats {
   enqueued: number;
   replayed: number;
   dropped: number;
+  /** Entries evicted because their age exceeded `maxAgeMs`. */
+  expired: number;
 }
 
 export interface DeadLetterQueueOptions {
@@ -66,6 +68,12 @@ export interface DeadLetterQueueOptions {
   maxEntries: number;
   maxAttempts: number;
   /**
+   * Optional maximum retention age in milliseconds. `null`, `0`, or omitted
+   * disables age-based eviction (count-only retention). Positive values are
+   * bounded to `[DEAD_LETTER_MIN_AGE_MS, DEAD_LETTER_MAX_AGE_MS]`.
+   */
+  maxAgeMs?: number | null | undefined;
+  /**
    * Config secrets to scrub from a recorded error, passed straight to
    * `safeErrorMessage`. The poller hands over its bot token: a Telegram failure
    * routinely embeds the token in the request URL, and main's shape rule
@@ -75,10 +83,36 @@ export interface DeadLetterQueueOptions {
   secrets?: readonly string[];
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /** Suppress informational console output (used by machine-readable CLI modes). */
+  quiet?: boolean;
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
+/** Minimum configurable positive retention window (1 second). */
+export const DEAD_LETTER_MIN_AGE_MS = 1_000;
+/** Maximum configurable retention window (90 days). */
+export const DEAD_LETTER_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1_000;
+
+/**
+ * Normalize an optional `maxAgeMs` setting into either `null` (disabled) or an
+ * integer bounded within `[DEAD_LETTER_MIN_AGE_MS, DEAD_LETTER_MAX_AGE_MS]`.
+ */
+export function resolveDeadLetterMaxAgeMs(
+  maxAgeMs: number | null | undefined,
+): number | null {
+  if (maxAgeMs === undefined || maxAgeMs === null || maxAgeMs === 0) {
+    return null;
+  }
+  if (!Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+    return null;
+  }
+  const truncated = Math.trunc(maxAgeMs);
+  if (truncated <= 0) {
+    return null;
+  }
+  return Math.min(DEAD_LETTER_MAX_AGE_MS, Math.max(DEAD_LETTER_MIN_AGE_MS, truncated));
+}
 
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
@@ -111,12 +145,15 @@ export function makeEntryId(
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
+  const maxAgeMs = resolveDeadLetterMaxAgeMs(options.maxAgeMs);
+  const quiet = options.quiet === true;
   let entries: DeadLetterEntry[] = [];
   const stats: DeadLetterStats = {
     depth: 0,
     enqueued: 0,
     replayed: 0,
     dropped: 0,
+    expired: 0,
   };
 
   /** Redacted, truncated error text — the only form that may be persisted. */
@@ -126,6 +163,36 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
 
   function syncDepth(): void {
     stats.depth = entries.length;
+  }
+
+  function isExpired(entry: DeadLetterEntry, nowMs: number): boolean {
+    if (maxAgeMs === null) return false;
+    const enqueuedMs = Date.parse(entry.enqueuedAt);
+    if (!Number.isFinite(enqueuedMs)) return false;
+    return nowMs - enqueuedMs > maxAgeMs;
+  }
+
+  function evictExpired(nowMs: number): number {
+    if (maxAgeMs === null || entries.length === 0) return 0;
+    let evicted = 0;
+    const retained: DeadLetterEntry[] = [];
+    for (const entry of entries) {
+      if (isExpired(entry, nowMs)) {
+        evicted += 1;
+        stats.expired += 1;
+        if (!quiet) {
+          console.warn(
+            `[dead-letter] expired ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
+              `(enqueued ${entry.enqueuedAt}, maxAgeMs=${maxAgeMs})`,
+          );
+        }
+      } else {
+        retained.push(entry);
+      }
+    }
+    entries = retained;
+    syncDepth();
+    return evicted;
   }
 
   async function load(): Promise<void> {
@@ -148,11 +215,14 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     try {
       const parsed = JSON.parse(raw) as DeadLetterFile;
       if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
-        console.warn(
-          `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
-        );
+        if (!quiet) {
+          console.warn(
+            `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
+          );
+        }
         entries = [];
       } else {
+        const nowMs = now();
         entries = parsed.entries
           .filter(
             (e) =>
@@ -164,7 +234,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
           .map((e) => ({
             id: e.id,
             enqueuedAt:
-              typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
+              typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(nowMs).toISOString(),
             source: typeof e.source === "string" ? e.source : "unknown",
             ledger: e.ledger,
             eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
@@ -172,6 +242,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
             attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
             lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
           }));
+        // Evict age-expired entries before enforcing count bounds so stale items
+        // are counted as expired and never crowd out valid recent failures.
+        evictExpired(nowMs);
         // Bound on load too: the file may have been edited by hand.
         while (entries.length > options.maxEntries) {
           entries.shift();
@@ -179,13 +252,15 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         }
       }
     } catch (err) {
-      console.warn(
-        `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
-      );
+      if (!quiet) {
+        console.warn(
+          `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
+        );
+      }
       entries = [];
     }
     syncDepth();
-    if (entries.length > 0) {
+    if (entries.length > 0 && !quiet) {
       console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
   }
@@ -222,6 +297,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     text: string;
     error: unknown;
   }): Promise<DeadLetterEntry> {
+    const nowMs = now();
+    evictExpired(nowMs);
+
     const id = makeEntryId(input.source, input.ledger, input.eventName, input.text);
     const existing = entries.find((e) => e.id === id);
     if (existing) {
@@ -234,7 +312,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     while (entries.length >= Math.max(1, options.maxEntries)) {
       const dropped = entries.shift();
       stats.dropped += 1;
-      if (dropped) {
+      if (dropped && !quiet) {
         console.warn(
           `[dead-letter] queue full (max ${options.maxEntries}); dropped oldest ` +
             `${dropped.source} ${dropped.eventName} @ ledger ${dropped.ledger}`,
@@ -244,7 +322,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
 
     const entry: DeadLetterEntry = {
       id,
-      enqueuedAt: new Date(now()).toISOString(),
+      enqueuedAt: new Date(nowMs).toISOString(),
       source: input.source,
       ledger: input.ledger,
       eventName: input.eventName,
@@ -255,10 +333,12 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     entries.push(entry);
     stats.enqueued += 1;
     syncDepth();
-    console.warn(
-      `[dead-letter] parked ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
-        `(depth ${entries.length}/${options.maxEntries}): ${entry.lastError}`,
-    );
+    if (!quiet) {
+      console.warn(
+        `[dead-letter] parked ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
+          `(depth ${entries.length}/${options.maxEntries}): ${entry.lastError}`,
+      );
+    }
     await persist();
     return entry;
   }
@@ -272,9 +352,17 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   async function flush(
     send: (text: string, entry: DeadLetterEntry) => Promise<void>,
     budget: number,
-  ): Promise<{ sent: number; remaining: number }> {
+  ): Promise<{ sent: number; remaining: number; expired: number }> {
+    if (entries.length === 0) {
+      return { sent: 0, remaining: 0, expired: 0 };
+    }
+
+    const expired = evictExpired(now());
     if (budget <= 0 || entries.length === 0) {
-      return { sent: 0, remaining: entries.length };
+      if (expired > 0) {
+        await persist();
+      }
+      return { sent: 0, remaining: entries.length, expired };
     }
 
     let sent = 0;
@@ -290,9 +378,11 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         await send(entry.text, entry);
         sent += 1;
         stats.replayed += 1;
-        console.log(
-          `[dead-letter] replayed ${entry.source} ${entry.eventName} @ ledger ${entry.ledger}`,
-        );
+        if (!quiet) {
+          console.log(
+            `[dead-letter] replayed ${entry.source} ${entry.eventName} @ ledger ${entry.ledger}`,
+          );
+        }
       } catch (err) {
         entry.attempts += 1;
         entry.lastError = safeError(err);
@@ -304,11 +394,13 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
           );
         } else {
           kept.push(entry);
-          console.warn(
-            `[dead-letter] replay failed for ${entry.source} ${entry.eventName} ` +
-              `@ ledger ${entry.ledger} (attempt ${entry.attempts}/${options.maxAttempts}): ` +
-              entry.lastError,
-          );
+          if (!quiet) {
+            console.warn(
+              `[dead-letter] replay failed for ${entry.source} ${entry.eventName} ` +
+                `@ ledger ${entry.ledger} (attempt ${entry.attempts}/${options.maxAttempts}): ` +
+                entry.lastError,
+            );
+          }
         }
       }
     }
@@ -316,13 +408,14 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     entries = kept;
     syncDepth();
     await persist();
-    return { sent, remaining: entries.length };
+    return { sent, remaining: entries.length, expired };
   }
 
   return {
     load,
     enqueue,
     flush,
+    maxAgeMs,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
     },

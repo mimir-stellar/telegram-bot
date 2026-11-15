@@ -25,15 +25,18 @@ import { pathToFileURL } from "node:url";
 
 import {
   createDeadLetterQueue,
+  DEAD_LETTER_MAX_AGE_MS,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
+  DEAD_LETTER_MIN_AGE_MS,
   type DeadLetterEntry,
+  type DeadLetterStats,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
 export const USAGE =
-  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
+  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--max-age <dur>] [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
   readonly exitCode = 2;
@@ -54,7 +57,14 @@ export interface ListDlqOptions {
   secrets?: readonly string[];
   maxEntries?: number;
   maxAttempts?: number;
+  maxAge?: string | number;
+  maxAgeMs?: number | null;
   now?: () => number;
+}
+
+export interface ListDlqReport {
+  entries: DlqEntryView[];
+  stats: DeadLetterStats;
 }
 
 export interface ShowDlqOptions extends ListDlqOptions {
@@ -70,6 +80,7 @@ export interface PurgeDlqOptions extends ListDlqOptions {
 export interface PurgeDlqResult {
   dryRun: boolean;
   purged: number;
+  expired: number;
   remaining: number;
   purgedIds: string[];
   entries: DlqEntryView[];
@@ -246,6 +257,36 @@ function toEntryView(
   };
 }
 
+/**
+ * Parse and bound `--max-age` (`0` = disabled, otherwise within
+ * `[DEAD_LETTER_MIN_AGE_MS, DEAD_LETTER_MAX_AGE_MS]`).
+ */
+export function parseBoundedMaxAgeMs(input: string | number): number {
+  const ms = parseDurationMs(input);
+  if (ms === 0) return 0;
+  if (ms < DEAD_LETTER_MIN_AGE_MS || ms > DEAD_LETTER_MAX_AGE_MS) {
+    throw new DlqUsageError(
+      `--max-age must be 0 or between ${DEAD_LETTER_MIN_AGE_MS}ms and ${DEAD_LETTER_MAX_AGE_MS}ms`,
+    );
+  }
+  return ms;
+}
+
+function resolveConfiguredMaxAgeMs(options: ListDlqOptions): number | null {
+  if (options.maxAgeMs !== undefined) {
+    if (options.maxAgeMs === null) return null;
+    return parseBoundedMaxAgeMs(options.maxAgeMs);
+  }
+  if (options.maxAge !== undefined) {
+    return parseBoundedMaxAgeMs(options.maxAge);
+  }
+  const envRaw = process.env.DEAD_LETTER_MAX_AGE_MS?.trim();
+  if (envRaw && Number.isInteger(Number(envRaw)) && Number(envRaw) > 0) {
+    return Number(envRaw);
+  }
+  return null;
+}
+
 function openQueue(options: ListDlqOptions) {
   const maxEntries =
     options.maxEntries ??
@@ -264,16 +305,29 @@ function openQueue(options: ListDlqOptions) {
     filePath: options.filePath,
     maxEntries,
     maxAttempts,
+    maxAgeMs: resolveConfiguredMaxAgeMs(options),
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
+}
+
+/** Load and return dead-letter entries alongside queue retention stats. */
+export async function inspectDeadLetterRetention(
+  options: ListDlqOptions,
+): Promise<ListDlqReport> {
+  const queue = openQueue(options);
+  await queue.load();
+  return {
+    entries: queue.snapshot().map((entry) => toEntryView(entry, options)),
+    stats: queue.stats(),
+  };
 }
 
 /** Load and return all dead-letter entries with redacted chat ids. */
 export async function listDeadLetters(options: ListDlqOptions): Promise<DlqEntryView[]> {
-  const queue = openQueue(options);
-  await queue.load();
-  return queue.snapshot().map((entry) => toEntryView(entry, options));
+  const { entries } = await inspectDeadLetterRetention(options);
+  return entries;
 }
 
 /** Load and return a single dead-letter entry by id, or throw if not found. */
@@ -320,12 +374,13 @@ export async function purgeDeadLetters(options: PurgeDlqOptions): Promise<PurgeD
 
   const queue = openQueue(options);
   await queue.load();
+  const stats = queue.stats();
   const before = queue.snapshot();
   const matched = before.filter((entry) => shouldPurgeEntry(entry, cutoffMs));
   const purgedIds = matched.map((entry) => entry.id);
   const purgedSet = new Set(purgedIds);
 
-  if (!dryRun && before.length > 0) {
+  if (!dryRun && (before.length > 0 || stats.expired > 0)) {
     // Write purges atomically via the queue's existing persistence function:
     // `flush` resolves for entries to discard and rejects for entries to keep,
     // then persists the kept entries with write-then-rename. Since kept entries
@@ -342,6 +397,7 @@ export async function purgeDeadLetters(options: PurgeDlqOptions): Promise<PurgeD
   return {
     dryRun,
     purged: purgedIds.length,
+    expired: stats.expired,
     remaining: remainingEntries.length,
     purgedIds,
     entries: matched.map((entry) => toEntryView(entry, options)),
@@ -372,6 +428,7 @@ async function persistPurgedQueue(
     ),
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    quiet: true,
   });
 
   await queue.load();
@@ -396,6 +453,7 @@ interface ParsedCliArgs {
   file?: string;
   id?: string;
   olderThan?: string;
+  maxAge?: string;
   yes: boolean;
   json: boolean;
   chatId?: string;
@@ -434,7 +492,12 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
-    if (arg === "--file" || arg === "--older-than" || arg === "--chat-id") {
+    if (
+      arg === "--file" ||
+      arg === "--older-than" ||
+      arg === "--max-age" ||
+      arg === "--chat-id"
+    ) {
       if (arg === "--older-than" && subcommand !== "purge") {
         throw new DlqUsageError(`--older-than is only valid with purge\n${USAGE}`);
       }
@@ -446,6 +509,7 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       }
       if (arg === "--file") parsed.file = value;
       else if (arg === "--older-than") parsed.olderThan = value;
+      else if (arg === "--max-age") parsed.maxAge = value;
       else if (arg === "--chat-id") parsed.chatId = value;
       i += 1;
       continue;
@@ -470,6 +534,9 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
   if (parsed.olderThan !== undefined) {
     parseDurationMs(parsed.olderThan);
   }
+  if (parsed.maxAge !== undefined) {
+    parseBoundedMaxAgeMs(parsed.maxAge);
+  }
 
   return parsed;
 }
@@ -480,18 +547,20 @@ function resolvePath(value: string): string {
 
 function formatListOutput(
   entries: DlqEntryView[],
+  expired: number,
   filePath: string,
   chatId: string,
   asJson: boolean,
 ): string {
   if (asJson) {
-    return `${JSON.stringify({ file: filePath, chatId, depth: entries.length, entries }, null, 2)}\n`;
+    return `${JSON.stringify({ file: filePath, chatId, depth: entries.length, expired, entries }, null, 2)}\n`;
   }
+  const expiredSuffix = expired > 0 ? ` (${expired} expired)` : "";
   if (entries.length === 0) {
-    return `[dlq] 0 entries (chat=${chatId}) in ${filePath}`;
+    return `[dlq] 0 entries${expiredSuffix} (chat=${chatId}) in ${filePath}`;
   }
   const lines = [
-    `[dlq] ${entries.length} entry(s) (chat=${chatId}) in ${filePath}`,
+    `[dlq] ${entries.length} entry(s)${expiredSuffix} (chat=${chatId}) in ${filePath}`,
     ...entries.map(
       (e) =>
         `  ${e.id}  enqueued=${e.enqueuedAt}  source=${e.source}  ledger=${e.ledger}  ` +
@@ -568,14 +637,23 @@ export async function runDlqCli(
   const commonOptions: ListDlqOptions = {
     filePath,
     chatId: parsed.chatId,
+    maxAge: parsed.maxAge,
     now: options.now,
   };
 
   try {
     if (parsed.subcommand === "list") {
-      const entries = await listDeadLetters(commonOptions);
+      const report = await inspectDeadLetterRetention(commonOptions);
       const chatId = resolveChatIdForSource("default", parsed.chatId);
-      out(formatListOutput(entries, filePath, chatId, parsed.json).trimEnd());
+      out(
+        formatListOutput(
+          report.entries,
+          report.stats.expired,
+          filePath,
+          chatId,
+          parsed.json,
+        ).trimEnd(),
+      );
       return { exitCode: 0 };
     }
 
@@ -604,7 +682,7 @@ export async function runDlqCli(
 }
 
 async function main(): Promise<void> {
-  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
+  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env", quiet: true });
   const { exitCode } = await runDlqCli();
   if (exitCode !== 0) {
     process.exit(exitCode);

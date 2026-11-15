@@ -343,7 +343,7 @@ export interface PollerStatus {
    */
   suppressedLogs: number;
   /** Dead-letter queue counters (see src/deadLetter.ts). */
-  deadLetter: DeadLetterStats;
+  deadLetter: Omit<DeadLetterStats, "expired"> & { expired?: number };
   /** Telegram sends abandoned by the per-send timeout, when tracked. */
   sendTimeouts?: number;
   /** Bounded description of the most recent send timeout, when tracked. */
@@ -1449,6 +1449,7 @@ export function createPoller(deps: PollerDeps) {
     filePath: deadLetterEnabled ? (config.deadLetterFile as string) : null,
     maxEntries: config.deadLetterMax ?? DEAD_LETTER_MAX_ENTRIES,
     maxAttempts: config.deadLetterMaxAttempts ?? DEAD_LETTER_MAX_ATTEMPTS,
+    maxAgeMs: config.deadLetterMaxAgeMs ?? 0,
     // A Telegram error embeds the token in its request URL, and the queue is
     // the last place it belongs.
     secrets: [config.botToken],
@@ -1509,7 +1510,7 @@ export function createPoller(deps: PollerDeps) {
     lastCycleEmptyPages: 0,
     lastCyclePages: 0,
     notificationsDropped: 0,
-    deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0 },
+    deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0, expired: 0 },
     eventsDeduplicated: 0,
     cursorRewinds: 0,
     restartGaps: 0,

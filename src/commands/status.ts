@@ -67,10 +67,15 @@ export function statusMessage(
 
   // Only shown when the queue is holding or has replayed something, so an
   // ordinary /status is unchanged.
-  if (status.deadLetter && (status.deadLetter.depth > 0 || status.deadLetter.replayed > 0)) {
+  const dlqExpired = status.deadLetter?.expired ?? 0;
+  if (
+    status.deadLetter &&
+    (status.deadLetter.depth > 0 || status.deadLetter.replayed > 0 || dlqExpired > 0)
+  ) {
     lines.push(
       `Parked sends: ${status.deadLetter.depth} waiting \u00b7 ` +
-        `${status.deadLetter.replayed} replayed \u00b7 ${status.deadLetter.dropped} dropped`,
+        `${status.deadLetter.replayed} replayed \u00b7 ${status.deadLetter.dropped} dropped` +
+        (dlqExpired > 0 ? ` \u00b7 ${dlqExpired} expired` : ""),
       "",
     );
   }

@@ -58,6 +58,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import { DEAD_LETTER_MAX_AGE_MS, DEAD_LETTER_MIN_AGE_MS } from "./deadLetter.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -244,6 +245,12 @@ export interface BotConfig extends StellarConfig {
   /** Replay attempts before a parked send is dropped as poison. */
   deadLetterMaxAttempts: number;
   /**
+   * Maximum retention age in milliseconds for parked sends (`DEAD_LETTER_MAX_AGE_MS`).
+   * `0` (default) disables age-based eviction; positive values must fall within
+   * `[DEAD_LETTER_MIN_AGE_MS, DEAD_LETTER_MAX_AGE_MS]`.
+   */
+  deadLetterMaxAgeMs?: number;
+  /**
    * Crash-safe send journal: intent is logged before a Telegram send and done
    * after, so a restart can tell which notifications may have been sent
    * (see src/notifications/send-journal.ts). Empty disables the journal.
@@ -349,6 +356,7 @@ const DEFAULTS = {
   deadLetterFile: "./data/dead-letter.json",
   deadLetterMax: 100,
   deadLetterMaxAttempts: 10,
+  deadLetterMaxAgeMs: 0,
   sendJournalFile: "./data/send-journal.jsonl",
   healthHost: "127.0.0.1",
   healthPort: 8787,
@@ -891,6 +899,21 @@ export function loadConfig(): BotConfig {
     );
   }
 
+  const deadLetterMaxAgeMs = c.int(
+    "DEAD_LETTER_MAX_AGE_MS",
+    DEFAULTS.deadLetterMaxAgeMs,
+    0,
+  );
+  if (
+    deadLetterMaxAgeMs > 0 &&
+    (deadLetterMaxAgeMs < DEAD_LETTER_MIN_AGE_MS ||
+      deadLetterMaxAgeMs > DEAD_LETTER_MAX_AGE_MS)
+  ) {
+    c.problems.push(
+      `DEAD_LETTER_MAX_AGE_MS must be 0 (disabled) or between ${DEAD_LETTER_MIN_AGE_MS} and ${DEAD_LETTER_MAX_AGE_MS}; got ${deadLetterMaxAgeMs}`,
+    );
+  }
+
   const config: BotConfig = {
     ...stellar,
     locale: locale ?? DEFAULT_LOCALE,
@@ -934,6 +957,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.deadLetterMaxAttempts,
       1,
     ),
+    deadLetterMaxAgeMs,
     sendJournalFile: path.resolve(
       process.cwd(),
       read("SEND_JOURNAL_FILE") ?? DEFAULTS.sendJournalFile,
@@ -1128,6 +1152,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "DEAD_LETTER_FILE", secret: false, hasBuiltInDefault: true },
   { key: "DEAD_LETTER_MAX", secret: false, hasBuiltInDefault: true },
   { key: "DEAD_LETTER_MAX_ATTEMPTS", secret: false, hasBuiltInDefault: true },
+  { key: "DEAD_LETTER_MAX_AGE_MS", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_HOST", secret: false, hasBuiltInDefault: true },
   {
     key: "HEALTH_PORT",
