@@ -65,14 +65,28 @@ export {
 } from "./commands/keyboards.js";
 export { TELEGRAM_OPTIONS, isChatAllowed, isOperator } from "./commands/runtime.js";
 export {
+  DEFAULT_RECENT_EVENTS_CAPACITY,
+  EVENTS_PAGE_SIZE,
+  EVENTS_PATH_REJECTED_MESSAGE,
+  EVENTS_USAGE_MESSAGE,
   aboutMessage,
-  helpMessage,
   contractsMessage,
+  createRecentEventRing,
+  eventsMessage,
   healthMessage,
+  helpMessage,
+  isCanonicalEventSummary,
   lastEventMessage,
+  parseEventsPageArg,
   pauseMessage,
+  resolveRetainedEventSummaries,
   resumeMessage,
   statusMessage,
+  toCanonicalEventSummary,
+  type CanonicalEventSummary,
+  type EventsPageArgResult,
+  type RecentEventRing,
+  type RenderedEventsPage,
 } from "./commands/index.js";
 export {
   CALLBACK_FALLBACK_FEEDBACK,

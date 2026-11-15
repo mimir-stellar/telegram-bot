@@ -17,7 +17,9 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
 import { safeErrorMessage } from "./notifications/format.js";
+import { parsePaginationCallback } from "./notifications/pagination.js";
 import { handleBroadcastCallback } from "./commands/broadcast.js";
+import { eventsMessage, resolveRetainedEventSummaries } from "./commands/events.js";
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
@@ -31,11 +33,18 @@ import { pauseMessage } from "./commands/pause.js";
 import { resumeMessage } from "./commands/resume.js";
 import { statusMessage } from "./commands/status.js";
 import type { CommandDeps } from "./commands/registry.js";
-import { TELEGRAM_OPTIONS, isOperator, safeAnswerCallback } from "./commands/runtime.js";
+import { TELEGRAM_OPTIONS, isChatAllowed, isOperator, safeAnswerCallback } from "./commands/runtime.js";
 
 // ── Callback payload validation ──────────────────────────────────────────────
 
-export type CallbackActionType = "status" | "contracts" | "help" | "pause" | "resume" | "broadcast";
+export type CallbackActionType =
+  | "status"
+  | "contracts"
+  | "help"
+  | "pause"
+  | "resume"
+  | "broadcast"
+  | "events";
 
 export interface ValidCallbackAction {
   type: CallbackActionType;
@@ -126,8 +135,15 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
     }
   }
 
-  // 2. Colon-delimited: e.g. "status:refresh", "mimir:contracts", etc.
+  // 2. Colon-delimited: e.g. "status:refresh", "mimir:contracts", "pg:v1:events:1", etc.
   if (trimmed.includes(":")) {
+    const paged = parsePaginationCallback(trimmed);
+    if (paged !== null && paged.kind === "events") {
+      return {
+        ok: true,
+        action: { type: "events", raw },
+      };
+    }
     const parts = trimmed.split(":");
     if (parts[0] === "mimir" && parts[1] && isKnownAction(parts[1])) {
       return {
@@ -290,6 +306,36 @@ export async function handleCallbackQuery(
           await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
         }
         await safeAnswerCallback(ctx, config, { text: "Help" });
+        break;
+      }
+
+      case "events": {
+        const chatId = ctx.chat?.id ?? ctx.callbackQuery?.message?.chat.id;
+        if (chatId === undefined || !isChatAllowed(config.allowedChatIds, chatId)) {
+          console.warn(
+            `[bot] /events pagination callback denied for chat ${chatId ?? "unknown"} (not in ALLOWED_CHAT_IDS)`,
+          );
+          await safeAnswerCallback(ctx, config);
+          break;
+        }
+        const paged = parsePaginationCallback(action.raw.trim());
+        const requestedPage = paged ? paged.page + 1 : 1;
+        const rendered = eventsMessage(
+          resolveRetainedEventSummaries(deps),
+          config,
+          requestedPage,
+        );
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, rendered.text, rendered.keyboard);
+        } else {
+          await ctx.api.sendMessage(config.chatId, rendered.text, {
+            ...TELEGRAM_OPTIONS,
+            ...(rendered.keyboard ? { reply_markup: rendered.keyboard } : {}),
+          });
+        }
+        await safeAnswerCallback(ctx, config, {
+          text: `Events page ${rendered.page}/${rendered.totalPages}`,
+        });
         break;
       }
 

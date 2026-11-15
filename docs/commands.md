@@ -12,6 +12,7 @@
 | `/contracts` | Contract ids and explorer links | No | Yes |
 | `/health` | Health assessment and operational readiness | No | Yes |
 | `/preview` | Preview channel notification formatting | No | Yes |
+| `/events` | Recent contract events with bounded pagination | No | Yes |
 | `/pause` | Operator only: pause new scans | Yes | No |
 | `/resume` | Operator only: resume polling now | Yes | No |
 

@@ -93,6 +93,10 @@ import {
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
+import {
+  createRecentEventRing,
+  type CanonicalEventSummary,
+} from "./recent-events.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
@@ -1433,6 +1437,7 @@ export function createPoller(deps: PollerDeps) {
   const rewindAttempts = new Map<ContractSource, number>(
     targets.map((t) => [t.source, 0]),
   );
+  const recentEventRing = createRecentEventRing();
 
   // Per-contract redelivery guard. Kept out of `TargetState` so status output
   // stays plain data; the window is internal bookkeeping.
@@ -2720,6 +2725,9 @@ export function createPoller(deps: PollerDeps) {
 
           const newest = scan.events[scan.events.length - 1];
           if (newest !== undefined) current.lastEvent = newest;
+          if (scan.events.length > 0) {
+            recentEventRing.recordAll(scan.events, config);
+          }
 
           const decodedCount = scan.events.reduce(
             (acc, event) => (event.payload.name !== "unknown" ? acc + 1 : acc),
@@ -3199,6 +3207,11 @@ export function createPoller(deps: PollerDeps) {
     },
 
     audit,
+
+    /** Bounded canonical summaries of recently observed contract events. */
+    recentEvents(): readonly CanonicalEventSummary[] {
+      return recentEventRing.entries();
+    },
 
     /** Persist buffered audit entries now (used on shutdown). */
     flushAuditFile(): Promise<void> {

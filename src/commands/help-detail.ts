@@ -76,6 +76,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     description: "Preview Telegram channel notification formatting and verify link preview settings for market or squad contracts.",
     examples: ["/preview", "/preview market", "/preview squad"],
   },
+  events: {
+    usage: "/events [page]",
+    arguments: "[page] (optional, default: 1) — positive 1-based page number of retained canonical event summaries",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Display a bounded, paginated summary of recent contract events retained in memory without reading arbitrary filesystem paths.",
+    examples: ["/events", "/events 2"],
+  },
   pause: {
     usage: "/pause",
     arguments: "None",
