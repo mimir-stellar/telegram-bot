@@ -34,6 +34,22 @@ that restricts who can reach the port. The health response includes
 configuration provenance (which env var supplied each setting) and poller
 counters. It contains no secrets, but it does confirm what is running.
 
+### Cache prevention
+
+All operational HTTP responses on both the health server and the standalone
+metrics server include cache-prevention headers so browsers, sidecars, and
+HTTP/1.0 or HTTP/1.1 reverse proxies never retain stale readiness, liveness,
+metrics, or authentication results:
+
+- `Cache-Control: no-store`
+- `Pragma: no-cache`
+- `Expires: 0`
+- `Vary: Authorization` (on the health listener, including `200`, `401`, `404`, and `503` responses)
+
+The container probe helper (`dist/healthcheck.js`) also sends
+`Cache-Control: no-store` and `Pragma: no-cache` on its outgoing `GET /health`
+request.
+
 ---
 
 ## Health server — `HEALTH_PORT` (default 8787)

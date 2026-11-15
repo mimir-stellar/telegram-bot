@@ -27,6 +27,10 @@ function main() {
       port,
       path: "/health",
       method: "GET",
+      headers: {
+        "cache-control": "no-store",
+        pragma: "no-cache",
+      },
       timeout: 2000,
     },
     (res) => {

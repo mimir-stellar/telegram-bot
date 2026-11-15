@@ -164,6 +164,28 @@ export interface HealthReport {
 
 const CURSOR_PREVIEW_LEN = 24;
 
+/**
+ * Cache-prevention headers applied to all operational HTTP responses so
+ * browser, CDN, and HTTP/1.0 or HTTP/1.1 reverse-proxy layers never retain
+ * stale health, readiness, metrics, or authentication status.
+ */
+export const OPERATIONAL_CACHE_HEADERS = {
+  "cache-control": "no-store",
+  pragma: "no-cache",
+  expires: "0",
+} as const;
+
+const HEALTH_CACHE_HEADERS = {
+  ...OPERATIONAL_CACHE_HEADERS,
+  vary: "Authorization",
+} as const;
+
+function applyHealthCacheHeaders(res: http.ServerResponse): void {
+  for (const [header, value] of Object.entries(HEALTH_CACHE_HEADERS)) {
+    res.setHeader(header, value);
+  }
+}
+
 function iso(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString();
 }
@@ -453,8 +475,8 @@ function sendJson(
 ): void {
   const payload = `${JSON.stringify(body)}\n`;
   res.writeHead(statusCode, {
+    ...HEALTH_CACHE_HEADERS,
     "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
     "content-length": Buffer.byteLength(payload),
   });
   res.end(payload);
@@ -462,8 +484,8 @@ function sendJson(
 
 function sendUnauthorized(res: http.ServerResponse): void {
   res.writeHead(401, {
+    ...HEALTH_CACHE_HEADERS,
     "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
     "content-length": "0",
   });
   res.end();
@@ -486,6 +508,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   }
 
   const server = http.createServer((req, res) => {
+    applyHealthCacheHeaders(res);
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
@@ -517,8 +540,8 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     if (method === "GET" && url.pathname === "/metrics") {
       const metrics = buildMetricsReport(config, status(), now());
       res.writeHead(200, {
+        ...HEALTH_CACHE_HEADERS,
         "content-type": "text/plain; version=0.0.4; charset=utf-8",
-        "cache-control": "no-store",
         "content-length": Buffer.byteLength(metrics),
       });
       res.end(metrics);

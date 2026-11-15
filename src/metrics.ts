@@ -146,6 +146,12 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
+const METRICS_CACHE_HEADERS = {
+  "Cache-Control": "no-store",
+  Pragma: "no-cache",
+  Expires: "0",
+} as const;
+
 export function createMetrics(): MetricsRegistry {
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
@@ -234,7 +240,11 @@ export function createMetrics(): MetricsRegistry {
 
     // Only GET is meaningful for a read-only metrics endpoint.
     if (method !== "GET") {
-      res.writeHead(405, { "Content-Type": "text/plain", Allow: "GET" });
+      res.writeHead(405, {
+        ...METRICS_CACHE_HEADERS,
+        "Content-Type": "text/plain",
+        Allow: "GET",
+      });
       res.end("Method Not Allowed\n");
       return;
     }
@@ -245,22 +255,27 @@ export function createMetrics(): MetricsRegistry {
     if (path === "/metrics") {
       const body = render();
       res.writeHead(200, {
+        ...METRICS_CACHE_HEADERS,
         "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
         "Content-Length": Buffer.byteLength(body),
-        // Instruct proxies not to cache — stale metrics are misleading.
-        "Cache-Control": "no-store",
       });
       res.end(body);
       return;
     }
 
     if (path === "/health") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.writeHead(200, {
+        ...METRICS_CACHE_HEADERS,
+        "Content-Type": "text/plain",
+      });
       res.end("OK\n");
       return;
     }
 
-    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.writeHead(404, {
+      ...METRICS_CACHE_HEADERS,
+      "Content-Type": "text/plain",
+    });
     res.end("Not Found\n");
   }
 
