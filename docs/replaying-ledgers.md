@@ -223,3 +223,13 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Archive Schema Version Negotiation
+
+Event archives (`src/stellar/archive.ts`) and JSONL captures (`src/stellar/scan-jsonl.ts`) perform explicit schema version negotiation so future breaking formats fail deterministically instead of silently misinterpreting fields:
+
+* **Supported Capabilities:** `getSupportedArchiveSchemaVersions()` exposes `SUPPORTED_ARCHIVE_READER_VERSIONS` (`[1]`), `SUPPORTED_ARCHIVE_WRITER_VERSIONS` (`[1]`), and `DEFAULT_ARCHIVE_SCHEMA_VERSION` (`1`) for formats `mimir-event-archive` and `mimir-scan-jsonl`.
+* **Explicit Headers & Sidecars:** `createEventArchive({ dir, schemaVersion: 1 })` writes `archive-schema.json`, and `formatScanJsonl(events, { schemaVersion: 1 })` emits a leading `{ type: "schema", format: "mimir-scan-jsonl", schemaVersion: 1 }` record while keeping 1-argument calls backward-compatible.
+* **Zero Field Guessing on Future Versions:** `negotiateArchiveSchemaVersion`, `inspectArchiveSchema`, `readArchive`, and `parseVersionedScanJsonl` refuse unknown future versions (such as `schemaVersion: 2` or `-v2` formats) up front with `UnsupportedArchiveSchemaError` (`UNSUPPORTED_SCHEMA_VERSION`, `INCOMPATIBLE_SCHEMA_FORMAT`, or `NO_MUTUAL_SCHEMA_VERSION`) before iterating events.
