@@ -367,9 +367,12 @@ export function createBot(deps: BotDeps): Bot {
 // Notifier moved to src/notifications/notifier.ts — re-exported here so all
 // existing imports from "bot.js" keep resolving without modification.
 export {
+  buildJournalRuntimeConfig,
   createNotifier,
   isMarkdownParseError,
   notifierSkips,
+  recoverOrphanedJournalEntries,
+  resolveNotifierRoutes,
   type SendExtra,
 } from "./notifications/notifier.js";
 

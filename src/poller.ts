@@ -78,6 +78,7 @@ import {
   createSendJournal,
   type SendJournal,
 } from "./notifications/send-journal.js";
+import { buildJournalRuntimeConfig } from "./notifications/notifier.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -2176,12 +2177,20 @@ export function createPoller(deps: PollerDeps) {
             .update(text)
             .digest("hex")
             .slice(0, 16);
+          const targetChat =
+            (event.source === "market" ? config.marketChatId : config.squadChatId) ||
+            config.chatId ||
+            config.chatIds?.[0];
           await sendJournal.recordIntent({
             id: event.eventId,
             source: event.source,
             ledger: event.ledger,
             eventName: event.payload.name,
             textHash,
+            route: event.source,
+            chatId: targetChat,
+            network: config.network,
+            networkPassphrase: config.networkPassphrase,
             at: now(),
           });
         } catch (err) {
@@ -2997,8 +3006,27 @@ export function createPoller(deps: PollerDeps) {
       // the cursor commit. Treat them as committed so a restart never duplicates
       // them (the existing lossy cursor-commit policy).
       if (sendJournal) {
-        for (const entry of await sendJournal.loadPending()) {
+        const activeRoutes = targets.map((t) => t.source);
+        const recovery = await sendJournal.inspectRecovery(
+          buildJournalRuntimeConfig({
+            chatId: config.chatId,
+            chatIds: config.chatIds,
+            marketChatId: config.marketChatId,
+            squadChatId: config.squadChatId,
+            network: config.network,
+            networkPassphrase: config.networkPassphrase,
+            activeRoutes,
+          }),
+        );
+        for (const entry of recovery.activePending) {
           maybeSent.add(entry.id);
+        }
+        if (recovery.orphaned.length > 0) {
+          console.warn(
+            `[poller] send journal has ${recovery.orphaned.length} orphaned entry(s) after ` +
+              `configuration change (${recovery.orphaned.map((o) => `${o.entry.id}:${o.reasons.join("+")}`).join(", ")}); ` +
+              `explicit discard or reroute decision required`,
+          );
         }
         await sendJournal.compact();
       }

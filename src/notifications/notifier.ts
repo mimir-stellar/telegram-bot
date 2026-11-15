@@ -21,6 +21,14 @@ import {
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+import {
+  OrphanDecisionRequiredError,
+  type JournalEntry,
+  type JournalRuntimeConfig,
+  type OrphanedJournalEntry,
+  type OrphanRecoveryDecision,
+  type SendJournal,
+} from "./send-journal.js";
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
 
@@ -95,6 +103,141 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
  * empty-text tests) can prove a blank render never reached the Telegram API.
  */
 export const notifierSkips = { emptyText: 0 };
+
+// ── Route & Journal Orphan Recovery ──────────────────────────────────────────
+
+export interface NotifierRouteConfig {
+  chatId?: string;
+  chatIds?: string[];
+  marketChatId?: string;
+  squadChatId?: string;
+  network?: string;
+  networkPassphrase?: string;
+}
+
+/**
+ * Build the active `route -> chatId` table from bot configuration. Routes with
+ * an empty or unconfigured destination are omitted so removed routes are
+ * cleanly detected on startup.
+ */
+export function resolveNotifierRoutes(config: NotifierRouteConfig): Record<string, string> {
+  const defaultChat = (config.chatId ?? config.chatIds?.[0] ?? "").trim();
+  const marketChat = (config.marketChatId ?? defaultChat).trim();
+  const squadChat = (config.squadChatId ?? defaultChat).trim();
+  const routes: Record<string, string> = {};
+  if (defaultChat !== "") routes.default = defaultChat;
+  if (marketChat !== "") routes.market = marketChat;
+  if (squadChat !== "") routes.squad = squadChat;
+  return routes;
+}
+
+/** Derive {@link JournalRuntimeConfig} from the active notifier configuration. */
+export function buildJournalRuntimeConfig(
+  config: NotifierRouteConfig & { activeRoutes?: readonly string[] },
+): JournalRuntimeConfig {
+  const routeMap = resolveNotifierRoutes(config);
+  const activeRoutes = config.activeRoutes ?? Object.keys(routeMap);
+  const filteredMap: Record<string, string> = {};
+  for (const route of activeRoutes) {
+    const dest = routeMap[route];
+    if (typeof dest === "string" && dest.trim() !== "") {
+      filteredMap[route] = dest.trim();
+    }
+  }
+  return {
+    activeRoutes: [...activeRoutes],
+    activeDestinations: filteredMap,
+    network: config.network,
+    networkPassphrase: config.networkPassphrase,
+  };
+}
+
+export interface RecoverOrphanedJournalOptions {
+  journal: SendJournal;
+  config: NotifierRouteConfig & { activeRoutes?: readonly string[] };
+  /**
+   * Explicit operator decisions keyed by journal entry `id`, or a callback.
+   * Orphaned entries without an explicit `discard` or `reroute` decision are
+   * never silently replayed; when `strict` is true (or `replay` is provided
+   * without a decision), {@link OrphanDecisionRequiredError} is thrown.
+   */
+  decisions?:
+    | Readonly<Record<string, OrphanRecoveryDecision>>
+    | ((orphan: OrphanedJournalEntry) => OrphanRecoveryDecision | undefined);
+  /** Optional replay callback invoked only for explicitly rerouted entries. */
+  replay?: (entry: JournalEntry, destination: { route: string; chatId: string }) => Promise<void>;
+  /** When true, throw {@link OrphanDecisionRequiredError} if any orphan lacks a decision. */
+  strict?: boolean;
+}
+
+export interface RecoverOrphanedJournalResult {
+  activePending: JournalEntry[];
+  discardedIds: string[];
+  rerouted: JournalEntry[];
+  replayedIds: string[];
+  unresolvedOrphans: OrphanedJournalEntry[];
+}
+
+/**
+ * Inspect and recover orphaned send-journal entries after configuration changes.
+ *
+ * Entries orphaned by a removed route or changed network identity are never
+ * silently replayed: each requires an explicit `discard` or `reroute` decision.
+ */
+export async function recoverOrphanedJournalEntries(
+  options: RecoverOrphanedJournalOptions,
+): Promise<RecoverOrphanedJournalResult> {
+  const runtime = buildJournalRuntimeConfig(options.config);
+  const routeMap = resolveNotifierRoutes(options.config);
+  const { activePending, orphaned } = await options.journal.inspectRecovery(runtime);
+
+  const discardedIds: string[] = [];
+  const rerouted: JournalEntry[] = [];
+  const replayedIds: string[] = [];
+  const unresolvedOrphans: OrphanedJournalEntry[] = [];
+
+  for (const orphan of orphaned) {
+    const decision =
+      typeof options.decisions === "function"
+        ? options.decisions(orphan)
+        : options.decisions?.[orphan.entry.id];
+
+    if (!decision) {
+      if (options.strict === true || options.replay !== undefined) {
+        throw new OrphanDecisionRequiredError(orphan.entry.id, orphan.reasons);
+      }
+      unresolvedOrphans.push(orphan);
+      continue;
+    }
+
+    const updated = await options.journal.resolveOrphan(orphan.entry.id, decision, runtime);
+    if (updated === null) {
+      discardedIds.push(orphan.entry.id);
+      continue;
+    }
+
+    rerouted.push(updated);
+    if (options.replay) {
+      const targetRoute = updated.route ?? "default";
+      const chatId =
+        (decision.action === "reroute" ? decision.targetChatId : undefined) ??
+        routeMap[targetRoute] ??
+        "";
+      await options.replay(updated, { route: targetRoute, chatId });
+      await options.journal.recordDone(updated.id);
+      replayedIds.push(updated.id);
+    }
+  }
+
+  await options.journal.compact();
+  return {
+    activePending,
+    discardedIds,
+    rerouted,
+    replayedIds,
+    unresolvedOrphans,
+  };
+}
 
 // ── createNotifier ───────────────────────────────────────────────────────────
 

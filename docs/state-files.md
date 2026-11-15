@@ -13,6 +13,7 @@ Operational reference describing all on-disk state files maintained by the Mimir
 | **Audit Trail File** | `AUDIT_FILE` | `./data/audit.jsonl` | `src/audit.ts` | Append (`appendFile` with JSON line per entry) | If absent, automatically created on next append. Historical audit records prior to deletion are lost. | `/audit` skips unreadable/malformed lines (`unreadableLines` count incremented) and processes valid lines. poller append operations continue appending new entries. |
 | **Status Snapshot File** | `STATUS_FILE` | `./data/status.json` | `src/status.ts` | Atomic (write temporary file `${STATUS_FILE}.tmp` then rename) | Harmless to poller loop. Recreated atomically on the next poll cycle. CLI `--status` command will fail to find status until rewritten. | Overwritten atomically on the next poll cycle. External tools or CLI reading corrupt file before next cycle encounter parse errors. |
 | **Instance Lock File** | `INSTANCE_LOCK_FILE` | `./data/poller.lock` | `src/instanceLock.ts` | Exclusive file creation (`O_EXCL` / `wx` flag via `open`) | Poller will re-acquire lock on next startup if no other instance holds it. During runtime, removal removes concurrency protection against double instances. | Stale or unparseable lock payload (non-JSON, bad schema, or dead PID) is warned and automatically unlinked by next acquiring instance. |
+| **Send Journal File** | `SEND_JOURNAL_FILE` | Disabled by default (opt-in JSONL path) | `src/notifications/send-journal.ts` | Append (`fsync` per line) + atomic compaction (`${file}.tmp` -> `${file}`) | Treated as empty journal on boot. | Torn/corrupt JSONL lines are skipped on load without failing recovery. |
 
 ---
 
@@ -64,3 +65,8 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Send Journal File (`SEND_JOURNAL_FILE`) & Orphan Recovery
+- **Writer Module**: [`src/notifications/send-journal.ts`](../src/notifications/send-journal.ts) (`createSendJournal`) and [`src/notifications/notifier.ts`](../src/notifications/notifier.ts) (`recoverOrphanedJournalEntries`)
+- **Write Pattern**: Durable `fsync` append for `intent`, `done`, `discarded`, and `rerouted` JSONL records, plus atomic write-then-rename compaction. Destination chats are stored only as non-reversible `destinationHash` digests alongside logical `route` and Stellar `network` / `networkPassphrase`.
+- **Configuration Changes & Orphaned Entries**: On recovery (`inspectRecovery` / `recoverOrphanedJournalEntries`), unresolved intents whose logical route or destination was removed (`removed_route`) or whose Stellar network identity changed (`changed_network`) are quarantined as orphaned rather than silently replayed or discarded. Operators/callers must supply an explicit `discard` or `reroute` decision (`resolveOrphan`), otherwise `OrphanDecisionRequiredError` is raised when replay/strict recovery is attempted and the orphaned entries remain preserved on disk.
