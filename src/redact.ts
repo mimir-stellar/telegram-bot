@@ -25,6 +25,13 @@
 /** Placeholder, matching the wording the status/health surfaces already use. */
 export const REDACTED = "[REDACTED]";
 
+/** Bounded sentinels for circular or unserializable values in error/log payloads. */
+export const CIRCULAR_SENTINEL = "[circular]";
+export const DEPTH_LIMIT_SENTINEL = "[depth-limit]";
+export const UNSERIALIZABLE_SENTINEL = "[unserializable]";
+export const FUNCTION_SENTINEL = "[function]";
+export const SYMBOL_SENTINEL = "[symbol]";
+
 /**
  * Default cap for redacted error text. Matches `safeErrorMessage`'s historical
  * bound so this module is a drop-in for the callers that already rely on it.
@@ -163,7 +170,126 @@ export interface RedactOptions {
  * shape at all; the patterns then catch the cases where no value was ever
  * registered (a hand-pasted token in a test, a seed key in an upstream error).
  */
+const MAX_ERROR_OBJECT_DEPTH = 4;
+const MAX_ERROR_COLLECTION_ITEMS = 50;
+
+function setOwnProperty(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+}
+
+function sanitizeErrorValue(value: unknown, depth: number, ancestors: Set<object>): unknown {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return value;
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) return value;
+    if (Number.isNaN(value)) return "[NaN]";
+    return value > 0 ? "[Infinity]" : "[-Infinity]";
+  }
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "symbol") return SYMBOL_SENTINEL;
+  if (typeof value === "function") return FUNCTION_SENTINEL;
+  if (value === undefined) return "[undefined]";
+  if (typeof value !== "object") return UNSERIALIZABLE_SENTINEL;
+
+  if (ancestors.has(value)) return CIRCULAR_SENTINEL;
+
+  try {
+    if (value instanceof Date) {
+      const ms = value.getTime();
+      return Number.isFinite(ms) ? value.toISOString() : "[Invalid Date]";
+    }
+    if (value instanceof RegExp) {
+      return String(value);
+    }
+    if (value instanceof Error) {
+      let name = "Error";
+      let message = "";
+      try {
+        if (typeof value.name === "string" && value.name.length > 0) name = value.name;
+      } catch {
+        name = "Error";
+      }
+      try {
+        message = typeof value.message === "string" ? value.message : UNSERIALIZABLE_SENTINEL;
+      } catch {
+        message = UNSERIALIZABLE_SENTINEL;
+      }
+      return name !== "Error" ? `${name}: ${message}` : message;
+    }
+  } catch {
+    return UNSERIALIZABLE_SENTINEL;
+  }
+
+  if (depth >= MAX_ERROR_OBJECT_DEPTH) return DEPTH_LIMIT_SENTINEL;
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const limit = Math.min(value.length, MAX_ERROR_COLLECTION_ITEMS);
+      const arr: unknown[] = [];
+      for (let i = 0; i < limit; i += 1) {
+        try {
+          arr.push(sanitizeErrorValue(value[i], depth + 1, ancestors));
+        } catch {
+          arr.push(UNSERIALIZABLE_SENTINEL);
+        }
+      }
+      if (value.length > limit) {
+        arr.push(`[+${value.length - limit} items]`);
+      }
+      return arr;
+    }
+
+    if (value instanceof Map) return `[Map(${value.size})]`;
+    if (value instanceof Set) return `[Set(${value.size})]`;
+    if (value instanceof WeakMap) return "[WeakMap]";
+    if (value instanceof WeakSet) return "[WeakSet]";
+    if (value instanceof Promise) return "[Promise]";
+    if (ArrayBuffer.isView(value)) return `[${value.constructor?.name ?? "TypedArray"}(${value.byteLength})]`;
+    if (value instanceof ArrayBuffer) return `[ArrayBuffer(${value.byteLength})]`;
+
+    let keys: string[];
+    try {
+      keys = Object.keys(value);
+    } catch {
+      return UNSERIALIZABLE_SENTINEL;
+    }
+
+    const out: Record<string, unknown> = {};
+    const limit = Math.min(keys.length, MAX_ERROR_COLLECTION_ITEMS);
+    for (let i = 0; i < limit; i += 1) {
+      const key = keys[i];
+      if (key === undefined) continue;
+      let item: unknown;
+      try {
+        item = (value as Record<string, unknown>)[key];
+      } catch {
+        setOwnProperty(out, key, UNSERIALIZABLE_SENTINEL);
+        continue;
+      }
+      if (item === undefined) continue;
+      setOwnProperty(out, key, sanitizeErrorValue(item, depth + 1, ancestors));
+    }
+    if (keys.length > limit) {
+      setOwnProperty(out, "__truncatedKeys", `[+${keys.length - limit} keys]`);
+    }
+    return out;
+  } catch {
+    return UNSERIALIZABLE_SENTINEL;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
 export function redactText(input: string, options: RedactOptions = {}): string {
+  if (typeof input !== "string") {
+    if (input === null || input === undefined) return "";
+    return redactError(input, options);
+  }
   if (!input) return "";
   let out = input;
 
@@ -183,23 +309,65 @@ export function redactText(input: string, options: RedactOptions = {}): string {
   return clamp(out, options.maxLen);
 }
 
-/** Redacted, bounded text for anything thrown at us. */
-export function redactError(err: unknown, options: RedactOptions = {}): string {
-  let raw: string;
-  if (err instanceof Error) {
-    const name = err.name && err.name !== "Error" ? `${err.name}: ` : "";
-    raw = `${name}${err.message}`;
-  } else if (typeof err === "string") {
-    raw = err;
-  } else if (err === null || err === undefined) {
-    raw = String(err);
-  } else {
+/**
+ * Safely convert any thrown value into a raw string without redacting yet,
+ * replacing circular references and throwing getters/primitives with bounded
+ * sentinels so neither `redactError` nor `audit.errorText` can ever throw.
+ */
+export function serializeUnknownError(err: unknown, includeErrorName = true): string {
+  try {
+    let isErrorInstance = false;
     try {
-      const json = JSON.stringify(err);
-      raw = typeof json === "string" ? json : String(err);
+      isErrorInstance = err instanceof Error;
     } catch {
-      raw = String(err);
+      isErrorInstance = false;
     }
+
+    if (isErrorInstance) {
+      const errorObj = err as Error;
+      let namePrefix = "";
+      if (includeErrorName) {
+        try {
+          const errName = errorObj.name;
+          if (typeof errName === "string" && errName.length > 0 && errName !== "Error") {
+            namePrefix = `${errName}: `;
+          }
+        } catch {
+          namePrefix = "Error: ";
+        }
+      }
+
+      let messagePart: string;
+      try {
+        const msg = errorObj.message;
+        messagePart = typeof msg === "string" ? msg : UNSERIALIZABLE_SENTINEL;
+      } catch {
+        messagePart = UNSERIALIZABLE_SENTINEL;
+      }
+      return `${namePrefix}${messagePart}`;
+    }
+    if (typeof err === "string") return err;
+    if (
+      err === null ||
+      err === undefined ||
+      typeof err === "boolean" ||
+      typeof err === "number" ||
+      typeof err === "bigint"
+    ) {
+      return String(err);
+    }
+    if (typeof err === "symbol") return SYMBOL_SENTINEL;
+    if (typeof err === "function") return FUNCTION_SENTINEL;
+
+    const safe = sanitizeErrorValue(err, 0, new Set());
+    const json = JSON.stringify(safe);
+    return typeof json === "string" ? json : UNSERIALIZABLE_SENTINEL;
+  } catch {
+    return UNSERIALIZABLE_SENTINEL;
   }
-  return redactText(raw, options);
+}
+
+/** Redacted, bounded text for anything thrown at us — never throws on hostile values. */
+export function redactError(err: unknown, options: RedactOptions = {}): string {
+  return redactText(serializeUnknownError(err, true), options);
 }

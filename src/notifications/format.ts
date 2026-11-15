@@ -14,7 +14,7 @@
  * commands and status messages to keep the UI clean.
  */
 
-import { redactText } from "../redact.js";
+import { redactText, UNSERIALIZABLE_SENTINEL } from "../redact.js";
 import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
@@ -121,24 +121,43 @@ export function splitTelegramMessage(
  * errors are read field-wise and only then fall back to a bounded dump.
  */
 function describeError(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (error === null || error === undefined) return "";
-  if (typeof error === "object") {
-    const record = error as { code?: unknown; message?: unknown };
-    const code =
-      typeof record.code === "number" || typeof record.code === "string" ? record.code : null;
-    if (typeof record.message === "string" && record.message !== "") {
-      return code === null ? record.message : `${code}: ${record.message}`;
+  try {
+    if (error instanceof Error) {
+      try {
+        return typeof error.message === "string" ? error.message : UNSERIALIZABLE_SENTINEL;
+      } catch {
+        return UNSERIALIZABLE_SENTINEL;
+      }
     }
-    try {
-      const json = JSON.stringify(error);
-      if (typeof json === "string" && json !== "{}") return json;
-    } catch {
-      // Circular or exotic object; fall through to the generic label.
+    if (error === null || error === undefined) return "";
+    if (typeof error === "object") {
+      const record = error as { code?: unknown; message?: unknown };
+      let code: number | string | null = null;
+      try {
+        code =
+          typeof record.code === "number" || typeof record.code === "string" ? record.code : null;
+      } catch {
+        code = null;
+      }
+      try {
+        if (typeof record.message === "string" && record.message !== "") {
+          return code === null ? record.message : `${code}: ${record.message}`;
+        }
+      } catch {
+        return code === null ? UNSERIALIZABLE_SENTINEL : `${code}: ${UNSERIALIZABLE_SENTINEL}`;
+      }
+      try {
+        const json = JSON.stringify(error);
+        if (typeof json === "string" && json !== "{}") return json;
+      } catch {
+        // Circular or exotic object; fall through to the generic label.
+      }
+      return code === null ? "error object" : `error code ${code}`;
     }
-    return code === null ? "error object" : `error code ${code}`;
+    return String(error);
+  } catch {
+    return UNSERIALIZABLE_SENTINEL;
   }
-  return String(error);
 }
 
 /**
@@ -158,23 +177,27 @@ export const TELEGRAM_SEND_TIMEOUT_MS = 10_000;
  * poller can log "timed out" instead of a generic failure and retry the batch.
  */
 export function isTimeoutError(error: unknown): boolean {
-  if (error instanceof Error) {
-    if (error.name === "AbortError" || error.name === "TimeoutError") return true;
-    const code = (error as { code?: unknown }).code;
-    if (typeof code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(code)) {
-      return true;
+  try {
+    if (error instanceof Error) {
+      if (error.name === "AbortError" || error.name === "TimeoutError") return true;
+      const code = (error as { code?: unknown }).code;
+      if (typeof code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(code)) {
+        return true;
+      }
+      return /timed? ?out/i.test(error.message);
     }
-    return /timed? ?out/i.test(error.message);
-  }
-  if (error !== null && typeof error === "object") {
-    const record = error as { name?: unknown; code?: unknown; message?: unknown };
-    if (record.name === "AbortError" || record.name === "TimeoutError") return true;
-    if (typeof record.code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(record.code)) {
-      return true;
+    if (error !== null && typeof error === "object") {
+      const record = error as { name?: unknown; code?: unknown; message?: unknown };
+      if (record.name === "AbortError" || record.name === "TimeoutError") return true;
+      if (typeof record.code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(record.code)) {
+        return true;
+      }
+      if (typeof record.message === "string" && /timed? ?out/i.test(record.message)) {
+        return true;
+      }
     }
-    if (typeof record.message === "string" && /timed? ?out/i.test(record.message)) {
-      return true;
-    }
+  } catch {
+    return false;
   }
   return false;
 }

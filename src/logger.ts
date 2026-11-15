@@ -30,6 +30,21 @@
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import {
+  CIRCULAR_SENTINEL,
+  DEPTH_LIMIT_SENTINEL,
+  FUNCTION_SENTINEL,
+  SYMBOL_SENTINEL,
+  UNSERIALIZABLE_SENTINEL,
+} from "./redact.js";
+
+export {
+  CIRCULAR_SENTINEL,
+  DEPTH_LIMIT_SENTINEL,
+  FUNCTION_SENTINEL,
+  SYMBOL_SENTINEL,
+  UNSERIALIZABLE_SENTINEL,
+};
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -120,6 +135,17 @@ export function createLogCapture(capacity: number): LogCapture {
  * does. Library chatter (e.g. grammy internals) that bypasses console is not
  * captured — acceptable for a notifier whose own lines carry the story.
  */
+function formatConsoleArg(arg: unknown): string {
+  if (typeof arg === "string") return arg;
+  if (typeof arg === "symbol") return String(arg);
+  if (typeof arg === "function") return FUNCTION_SENTINEL;
+  try {
+    return String(arg);
+  } catch {
+    return UNSERIALIZABLE_SENTINEL;
+  }
+}
+
 export function attachConsole(capture: LogCapture, secrets: string[]): () => void {
   const methods = ["log", "info", "warn", "error"] as const;
   type LogFn = (...args: unknown[]) => void;
@@ -131,9 +157,13 @@ export function attachConsole(capture: LogCapture, secrets: string[]): () => voi
     console[level] = (...args: unknown[]) => {
       // Original first: the host's own output stays untouched even if the
       // capture below throws (it must never take down the real log call).
-      original(...args);
       try {
-        capture.add(level, redactLine(args.map(String).join(" "), secrets));
+        original(...args);
+      } catch {
+        // Never allow console transport errors to crash polling.
+      }
+      try {
+        capture.add(level, redactLine(args.map(formatConsoleArg).join(" "), secrets));
       } catch {
         // Capture is best-effort by contract.
       }
@@ -243,6 +273,8 @@ export const MAX_LOG_FIELD_CHARS = 1_000;
 
 const LOG_REDACTED = "[REDACTED]";
 const MAX_FIELD_DEPTH = 4;
+const MAX_COLLECTION_ITEMS = 100;
+const FALLBACK_EPOCH_ISO = "1970-01-01T00:00:00.000Z";
 const LEVEL_RANK: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40, fatal: 50 };
 const TELEGRAM_TOKEN_SHAPE = /\b\d{5,}:[A-Za-z0-9_-]{20,}/g;
 
@@ -295,40 +327,226 @@ function boundField(text: string): string {
   return text.length <= MAX_LOG_FIELD_CHARS ? text : `${text.slice(0, MAX_LOG_FIELD_CHARS - 1)}…`;
 }
 
-function sanitize(value: unknown, depth: number): unknown {
-  if (typeof value === "string") return boundField(redactLogText(value));
-  if (typeof value === "bigint") return value.toString();
-  if (value === null || typeof value !== "object") return value;
-  if (depth >= MAX_FIELD_DEPTH) return "[depth-limit]";
-  if (Array.isArray(value)) return value.map((item) => sanitize(item, depth + 1));
-  const out: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (item === undefined || typeof item === "function") continue;
-    out[key] = sanitize(item, depth + 1);
-  }
-  return out;
+function setSafeProp(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
 }
 
-function emit(level: LogLevel, component: string, message: string, fields?: LogFields): void {
-  if (LEVEL_RANK[level] < LEVEL_RANK[state.level]) return;
-  const msg = redactLogText(message);
+function safeCoerceString(value: unknown, fallback: string): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "symbol") return SYMBOL_SENTINEL;
+  if (typeof value === "function") return FUNCTION_SENTINEL;
+  try {
+    return String(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function safeIsoTimestamp(): string {
+  try {
+    const nowValue = state.now();
+    if (nowValue instanceof Date) {
+      const ms = nowValue.getTime();
+      if (Number.isFinite(ms)) return nowValue.toISOString();
+    }
+  } catch {
+    // Fall back to deterministic epoch ISO string rather than crashing.
+  }
+  return FALLBACK_EPOCH_ISO;
+}
+
+function safeSinkCall(level: LogLevel, line: string): void {
+  try {
+    state.sink(level, line);
+  } catch {
+    // Never let a broken sink or EPIPE terminate polling.
+  }
+}
+
+function sanitize(value: unknown, depth: number, ancestors: Set<object>): unknown {
+  if (typeof value === "string") return boundField(redactLogText(value));
+  if (typeof value === "bigint") return boundField(value.toString());
+  if (typeof value === "boolean" || value === null) return value;
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) return value;
+    if (Number.isNaN(value)) return "[NaN]";
+    return value > 0 ? "[Infinity]" : "[-Infinity]";
+  }
+  if (typeof value === "symbol") return SYMBOL_SENTINEL;
+  if (typeof value === "function") return FUNCTION_SENTINEL;
+  if (value === undefined) return "[undefined]";
+  if (typeof value !== "object") return UNSERIALIZABLE_SENTINEL;
+
+  if (ancestors.has(value)) return CIRCULAR_SENTINEL;
+
+  try {
+    if (value instanceof Date) {
+      const ms = value.getTime();
+      return Number.isFinite(ms) ? value.toISOString() : "[Invalid Date]";
+    }
+    if (value instanceof RegExp) {
+      return boundField(redactLogText(String(value)));
+    }
+    if (value instanceof Error) {
+      let errName = "Error";
+      let errMsg = "";
+      try {
+        if (typeof value.name === "string" && value.name.length > 0) {
+          errName = boundField(redactLogText(value.name));
+        }
+      } catch {
+        errName = "Error";
+      }
+      try {
+        errMsg =
+          typeof value.message === "string"
+            ? boundField(redactLogText(value.message))
+            : UNSERIALIZABLE_SENTINEL;
+      } catch {
+        errMsg = UNSERIALIZABLE_SENTINEL;
+      }
+      const errOut: Record<string, unknown> = {};
+      setSafeProp(errOut, "name", errName);
+      setSafeProp(errOut, "message", errMsg);
+      return errOut;
+    }
+  } catch {
+    return UNSERIALIZABLE_SENTINEL;
+  }
+
+  if (depth >= MAX_FIELD_DEPTH) return DEPTH_LIMIT_SENTINEL;
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const limit = Math.min(value.length, MAX_COLLECTION_ITEMS);
+      const outArr: unknown[] = [];
+      for (let i = 0; i < limit; i += 1) {
+        try {
+          outArr.push(sanitize(value[i], depth + 1, ancestors));
+        } catch {
+          outArr.push(UNSERIALIZABLE_SENTINEL);
+        }
+      }
+      if (value.length > limit) {
+        outArr.push(`[+${value.length - limit} items]`);
+      }
+      return outArr;
+    }
+
+    if (value instanceof Map) return `[Map(${value.size})]`;
+    if (value instanceof Set) return `[Set(${value.size})]`;
+    if (value instanceof WeakMap) return "[WeakMap]";
+    if (value instanceof WeakSet) return "[WeakSet]";
+    if (value instanceof Promise) return "[Promise]";
+    if (ArrayBuffer.isView(value)) {
+      return `[${value.constructor?.name ?? "TypedArray"}(${value.byteLength})]`;
+    }
+    if (value instanceof ArrayBuffer) return `[ArrayBuffer(${value.byteLength})]`;
+
+    let keys: string[];
+    try {
+      keys = Object.keys(value);
+    } catch {
+      return UNSERIALIZABLE_SENTINEL;
+    }
+
+    const out: Record<string, unknown> = {};
+    const limit = Math.min(keys.length, MAX_COLLECTION_ITEMS);
+    for (let i = 0; i < limit; i += 1) {
+      const rawKey = keys[i];
+      if (rawKey === undefined) continue;
+      const safeKey = boundField(redactLogText(rawKey));
+      let item: unknown;
+      try {
+        item = (value as Record<string, unknown>)[rawKey];
+      } catch {
+        setSafeProp(out, safeKey, UNSERIALIZABLE_SENTINEL);
+        continue;
+      }
+      if (item === undefined) continue;
+      setSafeProp(out, safeKey, sanitize(item, depth + 1, ancestors));
+    }
+    if (keys.length > limit) {
+      setSafeProp(out, "__truncatedKeys", `[+${keys.length - limit} keys]`);
+    }
+    return out;
+  } catch {
+    return UNSERIALIZABLE_SENTINEL;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function emit(level: LogLevel, component: string, message: unknown, fields?: LogFields): void {
+  if (!(level in LEVEL_RANK) || LEVEL_RANK[level] < LEVEL_RANK[state.level]) return;
+  const safeComponent = boundField(redactLogText(safeCoerceString(component, "unknown")));
+  const msg = boundField(redactLogText(safeCoerceString(message, UNSERIALIZABLE_SENTINEL)));
+
   if (state.format === "text") {
-    state.sink(level, msg);
+    safeSinkCall(level, msg);
     return;
   }
+
+  const ts = safeIsoTimestamp();
   let line: string;
   try {
     const safe: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(fields ?? {})) {
-      if (item === undefined || typeof item === "function") continue;
-      safe[key] = sanitize(item, 0);
+    if (fields !== undefined && fields !== null) {
+      if (typeof fields !== "object" || Array.isArray(fields)) {
+        setSafeProp(safe, "fields", sanitize(fields, 0, new Set()));
+      } else {
+        let keys: string[] | null = null;
+        try {
+          keys = Object.keys(fields);
+        } catch {
+          setSafeProp(safe, "fields", UNSERIALIZABLE_SENTINEL);
+        }
+
+        if (keys !== null) {
+          const ancestors = new Set<object>([fields]);
+          const limit = Math.min(keys.length, MAX_COLLECTION_ITEMS);
+          for (let i = 0; i < limit; i += 1) {
+            const rawKey = keys[i];
+            if (rawKey === undefined) continue;
+            const safeKey = boundField(redactLogText(rawKey));
+            let item: unknown;
+            try {
+              item = fields[rawKey];
+            } catch {
+              setSafeProp(safe, safeKey, UNSERIALIZABLE_SENTINEL);
+              continue;
+            }
+            if (item === undefined) continue;
+            setSafeProp(safe, safeKey, sanitize(item, 0, ancestors));
+          }
+          if (keys.length > limit) {
+            setSafeProp(safe, "__truncatedKeys", `[+${keys.length - limit} keys]`);
+          }
+        }
+      }
     }
-    line = JSON.stringify({ ...safe, ts: state.now().toISOString(), level, component, msg });
+    setSafeProp(safe, "ts", ts);
+    setSafeProp(safe, "level", level);
+    setSafeProp(safe, "component", safeComponent);
+    setSafeProp(safe, "msg", msg);
+    line = JSON.stringify(safe);
   } catch {
-    // Never let a hostile field take the log call (or the caller) down.
-    line = msg;
+    // Minimal JSON envelope fallback retains original level, component, and stable message.
+    line = JSON.stringify({
+      ts,
+      level,
+      component: safeComponent,
+      msg,
+      serializationFallback: UNSERIALIZABLE_SENTINEL,
+    });
   }
-  state.sink(level, line);
+  safeSinkCall(level, line);
 }
 
 export const Logger = {

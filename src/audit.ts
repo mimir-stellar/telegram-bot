@@ -31,6 +31,7 @@ import { mkdir, appendFile, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { ContractSource } from "./stellar/decode.js";
+import { serializeUnknownError } from "./redact.js";
 
 // ── Kinds ────────────────────────────────────────────────────────────────────
 
@@ -167,22 +168,30 @@ export function redact(
   return out;
 }
 
-/** Extract a redactable message from anything thrown at us. */
+/** Extract a redactable message from anything thrown at us without throwing on hostile/circular objects. */
 export function errorText(err: unknown): string {
-  if (err instanceof Error) return err.message;
   if (typeof err === "string") return err;
   if (err && typeof err === "object") {
+    let isErr = false;
+    try {
+      isErr = err instanceof Error;
+    } catch {
+      isErr = false;
+    }
+    if (isErr) {
+      return serializeUnknownError(err, false);
+    }
     // The SDK's JSON-RPC layer throws raw response error objects
     // ({ code, message, data }), not Error instances.
-    const message = (err as { message?: unknown }).message;
-    if (typeof message === "string" && message !== "") return message;
     try {
-      return JSON.stringify(err);
+      const message = (err as { message?: unknown }).message;
+      if (typeof message === "string" && message !== "") return message;
     } catch {
-      return String(err);
+      // Fall through to safe serializer when .message getter throws.
     }
+    return serializeUnknownError(err, false);
   }
-  return String(err);
+  return serializeUnknownError(err, false);
 }
 
 // ── Construction ─────────────────────────────────────────────────────────────

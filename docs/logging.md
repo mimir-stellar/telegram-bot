@@ -115,10 +115,9 @@ Emitted by top-level Node.js error listeners.
 ### Field Bounds
 To protect log aggregators and prevent denial-of-service via massive RPC payloads:
 - **String length truncation**: Any string field value longer than `MAX_LOG_FIELD_CHARS` (`1,000` characters) is truncated to 999 characters and suffixed with an ellipsis (`…`).
-- **Object depth limit**: Deeply nested JSON structures are traversed up to `MAX_FIELD_DEPTH` (`4` levels). Anything deeper is replaced with `"[depth-limit]"`, protecting against circular references.
-- **BigInt serialization**: `BigInt` values are converted to standard numeric strings (`value.toString()`).
-- **Undefined & Functions**: Object keys whose values are `undefined` or functions are stripped before JSON serialization.
-- **Fail-safe fallback**: If serializing `fields` throws unexpectedly, the logger emits the bare sanitized `msg` string so the process never crashes on logging.
+- **Circular & depth bounds**: True ancestor cycles are detected immediately and replaced with `"[circular]"`, while shared non-cyclic references remain intact. Deeply nested JSON structures beyond `MAX_FIELD_DEPTH` (`4` levels) are replaced with `"[depth-limit]"`, and oversized arrays/objects beyond `100` entries append a bounded truncation marker (`"[+N items]"` / `"[+N keys]"`).
+- **BigInt & Error serialization**: `BigInt` values are converted to bounded numeric strings (`value.toString()`), and `Error` instances serialize as `{ name, message }` with secrets scrubbed.
+- **Unsupported & hostile value sentinels**: `undefined` object keys are omitted; unsupported JS primitives and containers are replaced with bounded sentinels (`"[function]"`, `"[symbol]"`, `"[NaN]"`, `"[Infinity]"`, `"[-Infinity]"`, `"[Invalid Date]"`, `"[Map(N)]"`, `"[Set(N)]"`). Throwing getters, hostile `Proxy` traps, throwing `toJSON()` methods, null-prototype objects (`Object.create(null)`), invalid clocks, and sink exceptions are isolated to `"[unserializable]"` so JSON records always retain their canonical `level`, `component`, and stable `msg`, and logger/error serialization failures can never terminate polling.
 
 ### Redaction Rules
 Every log record is redacted before it leaves the process:

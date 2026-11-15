@@ -149,25 +149,26 @@ test("text format redacts too, not only json", () => {
   assert.equal(lines[0].line, "failed with [REDACTED]");
 });
 
-test("fields are JSON-safe: bigint stringified, undefined dropped, depth bounded", () => {
+test("fields are JSON-safe: bigint stringified, undefined dropped, circular & depth bounded", () => {
   Logger.configure({ format: "json" });
   const lines = captureConsole();
   const cyclic = { name: "deep" };
   cyclic.self = cyclic;
+  const nested = { l1: { l2: { l3: { l4: { l5: "too-deep" } } } } };
   Logger.info("x", "msg", {
     amount: 20_000_000n,
     absent: undefined,
     missing: null,
     cyclic,
+    nested,
   });
   const record = JSON.parse(lines[0].line);
   assert.equal(record.amount, "20000000");
   assert.ok(!("absent" in record), "undefined is dropped rather than serialized");
   assert.equal(record.missing, null);
-  // A cyclic field is bounded by depth instead of throwing in JSON.stringify:
-  // `cyclic` sits at depth 0, so four levels down the cycle is cut.
   assert.equal(record.cyclic.name, "deep");
-  assert.equal(record.cyclic.self.self.self.self, "[depth-limit]");
+  assert.equal(record.cyclic.self, "[circular]");
+  assert.equal(record.nested.l1.l2.l3.l4, "[depth-limit]");
 });
 
 test("a long field is truncated to the log field budget", () => {
@@ -179,10 +180,10 @@ test("a long field is truncated to the log field budget", () => {
   assert.ok(record.reason.endsWith("…"));
 });
 
-test("a field that cannot be serialized degrades to the message, never throws", () => {
+test("a field that cannot be serialized uses a bounded sentinel and retains level and message", () => {
   Logger.configure({ format: "json" });
   const lines = captureConsole();
-  const hostile = {};
+  const hostile = { ok: true };
   Object.defineProperty(hostile, "boom", {
     enumerable: true,
     get() {
@@ -191,7 +192,12 @@ test("a field that cannot be serialized degrades to the message, never throws", 
   });
   assert.doesNotThrow(() => Logger.info("x", "still logged", { hostile }));
   assert.equal(lines.length, 1);
-  assert.equal(lines[0].line, "still logged");
+  assert.equal(lines[0].level, "info");
+  const record = JSON.parse(lines[0].line);
+  assert.equal(record.level, "info");
+  assert.equal(record.component, "x");
+  assert.equal(record.msg, "still logged");
+  assert.deepEqual(record.hostile, { ok: true, boom: "[unserializable]" });
 });
 
 test("configureFromEnv reads the level and format variables", () => {
