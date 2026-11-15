@@ -184,6 +184,13 @@ Thin wrapper around Stellar SDK's `rpc.Server` with explorer URL helpers.
 - **Unauthenticated**: Public Testnet RPC requires no keys
 - **HTTP-aware**: Allows HTTP for local quickstart containers
 
+### Atom Feed Builder (`src/stellar/feed.ts`)
+
+Renders decoded Mimir contract events into bounded, escaped Atom 1.0 documents without external XML dependencies:
+
+- **Separated timestamps**: `<updated>` and `<mimir:lastEventUpdatedAt>` reflect only the latest event timestamp (or `FEED_EMPTY_UPDATED_AT` when no event timestamp exists), never `Date.now()`. Optional feed render time (`generatedAt`) is emitted separately in `<mimir:generatedAt>`.
+- **Feed lifecycle state**: `<mimir:state>` and `FeedTimestampMetadata.state` distinguish `empty`, `unchanged` (matching `previousRevision`), and `updated` snapshots while keeping snapshot fixtures deterministic.
+
 ## Data Flow
 
 ### Event Processing Pipeline

@@ -11,9 +11,16 @@
  *   https://www.rfc-editor.org/rfc/rfc4287
  */
 
+import { createHash } from "node:crypto";
 import { formatPlainTextEvent, eventExplorerUrl } from "../notifications/format.js";
 import type { DecodedEvent } from "./decode.js";
 import type { StellarConfig } from "../config.js";
+
+/** XML namespace for Mimir Atom feed extension metadata. */
+export const MIMIR_FEED_XMLNS = "https://mimir.stellar/ns/feed/1.0";
+
+/** Deterministic RFC 3339 fallback `<updated>` timestamp when no event timestamp exists. */
+export const FEED_EMPTY_UPDATED_AT = "1970-01-01T00:00:00.000Z";
 
 // ---------------------------------------------------------------------------
 // XML escaping
@@ -100,6 +107,30 @@ export interface AtomEntry {
 // Feed document
 // ---------------------------------------------------------------------------
 
+export type FeedUpdateState = "empty" | "unchanged" | "updated";
+
+export interface FeedTimestampMetadata {
+  /** Lifecycle classification for this rendered snapshot. */
+  state: FeedUpdateState;
+  /** Number of entries rendered into the feed. */
+  entryCount: number;
+  /** Deterministic SHA-256 digest of the canonical event sequence in this feed. */
+  revision: string;
+  /** Whether the feed's event revision matches `previousRevision`. */
+  unchanged: boolean;
+  /** Latest positive `event.at` timestamp in ISO 8601, or `null` when absent/empty. */
+  lastEventUpdatedAt: string | null;
+  /** Effective Atom `<updated>` value (never derived from wall-clock render time). */
+  feedUpdatedAt: string;
+  /** Explicit feed snapshot generation timestamp when supplied, else `null`. */
+  generatedAt: string | null;
+}
+
+export interface AtomFeedBuildResult {
+  xml: string;
+  metadata: FeedTimestampMetadata;
+}
+
 export interface AtomFeedOptions {
   /** `<title>` for the feed (e.g. "Mimir Events"). */
   title: string;
@@ -109,10 +140,28 @@ export interface AtomFeedOptions {
   config: StellarConfig;
   /**
    * Override the feed's `<updated>` timestamp (ISO 8601 / RFC 3339).
-   * Defaults to the `at` field of the most-recent event, or the current
-   * wall-clock time when the events array is empty.
+   * Defaults to the `at` field of the most-recent event, or
+   * {@link FEED_EMPTY_UPDATED_AT} when no event timestamp is available.
    */
   updatedAt?: string;
+  /**
+   * Timestamp when this feed document was generated (ISO 8601 / RFC 3339).
+   * Kept strictly separate from `<updated>` so re-rendering an empty or
+   * unchanged feed never advances `<updated>`. Omitted in deterministic
+   * snapshot fixtures unless explicitly provided.
+   */
+  generatedAt?: string;
+  /**
+   * Optional `revision` from the previous feed render. When the current event
+   * revision matches a non-empty feed's `previousRevision`, the feed is marked
+   * `unchanged`.
+   */
+  previousRevision?: string;
+  /**
+   * Optional `<updated>` from the previous feed render, preserved when an
+   * empty or timeless feed remains unchanged.
+   */
+  previousUpdatedAt?: string;
   /** Optional subtitle / description for the feed. */
   subtitle?: string;
 }
@@ -193,40 +242,124 @@ function renderEntry(entry: AtomEntry): string {
     .join("\n");
 }
 
-/**
- * Build a complete Atom 1.0 feed document string from an array of decoded events.
- *
- * - `<feed id>` is the `selfUrl`.
- * - `<updated>` is the most recent `event.at` timestamp, or `updatedAt` when
- *   provided, or the current time for an empty event array.
- * - Each event becomes one `<entry>`.  Events with no plain-text rendering still
- *   get an entry (with an empty `<content/>`), so feed readers always see the
- *   full event count.
- * - All dynamic content is XML-escaped; XML-illegal control characters are
- *   stripped before escaping.
- */
-export function buildAtomFeed(
-  events: readonly DecodedEvent[],
-  options: AtomFeedOptions,
-): string {
-  const { title, selfUrl, config, subtitle } = options;
+function normalizeIsoTimestamp(value: string, fieldName: string): string {
+  const trimmed = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(trimmed)) {
+    throw new RangeError(`Invalid ISO 8601 timestamp for ${fieldName}: "${value}"`);
+  }
+  const ms = Date.parse(trimmed);
+  if (Number.isNaN(ms)) {
+    throw new RangeError(`Unparseable ISO 8601 timestamp for ${fieldName}: "${value}"`);
+  }
+  return trimmed;
+}
 
-  // Feed <updated>: caller override → latest event.at → now.
-  let feedUpdated: string;
-  if (options.updatedAt) {
-    feedUpdated = options.updatedAt;
-  } else if (events.length > 0) {
-    const maxAt = events.reduce((best, e) => Math.max(best, e.at ?? 0), 0);
-    feedUpdated = new Date(maxAt > 0 ? maxAt * 1000 : Date.now()).toISOString();
-  } else {
-    feedUpdated = new Date().toISOString();
+/**
+ * Compute a deterministic SHA-256 revision digest over the feed's ordered event identities.
+ */
+export function computeFeedRevision(events: readonly DecodedEvent[]): string {
+  const hash = createHash("sha256");
+  hash.update(`count:${events.length}\n`);
+  for (const event of events) {
+    hash.update(
+      [
+        event.source,
+        event.contractId,
+        String(event.ledger),
+        event.txHash,
+        event.eventId,
+        String(event.at ?? 0),
+        event.payload.name,
+      ].join("|"),
+    );
+    hash.update("\n");
+  }
+  return hash.digest("hex");
+}
+
+/**
+ * Resolve feed generation metadata separately from the last event update time.
+ *
+ * Never consults `Date.now()`: empty and unchanged feeds keep deterministic
+ * `<updated>` timestamps instead of advancing on every render.
+ */
+export function resolveFeedTimestamps(
+  events: readonly DecodedEvent[],
+  options: Pick<
+    AtomFeedOptions,
+    "updatedAt" | "generatedAt" | "previousRevision" | "previousUpdatedAt"
+  > = {},
+): FeedTimestampMetadata {
+  const updatedOverride =
+    options.updatedAt !== undefined
+      ? normalizeIsoTimestamp(options.updatedAt, "updatedAt")
+      : undefined;
+  const generatedAt =
+    options.generatedAt !== undefined
+      ? normalizeIsoTimestamp(options.generatedAt, "generatedAt")
+      : null;
+  const previousUpdatedAt =
+    options.previousUpdatedAt !== undefined
+      ? normalizeIsoTimestamp(options.previousUpdatedAt, "previousUpdatedAt")
+      : undefined;
+
+  const revision = computeFeedRevision(events);
+  let maxAt = 0;
+  for (const event of events) {
+    if (typeof event.at === "number" && Number.isFinite(event.at) && event.at > maxAt) {
+      maxAt = event.at;
+    }
   }
 
+  const lastEventUpdatedAt = maxAt > 0 ? new Date(maxAt * 1000).toISOString() : null;
+  const matchesPrevious =
+    options.previousRevision !== undefined && options.previousRevision === revision;
+
+  let state: FeedUpdateState;
+  if (events.length === 0) {
+    state = "empty";
+  } else if (matchesPrevious) {
+    state = "unchanged";
+  } else {
+    state = "updated";
+  }
+
+  let feedUpdatedAt: string;
+  if (updatedOverride !== undefined) {
+    feedUpdatedAt = updatedOverride;
+  } else if (lastEventUpdatedAt !== null) {
+    feedUpdatedAt = lastEventUpdatedAt;
+  } else if (matchesPrevious && previousUpdatedAt !== undefined) {
+    feedUpdatedAt = previousUpdatedAt;
+  } else {
+    feedUpdatedAt = FEED_EMPTY_UPDATED_AT;
+  }
+
+  return {
+    state,
+    entryCount: events.length,
+    revision,
+    unchanged: matchesPrevious,
+    lastEventUpdatedAt,
+    feedUpdatedAt,
+    generatedAt,
+  };
+}
+
+/**
+ * Build both the Atom 1.0 XML string and its separated timestamp/state metadata.
+ */
+export function buildAtomFeedResult(
+  events: readonly DecodedEvent[],
+  options: AtomFeedOptions,
+): AtomFeedBuildResult {
+  const { title, selfUrl, config, subtitle } = options;
+  const metadata = resolveFeedTimestamps(events, options);
   const validSelfUrl = safeHttpsUrl(selfUrl) ?? "";
 
   const lines: string[] = [
     '<?xml version="1.0" encoding="UTF-8"?>',
-    '<feed xmlns="http://www.w3.org/2005/Atom">',
+    `<feed xmlns="http://www.w3.org/2005/Atom" xmlns:mimir="${MIMIR_FEED_XMLNS}">`,
     `  <title type="text">${xmlText(title, FEED_TITLE_MAX_CHARS)}</title>`,
   ];
 
@@ -236,8 +369,19 @@ export function buildAtomFeed(
 
   lines.push(
     `  <id>${escapeXml(validSelfUrl || selfUrl)}</id>`,
-    `  <updated>${escapeXml(feedUpdated)}</updated>`,
+    `  <updated>${escapeXml(metadata.feedUpdatedAt)}</updated>`,
+    `  <mimir:state>${metadata.state}</mimir:state>`,
   );
+
+  if (metadata.lastEventUpdatedAt !== null) {
+    lines.push(
+      `  <mimir:lastEventUpdatedAt>${escapeXml(metadata.lastEventUpdatedAt)}</mimir:lastEventUpdatedAt>`,
+    );
+  }
+
+  if (metadata.generatedAt !== null) {
+    lines.push(`  <mimir:generatedAt>${escapeXml(metadata.generatedAt)}</mimir:generatedAt>`);
+  }
 
   if (validSelfUrl) {
     lines.push(
@@ -251,5 +395,30 @@ export function buildAtomFeed(
   }
 
   lines.push("</feed>");
-  return lines.join("\n");
+  return {
+    xml: lines.join("\n"),
+    metadata,
+  };
+}
+
+/**
+ * Build a complete Atom 1.0 feed document string from an array of decoded events.
+ *
+ * - `<feed id>` is the `selfUrl`.
+ * - `<updated>` is the most recent `event.at` timestamp, or `updatedAt` when
+ *   provided, or {@link FEED_EMPTY_UPDATED_AT} when no event timestamp exists.
+ * - Feed generation time (`generatedAt`) is emitted separately in `<mimir:generatedAt>`
+ *   when provided, keeping snapshot fixtures deterministic and preventing empty
+ *   or unchanged feeds from advancing `<updated>` on re-render.
+ * - Each event becomes one `<entry>`.  Events with no plain-text rendering still
+ *   get an entry (with an empty `<content/>`), so feed readers always see the
+ *   full event count.
+ * - All dynamic content is XML-escaped; XML-illegal control characters are
+ *   stripped before escaping.
+ */
+export function buildAtomFeed(
+  events: readonly DecodedEvent[],
+  options: AtomFeedOptions,
+): string {
+  return buildAtomFeedResult(events, options).xml;
 }
