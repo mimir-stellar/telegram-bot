@@ -30,6 +30,18 @@
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import {
+  applyErrorRedactionRules,
+  buildSyntheticRedactionProbes,
+  clearSecrets,
+  redactError,
+  redactText,
+  redactUrl,
+  registeredSecrets,
+  registerSecrets,
+  safeProbeFieldName,
+  type RedactionProbe,
+} from "./redact.js";
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -285,10 +297,14 @@ let state = defaultState();
 
 function redactLogText(text: string): string {
   let out = text;
-  for (const secret of state.secrets) {
-    if (secret.length > 0) out = out.split(secret).join(LOG_REDACTED);
+  const known = [...registeredSecrets(), ...state.secrets]
+    .filter((secret) => typeof secret === "string" && secret.length > 0)
+    .sort((a, b) => b.length - a.length);
+  for (const secret of known) {
+    if (out.includes(secret)) out = out.split(secret).join(LOG_REDACTED);
   }
-  return out.replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED);
+  out = out.replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED);
+  return applyErrorRedactionRules(out);
 }
 
 function boundField(text: string): string {
@@ -367,3 +383,201 @@ export const Logger = {
     emit("fatal", component, message, fields);
   },
 };
+
+export interface RedactionSelfCheckOptions {
+  /** Log formats to verify. Defaults to all supported formats (`text`, `json`). */
+  formats?: readonly LogFormat[];
+  /** Synthetic probes to execute. Defaults to `buildSyntheticRedactionProbes()`. */
+  probes?: readonly RedactionProbe[];
+  /**
+   * Optional line inspector hook for fault-injection tests to simulate a format
+   * or field leak without weakening production redaction rules.
+   */
+  inspectOutput?: (context: {
+    surface: "logger" | "redactText" | "redactError" | "redactUrl" | "redactLine";
+    format?: LogFormat;
+    field: string;
+    output: string;
+  }) => string;
+}
+
+export interface RedactionSelfCheckResult {
+  ok: boolean;
+  formatsChecked: LogFormat[];
+  probesRun: number;
+  /** Safe field names whose synthetic probe value leaked; never contains probe values. */
+  leakedFields: string[];
+}
+
+/**
+ * Run synthetic secret probes across every configured/supported log format and
+ * shared redaction surface without touching external services or mutating
+ * caller logger/registry state. Reports ONLY field names if any probe leaks.
+ */
+export function runRedactionSelfCheck(
+  options: RedactionSelfCheckOptions = {},
+): RedactionSelfCheckResult {
+  const requestedFormats = options.formats && options.formats.length > 0
+    ? options.formats
+    : LOG_FORMATS;
+  const formatsChecked: LogFormat[] = [];
+  for (const fmt of requestedFormats) {
+    const parsed = parseLogFormat(fmt);
+    if (!formatsChecked.includes(parsed)) {
+      formatsChecked.push(parsed);
+    }
+  }
+  if (formatsChecked.length === 0) {
+    formatsChecked.push(...LOG_FORMATS);
+  }
+
+  const probes =
+    options.probes && options.probes.length > 0
+      ? [...options.probes]
+      : buildSyntheticRedactionProbes();
+
+  const savedLoggerState: LoggerState = {
+    ...state,
+    secrets: [...state.secrets],
+  };
+  const savedRegistered = registeredSecrets();
+  const leaked = new Set<string>();
+  const inspect = options.inspectOutput;
+
+  try {
+    const registeredProbeValues = probes
+      .filter((p) => p.register && typeof p.secret === "string" && p.secret.length > 0)
+      .map((p) => p.secret);
+
+    clearSecrets();
+    registerSecrets([...savedRegistered, ...registeredProbeValues]);
+
+    for (const format of formatsChecked) {
+      const captured: string[] = [];
+      state = {
+        level: "debug",
+        format,
+        sink: (_lvl, line) => {
+          captured.push(line);
+        },
+        secrets: [...registeredProbeValues],
+        now: () => new Date("2026-01-01T00:00:00.000Z"),
+      };
+
+      for (const probe of probes) {
+        if (!probe.secret) continue;
+        const fieldName = safeProbeFieldName(probe.field, probe.secret);
+
+        // 1. Message probe across current format
+        captured.length = 0;
+        emit("error", "doctor", `probe ${probe.sample}`);
+        const msgLineRaw = captured[0] ?? "";
+        const msgLine = inspect
+          ? inspect({ surface: "logger", format, field: fieldName, output: msgLineRaw })
+          : msgLineRaw;
+        if (msgLine.includes(probe.secret)) {
+          leaked.add(fieldName);
+        }
+
+        // 2. Structured top-level and nested field probes
+        const nestedFieldName = safeProbeFieldName(`nested.${fieldName}`, probe.secret);
+        captured.length = 0;
+        emit("error", "doctor", "structured probe", {
+          [fieldName]: probe.sample,
+          nested: { [fieldName]: probe.sample },
+        });
+        const fieldLineRaw = captured[0] ?? "";
+        const topEvaluated = inspect
+          ? inspect({ surface: "logger", format, field: fieldName, output: fieldLineRaw })
+          : fieldLineRaw;
+        const nestedEvaluated = inspect
+          ? inspect({ surface: "logger", format, field: nestedFieldName, output: fieldLineRaw })
+          : fieldLineRaw;
+
+        if (format === "json") {
+          try {
+            const parsedTop = JSON.parse(topEvaluated) as Record<string, unknown>;
+            if (typeof parsedTop[fieldName] === "string" && parsedTop[fieldName].includes(probe.secret)) {
+              leaked.add(fieldName);
+            } else if (topEvaluated.includes(probe.secret) && !nestedEvaluated.includes(probe.secret)) {
+              leaked.add(fieldName);
+            }
+          } catch {
+            if (topEvaluated.includes(probe.secret)) leaked.add(fieldName);
+          }
+
+          try {
+            const parsedNested = JSON.parse(nestedEvaluated) as {
+              nested?: Record<string, unknown>;
+            };
+            const nestedVal = parsedNested.nested?.[fieldName];
+            if (typeof nestedVal === "string" && nestedVal.includes(probe.secret)) {
+              leaked.add(nestedFieldName);
+            } else if (nestedEvaluated.includes(probe.secret) && !leaked.has(fieldName)) {
+              leaked.add(nestedFieldName);
+            }
+          } catch {
+            if (nestedEvaluated.includes(probe.secret)) leaked.add(nestedFieldName);
+          }
+        } else {
+          if (topEvaluated.includes(probe.secret)) leaked.add(fieldName);
+          if (nestedEvaluated.includes(probe.secret)) leaked.add(nestedFieldName);
+        }
+      }
+    }
+
+    // 3. Shared error/URL/capture redaction surfaces
+    for (const probe of probes) {
+      if (!probe.secret) continue;
+      const fieldName = safeProbeFieldName(probe.field, probe.secret);
+
+      const textOutRaw = redactText(probe.sample);
+      const textOut = inspect
+        ? inspect({ surface: "redactText", field: fieldName, output: textOutRaw })
+        : textOutRaw;
+      if (textOut.includes(probe.secret)) {
+        leaked.add(fieldName);
+      }
+
+      const errOutRaw = redactError(new Error(probe.sample));
+      const errOut = inspect
+        ? inspect({ surface: "redactError", field: fieldName, output: errOutRaw })
+        : errOutRaw;
+      if (errOut.includes(probe.secret)) {
+        leaked.add(fieldName);
+      }
+
+      if (probe.isUrl) {
+        const urlOutRaw = redactUrl(probe.sample);
+        const urlOut = inspect
+          ? inspect({ surface: "redactUrl", field: fieldName, output: urlOutRaw })
+          : urlOutRaw;
+        if (urlOut.includes(probe.secret)) {
+          leaked.add(fieldName);
+        }
+      }
+
+      if (probe.register) {
+        const lineOutRaw = redactLine(probe.sample, registeredProbeValues);
+        const lineOut = inspect
+          ? inspect({ surface: "redactLine", field: fieldName, output: lineOutRaw })
+          : lineOutRaw;
+        if (lineOut.includes(probe.secret)) {
+          leaked.add(fieldName);
+        }
+      }
+    }
+  } finally {
+    state = savedLoggerState;
+    clearSecrets();
+    registerSecrets(savedRegistered);
+  }
+
+  const leakedFields = [...leaked];
+  return {
+    ok: leakedFields.length === 0,
+    formatsChecked,
+    probesRun: probes.length,
+    leakedFields,
+  };
+}

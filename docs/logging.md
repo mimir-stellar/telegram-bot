@@ -126,6 +126,7 @@ Every log record is redacted before it leaves the process:
 2. **Telegram Token Pattern**: Any substring matching Telegram bot token shape (`\b\d{5,}:[A-Za-z0-9_-]{20,}/g`) is automatically replaced with `[REDACTED]`, even if not explicitly registered in secrets configuration.
 3. **URL Redaction**: Internal helpers (`redactUrl`) mask HTTP basic auth or query credentials in URLs before logging.
 4. **All Fields Protected**: Redaction applies recursively to both the log `msg` and all string values in custom `fields`.
+5. **Doctor Self-Check (`redaction-policy`)**: Running `npm run doctor` executes `runRedactionSelfCheck()`, driving synthetic secret probes (registered values, bot tokens, Stellar seed strkeys, URL userinfo/query credentials, Bearer headers, and `TOKEN=...` assignments) through every supported log format (`text` and `json`) plus shared redaction helpers. If any probe survives into output, `doctor` fails with **field names only** and never echoes probe values.
 
 ---
 

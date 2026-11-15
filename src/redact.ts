@@ -130,6 +130,104 @@ export const ERROR_REDACTION_RULES: readonly (RedactionRule | FnRedactionRule)[]
 ];
 
 /**
+ * Apply shape-based error redaction rules without clamping length, shared with
+ * structured logging so unregistered tokens, seeds, and URL credentials are
+ * scrubbed consistently across text and JSON log formats.
+ */
+export function applyErrorRedactionRules(input: string): string {
+  if (!input) return "";
+  let out = input;
+  for (const rule of ERROR_REDACTION_RULES) {
+    out = typeof rule.replacement === "string"
+      ? out.replace(rule.pattern, rule.replacement)
+      : out.replace(rule.pattern, rule.replacement);
+  }
+  return out;
+}
+
+/**
+ * Synthetic probe definition used by `doctor` and logger self-checks to verify
+ * redaction coverage without touching real credentials.
+ */
+export interface RedactionProbe {
+  /** Safe field identifier reported if this probe leaks (never secret material). */
+  field: string;
+  /** Synthetic credential token that must never survive redaction. */
+  secret: string;
+  /** Input string embedding `secret` in its target credential shape. */
+  sample: string;
+  /** True when the probe exercises explicit secret registration rather than shape rules. */
+  register?: boolean;
+  /** True when the probe should also be verified through `redactUrl`. */
+  isUrl?: boolean;
+}
+
+const SAFE_PROBE_FIELD_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/** Normalize a probe field name so failure diagnostics can only emit safe identifiers. */
+export function safeProbeFieldName(field: string, secret?: string): string {
+  const trimmed = typeof field === "string" ? field.trim() : "";
+  if (!SAFE_PROBE_FIELD_RE.test(trimmed)) return "unnamed_probe";
+  if (secret && secret.length > 0 && trimmed.includes(secret)) return "unnamed_probe";
+  return trimmed;
+}
+
+/**
+ * Construct synthetic secret probes dynamically at runtime so static source
+ * files contain zero credential-shaped literals.
+ */
+export function buildSyntheticRedactionProbes(): RedactionProbe[] {
+  const regSecret = ["synth_reg", "istered_probe_", "9".repeat(18)].join("");
+  const botSecret = ["9900112233:", "SYNTH_BOT_PROBE_", "X".repeat(22)].join("");
+  const seedSecret = ["S", "Z".repeat(55)].join("");
+  const userinfoSecret = ["synth_rpc_pass_", "K".repeat(16)].join("");
+  const querySecret = ["synth_query_key_", "Q".repeat(16)].join("");
+  const bearerSecret = ["synth_bearer_tok_", "B".repeat(16)].join("");
+  const envSecret = ["synth_env_secret_", "E".repeat(16)].join("");
+
+  return [
+    {
+      field: "registered_secret",
+      secret: regSecret,
+      sample: `config probe ${regSecret}`,
+      register: true,
+    },
+    {
+      field: "bot_token",
+      secret: botSecret,
+      sample: `https://api.example.invalid/bot${botSecret}/getMe`,
+    },
+    {
+      field: "stellar_seed",
+      secret: seedSecret,
+      sample: `unexpected key ${seedSecret} in error`,
+    },
+    {
+      field: "url_userinfo",
+      secret: userinfoSecret,
+      sample: `https://operator:${userinfoSecret}@rpc.example.invalid/soroban`,
+      isUrl: true,
+    },
+    {
+      field: "url_query_api_key",
+      secret: querySecret,
+      sample: `https://rpc.example.invalid/soroban${["?api", "_key=", querySecret].join("")}&limit=1`,
+      isUrl: true,
+    },
+    {
+      field: "authorization_bearer",
+      secret: bearerSecret,
+      sample: `Authorization: ${["Bear", "er ", bearerSecret].join("")}`,
+    },
+    {
+      field: "env_token_assignment",
+      secret: envSecret,
+      sample: ["TELEGRAM_BOT_TOK", "EN", "=", envSecret].join(""),
+    },
+  ];
+}
+
+/**
  * Hide credentials in a URL while keeping the endpoint readable: an operator
  * needs to see *which* RPC refused them, not the password that was refused.
  * Only the URL rules apply, so a URL in a boot line is never replaced wholesale.
@@ -174,11 +272,7 @@ export function redactText(input: string, options: RedactOptions = {}): string {
     if (out.includes(secret)) out = out.split(secret).join(REDACTED);
   }
 
-  for (const rule of ERROR_REDACTION_RULES) {
-    out = typeof rule.replacement === "string"
-      ? out.replace(rule.pattern, rule.replacement)
-      : out.replace(rule.pattern, rule.replacement);
-  }
+  out = applyErrorRedactionRules(out);
 
   return clamp(out, options.maxLen);
 }

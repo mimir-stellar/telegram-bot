@@ -13,6 +13,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse as parseDotenv } from "dotenv";
 
 import { EXIT_ERROR, EXIT_OK } from "./exitCodes.js";
+import {
+  LOG_FORMAT_ENV,
+  LOG_FORMATS,
+  parseLogFormat,
+  runRedactionSelfCheck,
+  type LogFormat,
+  type RedactionSelfCheckOptions,
+} from "./logger.js";
 import { redactText, registerSecret } from "./redact.js";
 import { MOCK_BOT_TOKEN } from "./stellar/mock-constants.js";
 import { validateContractId } from "./stellar/client.js";
@@ -36,6 +44,7 @@ export interface DoctorOptions {
   envPath?: string;
   nodeVersion?: string;
   packageJsonPath?: string;
+  redactionSelfCheckOptions?: RedactionSelfCheckOptions;
 }
 
 export function parseSemver(v: string): [number, number, number] | null {
@@ -317,6 +326,32 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
         message: `TELEGRAM_CHAT_ID format is valid (${ids.length} destination${ids.length === 1 ? "" : "s"})`,
       });
     }
+  }
+
+  // 7. Redaction policy self-check across all configured/supported log formats
+  const configuredFormat = parseLogFormat(effectiveEnv[LOG_FORMAT_ENV]);
+  const defaultFormats: LogFormat[] = [];
+  for (const fmt of [configuredFormat, ...LOG_FORMATS]) {
+    if (!defaultFormats.includes(fmt)) defaultFormats.push(fmt);
+  }
+  const selfCheck = runRedactionSelfCheck({
+    formats: defaultFormats,
+    ...options.redactionSelfCheckOptions,
+  });
+  if (selfCheck.ok) {
+    checks.push({
+      name: "redaction-policy",
+      status: "OK",
+      message:
+        `Redaction policy self-check passed (${selfCheck.probesRun} synthetic probes ` +
+        `across ${selfCheck.formatsChecked.join(", ")})`,
+    });
+  } else {
+    checks.push({
+      name: "redaction-policy",
+      status: "FAIL",
+      message: `Redaction policy self-check failed: leaked fields [${selfCheck.leakedFields.join(", ")}]`,
+    });
   }
 
   const ok = !checks.some((c) => c.status === "FAIL");
