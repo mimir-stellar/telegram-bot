@@ -15,6 +15,26 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  assertEventsResponse,
+  assertNetworkIdentity,
+  DEFAULT_MAX_ADMISSION_RECORDS,
+  DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MS,
+  normalizeAdmissionProviderLabel,
+  RpcProviderAdmissionError,
+  type RpcProviderAdmissionProblem,
+  type VerifiedNetworkIdentity,
+} from "./rpc-guard.js";
+
+export {
+  assertNetworkIdentity,
+  DEFAULT_MAX_ADMISSION_RECORDS,
+  DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MS,
+  normalizeAdmissionProviderLabel,
+  RpcProviderAdmissionError,
+  type RpcProviderAdmissionProblem,
+  type VerifiedNetworkIdentity,
+};
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -364,6 +384,347 @@ export function clampStartLedger(
     return { startLedger: window.oldestLedger, clamped: true };
   }
   return { startLedger: requested, clamped: false };
+}
+
+// ── RPC provider network-identity admission ──────────────────────────────────
+
+export type AdmissionCapableServer = Pick<rpc.Server, "getHealth" | "getNetwork"> &
+  Partial<Pick<rpc.Server, "getEvents">>;
+
+export interface RpcProviderCandidate<
+  TServer extends AdmissionCapableServer = AdmissionCapableServer,
+> {
+  /** Provider endpoint URL or identifier (redacted before appearing in logs/errors). */
+  provider?: string | undefined;
+  /** Read-only Soroban RPC client candidate. */
+  server: TServer;
+}
+
+export interface AdmitRpcProviderOptions {
+  /** Per-RPC-call timeout in milliseconds (defaults to `10_000`). */
+  timeoutMs?: number | undefined;
+  /** Clock override in milliseconds for deterministic tests. */
+  now?: (() => number) | undefined;
+}
+
+export interface AdmittedRpcProvider<
+  TServer extends AdmissionCapableServer = AdmissionCapableServer,
+> {
+  readonly provider: string;
+  readonly admittedAtMs: number;
+  readonly ledgerWindow: LedgerWindow;
+  readonly protocolVersion: number | string | null;
+  readonly server: TServer;
+}
+
+export interface RpcProviderRejectionRecord {
+  readonly provider: string;
+  readonly rejectedAtMs: number;
+  readonly problem: RpcProviderAdmissionProblem;
+  readonly message: string;
+}
+
+async function runWithAdmissionTimeout<T>(
+  promiseFactory: () => Promise<T>,
+  timeoutMs: number,
+  stepLabel: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`${stepLabel} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      timer.unref?.();
+      promiseFactory().then(resolve, reject);
+    });
+  } finally {
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Validate both endpoint health (`getHealth`) and Stellar network identity
+ * (`getNetwork` passphrase alignment with `config.networkPassphrase`) BEFORE
+ * admitting an RPC provider into active polling or rotation.
+ *
+ * A provider whose `getHealth()` reports `"healthy"` with a valid ledger window
+ * is still rejected with {@link RpcProviderAdmissionError} (`"network-mismatch"`)
+ * when it serves another network.
+ */
+export async function admitRpcProvider<
+  TServer extends AdmissionCapableServer = AdmissionCapableServer,
+>(
+  candidate: RpcProviderCandidate<TServer>,
+  config: Pick<StellarConfig, "networkPassphrase"> &
+    Partial<Pick<StellarConfig, "rpcUrl">>,
+  options: AdmitRpcProviderOptions = {},
+): Promise<AdmittedRpcProvider<TServer>> {
+  const rawLabel = candidate.provider ?? config.rpcUrl ?? "rpc-provider";
+  const provider = normalizeAdmissionProviderLabel(rawLabel);
+
+  if (
+    typeof config?.networkPassphrase !== "string" ||
+    config.networkPassphrase.trim().length === 0
+  ) {
+    throw new RpcProviderAdmissionError(
+      provider,
+      "invalid-expected-passphrase",
+      typeof config?.networkPassphrase !== "string"
+        ? `configured networkPassphrase must be a string; got ${typeof config?.networkPassphrase}`
+        : "configured networkPassphrase cannot be empty",
+    );
+  }
+
+  const timeoutMs =
+    typeof options.timeoutMs === "number" &&
+    Number.isFinite(options.timeoutMs) &&
+    options.timeoutMs > 0
+      ? Math.floor(options.timeoutMs)
+      : DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MS;
+  const now = options.now ?? (() => Date.now());
+
+  let health: unknown;
+  try {
+    health = await runWithAdmissionTimeout(
+      () => candidate.server.getHealth(),
+      timeoutMs,
+      "getHealth",
+    );
+  } catch (err) {
+    throw new RpcProviderAdmissionError(
+      provider,
+      "health-failed",
+      `getHealth failed: ${boundedRemoteError(err)}`,
+    );
+  }
+
+  const healthObj = health as Record<string, unknown> | null;
+  if (
+    !healthObj ||
+    typeof healthObj !== "object" ||
+    Array.isArray(healthObj)
+  ) {
+    throw new RpcProviderAdmissionError(
+      provider,
+      "malformed-health-window",
+      "getHealth returned a non-object payload",
+    );
+  }
+
+  if (healthObj.status !== "healthy") {
+    throw new RpcProviderAdmissionError(
+      provider,
+      "unhealthy-status",
+      `getHealth reported non-healthy status (${boundedLedgerValue(healthObj.status)})`,
+    );
+  }
+
+  let ledgerWindow: LedgerWindow;
+  try {
+    ledgerWindow = validateLedgerWindow({
+      oldestLedger: healthObj.oldestLedger,
+      latestLedger: healthObj.latestLedger,
+    });
+  } catch (err) {
+    throw new RpcProviderAdmissionError(
+      provider,
+      "malformed-health-window",
+      err instanceof Error ? err.message : boundedRemoteError(err),
+    );
+  }
+
+  let networkResp: unknown;
+  try {
+    networkResp = await runWithAdmissionTimeout(
+      () => candidate.server.getNetwork(),
+      timeoutMs,
+      "getNetwork",
+    );
+  } catch (err) {
+    throw new RpcProviderAdmissionError(
+      provider,
+      "network-failed",
+      `getNetwork failed: ${boundedRemoteError(err)}`,
+    );
+  }
+
+  const verified = assertNetworkIdentity(
+    networkResp,
+    config.networkPassphrase,
+    provider,
+  );
+
+  return {
+    provider,
+    admittedAtMs: now(),
+    ledgerWindow,
+    protocolVersion: verified.protocolVersion,
+    server: candidate.server,
+  };
+}
+
+export interface RpcProviderAdmissionGateOptions extends AdmitRpcProviderOptions {
+  /** Maximum admitted/rejected provider records retained in memory (default `32`). */
+  maxRecords?: number | undefined;
+}
+
+export interface AdmissionGuardedServer {
+  readonly provider: string;
+  isAdmitted(): boolean;
+  admit(): Promise<AdmittedRpcProvider>;
+  evict(): void;
+  getHealth(): Promise<rpc.Api.GetHealthResponse>;
+  getNetwork(): Promise<rpc.Api.GetNetworkResponse>;
+  getEvents(request: rpc.Api.GetEventsRequest): Promise<rpc.Api.GetEventsResponse>;
+}
+
+/**
+ * Admission gate for single- or multi-provider RPC setups that refuses to admit
+ * or read events from any provider whose reported `getNetwork()` passphrase
+ * differs from the configured network passphrase.
+ */
+export class RpcProviderAdmissionGate {
+  private readonly config: Pick<StellarConfig, "networkPassphrase"> &
+    Partial<Pick<StellarConfig, "rpcUrl">>;
+  private readonly options: AdmitRpcProviderOptions;
+  private readonly maxRecords: number;
+  private readonly now: () => number;
+
+  private readonly admitted = new Map<string, AdmittedRpcProvider>();
+  private readonly rejections: RpcProviderRejectionRecord[] = [];
+
+  constructor(
+    config: Pick<StellarConfig, "networkPassphrase"> &
+      Partial<Pick<StellarConfig, "rpcUrl">>,
+    options: RpcProviderAdmissionGateOptions = {},
+  ) {
+    this.config = config;
+    this.options = {
+      timeoutMs: options.timeoutMs,
+      now: options.now,
+    };
+    this.maxRecords =
+      typeof options.maxRecords === "number" &&
+      Number.isFinite(options.maxRecords) &&
+      options.maxRecords >= 1
+        ? Math.floor(options.maxRecords)
+        : DEFAULT_MAX_ADMISSION_RECORDS;
+    this.now = options.now ?? (() => Date.now());
+  }
+
+  /** Admit a single candidate provider, recording bounded rejection telemetry on failure. */
+  async admit<TServer extends AdmissionCapableServer>(
+    candidate: RpcProviderCandidate<TServer>,
+  ): Promise<AdmittedRpcProvider<TServer>> {
+    try {
+      const record = await admitRpcProvider(candidate, this.config, this.options);
+      this.admitted.delete(record.provider);
+      if (this.admitted.size >= this.maxRecords) {
+        const oldestKey = this.admitted.keys().next().value;
+        if (oldestKey !== undefined) this.admitted.delete(oldestKey);
+      }
+      this.admitted.set(record.provider, record);
+      return record;
+    } catch (err) {
+      if (err instanceof RpcProviderAdmissionError) {
+        this.admitted.delete(err.provider);
+        if (this.rejections.length >= this.maxRecords) {
+          this.rejections.shift();
+        }
+        this.rejections.push({
+          provider: err.provider,
+          rejectedAtMs: this.now(),
+          problem: err.problem,
+          message: err.message,
+        });
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Evaluate multiple candidate RPC providers concurrently, admitting only
+   * healthy providers whose network passphrase matches configuration.
+   */
+  async admitMany<TServer extends AdmissionCapableServer>(
+    candidates: readonly RpcProviderCandidate<TServer>[],
+  ): Promise<{
+    admitted: AdmittedRpcProvider<TServer>[];
+    rejected: RpcProviderRejectionRecord[];
+  }> {
+    const admittedList: AdmittedRpcProvider<TServer>[] = [];
+    const rejectedList: RpcProviderRejectionRecord[] = [];
+
+    for (const candidate of candidates) {
+      try {
+        const ok = await this.admit(candidate);
+        admittedList.push(ok);
+      } catch (err) {
+        if (err instanceof RpcProviderAdmissionError) {
+          rejectedList.push({
+            provider: err.provider,
+            rejectedAtMs: this.now(),
+            problem: err.problem,
+            message: err.message,
+          });
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    return { admitted: admittedList, rejected: rejectedList };
+  }
+
+  /**
+   * Wrap a read-only RPC server so `getEvents` cannot execute unless and until
+   * the provider has passed both `getHealth()` and `getNetwork()` admission.
+   */
+  guardServer(
+    candidate: RpcProviderCandidate<
+      Pick<rpc.Server, "getHealth" | "getNetwork" | "getEvents">
+    >,
+  ): AdmissionGuardedServer {
+    const provider = normalizeAdmissionProviderLabel(
+      candidate.provider ?? this.config.rpcUrl ?? "rpc-provider",
+    );
+
+    return {
+      provider,
+      isAdmitted: () => this.admitted.has(provider),
+      admit: () => this.admit({ provider, server: candidate.server }),
+      evict: () => {
+        this.admitted.delete(provider);
+      },
+      getHealth: () => candidate.server.getHealth(),
+      getNetwork: () => candidate.server.getNetwork(),
+      getEvents: async (request: rpc.Api.GetEventsRequest) => {
+        if (!this.admitted.has(provider)) {
+          throw new RpcProviderAdmissionError(
+            provider,
+            "provider-not-admitted",
+            "provider must pass network identity admission before getEvents is permitted",
+          );
+        }
+        const raw = await candidate.server.getEvents(request);
+        return assertEventsResponse(raw);
+      },
+    };
+  }
+
+  /** Snapshot currently admitted providers and bounded rejection history. */
+  snapshot(): {
+    admitted: AdmittedRpcProvider[];
+    rejections: RpcProviderRejectionRecord[];
+  } {
+    return {
+      admitted: [...this.admitted.values()],
+      rejections: [...this.rejections],
+    };
+  }
 }
 
 /**

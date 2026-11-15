@@ -37,14 +37,15 @@ Called with JSON-RPC parameters matching Soroban RPC specs:
 - **Note on pagination**: In Soroban RPC, an empty `events` list does not necessarily indicate the end of events—it indicates no events were found in the inspected slice of ledgers. The bot continues walking via `cursor` until the cursor reaches the tip.
 
 #### `getNetwork`
-Used at boot to verify the network passphrase (e.g. `Test SDF Network ; September 2015` for Testnet or `Public Global Stellar Network ; September 2015` for Mainnet):
+Used at boot and before provider admission to verify the network passphrase (e.g. `Test SDF Network ; September 2015` for Testnet or `Public Global Stellar Network ; September 2015` for Mainnet):
 ```json
 {
   "passphrase": "Test SDF Network ; September 2015",
   "protocolVersion": 22
 }
 ```
-If the passphrase does not match configuration, the bot refuses to boot with `NetworkPassphraseMismatchError`.
+- Boot check (`validateNetworkPassphrase`): If the passphrase does not match configuration, the bot refuses to boot with `NetworkPassphraseMismatchError`.
+- Provider admission gate (`admitRpcProvider` / `RpcProviderAdmissionGate` in `src/stellar/client.ts` backed by `assertNetworkIdentity` in `src/stellar/rpc-guard.ts`): Every candidate RPC provider must report both `"status": "healthy"` with a valid ledger window via `getHealth` **and** an exact passphrase match via `getNetwork` before being admitted or allowed to serve `getEvents`. A healthy provider serving another network is rejected with `RpcProviderAdmissionError("network-mismatch")` without echoing either passphrase or leaking URL credentials/query parameters.
 
 ---
 
