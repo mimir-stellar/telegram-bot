@@ -30,6 +30,7 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Default Path**: `${cursorFile}.bak` (typically `./data/cursor.json.bak`)
 - **Write Pattern**: Non-atomic `copyFile` immediately following atomic commit of primary cursor file.
 - **Recovery Role**: Acts as an offline recovery snapshot one generation older than the live cursor.
+- **Recovery Preview**: Operators can run `npm run cursor -- preview --from <backup> [--file <cursor>] [--status-file <status>] [--oldest-ledger N] [--latest-ledger N] [--json]` (or `restore --dry-run`) to inspect old vs proposed target positions against retained-window evidence (`oldestLedger` / `latestLedger`), including estimated unrecoverable below-floor missed ledger ranges and replay/skip ranges, without guessing opaque cursor tokens, modifying disk files, or writing to the chain.
 
 ### 3. Cursor Quarantine Copy
 - **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`quarantineCorruptCursorFile`)

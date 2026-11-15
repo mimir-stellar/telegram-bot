@@ -1021,6 +1021,309 @@ export function buildCursorFile(
   };
 }
 
+export interface LedgerRangeEstimate {
+  startLedger: number;
+  endLedger: number;
+  ledgerCount: number;
+}
+
+export interface RetainedWindowEvidence {
+  available: boolean;
+  source: "explicit" | "status_file" | "poller_status" | "unavailable";
+  oldestLedger: number | null;
+  latestLedger: number | null;
+  capturedAt: string | null;
+}
+
+export interface PreviewCursorPosition {
+  kind: "none" | "ledger" | "rewind" | "opaque" | "unreadable";
+  ledger: number | null;
+  lastEventLedger: number | null;
+}
+
+export type TargetWindowPlacement =
+  | "within_window"
+  | "below_floor"
+  | "ahead_of_tip"
+  | "opaque_cursor"
+  | "no_cursor"
+  | "unknown_window";
+
+export interface TargetRecoveryPreview {
+  source: string;
+  oldPosition: PreviewCursorPosition;
+  proposedPosition: PreviewCursorPosition;
+  windowPlacement: TargetWindowPlacement;
+  missedLedgers: number | null;
+  estimatedMissedRange: LedgerRangeEstimate | null;
+  estimatedReplayRange: LedgerRangeEstimate | null;
+  estimatedSkippedForwardRange: LedgerRangeEstimate | null;
+  note: string;
+}
+
+export interface CursorRecoveryPreview {
+  cursorFile: string;
+  backupFile: string;
+  liveState: "valid" | "missing" | "unreadable";
+  proposedSchemaSource: string;
+  windowEvidence: RetainedWindowEvidence;
+  targets: Record<string, TargetRecoveryPreview>;
+}
+
+/**
+ * Extract a verified ledger position for previewing recovery without ever
+ * guessing a ledger from an opaque cursor token.
+ */
+export function classifyPreviewCursorPosition(
+  entry:
+    | {
+        cursor?: string | null;
+        lastEventLedger?: number | null;
+        rewindFromLedger?: number | null;
+      }
+    | null
+    | undefined,
+): PreviewCursorPosition {
+  if (!entry) {
+    return { kind: "none", ledger: null, lastEventLedger: null };
+  }
+  const lastEventLedger =
+    typeof entry.lastEventLedger === "number" &&
+    Number.isSafeInteger(entry.lastEventLedger) &&
+    entry.lastEventLedger >= 0
+      ? entry.lastEventLedger
+      : null;
+  const rewind = parseRewindFromLedger(entry.rewindFromLedger);
+  if (rewind !== null) {
+    return { kind: "rewind", ledger: rewind, lastEventLedger };
+  }
+  if (entry.cursor === null || entry.cursor === undefined || entry.cursor === "") {
+    return { kind: "none", ledger: null, lastEventLedger };
+  }
+  const cursorLedger = eventCursorLedger(entry.cursor);
+  if (cursorLedger !== null && Number.isSafeInteger(cursorLedger) && cursorLedger > 0) {
+    return { kind: "ledger", ledger: cursorLedger, lastEventLedger };
+  }
+  // Never infer a resume ledger from lastEventLedger or token text when the
+  // cursor itself is opaque.
+  return { kind: "opaque", ledger: null, lastEventLedger };
+}
+
+/**
+ * Pure, read-only calculation of old vs proposed cursor positions, retained
+ * window placement, and estimated missed / replayed / skipped ledger ranges.
+ */
+export function evaluateCursorRecoveryPreview(params: {
+  cursorFile: string;
+  backupFile: string;
+  liveState: "valid" | "missing" | "unreadable";
+  liveTargets?: Record<
+    string,
+    {
+      cursor?: string | null;
+      lastEventLedger?: number | null;
+      rewindFromLedger?: number | null;
+    }
+  >;
+  proposedFile: CursorFile;
+  proposedSchemaSource: string;
+  windowEvidence?: Partial<RetainedWindowEvidence> | null;
+}): CursorRecoveryPreview {
+  const rawEvidence = params.windowEvidence;
+  const validOldest =
+    rawEvidence &&
+    typeof rawEvidence.oldestLedger === "number" &&
+    Number.isSafeInteger(rawEvidence.oldestLedger) &&
+    rawEvidence.oldestLedger > 0
+      ? rawEvidence.oldestLedger
+      : null;
+  const validLatest =
+    rawEvidence &&
+    typeof rawEvidence.latestLedger === "number" &&
+    Number.isSafeInteger(rawEvidence.latestLedger) &&
+    rawEvidence.latestLedger > 0 &&
+    (validOldest === null || rawEvidence.latestLedger >= validOldest)
+      ? rawEvidence.latestLedger
+      : null;
+
+  const windowEvidence: RetainedWindowEvidence =
+    validOldest !== null
+      ? {
+          available: true,
+          source:
+            rawEvidence?.source && rawEvidence.source !== "unavailable"
+              ? rawEvidence.source
+              : "explicit",
+          oldestLedger: validOldest,
+          latestLedger: validLatest,
+          capturedAt: typeof rawEvidence?.capturedAt === "string" ? rawEvidence.capturedAt : null,
+        }
+      : {
+          available: false,
+          source: "unavailable",
+          oldestLedger: null,
+          latestLedger: null,
+          capturedAt: null,
+        };
+
+  const liveMap = params.liveTargets ?? {};
+  const allSources = [
+    ...new Set<string>([...Object.keys(liveMap), ...Object.keys(params.proposedFile.targets)]),
+  ].sort();
+
+  const targets: Record<string, TargetRecoveryPreview> = {};
+  for (const source of allSources) {
+    const oldPosition: PreviewCursorPosition =
+      params.liveState === "missing"
+        ? { kind: "none", ledger: null, lastEventLedger: null }
+        : params.liveState === "unreadable"
+          ? { kind: "unreadable", ledger: null, lastEventLedger: null }
+          : classifyPreviewCursorPosition(liveMap[source]);
+
+    const proposedPosition = classifyPreviewCursorPosition(params.proposedFile.targets[source]);
+
+    let windowPlacement: TargetWindowPlacement;
+    let missedLedgers: number | null = null;
+    let estimatedMissedRange: LedgerRangeEstimate | null = null;
+    let estimatedReplayRange: LedgerRangeEstimate | null = null;
+    let estimatedSkippedForwardRange: LedgerRangeEstimate | null = null;
+    let note: string;
+
+    if (proposedPosition.kind === "opaque") {
+      windowPlacement = "opaque_cursor";
+      note =
+        "opaque cursor token cannot be decoded to a ledger position; refusing to guess missed or replayed ranges";
+    } else if (proposedPosition.kind === "none") {
+      windowPlacement = "no_cursor";
+      missedLedgers = windowEvidence.available ? 0 : null;
+      note = "proposed target has no cursor; poller will cold-start from lookback behind chain tip";
+    } else {
+      const proposedLedger = proposedPosition.ledger!;
+      if (!windowEvidence.available || windowEvidence.oldestLedger === null) {
+        windowPlacement = "unknown_window";
+        missedLedgers = null;
+        note =
+          "retained ledger window evidence not provided; supply --oldest-ledger or --status-file to estimate floor gaps";
+      } else if (proposedLedger < windowEvidence.oldestLedger) {
+        windowPlacement = "below_floor";
+        const gap = windowEvidence.oldestLedger - proposedLedger;
+        missedLedgers = gap;
+        estimatedMissedRange = {
+          startLedger: proposedLedger,
+          endLedger: windowEvidence.oldestLedger - 1,
+          ledgerCount: gap,
+        };
+        note =
+          `proposed ledger ${proposedLedger} is ${gap} ledger(s) below retained floor ` +
+          `${windowEvidence.oldestLedger}; ledgers ${proposedLedger}..${windowEvidence.oldestLedger - 1} are unrecoverable from RPC`;
+      } else if (
+        windowEvidence.latestLedger !== null &&
+        proposedLedger > windowEvidence.latestLedger
+      ) {
+        windowPlacement = "ahead_of_tip";
+        missedLedgers = 0;
+        note =
+          `proposed ledger ${proposedLedger} is ahead of reported tip ${windowEvidence.latestLedger}; ` +
+          `verify network and snapshot freshness before restoring`;
+      } else {
+        windowPlacement = "within_window";
+        missedLedgers = 0;
+        note = `proposed ledger ${proposedLedger} sits inside retained window (>= ${windowEvidence.oldestLedger})`;
+      }
+
+      // Compare against old live position only when old position also has a verified ledger.
+      if (
+        (oldPosition.kind === "ledger" || oldPosition.kind === "rewind") &&
+        oldPosition.ledger !== null
+      ) {
+        const oldLedger = oldPosition.ledger;
+        if (proposedLedger < oldLedger) {
+          const effectiveStart =
+            windowEvidence.oldestLedger !== null
+              ? Math.max(proposedLedger, windowEvidence.oldestLedger)
+              : proposedLedger;
+          if (effectiveStart <= oldLedger) {
+            estimatedReplayRange = {
+              startLedger: effectiveStart,
+              endLedger: oldLedger,
+              ledgerCount: oldLedger - effectiveStart + 1,
+            };
+          }
+        } else if (proposedLedger > oldLedger) {
+          estimatedSkippedForwardRange = {
+            startLedger: oldLedger + 1,
+            endLedger: proposedLedger,
+            ledgerCount: proposedLedger - oldLedger,
+          };
+        }
+      }
+    }
+
+    targets[source] = {
+      source,
+      oldPosition,
+      proposedPosition,
+      windowPlacement,
+      missedLedgers,
+      estimatedMissedRange,
+      estimatedReplayRange,
+      estimatedSkippedForwardRange,
+      note,
+    };
+  }
+
+  return {
+    cursorFile: params.cursorFile,
+    backupFile: params.backupFile,
+    liveState: params.liveState,
+    proposedSchemaSource: params.proposedSchemaSource,
+    windowEvidence,
+    targets,
+  };
+}
+
+function formatPreviewPosition(pos: PreviewCursorPosition): string {
+  if (pos.kind === "ledger") return `ledger:${pos.ledger}`;
+  if (pos.kind === "rewind") return `rewind:${pos.ledger}`;
+  return pos.kind;
+}
+
+/** Render a concise operator-facing recovery preview summary. */
+export function formatCursorRecoveryPreview(preview: CursorRecoveryPreview): string {
+  const windowDesc = preview.windowEvidence.available
+    ? `oldest=${preview.windowEvidence.oldestLedger} latest=${preview.windowEvidence.latestLedger ?? "unknown"} source=${preview.windowEvidence.source}`
+    : "unavailable";
+  const lines = [
+    `[cursor] recovery preview (read-only; no files or chain state modified)`,
+    `  live=${preview.cursorFile} (${preview.liveState})`,
+    `  proposed=${preview.backupFile} (schema=${preview.proposedSchemaSource})`,
+    `  retainedWindow: ${windowDesc}`,
+  ];
+  for (const target of Object.values(preview.targets)) {
+    const missedText =
+      target.estimatedMissedRange !== null
+        ? `${target.estimatedMissedRange.startLedger}..${target.estimatedMissedRange.endLedger} (${target.estimatedMissedRange.ledgerCount} ledgers)`
+        : target.missedLedgers === 0
+          ? "0 ledgers"
+          : "unknown";
+    const replayText =
+      target.estimatedReplayRange !== null
+        ? ` replay=${target.estimatedReplayRange.startLedger}..${target.estimatedReplayRange.endLedger} (${target.estimatedReplayRange.ledgerCount} ledgers)`
+        : "";
+    const skipText =
+      target.estimatedSkippedForwardRange !== null
+        ? ` forwardSkip=${target.estimatedSkippedForwardRange.startLedger}..${target.estimatedSkippedForwardRange.endLedger} (${target.estimatedSkippedForwardRange.ledgerCount} ledgers)`
+        : "";
+    lines.push(
+      `  target=${target.source} old=${formatPreviewPosition(target.oldPosition)} ` +
+        `proposed=${formatPreviewPosition(target.proposedPosition)} ` +
+        `placement=${target.windowPlacement} missed=${missedText}${replayText}${skipText}`,
+    );
+    lines.push(`    note: ${target.note}`);
+  }
+  return lines.join("\n");
+}
+
 function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
@@ -3193,6 +3496,42 @@ export function createPoller(deps: PollerDeps) {
      */
     loadCursors,
     loadCounters,
+    /**
+     * Read-only preview of restoring `backupFile` against current in-memory
+     * targets and retained-window evidence (`status.oldestLedger` / `latestLedger`).
+     */
+    async previewCursorRecovery(backupFile: string): Promise<CursorRecoveryPreview> {
+      const raw = await readFile(backupFile, "utf8");
+      const parsed = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
+      const liveTargets = Object.fromEntries(
+        [...state.values()].map((t) => [
+          t.source,
+          {
+            cursor: t.cursor,
+            lastEventLedger: t.lastEventLedger,
+            rewindFromLedger: t.rewindFromLedger,
+          },
+        ]),
+      );
+      return evaluateCursorRecoveryPreview({
+        cursorFile: config.cursorFile,
+        backupFile,
+        liveState: "valid",
+        liveTargets,
+        proposedFile: parsed.file,
+        proposedSchemaSource: parsed.source,
+        windowEvidence:
+          status.oldestLedger !== null
+            ? {
+                source: "poller_status",
+                oldestLedger: status.oldestLedger,
+                latestLedger: status.latestLedger,
+                capturedAt:
+                  status.lastSuccessAt !== null ? new Date(status.lastSuccessAt).toISOString() : null,
+              }
+            : null,
+      });
+    },
     /** Machine-readable snapshot, same shape as the file on disk. */
     snapshot(): StatusSnapshot {
       return snapshot();
