@@ -1463,6 +1463,7 @@ export function createPoller(deps: PollerDeps) {
     sendJournal = createSendJournal({
       filePath: config.sendJournalFile,
       now,
+      secrets: config.botToken ? [config.botToken] : [],
     });
   }
 
@@ -2214,6 +2215,25 @@ export function createPoller(deps: PollerDeps) {
           }
         }
       } catch (err) {
+        if (sendJournal) {
+          try {
+            await sendJournal.recordFailure({
+              id: event.eventId,
+              error: err,
+              source: event.source,
+              ledger: event.ledger,
+              eventName: event.payload.name,
+              secrets: config.botToken ? [config.botToken] : [],
+            });
+          } catch (journalErr) {
+            console.error(
+              `[poller] send journal failure write failed for ${event.eventId}: ${safeErrorMessage(
+                journalErr,
+                config.botToken ? [config.botToken] : [],
+              )}`,
+            );
+          }
+        }
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
@@ -2998,7 +3018,9 @@ export function createPoller(deps: PollerDeps) {
       // them (the existing lossy cursor-commit policy).
       if (sendJournal) {
         for (const entry of await sendJournal.loadPending()) {
-          maybeSent.add(entry.id);
+          if (entry.errorCode === undefined) {
+            maybeSent.add(entry.id);
+          }
         }
         await sendJournal.compact();
       }

@@ -6,7 +6,9 @@
  *
  * Public API (all re-exported from `src/bot.ts` for backwards compatibility):
  *   - {@link SendExtra}         — extra options a caller attaches to a send
+ *   - {@link NotifierOptions}   — optional send-journal failure wiring
  *   - {@link isMarkdownParseError} — classifier for Telegram entity-parse failures
+ *   - {@link sanitizeTelegramJournalError} — sanitizer for Telegram error descriptions
  *   - {@link notifierSkips}    — counters for suppressed sends
  *   - {@link createNotifier}   — factory that returns the poller's send function
  */
@@ -21,8 +23,22 @@ import {
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+import {
+  MAX_JOURNAL_ERROR_DESCRIPTION_CHARS,
+  sanitizeTelegramJournalError,
+  type SanitizedJournalError,
+  type SendJournal,
+  type TelegramJournalErrorCode,
+} from "./send-journal.js";
 
-// ── SendExtra ────────────────────────────────────────────────────────────────
+export {
+  MAX_JOURNAL_ERROR_DESCRIPTION_CHARS,
+  sanitizeTelegramJournalError,
+  type SanitizedJournalError,
+  type TelegramJournalErrorCode,
+};
+
+// ── SendExtra & NotifierOptions ──────────────────────────────────────────────
 
 /** Extra Telegram send options the poller may attach to a notification. */
 export interface SendExtra {
@@ -46,6 +62,14 @@ export interface SendExtra {
   replyToMessageId?: number | undefined;
   /** Decoded contract event name used to apply silent-notification policy. */
   eventName?: string | undefined;
+}
+
+export interface NotifierOptions {
+  /**
+   * Optional send journal to record redacted, length-bounded Telegram failure
+   * descriptions and stable error codes when an outbound send fails.
+   */
+  sendJournal?: SendJournal | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -120,6 +144,7 @@ export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
     Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  options?: NotifierOptions,
 ) {
   return async (
     text: string | null,
@@ -137,6 +162,30 @@ export function createNotifier(
       );
       return;
     }
+
+    const recordSanitizedFailure = async (err: unknown): Promise<void> => {
+      const eventId = extra?.eventRef?.eventId;
+      if (!options?.sendJournal || typeof eventId !== "string" || eventId === "") {
+        return;
+      }
+      try {
+        await options.sendJournal.recordFailure({
+          id: eventId,
+          error: err,
+          ...(typeof source === "string" ? { source } : {}),
+          ...(typeof extra?.eventRef?.ledger === "number" ? { ledger: extra.eventRef.ledger } : {}),
+          ...(typeof extra?.eventName === "string" ? { eventName: extra.eventName } : {}),
+          secrets: typeof config.botToken === "string" && config.botToken ? [config.botToken] : [],
+        });
+      } catch (journalErr) {
+        console.error(
+          `[notifier] send journal failure write failed for ${eventId}: ${safeErrorMessage(
+            journalErr,
+            typeof config.botToken === "string" && config.botToken ? [config.botToken] : [],
+          )}`,
+        );
+      }
+    };
 
     const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
     const chatId = source === "market"
@@ -167,18 +216,23 @@ export function createNotifier(
     // last, so the message reads exactly like the unsplit one.
     const parts = splitTelegramMessage(text);
     if (parts.length > 1) {
-      for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
-          ...notificationOptions,
-          ...(index === parts.length - 1 && extra?.reply_markup
-            ? { reply_markup: extra.reply_markup }
-            : {}),
-          ...(index === 0 && extra?.replyToMessageId !== undefined
-            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-            : {}),
-        });
+      try {
+        for (const [index, part] of parts.entries()) {
+          await bot.api.sendMessage(chatId, part, {
+            ...notificationOptions,
+            ...(index === parts.length - 1 && extra?.reply_markup
+              ? { reply_markup: extra.reply_markup }
+              : {}),
+            ...(index === 0 && extra?.replyToMessageId !== undefined
+              ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+              : {}),
+          });
+        }
+        return;
+      } catch (err) {
+        await recordSanitizedFailure(err);
+        throw err;
       }
-      return;
     }
 
     try {
@@ -195,6 +249,7 @@ export function createNotifier(
       // just draw the same 400, so the original parse error propagates.
       const fallback = extra?.plainText;
       if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
+        await recordSanitizedFailure(err);
         throw err;
       }
       // Only bounded metadata is logged: the fallback outcome, the safe error
@@ -207,15 +262,20 @@ export function createNotifier(
             typeof config.botToken === "string" ? [config.botToken] : [],
           )}`,
       );
-      // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
-        link_preview_options: notificationOptions.link_preview_options,
-        ...silentOption,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(extra?.replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-          : {}),
-      });
+      try {
+        // Plain text (no parse mode), same per-source link preview setting.
+        await bot.api.sendMessage(chatId, fallback, {
+          link_preview_options: notificationOptions.link_preview_options,
+          ...silentOption,
+          ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+          ...(extra?.replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+            : {}),
+        });
+      } catch (fallbackErr) {
+        await recordSanitizedFailure(fallbackErr);
+        throw fallbackErr;
+      }
     }
   };
 }

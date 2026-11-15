@@ -64,3 +64,8 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Send Journal File (`SEND_JOURNAL_FILE`)
+- **Writer Module**: [`src/notifications/send-journal.ts`](../src/notifications/send-journal.ts) (`createSendJournal`, `sanitizeTelegramJournalError`)
+- **Write Pattern**: Fsynced newline-delimited JSON (`JSONL`) appends (`intent`, `done`, `failed`), with atomic `.tmp` write-then-rename during `compact()`.
+- **Error Sanitization**: Remote Telegram error descriptions persisted via `recordFailure()` pass through `sanitizeTelegramJournalError()`, which strips control characters and newlines, applies [`src/redact.ts`](../src/redact.ts) credential redaction rules (Telegram bot tokens, Stellar `S...` seeds, bearer/query credentials, and configured secrets), clamps descriptions to `MAX_JOURNAL_ERROR_DESCRIPTION_CHARS` (`240` chars), and retains stable operator triage codes (`TG_RATE_LIMITED`, `TG_UNAUTHORIZED`, `TG_FORBIDDEN`, `TG_NOT_FOUND`, `TG_ENTITY_PARSE_ERROR`, `TG_BAD_REQUEST`, `TG_CONFLICT`, `TG_SERVER_ERROR`, `TG_HTTP_ERROR`, `SEND_TIMEOUT`, `NETWORK_ERROR`, `UNKNOWN_ERROR`) plus numeric `telegramErrorCode` and `retryAfterSeconds`.

@@ -369,8 +369,13 @@ export function createBot(deps: BotDeps): Bot {
 export {
   createNotifier,
   isMarkdownParseError,
+  MAX_JOURNAL_ERROR_DESCRIPTION_CHARS,
   notifierSkips,
+  sanitizeTelegramJournalError,
+  type NotifierOptions,
+  type SanitizedJournalError,
   type SendExtra,
+  type TelegramJournalErrorCode,
 } from "./notifications/notifier.js";
 
 /** Registers the command list so Telegram's UI offers autocompletion. */

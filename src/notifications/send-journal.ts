@@ -2,14 +2,15 @@
  * Crash-safe send journal for Telegram notifications.
  *
  * Before a send is attempted the poller appends an `intent` line; after the
- * send succeeds it appends a matching `done` line. On restart, lines that carry
- * an `intent` but no `done` identify notifications that may or may not have
- * been delivered -- instead of guessing from the cursor.
+ * send succeeds it appends a matching `done` line. When a send fails with a
+ * Telegram API, timeout, or network error, `recordFailure` persists a redacted,
+ * length-bounded remote error description alongside a stable error code for
+ * operator triage.
  *
  * Every append is fsynced before it returns, so a journal entry survives an
  * abrupt termination. The file is JSONL and is kept bounded by compaction:
  * resolved (`intent` + `done`) pairs are dropped, leaving only unresolved
- * intents.
+ * intents (with their latest sanitized failure triage metadata when present).
  *
  * The journal is best-effort: a write failure is logged and the poller carries
  * on, falling back to guessing from the cursor exactly as it does today.
@@ -18,17 +19,210 @@
 import { mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
+import { DEFAULT_MAX_LEN, redactText } from "../redact.js";
+import { isTimeoutError, safeErrorMessage } from "./format.js";
+
 export const DEFAULT_SEND_JOURNAL_MAX_ENTRIES = 1_000;
 export const DEFAULT_SEND_JOURNAL_MAX_BYTES = 1_000_000;
+export const MAX_JOURNAL_ERROR_DESCRIPTION_CHARS = DEFAULT_MAX_LEN;
+
+export type TelegramJournalErrorCode =
+  | "TG_RATE_LIMITED"
+  | "TG_UNAUTHORIZED"
+  | "TG_FORBIDDEN"
+  | "TG_NOT_FOUND"
+  | "TG_ENTITY_PARSE_ERROR"
+  | "TG_BAD_REQUEST"
+  | "TG_CONFLICT"
+  | "TG_SERVER_ERROR"
+  | "TG_HTTP_ERROR"
+  | "SEND_TIMEOUT"
+  | "NETWORK_ERROR"
+  | "UNKNOWN_ERROR";
+
+export interface SanitizedJournalError {
+  errorCode: TelegramJournalErrorCode;
+  telegramErrorCode?: number;
+  description: string;
+  retryAfterSeconds?: number;
+}
+
+function extractTelegramStatusCode(err: unknown): number | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const rec = err as {
+    error_code?: unknown;
+    status?: unknown;
+    statusCode?: unknown;
+    message?: unknown;
+  };
+  for (const candidate of [rec.error_code, rec.status, rec.statusCode]) {
+    if (
+      typeof candidate === "number" &&
+      Number.isInteger(candidate) &&
+      candidate >= 100 &&
+      candidate <= 599
+    ) {
+      return candidate;
+    }
+  }
+  if (typeof rec.message === "string") {
+    const match = /\((\d{3}):\s/.exec(rec.message);
+    if (match) {
+      const parsed = Number.parseInt(match[1]!, 10);
+      if (parsed >= 100 && parsed <= 599) return parsed;
+    }
+  }
+  return undefined;
+}
+
+function extractRetryAfterSeconds(err: unknown): number | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const rec = err as {
+    parameters?: { retry_after?: unknown } | undefined;
+    description?: unknown;
+    message?: unknown;
+  };
+  const paramRetry = rec.parameters?.retry_after;
+  if (typeof paramRetry === "number" && Number.isFinite(paramRetry) && paramRetry > 0) {
+    return Math.min(3600, Math.ceil(paramRetry));
+  }
+  const raw = [rec.description, rec.message]
+    .filter((v): v is string => typeof v === "string")
+    .join(" ");
+  const match = /retry after (\d+)/i.exec(raw);
+  if (match) {
+    const parsed = Number.parseInt(match[1]!, 10);
+    if (parsed > 0) return Math.min(3600, parsed);
+  }
+  return undefined;
+}
+
+function isNetworkFailure(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const rec = err as { name?: unknown; code?: unknown; message?: unknown };
+  if (rec.name === "HttpError") return true;
+  if (
+    typeof rec.code === "string" &&
+    /^(ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|EPIPE)$/.test(
+      rec.code,
+    )
+  ) {
+    return true;
+  }
+  if (
+    typeof rec.message === "string" &&
+    /network request for .* failed|fetch failed|socket hang up/i.test(rec.message)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function classifyErrorCode(
+  err: unknown,
+  telegramStatus: number | undefined,
+  rawText: string,
+): TelegramJournalErrorCode {
+  if (isTimeoutError(err)) return "SEND_TIMEOUT";
+  if (telegramStatus !== undefined) {
+    if (telegramStatus === 429) return "TG_RATE_LIMITED";
+    if (telegramStatus === 401) return "TG_UNAUTHORIZED";
+    if (telegramStatus === 403) return "TG_FORBIDDEN";
+    if (telegramStatus === 404) return "TG_NOT_FOUND";
+    if (telegramStatus === 409) return "TG_CONFLICT";
+    if (telegramStatus === 400) {
+      if (/can't parse entities|can't find end of the entity/i.test(rawText)) {
+        return "TG_ENTITY_PARSE_ERROR";
+      }
+      return "TG_BAD_REQUEST";
+    }
+    if (telegramStatus >= 500 && telegramStatus <= 599) return "TG_SERVER_ERROR";
+    return "TG_HTTP_ERROR";
+  }
+  if (isNetworkFailure(err)) return "NETWORK_ERROR";
+  return "UNKNOWN_ERROR";
+}
+
+function clampJournalText(text: string, maxLen: number): string {
+  const cap = Math.max(1, Math.min(MAX_JOURNAL_ERROR_DESCRIPTION_CHARS, Math.floor(maxLen)));
+  if (text.length <= cap) return text;
+  return `${text.slice(0, Math.max(0, cap - 1))}…`;
+}
+
+/**
+ * Sanitize an untrusted Telegram/network error before persisting to the send
+ * journal: applies the repository's credential redaction rules, strips control
+ * characters and newlines, enforces length bounds, and extracts a stable error
+ * code for operator triage.
+ */
+export function sanitizeTelegramJournalError(
+  err: unknown,
+  options: { secrets?: readonly string[]; maxLen?: number } = {},
+): SanitizedJournalError {
+  const secrets = options.secrets ?? [];
+  const maxLen = options.maxLen ?? MAX_JOURNAL_ERROR_DESCRIPTION_CHARS;
+  const telegramErrorCode = extractTelegramStatusCode(err);
+
+  let rawCandidate = "";
+  if (err && typeof err === "object") {
+    const rec = err as { description?: unknown; message?: unknown };
+    if (typeof rec.description === "string" && rec.description.trim() !== "") {
+      rawCandidate = rec.description;
+    } else if (typeof rec.message === "string" && rec.message.trim() !== "") {
+      rawCandidate = rec.message;
+    }
+  } else if (typeof err === "string") {
+    rawCandidate = err;
+  }
+
+  const normalized = rawCandidate
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  let sanitizedDescription: string;
+  if (normalized !== "") {
+    const redacted = redactText(normalized, { secrets, maxLen }).trim();
+    sanitizedDescription = clampJournalText(
+      redacted || (isTimeoutError(err) ? "send timed out" : "unknown error"),
+      maxLen,
+    );
+  } else {
+    const fallback = safeErrorMessage(err, secrets)
+      .replace(/[\u0000-\u001f\u007f]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    sanitizedDescription = clampJournalText(fallback || "unknown error", maxLen);
+  }
+
+  const errorCode = classifyErrorCode(err, telegramErrorCode, rawCandidate || sanitizedDescription);
+  const retryAfterSeconds =
+    errorCode === "TG_RATE_LIMITED" ? extractRetryAfterSeconds(err) : undefined;
+
+  return {
+    errorCode,
+    ...(telegramErrorCode !== undefined ? { telegramErrorCode } : {}),
+    description: sanitizedDescription,
+    ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+  };
+}
 
 export interface JournalEntry {
-  kind: "intent" | "done";
+  kind: "intent" | "done" | "failed";
   id: string;
   source: string;
   ledger: number;
   eventName: string;
   /** Bounded hash of the message body; the body itself is never persisted. */
   textHash?: string;
+  /** Stable operator triage category when `kind === "failed"` or compacted onto an unresolved intent. */
+  errorCode?: TelegramJournalErrorCode;
+  /** Numeric HTTP / Bot API status code when present (e.g. `429`, `403`, `400`). */
+  telegramErrorCode?: number;
+  /** Redacted, length-bounded remote error description. */
+  errorDescription?: string;
+  /** Bounded retry-after hint in seconds on `429` failures. */
+  retryAfterSeconds?: number;
   at: number;
 }
 
@@ -37,6 +231,8 @@ export interface SendJournalOptions {
   maxEntries?: number;
   maxBytes?: number;
   now?: () => number;
+  secrets?: readonly string[];
+  maxErrorDescriptionChars?: number;
 }
 
 export interface SendJournalStats {
@@ -54,14 +250,21 @@ export interface SendJournal {
     at: number;
   }): Promise<void>;
   recordDone(id: string): Promise<void>;
-  /** Intents with no matching done: notifications that may have been sent. */
+  recordFailure(entry: {
+    id: string;
+    error: unknown;
+    source?: string;
+    ledger?: number;
+    eventName?: string;
+    at?: number;
+    secrets?: readonly string[];
+  }): Promise<SanitizedJournalError>;
+  /** Intents with no matching done: notifications that may have been sent or failed. */
   loadPending(): Promise<JournalEntry[]>;
+  /** Unsettled sanitized failure records retained for operator triage. */
+  loadFailures(): Promise<JournalEntry[]>;
   compact(): Promise<void>;
   stats(): Promise<SendJournalStats>;
-}
-
-function line(entry: JournalEntry): string {
-  return JSON.stringify(entry);
 }
 
 function isDoneError(err: unknown): boolean {
@@ -74,6 +277,32 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
   const maxEntries = Math.max(0, options.maxEntries ?? DEFAULT_SEND_JOURNAL_MAX_ENTRIES);
   const maxBytes = Math.max(0, options.maxBytes ?? DEFAULT_SEND_JOURNAL_MAX_BYTES);
   const now = options.now ?? Date.now;
+  const defaultSecrets = options.secrets ?? [];
+  const maxErrorLen = options.maxErrorDescriptionChars ?? MAX_JOURNAL_ERROR_DESCRIPTION_CHARS;
+
+  function sanitizeEntryForWrite(entry: JournalEntry): JournalEntry {
+    if (typeof entry.errorDescription !== "string") {
+      return entry;
+    }
+    const cleaned = clampJournalText(
+      redactText(
+        entry.errorDescription
+          .replace(/[\u0000-\u001f\u007f]+/g, " ")
+          .replace(/\s+/g, " ")
+          .trim(),
+        { secrets: defaultSecrets, maxLen: maxErrorLen },
+      ),
+      maxErrorLen,
+    );
+    return {
+      ...entry,
+      errorDescription: cleaned || "unknown error",
+    };
+  }
+
+  function line(entry: JournalEntry): string {
+    return JSON.stringify(sanitizeEntryForWrite(entry));
+  }
 
   async function ensureDir(): Promise<void> {
     await mkdir(dir, { recursive: true });
@@ -104,7 +333,7 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
       const trimmed = ln.trim();
       if (trimmed === "") continue;
       try {
-        out.push(JSON.parse(trimmed) as JournalEntry);
+        out.push(sanitizeEntryForWrite(JSON.parse(trimmed) as JournalEntry));
       } catch {
         // A torn or corrupt line is skipped rather than failing the journal.
       }
@@ -138,6 +367,13 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     }
   }
 
+  async function maybeCompact(): Promise<void> {
+    const current = await journalStats();
+    if (current.entries > maxEntries || current.bytes > maxBytes) {
+      await compact();
+    }
+  }
+
   async function recordIntent(entry: {
     id: string;
     source: string;
@@ -149,35 +385,116 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     await append({ kind: "intent", ...entry });
   }
 
+  async function recordFailure(entry: {
+    id: string;
+    error: unknown;
+    source?: string;
+    ledger?: number;
+    eventName?: string;
+    at?: number;
+    secrets?: readonly string[];
+  }): Promise<SanitizedJournalError> {
+    const mergedSecrets = [...defaultSecrets, ...(entry.secrets ?? [])];
+    const sanitized = sanitizeTelegramJournalError(entry.error, {
+      secrets: mergedSecrets,
+      maxLen: maxErrorLen,
+    });
+    await append({
+      kind: "failed",
+      id: entry.id,
+      source: entry.source ?? "",
+      ledger: entry.ledger ?? 0,
+      eventName: entry.eventName ?? "",
+      errorCode: sanitized.errorCode,
+      ...(sanitized.telegramErrorCode !== undefined
+        ? { telegramErrorCode: sanitized.telegramErrorCode }
+        : {}),
+      errorDescription: sanitized.description,
+      ...(sanitized.retryAfterSeconds !== undefined
+        ? { retryAfterSeconds: sanitized.retryAfterSeconds }
+        : {}),
+      at: entry.at ?? now(),
+    });
+    await maybeCompact();
+    return sanitized;
+  }
+
   async function recordDone(id: string): Promise<void> {
     await append({ kind: "done", id, source: "", ledger: 0, eventName: "", at: now() });
     // Once a send is accounted for, compact resolved pairs away when the file
     // has grown past its budget so the journal stays bounded.
-    const stats = await journalStats();
-    if (stats.entries > maxEntries || stats.bytes > maxBytes) {
-      await compact();
+    await maybeCompact();
+  }
+
+  function resolveState(entries: readonly JournalEntry[]): {
+    pending: JournalEntry[];
+    failures: JournalEntry[];
+  } {
+    const done = new Set<string>();
+    const latestFailureById = new Map<string, JournalEntry>();
+    for (const entry of entries) {
+      if (entry.kind === "done") {
+        done.add(entry.id);
+      } else if (entry.kind === "failed" || entry.errorCode !== undefined) {
+        latestFailureById.set(entry.id, entry);
+      }
     }
+
+    const seenIntentIds = new Set<string>();
+    const pending: JournalEntry[] = [];
+    for (const entry of entries) {
+      if (entry.kind !== "intent" || done.has(entry.id)) continue;
+      seenIntentIds.add(entry.id);
+      const failure = latestFailureById.get(entry.id);
+      if (failure) {
+        pending.push({
+          ...entry,
+          ...(failure.errorCode !== undefined ? { errorCode: failure.errorCode } : {}),
+          ...(failure.telegramErrorCode !== undefined
+            ? { telegramErrorCode: failure.telegramErrorCode }
+            : {}),
+          ...(failure.errorDescription !== undefined
+            ? { errorDescription: failure.errorDescription }
+            : {}),
+          ...(failure.retryAfterSeconds !== undefined
+            ? { retryAfterSeconds: failure.retryAfterSeconds }
+            : {}),
+        });
+      } else {
+        pending.push(entry);
+      }
+    }
+
+    const failures: JournalEntry[] = [];
+    for (const [id, failure] of latestFailureById.entries()) {
+      if (done.has(id)) continue;
+      if (seenIntentIds.has(id)) {
+        const enriched = pending.find((p) => p.id === id);
+        if (enriched) failures.push(enriched);
+      } else {
+        failures.push(failure);
+      }
+    }
+
+    return { pending, failures };
   }
 
   async function loadPending(): Promise<JournalEntry[]> {
     const entries = await readLines();
-    const done = new Set<string>();
-    for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
-    }
-    return entries.filter((e) => e.kind === "intent" && !done.has(e.id));
+    return resolveState(entries).pending;
+  }
+
+  async function loadFailures(): Promise<JournalEntry[]> {
+    const entries = await readLines();
+    return resolveState(entries).failures;
   }
 
   async function compact(): Promise<void> {
     const entries = await readLines();
-    const done = new Set<string>();
-    for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
-    }
-    // A done line settles its intent: both lines can be dropped. Keep only
-    // unresolved intents.
-    const unresolved = entries.filter((e) => e.kind === "intent" && !done.has(e.id));
-    await persist(unresolved);
+    const { pending, failures } = resolveState(entries);
+    const pendingIds = new Set(pending.map((p) => p.id));
+    const standaloneFailures = failures.filter((f) => !pendingIds.has(f.id));
+    await persist([...pending, ...standaloneFailures]);
   }
 
   async function journalStats(): Promise<SendJournalStats> {
@@ -199,5 +516,13 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     return journalStats();
   }
 
-  return { recordIntent, recordDone, loadPending, compact, stats };
+  return {
+    recordIntent,
+    recordDone,
+    recordFailure,
+    loadPending,
+    loadFailures,
+    compact,
+    stats,
+  };
 }
