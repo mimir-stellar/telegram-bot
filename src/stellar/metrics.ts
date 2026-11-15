@@ -136,3 +136,74 @@ export function formatRpcTiming(summary: RpcTimingSummary): string {
     `health=${operations.health.requests} events=${operations.events.requests}`
   );
 }
+
+// ── Dead-letter capacity utilization ─────────────────────────────────────────
+
+/** Count-only input for dead-letter queue utilization (never carries message bodies). */
+export interface DeadLetterCapacityInput {
+  /** True when persistent dead-letter queueing is enabled. */
+  enabled: boolean;
+  /** Current number of parked entries (`depth`). */
+  usedEntries: number;
+  /** Configured maximum entry ceiling (`DEAD_LETTER_MAX`). */
+  maxEntries: number;
+}
+
+/**
+ * Bounded, secret-free snapshot of dead-letter queue capacity utilization.
+ *
+ * Disabled semantics (`enabled === false` or `maxEntries <= 0`):
+ *  - `enabled` is `false`
+ *  - `usedEntries` is `0`
+ *  - `maxEntries` is `0`
+ *  - `utilizationRatio` is `0`
+ *  - `utilizationPercent` is `0`
+ *
+ * Enabled semantics:
+ *  - `usedEntries` is clamped to a non-negative integer
+ *  - `maxEntries` is clamped to an integer `>= 1`
+ *  - `utilizationRatio` is strictly bounded in `[0, 1]` (rounded to 6 decimals)
+ *  - `utilizationPercent` is strictly bounded in `[0, 100]`
+ */
+export interface DeadLetterCapacitySnapshot {
+  enabled: boolean;
+  usedEntries: number;
+  maxEntries: number;
+  utilizationRatio: number;
+  utilizationPercent: number;
+}
+
+export function computeDeadLetterCapacity(
+  input: DeadLetterCapacityInput,
+): DeadLetterCapacitySnapshot {
+  const rawMax = input.maxEntries;
+  if (!input.enabled || typeof rawMax !== "number" || !Number.isFinite(rawMax) || rawMax <= 0) {
+    return {
+      enabled: false,
+      usedEntries: 0,
+      maxEntries: 0,
+      utilizationRatio: 0,
+      utilizationPercent: 0,
+    };
+  }
+
+  const maxEntries = Math.max(1, Math.floor(rawMax));
+  const usedEntries =
+    typeof input.usedEntries === "number" &&
+    Number.isFinite(input.usedEntries) &&
+    input.usedEntries > 0
+      ? Math.floor(input.usedEntries)
+      : 0;
+
+  const clampedRatio = Math.min(1, Math.max(0, usedEntries / maxEntries));
+  const utilizationRatio = Math.round(clampedRatio * 1_000_000) / 1_000_000;
+  const utilizationPercent = Math.min(100, Math.max(0, Math.round(clampedRatio * 100)));
+
+  return {
+    enabled: true,
+    usedEntries,
+    maxEntries,
+    utilizationRatio,
+    utilizationPercent,
+  };
+}

@@ -21,6 +21,10 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import {
+  computeDeadLetterCapacity,
+  type DeadLetterCapacitySnapshot,
+} from "./stellar/metrics.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -98,6 +102,8 @@ export interface HealthReport {
      * be replayed. Counts only: no message text, no destination.
      */
     deadLetter: { depth: number; enqueued: number; replayed: number; dropped: number };
+    /** Bounded dead-letter queue capacity utilization (counts only, no message bodies). */
+    deadLetterCapacity: DeadLetterCapacitySnapshot;
     consecutiveFailures: number;
     /** Repetitive error lines summarized rather than printed since start. */
     suppressedLogs: number;
@@ -318,6 +324,13 @@ export function buildHealthReport(
         replayed: poller.deadLetter?.replayed ?? 0,
         dropped: poller.deadLetter?.dropped ?? 0,
       },
+      deadLetterCapacity:
+        poller.deadLetterCapacity ??
+        computeDeadLetterCapacity({
+          enabled: typeof config.deadLetterFile === "string" && config.deadLetterFile.length > 0,
+          usedEntries: poller.deadLetter?.depth ?? 0,
+          maxEntries: config.deadLetterMax ?? 0,
+        }),
       consecutiveFailures: poller.consecutiveFailures,
       suppressedLogs: poller.suppressedLogs ?? 0,
       lastError: poller.lastError
@@ -373,6 +386,13 @@ export function buildMetricsReport(
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
   const network = networkLabel(config);
   const activity = poller.activityBaseline ?? emptyActivityBaseline();
+  const dlqCap =
+    poller.deadLetterCapacity ??
+    computeDeadLetterCapacity({
+      enabled: typeof config.deadLetterFile === "string" && config.deadLetterFile.length > 0,
+      usedEntries: poller.deadLetter?.depth ?? 0,
+      maxEntries: config.deadLetterMax ?? 0,
+    });
 
   const lines: string[] = [
     `# HELP mimir_telegram_uptime_ms Uptime in milliseconds`,
@@ -418,6 +438,22 @@ export function buildMetricsReport(
     `# HELP mimir_telegram_activity_anomalies_total Complete cycles classified as a spike or drop against the rolling baseline`,
     `# TYPE mimir_telegram_activity_anomalies_total counter`,
     `mimir_telegram_activity_anomalies_total{network="${network}"} ${activity.anomalies}`,
+    ``,
+    `# HELP mimir_telegram_dead_letter_enabled Whether the dead-letter queue is enabled (1) or disabled (0)`,
+    `# TYPE mimir_telegram_dead_letter_enabled gauge`,
+    `mimir_telegram_dead_letter_enabled{network="${network}"} ${dlqCap.enabled ? 1 : 0}`,
+    ``,
+    `# HELP mimir_telegram_dead_letter_used_entries Current number of parked entries in the dead-letter queue (0 when disabled)`,
+    `# TYPE mimir_telegram_dead_letter_used_entries gauge`,
+    `mimir_telegram_dead_letter_used_entries{network="${network}"} ${dlqCap.usedEntries}`,
+    ``,
+    `# HELP mimir_telegram_dead_letter_max_entries Configured maximum entry capacity of the dead-letter queue (0 when disabled)`,
+    `# TYPE mimir_telegram_dead_letter_max_entries gauge`,
+    `mimir_telegram_dead_letter_max_entries{network="${network}"} ${dlqCap.maxEntries}`,
+    ``,
+    `# HELP mimir_telegram_dead_letter_utilization_ratio Bounded dead-letter queue capacity utilization ratio in [0, 1] (0 when disabled)`,
+    `# TYPE mimir_telegram_dead_letter_utilization_ratio gauge`,
+    `mimir_telegram_dead_letter_utilization_ratio{network="${network}"} ${dlqCap.utilizationRatio}`,
   ];
 
   if (poller.latestLedger !== null) {

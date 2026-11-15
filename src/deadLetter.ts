@@ -28,6 +28,10 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { safeErrorMessage } from "./notifications/format.js";
+import {
+  computeDeadLetterCapacity,
+  type DeadLetterCapacitySnapshot,
+} from "./stellar/metrics.js";
 
 export interface DeadLetterEntry {
   /** Stable id within the queue (source + ledger + event + short text hash). */
@@ -325,6 +329,18 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     flush,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
+    },
+    /**
+     * Bounded capacity utilization derived solely from entry counts and limits
+     * (never reads or exposes message bodies). Defaults to disabled when
+     * `filePath === null`.
+     */
+    capacity(enabled: boolean = filePath !== null): DeadLetterCapacitySnapshot {
+      return computeDeadLetterCapacity({
+        enabled,
+        usedEntries: entries.length,
+        maxEntries: options.maxEntries,
+      });
     },
     /** Test helper — snapshot of current entries. */
     snapshot(): DeadLetterEntry[] {

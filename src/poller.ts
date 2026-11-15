@@ -74,6 +74,7 @@ import {
   DEAD_LETTER_MAX_ENTRIES,
   type DeadLetterStats,
 } from "./deadLetter.js";
+import type { DeadLetterCapacitySnapshot } from "./stellar/metrics.js";
 import {
   createSendJournal,
   type SendJournal,
@@ -344,6 +345,8 @@ export interface PollerStatus {
   suppressedLogs: number;
   /** Dead-letter queue counters (see src/deadLetter.ts). */
   deadLetter: DeadLetterStats;
+  /** Bounded dead-letter queue capacity utilization (counts only, no message bodies). */
+  deadLetterCapacity?: DeadLetterCapacitySnapshot;
   /** Telegram sends abandoned by the per-send timeout, when tracked. */
   sendTimeouts?: number;
   /** Bounded description of the most recent send timeout, when tracked. */
@@ -1472,6 +1475,13 @@ export function createPoller(deps: PollerDeps) {
   /** Mirror the queue's counters into the status this poller reports. */
   function refreshDeadLetterStatus(): void {
     status.deadLetter = deadLetter.stats();
+    const cap = deadLetter.capacity(deadLetterEnabled);
+    status.deadLetterCapacity = cap;
+    metrics?.deadLetterCapacity.update({
+      enabled: cap.enabled,
+      usedEntries: cap.usedEntries,
+      maxEntries: cap.maxEntries,
+    });
   }
 
   const sinceStartCounters: PollerCounters = {
@@ -1531,6 +1541,7 @@ export function createPoller(deps: PollerDeps) {
       lastFailureAt: null,
     },
   };
+  refreshDeadLetterStatus();
 
   function syncCounterSnapshots(): void {
     status.sinceStart = { ...sinceStartCounters };

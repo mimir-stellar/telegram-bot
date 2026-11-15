@@ -25,6 +25,12 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import {
+  computeDeadLetterCapacity,
+  type DeadLetterCapacityInput,
+  type DeadLetterCapacitySnapshot,
+} from "./stellar/metrics.js";
+
 // ── Metric types ──────────────────────────────────────────────────────────────
 
 export interface Counter {
@@ -39,6 +45,16 @@ export interface Gauge {
   set(value: number): void;
   /** Current value. */
   value(): number;
+}
+
+/** Bounded dead-letter queue capacity gauges exposed by {@link MetricsRegistry}. */
+export interface DeadLetterCapacityGauge {
+  /** Update dead-letter capacity gauges from counts only (no message bodies). */
+  update(input: DeadLetterCapacityInput): DeadLetterCapacitySnapshot;
+  /** Reset dead-letter gauges to the explicit disabled state (all zeros). */
+  disable(): DeadLetterCapacitySnapshot;
+  /** Read the current bounded capacity snapshot. */
+  snapshot(): DeadLetterCapacitySnapshot;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -89,6 +105,8 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** Bounded dead-letter queue capacity utilization gauges (counts only, no message bodies). */
+  deadLetterCapacity: DeadLetterCapacityGauge;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -195,6 +213,37 @@ export function createMetrics(): MetricsRegistry {
     `${METRICS_PREFIX}activity_anomalies_total`,
     "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
   );
+  const deadLetterEnabledGauge = makeGauge(
+    `${METRICS_PREFIX}dead_letter_enabled`,
+    "Whether the dead-letter queue is enabled (1) or disabled (0).",
+  );
+  const deadLetterUsedEntriesGauge = makeGauge(
+    `${METRICS_PREFIX}dead_letter_used_entries`,
+    "Current number of parked entries in the dead-letter queue (0 when disabled).",
+  );
+  const deadLetterMaxEntriesGauge = makeGauge(
+    `${METRICS_PREFIX}dead_letter_max_entries`,
+    "Configured maximum entry capacity of the dead-letter queue (0 when disabled).",
+  );
+  const deadLetterUtilizationRatioGauge = makeGauge(
+    `${METRICS_PREFIX}dead_letter_utilization_ratio`,
+    "Bounded dead-letter queue capacity utilization ratio in [0, 1] (0 when disabled).",
+  );
+
+  let currentDeadLetterCapacity: DeadLetterCapacitySnapshot = computeDeadLetterCapacity({
+    enabled: false,
+    usedEntries: 0,
+    maxEntries: 0,
+  });
+
+  function applyDeadLetterCapacity(snap: DeadLetterCapacitySnapshot): DeadLetterCapacitySnapshot {
+    currentDeadLetterCapacity = snap;
+    deadLetterEnabledGauge.set(snap.enabled ? 1 : 0);
+    deadLetterUsedEntriesGauge.set(snap.usedEntries);
+    deadLetterMaxEntriesGauge.set(snap.maxEntries);
+    deadLetterUtilizationRatioGauge.set(snap.utilizationRatio);
+    return snap;
+  }
 
   const counters = [
     pollCycles,
@@ -207,7 +256,15 @@ export function createMetrics(): MetricsRegistry {
     staleCursorEvents,
     activityAnomalies,
   ];
-  const gauges = [consecutiveFailures, lastCycleEvents, activityBaselineEvents];
+  const gauges = [
+    consecutiveFailures,
+    lastCycleEvents,
+    activityBaselineEvents,
+    deadLetterEnabledGauge,
+    deadLetterUsedEntriesGauge,
+    deadLetterMaxEntriesGauge,
+    deadLetterUtilizationRatioGauge,
+  ];
 
   function render(): string {
     const lines: string[] = [];
@@ -306,6 +363,14 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    deadLetterCapacity: {
+      update: (input) => applyDeadLetterCapacity(computeDeadLetterCapacity(input)),
+      disable: () =>
+        applyDeadLetterCapacity(
+          computeDeadLetterCapacity({ enabled: false, usedEntries: 0, maxEntries: 0 }),
+        ),
+      snapshot: () => ({ ...currentDeadLetterCapacity }),
+    },
     render,
     startServer,
   };

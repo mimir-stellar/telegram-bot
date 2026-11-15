@@ -10,6 +10,21 @@ Instead, failed sends are persisted locally to disk in the file configured by `D
 
 If `DEAD_LETTER_FILE` is unset or empty, persistence is disabled and the queue operates purely in memory.
 
+### Capacity Utilization Metrics
+
+Both Prometheus endpoints (`GET /metrics` on the health server and the standalone metrics registry) and `GET /health` (`poller.deadLetterCapacity`) expose bounded capacity gauges computed strictly from entry counts (`usedEntries` and `maxEntries`) — message bodies, chat IDs, and error strings are never included:
+
+* **Enabled queue (`DEAD_LETTER_FILE` set, `DEAD_LETTER_MAX >= 1`)**:
+  * `enabled = 1` (`true` in JSON)
+  * `used_entries = depth` (non-negative integer)
+  * `max_entries = DEAD_LETTER_MAX`
+  * `utilization_ratio = min(1, max(0, used_entries / max_entries))` (bounded in `[0, 1]`)
+* **Disabled queue (`DEAD_LETTER_FILE` unset/empty or `maxEntries <= 0`)**:
+  * `enabled = 0` (`false` in JSON)
+  * `used_entries = 0`, `max_entries = 0`, `utilization_ratio = 0` (no division by zero or `NaN`).
+
+See [http-endpoints.md](http-endpoints.md) for exact metric names and response fields.
+
 ---
 
 ## File Format & Entry Fields

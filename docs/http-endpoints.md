@@ -110,6 +110,13 @@ is the machine-readable signal; the JSON body adds detail.
       "replayed": 0,                   // lifetime total replayed successfully
       "dropped": 0                     // exhausted retries and discarded
     },
+    "deadLetterCapacity": {
+      "enabled": true,                 // false when DEAD_LETTER_FILE is unset/empty
+      "usedEntries": 0,                // current parked count (0 when disabled)
+      "maxEntries": 100,               // configured DEAD_LETTER_MAX (0 when disabled)
+      "utilizationRatio": 0,           // bounded in [0, 1] (0 when disabled)
+      "utilizationPercent": 0          // bounded in [0, 100] (0 when disabled)
+    },
     "consecutiveFailures": 0,
     "suppressedLogs": 0,
     "lastError": null,                 // { at: ISO8601, message: string } or null
@@ -317,6 +324,10 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_dead_letter_enabled` | gauge | `1` when the dead-letter queue is enabled, `0` when disabled |
+| `mimir_bot_dead_letter_used_entries` | gauge | Current parked dead-letter entry count (`0` when disabled; no message bodies) |
+| `mimir_bot_dead_letter_max_entries` | gauge | Configured maximum dead-letter capacity (`0` when disabled) |
+| `mimir_bot_dead_letter_utilization_ratio` | gauge | Bounded dead-letter capacity utilization ratio in `[0, 1]` (`0` when disabled) |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment
