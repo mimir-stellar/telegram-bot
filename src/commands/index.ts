@@ -43,9 +43,12 @@ export {
   chatAllowed,
   commandArgument,
   isChatAllowed,
+  isCommandAddressedToBot,
   isOperator,
   operatorAllowed,
+  parseSlashCommand,
   replyMarkdown,
+  type ParsedCommandTarget,
 } from "./runtime.js";
 export {
   CALLBACK_PAUSE_CANCEL,

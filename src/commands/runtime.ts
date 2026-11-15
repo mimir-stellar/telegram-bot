@@ -121,6 +121,98 @@ export function commandArgument(ctx: CommandContext<Context>): string {
     return ctx.match.trim();
   }
   const text = ctx.message?.text ?? "";
+  const parsed = parseSlashCommand(text, ctx.message?.entities);
+  if (parsed !== null) {
+    return parsed.args;
+  }
   const spaceIndex = text.indexOf(" ");
   return spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
+}
+
+export interface ParsedCommandTarget {
+  /** Normalized lowercase command name without leading `/` or `@username`. */
+  readonly command: string;
+  /**
+   * Bot username suffix after `@` (without `@`), `""` when `@` has no username
+   * (`/cmd@`), or `null` when the command has no `@` suffix (`/cmd`).
+   */
+  readonly targetBotUsername: string | null;
+  /** Trimmed argument text after the command token. */
+  readonly args: string;
+}
+
+const SLASH_COMMAND_RE = /^\/([A-Za-z0-9_-]+)(?:@([^\s]*))?(?:\s+([\s\S]*))?$/;
+const VALID_BOT_USERNAME_RE = /^[A-Za-z0-9_]{1,64}$/;
+
+/**
+ * Parse a leading slash command token and optional `@bot_username` target from
+ * message text (using a leading `bot_command` entity when present).
+ */
+export function parseSlashCommand(
+  text: string | undefined,
+  entities?: readonly { type: string; offset: number; length: number }[],
+): ParsedCommandTarget | null {
+  if (typeof text !== "string" || !text.startsWith("/")) return null;
+
+  const leadEntity = entities?.find((e) => e.type === "bot_command" && e.offset === 0);
+  if (leadEntity && leadEntity.length > 1 && leadEntity.length <= text.length) {
+    const rawToken = text.slice(1, leadEntity.length);
+    if (rawToken.length === 0 || /\s/.test(rawToken)) return null;
+    const atIndex = rawToken.indexOf("@");
+    const command = (atIndex === -1 ? rawToken : rawToken.slice(0, atIndex)).toLowerCase();
+    if (!command || !/^[a-z0-9_-]+$/.test(command)) return null;
+    const targetBotUsername = atIndex === -1 ? null : rawToken.slice(atIndex + 1);
+    const args = text.slice(leadEntity.length).trim();
+    return { command, targetBotUsername, args };
+  }
+
+  const match = SLASH_COMMAND_RE.exec(text);
+  if (!match || !match[1]) return null;
+  return {
+    command: match[1].toLowerCase(),
+    targetBotUsername: match[2] !== undefined ? match[2] : null,
+    args: (match[3] ?? "").trim(),
+  };
+}
+
+/**
+ * Return `true` when the slash command in `ctx` has no `@bot` suffix or is
+ * addressed (case-insensitively) to this bot's username. Commands carrying a
+ * different or malformed `@bot` username return `false` so they are ignored.
+ */
+export function isCommandAddressedToBot(
+  ctx: {
+    message?: {
+      text?: string | undefined;
+      entities?: readonly { type: string; offset: number; length: number }[] | undefined;
+    } | undefined;
+    me?: { username?: string | undefined } | undefined;
+  },
+  fallbackBotUsername?: string | undefined,
+): boolean {
+  const text = ctx.message?.text;
+  if (typeof text !== "string" || text.length === 0) {
+    return true;
+  }
+
+  const parsed = parseSlashCommand(text, ctx.message?.entities);
+  if (parsed === null) {
+    return true;
+  }
+
+  if (parsed.targetBotUsername === null) {
+    return true;
+  }
+
+  const target = parsed.targetBotUsername.trim();
+  if (!VALID_BOT_USERNAME_RE.test(target)) {
+    return false;
+  }
+
+  const ownUsername = (ctx.me?.username ?? fallbackBotUsername ?? "").trim();
+  if (!ownUsername) {
+    return false;
+  }
+
+  return target.toLowerCase() === ownUsername.toLowerCase();
 }

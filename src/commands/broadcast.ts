@@ -10,7 +10,7 @@
 
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { BotConfig } from "../config.js";
-import { isOperator, safeAnswerCallback } from "./runtime.js";
+import { isCommandAddressedToBot, isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
 
@@ -233,12 +233,15 @@ export interface BroadcastDeps {
  */
 export async function handleBroadcastCommand(
   ctx: CommandContext<Context>,
-  deps: Pick<BotDeps, "config"> & {
+  deps: Pick<BotDeps, "config" | "botInfo"> & {
     broadcastStore?: BroadcastStore;
     broadcastExpiryMs?: number;
   },
 ): Promise<void> {
   const { config } = deps;
+  if (!isCommandAddressedToBot(ctx, deps.botInfo?.username)) {
+    return;
+  }
   const isPrivate = ctx.chat?.type === "private";
 
   if (!isOperator(ctx, config) || !isPrivate) {

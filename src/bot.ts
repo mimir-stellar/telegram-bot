@@ -27,8 +27,10 @@ import {
   CALLBACK_PAUSE_CONFIRM,
   chatAllowed,
   commandMetadata,
+  isCommandAddressedToBot,
   isOperator,
   operatorAllowed,
+  parseSlashCommand,
   registeredCommands,
   visibleCommandMetadata,
   type CommandDeps,
@@ -63,7 +65,14 @@ export {
   pauseConfirmKeyboard,
   statusKeyboard,
 } from "./commands/keyboards.js";
-export { TELEGRAM_OPTIONS, isChatAllowed, isOperator } from "./commands/runtime.js";
+export {
+  TELEGRAM_OPTIONS,
+  isChatAllowed,
+  isCommandAddressedToBot,
+  isOperator,
+  parseSlashCommand,
+  type ParsedCommandTarget,
+} from "./commands/runtime.js";
 export {
   aboutMessage,
   helpMessage,
@@ -238,6 +247,7 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
   const modules = registeredCommands();
   for (const module of modules) {
     registrar.command(module.command, async (ctx) => {
+      if (!isCommandAddressedToBot(ctx, deps.botInfo?.username)) return;
       if (!withinRateLimit(ctx, module.command)) return;
       await dispatch(module, ctx, deps);
     });
@@ -259,6 +269,7 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
       registrar as Required<Pick<CommandRegistrar, "on">>,
       deps.config,
       modules.map(({ command }) => command),
+      deps.botInfo?.username,
     );
   }
 }
@@ -273,6 +284,9 @@ function dispatch(
   ctx: CommandContext<Context>,
   deps: BotDeps,
 ): Promise<void> {
+  if (!isCommandAddressedToBot(ctx, deps.botInfo?.username)) {
+    return Promise.resolve();
+  }
   if (module.operatorOnly === true && !operatorAllowed(ctx, deps.config, module.command)) {
     return Promise.resolve();
   }
@@ -292,28 +306,16 @@ function registerUnknownCommandFallback(
   bot: Required<Pick<CommandRegistrar, "on">>,
   config: BotConfig,
   knownCommandNames: readonly string[],
+  fallbackBotUsername?: string,
 ): void {
   bot.on("message:entities:bot_command", async (ctx: Context) => {
     if (ctx.chat?.type !== "private") return;
+    if (!isCommandAddressedToBot(ctx, fallbackBotUsername)) return;
 
-    const text = ctx.message?.text ?? "";
-    const entities = ctx.message?.entities ?? [];
+    const parsed = parseSlashCommand(ctx.message?.text, ctx.message?.entities);
+    if (!parsed) return;
 
-    // Find the first bot_command entity at offset 0.
-    const cmdEntity = entities.find((e) => e.type === "bot_command" && e.offset === 0);
-    if (!cmdEntity) return;
-
-    // Extract the raw command token, e.g. "/status@mybot" → "status@mybot".
-    const raw = text.slice(1, cmdEntity.length);
-    const atIndex = raw.indexOf("@");
-    const cmdName = atIndex === -1 ? raw : raw.slice(0, atIndex);
-    const mention = atIndex === -1 ? null : raw.slice(atIndex + 1);
-
-    // If it targets another bot, ignore.
-    if (mention !== null) {
-      const myUsername = (ctx as unknown as { me?: { username?: string } }).me?.username;
-      if (myUsername && mention.toLowerCase() !== myUsername.toLowerCase()) return;
-    }
+    const cmdName = parsed.command;
 
     // Already handled by a known-command handler — do nothing.
     if (knownCommandNames.includes(cmdName)) return;
@@ -348,9 +350,9 @@ export function createBot(deps: BotDeps): Bot {
       ? { botInfo: deps.botInfo, ...clientOptions }
       : clientOptions,
   );
+  registerBroadcastHandlers(bot, deps);
   registerCommandHandlers(bot, deps);
   registerCallbackHandlers(bot, deps);
-  registerBroadcastHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.

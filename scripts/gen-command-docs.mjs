@@ -76,6 +76,7 @@ export function formatCommandDocs(commands = COMMANDS) {
     "",
     "- **Operator-only**: Requires `OPERATOR_TELEGRAM_USER_ID` to be configured. Only the designated operator can execute these commands.",
     "- **Allowlist-gated**: Restricted to chats listed in `ALLOWED_CHAT_IDS`. If `ALLOWED_CHAT_IDS` is unset or empty, these commands are open to any chat.",
+    "- **Bot mention targeting**: Slash commands carrying an `@<bot_username>` suffix are only handled when the username matches this bot (case-insensitively); commands addressed to another Telegram bot are ignored.",
     "",
   );
 
