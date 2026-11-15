@@ -10,6 +10,7 @@
  */
 
 import { compareEvents, sortEvents, type DecodedEvent } from "../stellar/decode.js";
+import { parseDigestMaxAgeMs } from "./schedule.js";
 
 export interface DigestGroup {
   /**
@@ -75,4 +76,124 @@ export function groupDigestEvents(events: readonly DecodedEvent[]): DigestGroup[
     groups.push({ key, events: sortEvents(raw) });
   }
   return groups;
+}
+
+/**
+ * High-priority / lifecycle-terminal contract events that must never be silently
+ * dropped by digest age pruning even when delayed beyond `maxAge`.
+ */
+export const DEFAULT_CRITICAL_DIGEST_EVENTS = [
+  "claim_resolved",
+  "market_settled",
+  "resolved",
+  "claim_challenged",
+  "claim_cancelled",
+] as const;
+
+export interface DigestRetentionOptions {
+  /**
+   * Maximum allowed age for non-critical digest entries (`number` in ms or
+   * duration string like `"6h"` / `"1d"`). When omitted, no entries expire.
+   */
+  maxAge?: number | string;
+  /** Reference UTC millisecond timestamp. Defaults to `Date.now()`. */
+  nowMs?: number;
+  /**
+   * Event names treated as critical and always retained regardless of age.
+   * Defaults to {@link DEFAULT_CRITICAL_DIGEST_EVENTS}.
+   */
+  criticalEvents?: readonly string[];
+  /**
+   * Optional allowlist of low-priority event names subject to expiration.
+   * When omitted, every event outside `criticalEvents` is subject to `maxAge`.
+   */
+  lowPriorityEvents?: readonly string[];
+}
+
+export interface PrunedDigestResult {
+  /** Retained events in their original relative order. */
+  events: DecodedEvent[];
+  /** Deterministically grouped retained events. */
+  groups: DigestGroup[];
+  /** Number of expired low-priority entries dropped. */
+  omittedCount: number;
+  /** Number of expired critical entries kept despite exceeding `maxAge`. */
+  retainedCriticalCount: number;
+}
+
+function eventNameOf(event: DecodedEvent): string {
+  return event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
+}
+
+export function isCriticalDigestEvent(
+  event: DecodedEvent,
+  criticalEvents: readonly string[] = DEFAULT_CRITICAL_DIGEST_EVENTS,
+): boolean {
+  return criticalEvents.includes(eventNameOf(event));
+}
+
+/**
+ * Drop expired low-priority digest entries exceeding `options.maxAge` while
+ * retaining critical events and exposing an explicit `omittedCount` counter.
+ */
+export function pruneExpiredDigestEvents(
+  events: readonly DecodedEvent[],
+  options: DigestRetentionOptions = {},
+): PrunedDigestResult {
+  if (options.maxAge === undefined) {
+    const retained = [...events];
+    return {
+      events: retained,
+      groups: groupDigestEvents(retained),
+      omittedCount: 0,
+      retainedCriticalCount: 0,
+    };
+  }
+
+  const maxAgeMs = parseDigestMaxAgeMs(options.maxAge);
+  const nowMs = options.nowMs ?? Date.now();
+  if (!Number.isFinite(nowMs)) {
+    throw new RangeError("nowMs must be a finite timestamp");
+  }
+
+  const criticalSet = new Set(options.criticalEvents ?? DEFAULT_CRITICAL_DIGEST_EVENTS);
+  const lowPrioritySet = options.lowPriorityEvents
+    ? new Set(options.lowPriorityEvents)
+    : null;
+
+  const retained: DecodedEvent[] = [];
+  let omittedCount = 0;
+  let retainedCriticalCount = 0;
+
+  for (const event of events) {
+    const name = eventNameOf(event);
+    const isCritical = criticalSet.has(name);
+    const hasChainTimestamp = typeof event.at === "number" && Number.isFinite(event.at) && event.at > 0;
+    const isExpired = hasChainTimestamp && nowMs - event.at * 1000 > maxAgeMs;
+
+    if (!isExpired) {
+      retained.push(event);
+      continue;
+    }
+
+    if (isCritical) {
+      retained.push(event);
+      retainedCriticalCount += 1;
+      continue;
+    }
+
+    const isLowPriority = lowPrioritySet === null || lowPrioritySet.has(name);
+    if (isLowPriority) {
+      omittedCount += 1;
+    } else {
+      retained.push(event);
+    }
+  }
+
+  return {
+    events: retained,
+    groups: groupDigestEvents(retained),
+    omittedCount,
+    retainedCriticalCount,
+  };
 }

@@ -129,6 +129,7 @@ Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's
 - **Bounded fields**: Contract strings clipped at 200 Unicode code points
 - **Explorer links**: Includes transaction links to stellar.expert
 - **Preview mode**: Optional `[PREVIEW MODE]` badge for testing
+- **Digest age pruning (`src/notifications/digest-grouping.ts`, `src/notifications/schedule.ts`)**: `pruneExpiredDigestEvents()` and `formatDigest(..., { maxAge })` drop expired low-priority entries past a configurable age bound (`parseDigestMaxAgeMs`), always retain critical settlement/resolution events (`DEFAULT_CRITICAL_DIGEST_EVENTS`), and expose an explicit omitted-entry counter (`omittedCount`).
 
 ### Telegram Integration (`src/bot.ts`)
 

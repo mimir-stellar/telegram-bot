@@ -111,6 +111,54 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+const AGE_UNITS_MS: Record<string, number> = {
+  ms: 1,
+  s: 1_000,
+  m: 60 * 1_000,
+  h: 60 * 60 * 1_000,
+  d: MS_PER_DAY,
+  w: MS_PER_WEEK,
+};
+
+/**
+ * Parse a configurable digest entry age bound (`number` in ms or duration
+ * string such as `"30m"`, `"6h"`, `"1d"`, `"7d"`).
+ */
+export function parseDigestMaxAgeMs(spec: number | string): number {
+  if (typeof spec === "number") {
+    if (!Number.isFinite(spec) || spec < 0) {
+      throw new ScheduleParseError("Digest maxAgeMs must be a finite non-negative number");
+    }
+    return spec;
+  }
+  if (typeof spec === "string") {
+    const trimmed = spec.trim();
+    const match = /^(\d+)(ms|s|m|h|d|w)?$/i.exec(trimmed);
+    if (!match) {
+      throw new ScheduleParseError(
+        `Invalid digest max age "${spec}": expected non-negative duration (e.g. "30m", "6h", "1d")`,
+      );
+    }
+    const amount = Number(match[1]);
+    const unit = (match[2] ?? "ms").toLowerCase();
+    const multiplier = AGE_UNITS_MS[unit];
+    if (!Number.isFinite(amount) || multiplier === undefined) {
+      throw new ScheduleParseError(`Invalid digest max age "${spec}"`);
+    }
+    return amount * multiplier;
+  }
+  throw new ScheduleParseError("Digest max age must be a duration string or millisecond number");
+}
+
+/**
+ * Default entry retention age bound for a schedule (`24h` for daily, `7d` for weekly).
+ */
+export function defaultMaxAgeForSchedule(scheduleInput: Schedule | string): number {
+  const schedule =
+    typeof scheduleInput === "string" ? parseSchedule(scheduleInput) : scheduleInput;
+  return schedule.kind === "weekly" ? MS_PER_WEEK : MS_PER_DAY;
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;

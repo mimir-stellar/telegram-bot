@@ -27,7 +27,11 @@ import {
 import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
 import { iconForCategory } from "./category-icons.js";
-import { groupDigestEvents } from "./digest-grouping.js";
+import {
+  groupDigestEvents,
+  pruneExpiredDigestEvents,
+  type DigestRetentionOptions,
+} from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
@@ -316,7 +320,7 @@ export function formatLastEvent(
 }
 
 /** Options for {@link formatDigest}. */
-export interface FormatDigestOptions {
+export interface FormatDigestOptions extends DigestRetentionOptions {
   /**
    * When `true`, events are grouped by claim / squad market before rendering.
    * Multi-event groups get an escaped Group_Key header and indented sub-lines;
@@ -326,6 +330,11 @@ export interface FormatDigestOptions {
    * option is omitted or set to `false`.
    */
   grouped?: boolean;
+  /**
+   * Additional pre-counted expired low-priority entries omitted upstream before
+   * formatting. Combined with any entries pruned via `maxAge`.
+   */
+  omittedExpiredCount?: number;
 }
 
 /**
@@ -337,10 +346,18 @@ function flatLine(event: DecodedEvent): string {
   return `· mimir\\-${escapeMd(event.source)} \`${escapeMd(clip(name, 80))}\` at ledger ${event.ledger}`;
 }
 
+function formatOmittedExpiredLine(count: number): string {
+  const noun = count === 1 ? "entry" : "entries";
+  return `_${escapeMd(`${count} expired low-priority ${noun} omitted`)}_`;
+}
+
 /**
  * Render a grouped digest.  Called only when `options.grouped` is `true`.
  */
-function renderGroupedDigest(events: readonly DecodedEvent[]): string {
+function renderGroupedDigest(
+  events: readonly DecodedEvent[],
+  omittedCount: number,
+): string {
   const groups = groupDigestEvents(events);
   const header = `*Mimir Digest* — ${events.length} events in this cycle`;
   const body: string[] = [];
@@ -360,7 +377,11 @@ function renderGroupedDigest(events: readonly DecodedEvent[]): string {
     }
   }
 
-  return [header, "", ...body].join("\n");
+  const sections = body.length > 0 ? [header, "", ...body] : [header];
+  if (omittedCount > 0) {
+    sections.push("", formatOmittedExpiredLine(omittedCount));
+  }
+  return sections.join("\n");
 }
 
 /**
@@ -374,10 +395,28 @@ export function formatDigest(
   events: readonly DecodedEvent[],
   options: FormatDigestOptions = {},
 ): string | null {
-  if (events.length === 0) return null;
-  if (options.grouped) return renderGroupedDigest(events);
-  const lines = events.map(flatLine);
-  return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
+  const extraOmitted = options.omittedExpiredCount ?? 0;
+  if (!Number.isInteger(extraOmitted) || extraOmitted < 0) {
+    throw new RangeError("omittedExpiredCount must be a non-negative integer");
+  }
+
+  const pruned =
+    options.maxAge !== undefined
+      ? pruneExpiredDigestEvents(events, options)
+      : { events, omittedCount: 0 };
+  const retained = pruned.events;
+  const totalOmitted = pruned.omittedCount + extraOmitted;
+
+  if (retained.length === 0 && totalOmitted === 0) return null;
+  if (options.grouped) return renderGroupedDigest(retained, totalOmitted);
+
+  const lines = retained.map(flatLine);
+  const header = `*Mimir Digest* — ${retained.length} events in this cycle`;
+  const sections = lines.length > 0 ? [header, "", ...lines] : [header];
+  if (totalOmitted > 0) {
+    sections.push("", formatOmittedExpiredLine(totalOmitted));
+  }
+  return sections.join("\n");
 }
 
 /**
