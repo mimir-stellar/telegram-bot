@@ -111,6 +111,289 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+export const MIN_CHAT_DIGEST_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+export const MAX_CHAT_DIGEST_INTERVAL_MS = MS_PER_WEEK; // 7 days
+export const DEFAULT_MAX_CHAT_DIGEST_DESTINATIONS = 200;
+
+export interface ChatDigestBounds {
+  minIntervalMs?: number;
+  maxIntervalMs?: number;
+}
+
+export interface ChatDigestPreference {
+  destination: string;
+  mode: "interval" | "schedule" | "immediate";
+  intervalMs?: number;
+  schedule?: Schedule;
+  spec: string;
+}
+
+const DESTINATION_CHAT_ID_RE = /^(?:-?[1-9]\d{0,19}|@[A-Za-z][A-Za-z0-9_]{3,31})$/;
+
+const INTERVAL_UNIT_MS: Record<string, number> = {
+  ms: 1,
+  s: 1_000,
+  m: 60 * 1_000,
+  h: 60 * 60 * 1_000,
+  d: MS_PER_DAY,
+  w: MS_PER_WEEK,
+};
+
+export function validateDestinationChatId(destination: string): string {
+  if (typeof destination !== "string") {
+    throw new ScheduleParseError("Destination chat ID must be a string");
+  }
+  const trimmed = destination.trim();
+  if (!DESTINATION_CHAT_ID_RE.test(trimmed)) {
+    throw new ScheduleParseError(
+      `Invalid destination chat ID "${destination}": expected non-zero numeric ID or @channel handle`,
+    );
+  }
+  return trimmed;
+}
+
+function resolveIntervalBounds(bounds: ChatDigestBounds = {}): {
+  minIntervalMs: number;
+  maxIntervalMs: number;
+} {
+  const minIntervalMs = bounds.minIntervalMs ?? MIN_CHAT_DIGEST_INTERVAL_MS;
+  const maxIntervalMs = bounds.maxIntervalMs ?? MAX_CHAT_DIGEST_INTERVAL_MS;
+  if (
+    !Number.isInteger(minIntervalMs) ||
+    !Number.isInteger(maxIntervalMs) ||
+    minIntervalMs < 1_000 ||
+    maxIntervalMs < minIntervalMs
+  ) {
+    throw new ScheduleParseError(
+      `Invalid chat digest interval bounds [${minIntervalMs}, ${maxIntervalMs}]`,
+    );
+  }
+  return { minIntervalMs, maxIntervalMs };
+}
+
+/**
+ * Validate a bounded per-destination digest interval in milliseconds.
+ */
+export function parseChatDigestIntervalMs(
+  spec: number | string,
+  bounds: ChatDigestBounds = {},
+): number {
+  const { minIntervalMs, maxIntervalMs } = resolveIntervalBounds(bounds);
+  let intervalMs: number;
+
+  if (typeof spec === "number") {
+    if (!Number.isInteger(spec)) {
+      throw new ScheduleParseError("Digest interval must be an integer number of milliseconds");
+    }
+    intervalMs = spec;
+  } else if (typeof spec === "string") {
+    const raw = spec.trim().replace(/^every@/i, "").trim();
+    const match = /^(\d+)(ms|s|m|h|d|w)?$/i.exec(raw);
+    if (!match) {
+      throw new ScheduleParseError(
+        `Invalid digest interval "${spec}": expected duration such as "every@15m", "1h", or "1d"`,
+      );
+    }
+    const count = Number(match[1]);
+    const unit = (match[2] ?? "ms").toLowerCase();
+    const mult = INTERVAL_UNIT_MS[unit];
+    if (!Number.isFinite(count) || mult === undefined) {
+      throw new ScheduleParseError(`Invalid digest interval "${spec}"`);
+    }
+    intervalMs = count * mult;
+  } else {
+    throw new ScheduleParseError("Digest interval must be a string or millisecond integer");
+  }
+
+  if (intervalMs < minIntervalMs || intervalMs > maxIntervalMs) {
+    throw new ScheduleParseError(
+      `Digest interval ${intervalMs}ms is outside allowed bounds [${minIntervalMs}ms, ${maxIntervalMs}ms]`,
+    );
+  }
+  return intervalMs;
+}
+
+/**
+ * Parse and validate a per-chat digest scheduling preference (`"immediate"`,
+ * `"daily@HH:mm"`, `"weekly@day HH:mm"`, `"every@<duration>"`, or integer `ms`).
+ */
+export function parseChatDigestPreference(
+  destination: string,
+  spec: number | string,
+  bounds: ChatDigestBounds = {},
+): ChatDigestPreference {
+  const validDest = validateDestinationChatId(destination);
+  const { minIntervalMs, maxIntervalMs } = resolveIntervalBounds(bounds);
+
+  if (typeof spec === "string") {
+    const trimmed = spec.trim();
+    if (/^immediate$/i.test(trimmed)) {
+      return { destination: validDest, mode: "immediate", spec: "immediate" };
+    }
+    if (/^(?:daily|weekly)@/i.test(trimmed)) {
+      const schedule = parseSchedule(trimmed);
+      const effectiveSpan = schedule.kind === "weekly" ? MS_PER_WEEK : MS_PER_DAY;
+      if (effectiveSpan < minIntervalMs || effectiveSpan > maxIntervalMs) {
+        throw new ScheduleParseError(
+          `Schedule "${trimmed}" (${effectiveSpan}ms) is outside allowed bounds [${minIntervalMs}ms, ${maxIntervalMs}ms]`,
+        );
+      }
+      return {
+        destination: validDest,
+        mode: "schedule",
+        schedule,
+        spec: trimmed.toLowerCase(),
+      };
+    }
+  }
+
+  const intervalMs = parseChatDigestIntervalMs(spec, { minIntervalMs, maxIntervalMs });
+  const canonicalSpec =
+    typeof spec === "string" && spec.trim().length > 0
+      ? spec.trim().toLowerCase()
+      : `${intervalMs}ms`;
+  return {
+    destination: validDest,
+    mode: "interval",
+    intervalMs,
+    spec: canonicalSpec,
+  };
+}
+
+/**
+ * Compute the next UTC millisecond timestamp when `preference` is due to flush,
+ * or `null` when `preference.mode === "immediate"`.
+ */
+export function nextChatDigestFlushMs(
+  preference: ChatDigestPreference,
+  lastFlushMs: number | null,
+  nowMs: number,
+): number | null {
+  if (!Number.isFinite(nowMs)) {
+    throw new ScheduleParseError("nowMs must be a finite number");
+  }
+  if (preference.mode === "immediate") return null;
+  const anchor = lastFlushMs ?? nowMs;
+  if (preference.mode === "schedule" && preference.schedule) {
+    return nextRun(preference.schedule, anchor);
+  }
+  if (preference.mode === "interval" && preference.intervalMs !== undefined) {
+    return anchor + preference.intervalMs;
+  }
+  throw new ScheduleParseError(`Malformed chat digest preference for ${preference.destination}`);
+}
+
+export interface PersistedChatDigestEntry {
+  spec: string;
+  lastFlushMs: number | null;
+}
+
+export class FileChatDigestPreferencesStore {
+  private readonly bounds: ChatDigestBounds;
+  private readonly maxDestinations: number;
+
+  constructor(
+    private readonly filePath: string,
+    options: ChatDigestBounds & { maxDestinations?: number } = {},
+  ) {
+    this.bounds = {
+      minIntervalMs: options.minIntervalMs,
+      maxIntervalMs: options.maxIntervalMs,
+    };
+    this.maxDestinations = Math.max(
+      1,
+      options.maxDestinations ?? DEFAULT_MAX_CHAT_DIGEST_DESTINATIONS,
+    );
+  }
+
+  async load(): Promise<Map<string, { preference: ChatDigestPreference; lastFlushMs: number | null }>> {
+    let raw: string;
+    try {
+      raw = await fs.readFile(this.filePath, "utf-8");
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return new Map();
+      throw err;
+    }
+    const trimmed = raw.trim();
+    if (!trimmed) return new Map();
+
+    const parsed = JSON.parse(trimmed) as {
+      version?: unknown;
+      chats?: Record<string, PersistedChatDigestEntry>;
+    };
+    if (parsed?.version !== 1 || typeof parsed.chats !== "object" || parsed.chats === null) {
+      throw new ScheduleParseError("Unsupported chat digest preferences file schema");
+    }
+
+    const entries = Object.entries(parsed.chats);
+    if (entries.length > this.maxDestinations) {
+      throw new ScheduleParseError(
+        `Chat digest preferences count (${entries.length}) exceeds limit (${this.maxDestinations})`,
+      );
+    }
+
+    const result = new Map<
+      string,
+      { preference: ChatDigestPreference; lastFlushMs: number | null }
+    >();
+    for (const [dest, item] of entries) {
+      const preference = parseChatDigestPreference(dest, item.spec, this.bounds);
+      const lastFlushMs =
+        typeof item.lastFlushMs === "number" && Number.isFinite(item.lastFlushMs)
+          ? item.lastFlushMs
+          : null;
+      result.set(preference.destination, { preference, lastFlushMs });
+    }
+    return result;
+  }
+
+  async setPreference(
+    destination: string,
+    spec: number | string,
+    seededAtMs: number | null = null,
+  ): Promise<ChatDigestPreference> {
+    const preference = parseChatDigestPreference(destination, spec, this.bounds);
+    const current = await this.load();
+    if (!current.has(preference.destination) && current.size >= this.maxDestinations) {
+      throw new ScheduleParseError(
+        `Cannot exceed maximum configured chat digest destinations (${this.maxDestinations})`,
+      );
+    }
+    const existing = current.get(preference.destination);
+    current.set(preference.destination, {
+      preference,
+      lastFlushMs: seededAtMs ?? existing?.lastFlushMs ?? null,
+    });
+    await this.persist(current);
+    return preference;
+  }
+
+  async recordFlush(destination: string, flushedAtMs: number): Promise<void> {
+    const validDest = validateDestinationChatId(destination);
+    const current = await this.load();
+    const existing = current.get(validDest);
+    if (!existing) return;
+    existing.lastFlushMs = flushedAtMs;
+    await this.persist(current);
+  }
+
+  private async persist(
+    map: Map<string, { preference: ChatDigestPreference; lastFlushMs: number | null }>,
+  ): Promise<void> {
+    await fs.mkdir(dirname(this.filePath), { recursive: true });
+    const chats: Record<string, PersistedChatDigestEntry> = {};
+    for (const [dest, value] of map.entries()) {
+      chats[dest] = {
+        spec: value.preference.spec,
+        lastFlushMs: value.lastFlushMs,
+      };
+    }
+    const tmp = `${this.filePath}.tmp`;
+    await fs.writeFile(tmp, `${JSON.stringify({ version: 1, chats }, null, 2)}\n`, "utf-8");
+    await fs.rename(tmp, this.filePath);
+  }
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;

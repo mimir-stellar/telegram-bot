@@ -129,6 +129,7 @@ Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's
 - **Bounded fields**: Contract strings clipped at 200 Unicode code points
 - **Explorer links**: Includes transaction links to stellar.expert
 - **Preview mode**: Optional `[PREVIEW MODE]` badge for testing
+- **Per-chat digest scheduling (`src/notifications/schedule.ts`, `src/notifications/digest-grouping.ts`)**: `parseChatDigestPreference()`, `FileChatDigestPreferencesStore`, and `createPerChatDigestRouter()` validate bounded per-destination digest intervals (`[5m, 7d]` by default, plus `daily@HH:mm`, `weekly@day HH:mm`, and `immediate`) while routing critical settlement/dispute events immediately regardless of digest timing.
 
 ### Telegram Integration (`src/bot.ts`)
 
