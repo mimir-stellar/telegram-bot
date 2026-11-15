@@ -4,7 +4,7 @@
   "description": "Body of GET /health and GET /healthz: the object buildHealthReport in src/health.ts returns, serialised with JSON.stringify. HTTP 200 when ok is true, 503 otherwise. Every object is closed (additionalProperties: false), so a field added to or renamed in the report must be changed here too; tests/health-schema.test.mjs fails until it is.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["ok", "status", "service", "version", "network", "uptimeMs", "checkedAt", "poller", "config"],
+  "required": ["ok", "status", "service", "version", "network", "uptimeMs", "checkedAt", "poller", "readiness", "config"],
   "properties": {
     "ok": { "type": "boolean", "description": "True exactly when status is \"ok\"." },
     "status": {
@@ -194,6 +194,89 @@
         },
         "persistentVolumeAvailable": { "type": "boolean" },
         "persistentVolumeError": { "type": ["string", "null"] }
+      }
+    },
+    "readiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Dependency-specific readiness reasons across RPC, cursor, route, and delivery. Closed enum codes only: no credentials, URLs, or destination chat identifiers.",
+      "required": ["rpc", "cursor", "route", "delivery"],
+      "properties": {
+        "rpc": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ready", "status", "reason"],
+          "properties": {
+            "ready": { "type": "boolean" },
+            "status": { "enum": ["ready", "degraded", "stopped"] },
+            "reason": {
+              "enum": [
+                "ok",
+                "cold_start",
+                "paused",
+                "draining",
+                "stopped",
+                "circuit_open",
+                "consecutive_failures",
+                "poll_stale"
+              ]
+            }
+          }
+        },
+        "cursor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ready", "status", "reason"],
+          "properties": {
+            "ready": { "type": "boolean" },
+            "status": { "enum": ["ready", "degraded", "stopped"] },
+            "reason": {
+              "enum": [
+                "ok",
+                "stopped",
+                "cursor_stale",
+                "cursor_stalled",
+                "persistence_unavailable"
+              ]
+            }
+          }
+        },
+        "route": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ready", "status", "reason"],
+          "properties": {
+            "ready": { "type": "boolean" },
+            "status": { "enum": ["ready", "degraded", "stopped"] },
+            "reason": {
+              "enum": [
+                "ok",
+                "notifications_disabled",
+                "partial_source_disabled",
+                "missing_destination"
+              ]
+            }
+          }
+        },
+        "delivery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ready", "status", "reason"],
+          "properties": {
+            "ready": { "type": "boolean" },
+            "status": { "enum": ["ready", "degraded", "stopped"] },
+            "reason": {
+              "enum": [
+                "ok",
+                "stopped",
+                "draining",
+                "dead_letter_backlog",
+                "dead_letter_dropped",
+                "send_timeouts"
+              ]
+            }
+          }
+        }
       }
     },
     "config": {

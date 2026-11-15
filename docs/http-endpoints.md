@@ -139,6 +139,13 @@ is the machine-readable signal; the JSON body adds detail.
     "persistentVolumeAvailable": true,
     "persistentVolumeError": null
   },
+  "readiness": {
+    // Closed enum reason codes per dependency; never includes URLs, tokens, or chat IDs.
+    "rpc":      { "ready": true, "status": "ready", "reason": "ok" },
+    "cursor":   { "ready": true, "status": "ready", "reason": "ok" },
+    "route":    { "ready": true, "status": "ready", "reason": "ok" },
+    "delivery": { "ready": true, "status": "ready", "reason": "ok" }
+  },
   "config": {
     // Key names and their source (env var name, default, etc.). No values.
     "BOT_TOKEN": { "source": "env" },

@@ -46,6 +46,52 @@ export interface HealthServer {
   close(): Promise<void>;
 }
 
+export type ReadinessStatus = "ready" | "degraded" | "stopped";
+
+export type RpcReadinessReason =
+  | "ok"
+  | "cold_start"
+  | "paused"
+  | "draining"
+  | "stopped"
+  | "circuit_open"
+  | "consecutive_failures"
+  | "poll_stale";
+
+export type CursorReadinessReason =
+  | "ok"
+  | "stopped"
+  | "cursor_stale"
+  | "cursor_stalled"
+  | "persistence_unavailable";
+
+export type RouteReadinessReason =
+  | "ok"
+  | "notifications_disabled"
+  | "partial_source_disabled"
+  | "missing_destination";
+
+export type DeliveryReadinessReason =
+  | "ok"
+  | "stopped"
+  | "draining"
+  | "dead_letter_backlog"
+  | "dead_letter_dropped"
+  | "send_timeouts";
+
+export interface DependencyReadiness<R extends string = string> {
+  ready: boolean;
+  status: ReadinessStatus;
+  reason: R;
+}
+
+export interface HealthReadinessBreakdown {
+  rpc: DependencyReadiness<RpcReadinessReason>;
+  cursor: DependencyReadiness<CursorReadinessReason>;
+  route: DependencyReadiness<RouteReadinessReason>;
+  delivery: DependencyReadiness<DeliveryReadinessReason>;
+}
+
 /** Safe, redacted snapshot for HTTP clients. Never includes secrets. */
 export interface HealthReport {
   ok: boolean;
@@ -154,6 +200,12 @@ export interface HealthReport {
     persistentVolumeError: string | null;
   };
   /**
+   * Dependency-specific readiness reasons across RPC, cursor, route, and
+   * delivery subsystems. Uses closed enum codes only — never credentials,
+   * endpoint URLs, or private Telegram destination identifiers.
+   */
+  readiness: HealthReadinessBreakdown;
+  /**
    * Where configuration came from: each setting's name and the source that
    * supplied it. No value — secret or not — is ever included, so an operator
    * can confirm *which* token and chat id this process is using without either
@@ -233,6 +285,103 @@ export function chainClockLabel(chainClockAt: number | null | undefined, nowMs: 
   return skewMs >= 0
     ? `local clock ${human} ahead of chain`
     : `chain clock ${human} ahead of local`;
+}
+
+function hasNonEmptyString(value: unknown): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * Evaluate dependency-specific readiness (`rpc`, `cursor`, `route`, `delivery`)
+ * using closed, value-free reason codes so credentials, URLs, and private chat
+ * identifiers never enter the public schema.
+ */
+export function buildDependencyReadiness(
+  config: BotConfig,
+  poller: PollerStatus,
+  nowMs: number = Date.now(),
+): HealthReadinessBreakdown {
+  const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
+  const tooManyFailures = poller.consecutiveFailures >= failureBudget;
+  const hasStaleCursor = poller.targets.some((target) => target.cursorStale === true);
+  const hasStalledCursor = poller.targets.some((target) => target.cursorStalled === true);
+  const hasEverSucceeded = poller.lastSuccessAt !== null;
+  const stale =
+    hasEverSucceeded &&
+    config.healthStaleMs > 0 &&
+    nowMs - (poller.lastSuccessAt as number) > config.healthStaleMs;
+
+  let rpc: DependencyReadiness<RpcReadinessReason>;
+  if (!poller.running) {
+    rpc = { ready: false, status: "stopped", reason: "stopped" };
+  } else if (poller.stopping === true) {
+    rpc = { ready: true, status: "ready", reason: "draining" };
+  } else if (poller.paused === true) {
+    rpc = { ready: true, status: "ready", reason: "paused" };
+  } else if (poller.circuitBreaker?.open === true) {
+    rpc = { ready: false, status: "degraded", reason: "circuit_open" };
+  } else if (tooManyFailures) {
+    rpc = { ready: false, status: "degraded", reason: "consecutive_failures" };
+  } else if (stale) {
+    rpc = { ready: false, status: "degraded", reason: "poll_stale" };
+  } else if (!hasEverSucceeded) {
+    rpc = { ready: true, status: "ready", reason: "cold_start" };
+  } else {
+    rpc = { ready: true, status: "ready", reason: "ok" };
+  }
+
+  let cursor: DependencyReadiness<CursorReadinessReason>;
+  if (!poller.running) {
+    cursor = { ready: false, status: "stopped", reason: "stopped" };
+  } else if (!poller.paused && !poller.stopping && hasStaleCursor) {
+    cursor = { ready: false, status: "degraded", reason: "cursor_stale" };
+  } else if (!poller.paused && !poller.stopping && hasStalledCursor) {
+    cursor = { ready: false, status: "degraded", reason: "cursor_stalled" };
+  } else if (poller.persistentVolumeAvailable === false) {
+    cursor = { ready: false, status: "degraded", reason: "persistence_unavailable" };
+  } else {
+    cursor = { ready: true, status: "ready", reason: "ok" };
+  }
+
+  const defaultDestPresent =
+    hasNonEmptyString(config.chatId) ||
+    (Array.isArray(config.chatIds) && config.chatIds.some((id) => hasNonEmptyString(id))) ||
+    (Array.isArray(config.routes) && config.routes.some((r) => hasNonEmptyString(r?.chatId)));
+  const marketDestPresent = hasNonEmptyString(config.marketChatId) || defaultDestPresent;
+  const squadDestPresent = hasNonEmptyString(config.squadChatId) || defaultDestPresent;
+
+  const flags = config.featureFlags;
+  const marketEnabled = flags?.market ?? true;
+  const squadEnabled = flags?.squad ?? true;
+  const globallyDisabled = flags?.enabled === false || (!marketEnabled && !squadEnabled);
+
+  let route: DependencyReadiness<RouteReadinessReason>;
+  if (globallyDisabled) {
+    route = { ready: true, status: "ready", reason: "notifications_disabled" };
+  } else if ((marketEnabled && !marketDestPresent) || (squadEnabled && !squadDestPresent)) {
+    route = { ready: false, status: "degraded", reason: "missing_destination" };
+  } else if (!marketEnabled || !squadEnabled) {
+    route = { ready: true, status: "ready", reason: "partial_source_disabled" };
+  } else {
+    route = { ready: true, status: "ready", reason: "ok" };
+  }
+
+  let delivery: DependencyReadiness<DeliveryReadinessReason>;
+  if (!poller.running) {
+    delivery = { ready: false, status: "stopped", reason: "stopped" };
+  } else if (poller.stopping === true) {
+    delivery = { ready: true, status: "ready", reason: "draining" };
+  } else if ((poller.deadLetter?.dropped ?? 0) > 0) {
+    delivery = { ready: false, status: "degraded", reason: "dead_letter_dropped" };
+  } else if ((poller.deadLetter?.depth ?? 0) > 0) {
+    delivery = { ready: false, status: "degraded", reason: "dead_letter_backlog" };
+  } else if ((poller.sendTimeouts ?? 0) > 0) {
+    delivery = { ready: false, status: "degraded", reason: "send_timeouts" };
+  } else {
+    delivery = { ready: true, status: "ready", reason: "ok" };
+  }
+
+  return { rpc, cursor, route, delivery };
 }
 
 /**
@@ -358,6 +507,7 @@ export function buildHealthReport(
       persistentVolumeAvailable: poller.persistentVolumeAvailable ?? true,
       persistentVolumeError: poller.persistentVolumeError ?? null,
     },
+    readiness: buildDependencyReadiness(config, poller, nowMs),
     config: provenance,
   };
 }
