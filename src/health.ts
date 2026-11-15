@@ -21,6 +21,10 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import {
+  DROPPED_SAMPLE_REASONS,
+  DroppedMetricSamplesTracker,
+} from "./stellar/metrics.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -362,86 +366,164 @@ export function buildHealthReport(
   };
 }
 
+const ALLOWED_TARGET_SOURCES = new Set<string>(["market", "squad"]);
+const SAFE_CONTRACT_LABEL_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
 /**
- * Render poller status as Prometheus metrics.
+ * Render poller status as Prometheus metrics while dropping non-finite numbers
+ * and unknown/unsafe target labels before exposition.
  */
 export function buildMetricsReport(
   config: BotConfig,
   poller: PollerStatus,
   nowMs: number = Date.now(),
 ): string {
-  const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
+  const dropped = new DroppedMetricSamplesTracker();
+  if (poller.droppedMetricSamples) {
+    for (const reason of DROPPED_SAMPLE_REASONS) {
+      const upstream = poller.droppedMetricSamples[reason];
+      if (typeof upstream === "number" && Number.isFinite(upstream) && upstream > 0) {
+        dropped.recordDrop(reason, upstream);
+      }
+    }
+  }
+
+  const rawUptimeMs =
+    typeof poller.startedAt === "number" && Number.isFinite(poller.startedAt) && poller.startedAt > 0
+      ? nowMs - poller.startedAt
+      : 0;
+  const uptimeMs = Number.isFinite(rawUptimeMs) ? Math.max(0, rawUptimeMs) : Number.NaN;
   const network = networkLabel(config);
   const activity = poller.activityBaseline ?? emptyActivityBaseline();
 
-  const lines: string[] = [
-    `# HELP mimir_telegram_uptime_ms Uptime in milliseconds`,
-    `# TYPE mimir_telegram_uptime_ms gauge`,
-    `mimir_telegram_uptime_ms{network="${network}"} ${uptimeMs}`,
-    ``,
-    `# HELP mimir_telegram_poller_running Whether the poller is currently running (1) or stopped/paused (0)`,
-    `# TYPE mimir_telegram_poller_running gauge`,
-    `mimir_telegram_poller_running{network="${network}"} ${poller.running && !poller.paused ? 1 : 0}`,
-    ``,
-    `# HELP mimir_telegram_poller_cycles_total Total number of completed poll cycles`,
-    `# TYPE mimir_telegram_poller_cycles_total counter`,
-    `mimir_telegram_poller_cycles_total{network="${network}"} ${poller.cycles}`,
-    ``,
-    `# HELP mimir_telegram_notifications_sent_total Total number of Telegram messages successfully sent`,
-    `# TYPE mimir_telegram_notifications_sent_total counter`,
-    `mimir_telegram_notifications_sent_total{network="${network}"} ${poller.notificationsSent}`,
-    ``,
-    `# HELP mimir_telegram_notifications_failed_total Total number of Telegram messages that failed to send after retries`,
-    `# TYPE mimir_telegram_notifications_failed_total counter`,
-    `mimir_telegram_notifications_failed_total{network="${network}"} ${poller.notificationsFailed}`,
-    ``,
-    `# HELP mimir_telegram_events_skipped_total Total number of events skipped (unrecognized, unformatted, or rate-limited)`,
-    `# TYPE mimir_telegram_events_skipped_total counter`,
-    `mimir_telegram_events_skipped_total{network="${network}"} ${poller.eventsSkipped}`,
-    ``,
-    `# HELP mimir_telegram_consecutive_failures Current number of consecutive failed poll cycles`,
-    `# TYPE mimir_telegram_consecutive_failures gauge`,
-    `mimir_telegram_consecutive_failures{network="${network}"} ${poller.consecutiveFailures}`,
-    ``,
-    `# HELP mimir_telegram_activity_last_cycle_events Events observed in the most recent complete poll cycle`,
-    `# TYPE mimir_telegram_activity_last_cycle_events gauge`,
-    `mimir_telegram_activity_last_cycle_events{network="${network}"} ${activity.lastValue ?? 0}`,
-    ``,
-    `# HELP mimir_telegram_activity_baseline_events Mean events per cycle in the rolling baseline (0 while warming up)`,
-    `# TYPE mimir_telegram_activity_baseline_events gauge`,
-    `mimir_telegram_activity_baseline_events{network="${network}"} ${activity.baselineMean ?? 0}`,
-    ``,
-    `# HELP mimir_telegram_activity_deviation Z-score of the latest complete cycle against the rolling baseline (0 while warming up)`,
-    `# TYPE mimir_telegram_activity_deviation gauge`,
-    `mimir_telegram_activity_deviation{network="${network}"} ${activity.zScore ?? 0}`,
-    ``,
-    `# HELP mimir_telegram_activity_anomalies_total Complete cycles classified as a spike or drop against the rolling baseline`,
-    `# TYPE mimir_telegram_activity_anomalies_total counter`,
-    `mimir_telegram_activity_anomalies_total{network="${network}"} ${activity.anomalies}`,
-  ];
+  const lines: string[] = [];
 
-  if (poller.latestLedger !== null) {
+  const pushScalarMetric = (
+    name: string,
+    type: "counter" | "gauge",
+    help: string,
+    value: unknown,
+  ): void => {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      dropped.recordDrop("invalid_number");
+      return;
+    }
+    if (lines.length > 0) lines.push(``);
     lines.push(
-      ``,
-      `# HELP mimir_telegram_latest_ledger Highest ledger seen by the poller`,
-      `# TYPE mimir_telegram_latest_ledger gauge`,
-      `mimir_telegram_latest_ledger{network="${network}"} ${poller.latestLedger}`
+      `# HELP ${name} ${help}`,
+      `# TYPE ${name} ${type}`,
+      `${name}{network="${network}"} ${value}`,
+    );
+  };
+
+  pushScalarMetric(`mimir_telegram_uptime_ms`, `gauge`, `Uptime in milliseconds`, uptimeMs);
+  pushScalarMetric(
+    `mimir_telegram_poller_running`,
+    `gauge`,
+    `Whether the poller is currently running (1) or stopped/paused (0)`,
+    poller.running && !poller.paused ? 1 : 0,
+  );
+  pushScalarMetric(
+    `mimir_telegram_poller_cycles_total`,
+    `counter`,
+    `Total number of completed poll cycles`,
+    poller.cycles,
+  );
+  pushScalarMetric(
+    `mimir_telegram_notifications_sent_total`,
+    `counter`,
+    `Total number of Telegram messages successfully sent`,
+    poller.notificationsSent,
+  );
+  pushScalarMetric(
+    `mimir_telegram_notifications_failed_total`,
+    `counter`,
+    `Total number of Telegram messages that failed to send after retries`,
+    poller.notificationsFailed,
+  );
+  pushScalarMetric(
+    `mimir_telegram_events_skipped_total`,
+    `counter`,
+    `Total number of events skipped (unrecognized, unformatted, or rate-limited)`,
+    poller.eventsSkipped,
+  );
+  pushScalarMetric(
+    `mimir_telegram_consecutive_failures`,
+    `gauge`,
+    `Current number of consecutive failed poll cycles`,
+    poller.consecutiveFailures,
+  );
+  pushScalarMetric(
+    `mimir_telegram_activity_last_cycle_events`,
+    `gauge`,
+    `Events observed in the most recent complete poll cycle`,
+    activity.lastValue ?? 0,
+  );
+  pushScalarMetric(
+    `mimir_telegram_activity_baseline_events`,
+    `gauge`,
+    `Mean events per cycle in the rolling baseline (0 while warming up)`,
+    activity.baselineMean ?? 0,
+  );
+  pushScalarMetric(
+    `mimir_telegram_activity_deviation`,
+    `gauge`,
+    `Z-score of the latest complete cycle against the rolling baseline (0 while warming up)`,
+    activity.zScore ?? 0,
+  );
+  pushScalarMetric(
+    `mimir_telegram_activity_anomalies_total`,
+    `counter`,
+    `Complete cycles classified as a spike or drop against the rolling baseline`,
+    activity.anomalies,
+  );
+
+  if (poller.latestLedger !== null && poller.latestLedger !== undefined) {
+    pushScalarMetric(
+      `mimir_telegram_latest_ledger`,
+      `gauge`,
+      `Highest ledger seen by the poller`,
+      poller.latestLedger,
     );
   }
 
-  const targetsWithLedgers = poller.targets.filter((t) => t.lastEventLedger !== null);
-  if (targetsWithLedgers.length > 0) {
+  const validTargetLines: string[] = [];
+  for (const target of poller.targets) {
+    if (target.lastEventLedger === null || target.lastEventLedger === undefined) continue;
+    if (
+      !ALLOWED_TARGET_SOURCES.has(target.source) ||
+      typeof target.contractId !== "string" ||
+      !SAFE_CONTRACT_LABEL_RE.test(target.contractId)
+    ) {
+      dropped.recordDrop("unknown_label");
+      continue;
+    }
+    if (typeof target.lastEventLedger !== "number" || !Number.isFinite(target.lastEventLedger)) {
+      dropped.recordDrop("invalid_number");
+      continue;
+    }
+    validTargetLines.push(
+      `mimir_telegram_target_last_event_ledger{network="${network}",source="${target.source}",contract="${target.contractId}"} ${target.lastEventLedger}`,
+    );
+  }
+
+  if (validTargetLines.length > 0) {
     lines.push(
       ``,
       `# HELP mimir_telegram_target_last_event_ledger Highest ledger in which an event was processed for a target`,
       `# TYPE mimir_telegram_target_last_event_ledger gauge`,
+      ...validTargetLines,
     );
-    for (const target of targetsWithLedgers) {
-      lines.push(
-        `mimir_telegram_target_last_event_ledger{network="${network}",source="${target.source}",contract="${target.contractId}"} ${target.lastEventLedger}`
-      );
-    }
   }
+
+  lines.push(
+    ``,
+    ...dropped.renderPrometheusLines(
+      `mimir_telegram_dropped_metric_samples_total`,
+      `Total metric samples dropped before exposition by bounded reason`,
+      { network },
+    ),
+  );
 
   return lines.join("\\n") + "\\n";
 }

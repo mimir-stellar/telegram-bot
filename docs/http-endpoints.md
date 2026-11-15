@@ -238,6 +238,13 @@ The `mimir_telegram_latest_ledger` and `mimir_telegram_target_last_event_ledger`
 lines are omitted when no ledger has been observed yet (cold start or no
 events seen).
 
+Non-finite values (`NaN`, `Infinity`, `-Infinity`) and unknown/malformed target
+labels are never silently emitted into Prometheus output; instead, rejected
+samples increment `mimir_telegram_dropped_metric_samples_total` (on the health
+server) and `mimir_bot_dropped_metric_samples_total` (on the metrics server)
+partitioned strictly by the bounded `reason` label (`invalid_number`,
+`negative_delta`, `unknown_label`, `unknown_metric`).
+
 ```bash
 curl -s http://127.0.0.1:8787/metrics
 
@@ -317,6 +324,7 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_dropped_metric_samples_total` | counter | Metric samples dropped before exposition by bounded `reason` (`invalid_number`, `negative_delta`, `unknown_label`, `unknown_metric`) |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment

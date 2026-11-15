@@ -15,6 +15,79 @@
 
 export type RpcOperation = "health" | "events";
 
+/** Bounded, low-cardinality reasons for dropping an invalid metric sample. */
+export const DROPPED_SAMPLE_REASONS = [
+  "invalid_number",
+  "negative_delta",
+  "unknown_label",
+  "unknown_metric",
+] as const;
+
+export type DroppedSampleReason = (typeof DROPPED_SAMPLE_REASONS)[number];
+
+export function isDroppedSampleReason(value: unknown): value is DroppedSampleReason {
+  return (
+    typeof value === "string" &&
+    (DROPPED_SAMPLE_REASONS as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Bounded O(1) counter for metric samples rejected before Prometheus exposition.
+ * Reason labels are restricted strictly to {@link DROPPED_SAMPLE_REASONS}.
+ */
+export class DroppedMetricSamplesTracker {
+  private readonly counts: Record<DroppedSampleReason, number> = {
+    invalid_number: 0,
+    negative_delta: 0,
+    unknown_label: 0,
+    unknown_metric: 0,
+  };
+
+  recordDrop(reason: DroppedSampleReason, count = 1): void {
+    if (typeof count !== "number" || !Number.isFinite(count)) {
+      this.counts.invalid_number += 1;
+      return;
+    }
+    if (count <= 0) return;
+    const safeReason: DroppedSampleReason = isDroppedSampleReason(reason)
+      ? reason
+      : "unknown_label";
+    this.counts[safeReason] += Math.floor(count);
+  }
+
+  value(reason?: DroppedSampleReason): number {
+    if (reason === undefined) {
+      let sum = 0;
+      for (const r of DROPPED_SAMPLE_REASONS) sum += this.counts[r];
+      return sum;
+    }
+    if (!isDroppedSampleReason(reason)) return 0;
+    return this.counts[reason];
+  }
+
+  byReason(): Record<DroppedSampleReason, number> {
+    return { ...this.counts };
+  }
+
+  renderPrometheusLines(
+    metricName: string,
+    help: string,
+    staticLabels: Readonly<Record<string, string>> = {},
+  ): string[] {
+    const lines: string[] = [
+      `# HELP ${metricName} ${help}`,
+      `# TYPE ${metricName} counter`,
+    ];
+    const staticPairs = Object.entries(staticLabels).map(([k, v]) => `${k}="${v}"`);
+    for (const reason of DROPPED_SAMPLE_REASONS) {
+      const labelBlock = `{${[...staticPairs, `reason="${reason}"`].join(",")}}`;
+      lines.push(`${metricName}${labelBlock} ${this.counts[reason]}`);
+    }
+    return lines;
+  }
+}
+
 /** Per-operation aggregate. Every quantity is a count or a duration in ms. */
 export interface RpcOperationTiming {
   requests: number;
@@ -33,6 +106,8 @@ export interface RpcTimingSummary {
   maxMs: number;
   avgMs: number;
   operations: Record<RpcOperation, RpcOperationTiming>;
+  /** Bounded counts of invalid durations or unknown operation labels rejected during recording. */
+  droppedSamples?: Record<DroppedSampleReason, number>;
 }
 
 const RPC_OPERATIONS: readonly RpcOperation[] = ["health", "events"];
@@ -51,6 +126,7 @@ export class RpcTiming {
     health: emptyOperation(),
     events: emptyOperation(),
   };
+  private readonly dropped = new DroppedMetricSamplesTracker();
   private readonly clock: () => number;
 
   /**
@@ -76,9 +152,20 @@ export class RpcTiming {
 
   /**
    * Record a completed observation. Non-finite or negative durations are
-   * clamped to 0 rather than poisoning the aggregate with `NaN`/negatives.
+   * clamped to 0 rather than poisoning the aggregate with `NaN`/negatives, and
+   * unknown operations or invalid durations are counted by bounded drop reason.
    */
   record(operation: RpcOperation, durationMs: number, ok: boolean): void {
+    if (typeof operation !== "string" || !Object.hasOwn(this.operations, operation)) {
+      this.dropped.recordDrop("unknown_label");
+      return;
+    }
+    if (typeof durationMs !== "number" || !Number.isFinite(durationMs)) {
+      this.dropped.recordDrop("invalid_number");
+    } else if (durationMs < 0) {
+      this.dropped.recordDrop("negative_delta");
+    }
+
     const aggregate = this.operations[operation];
     const duration = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : 0;
 
@@ -87,6 +174,14 @@ export class RpcTiming {
     aggregate.totalMs += duration;
     if (aggregate.requests === 1 || duration < aggregate.minMs) aggregate.minMs = duration;
     if (duration > aggregate.maxMs) aggregate.maxMs = duration;
+  }
+
+  droppedSamples(): Record<DroppedSampleReason, number> {
+    return this.dropped.byReason();
+  }
+
+  droppedSamplesTotal(): number {
+    return this.dropped.value();
   }
 
   summary(): RpcTimingSummary {
@@ -123,6 +218,7 @@ export class RpcTiming {
       maxMs: round(maxMs),
       avgMs: requests > 0 ? round(totalMs / requests) : 0,
       operations,
+      droppedSamples: this.dropped.byReason(),
     };
   }
 }

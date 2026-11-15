@@ -96,6 +96,7 @@ import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
+import type { DroppedSampleReason } from "./stellar/metrics.js";
 import {
   eventCursorLedger,
   readContractEvents,
@@ -344,6 +345,8 @@ export interface PollerStatus {
   suppressedLogs: number;
   /** Dead-letter queue counters (see src/deadLetter.ts). */
   deadLetter: DeadLetterStats;
+  /** Optional bounded counts of dropped metric samples recorded by the attached registry. */
+  droppedMetricSamples?: Partial<Record<DroppedSampleReason, number>>;
   /** Telegram sends abandoned by the per-send timeout, when tracked. */
   sendTimeouts?: number;
   /** Bounded description of the most recent send timeout, when tracked. */
@@ -3169,6 +3172,7 @@ export function createPoller(deps: PollerDeps) {
         },
         ledgerCache: ledgerCache.stats(),
         suppressedLogs: errorSampler.suppressedTotal(),
+        ...(metrics ? { droppedMetricSamples: metrics.droppedSamples.byReason() } : {}),
         targets: [...state.values()].map((t) => ({ ...t })),
       };
     },
