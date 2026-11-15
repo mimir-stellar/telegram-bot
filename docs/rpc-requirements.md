@@ -132,7 +132,7 @@ docker run -d \
 
 ### Pointing the Bot to Local RPC
 
-Configure your bot's `.env` file or environment variables:
+Configure your bot's `.env` file or environment variables (endpoint URLs must not contain embedded `user:pass@` userinfo credentials; startup validation rejects embedded credentials and reports only the affected configuration key):
 
 ```env
 STELLAR_NETWORK=testnet

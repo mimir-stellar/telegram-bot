@@ -58,6 +58,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import { validateEndpointUrl } from "./stellar/rpc-guard.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -554,12 +555,9 @@ function collector(profile: Record<string, string>) {
     url(name: string, fallback: string): string {
       const value = get(name) ?? fallback;
       try {
-        const parsed = new URL(value);
-        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          problems.push(`${name} must be an http(s) URL; got "${value}"`);
-        }
-      } catch {
-        problems.push(`${name} is not a valid URL; got "${value}"`);
+        validateEndpointUrl(value, name);
+      } catch (err) {
+        problems.push(err instanceof Error ? err.message : `${name} is not a valid URL`);
       }
       return value;
     },
@@ -568,12 +566,9 @@ function collector(profile: Record<string, string>) {
       const value = read(name);
       if (value === undefined) return null;
       try {
-        const parsed = new URL(value);
-        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          problems.push(`${name} must be an http(s) URL; got "${value}"`);
-        }
-      } catch {
-        problems.push(`${name} is not a valid URL; got "${value}"`);
+        validateEndpointUrl(value, name);
+      } catch (err) {
+        problems.push(err instanceof Error ? err.message : `${name} is not a valid URL`);
       }
       return value;
     },
@@ -587,20 +582,18 @@ function collector(profile: Record<string, string>) {
       if (value === undefined) return null;
       let parsed: URL;
       try {
-        parsed = new URL(value);
-      } catch {
-        problems.push(`${name} is not a valid URL; got "${value}"`);
+        parsed = validateEndpointUrl(value, name);
+      } catch (err) {
+        problems.push(err instanceof Error ? err.message : `${name} is not a valid URL`);
         return null;
       }
       if (parsed.protocol !== "http:") {
-        problems.push(`${name} must use http:// (loopback only); got "${value}"`);
+        problems.push(`${name} must use http:// (loopback only)`);
         return null;
       }
       const host = parsed.hostname;
       if (host !== "127.0.0.1" && host !== "localhost") {
-        problems.push(
-          `${name} must point at 127.0.0.1 or localhost (dev only); got "${value}"`,
-        );
+        problems.push(`${name} must point at 127.0.0.1 or localhost (dev only)`);
         return null;
       }
       return value;
@@ -616,13 +609,9 @@ function collector(profile: Record<string, string>) {
       const value = read(name);
       if (value === undefined) return null;
       try {
-        const parsed = new URL(value);
-        if (parsed.protocol !== "https:") {
-          problems.push(`${name} must be an https URL; got "${value}"`);
-          return null;
-        }
-      } catch {
-        problems.push(`${name} is not a valid URL; got "${value}"`);
+        validateEndpointUrl(value, name, { httpsOnly: true });
+      } catch (err) {
+        problems.push(err instanceof Error ? err.message : `${name} is not a valid URL`);
         return null;
       }
       return value;

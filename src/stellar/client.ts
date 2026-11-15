@@ -15,6 +15,23 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  assertCredentialFreeRpcUrl,
+  hasEmbeddedUrlCredentials,
+  RpcEndpointUrlError,
+  validateEndpointUrl,
+  type RpcEndpointUrlProblem,
+  type ValidateEndpointUrlOptions,
+} from "./rpc-guard.js";
+
+export {
+  assertCredentialFreeRpcUrl,
+  hasEmbeddedUrlCredentials,
+  RpcEndpointUrlError,
+  validateEndpointUrl,
+  type RpcEndpointUrlProblem,
+  type ValidateEndpointUrlOptions,
+};
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -27,13 +44,21 @@ export class RpcPassphraseError extends Error {
 }
 
 /**
- * Create an RPC server. Construction is offline; the network passphrase is
+ * Create an RPC server. Construction is offline; configured URLs are validated
+ * to be credential-free before instantiation, and the network passphrase is
  * verified separately at boot by {@link validateNetworkPassphrase}.
  */
 export function createRpcServer(config: StellarConfig): rpc.Server {
+  const parsedRpc = validateEndpointUrl(config.rpcUrl, "STELLAR_RPC_URL");
+  if (typeof config.horizonUrl === "string" && config.horizonUrl.trim() !== "") {
+    validateEndpointUrl(config.horizonUrl, "STELLAR_HORIZON_URL");
+  }
+  if (typeof config.explorerBaseUrl === "string" && config.explorerBaseUrl.trim() !== "") {
+    validateEndpointUrl(config.explorerBaseUrl, "STELLAR_EXPLORER_BASE_URL");
+  }
   return new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
-    allowHttp: new URL(config.rpcUrl).protocol === "http:",
+    allowHttp: parsedRpc.protocol === "http:",
     timeout: 15000,
   });
 }

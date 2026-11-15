@@ -21,8 +21,8 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - `SQUAD_CONTRACT_ID`: The Mimir squad Soroban contract address. Required. Must be a valid `C...` strkey.
 
 ### Network Settings
-- `STELLAR_RPC_URL`: The Soroban RPC endpoint used to poll for events. (e.g., `https://soroban-testnet.stellar.org`).
-- `STELLAR_HORIZON_URL`: Used for generating transaction links.
+- `STELLAR_RPC_URL`: The Soroban RPC endpoint used to poll for events. (e.g., `https://soroban-testnet.stellar.org`). Must be a valid `http://` or `https://` URL with no embedded URL userinfo credentials (`user:pass@host`); startup validation reports only the affected configuration key if invalid.
+- `STELLAR_HORIZON_URL`: Used for generating transaction links. Must be a credential-free `http(s)` URL.
 - `STELLAR_NETWORK_PASSPHRASE`: Must match the RPC network's passphrase.
 
 ### Poller Tuning & Safeguards
