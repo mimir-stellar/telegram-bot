@@ -31,6 +31,21 @@ export const REDACTED = "[REDACTED]";
  */
 export const DEFAULT_MAX_LEN = 240;
 
+/** Default maximum `.cause` hops traversed after the root error. */
+export const MAX_ERROR_CAUSE_DEPTH = 4;
+
+/** Hard ceiling on `maxCauseDepth` overrides so traversal stays strictly bounded. */
+export const HARD_MAX_ERROR_CAUSE_DEPTH = 16;
+
+/** Maximum child errors summarized from an `AggregateError.errors` array. */
+export const MAX_AGGREGATE_ERRORS = 3;
+
+/** Marker emitted when an error `.cause` chain contains a cycle. */
+export const CIRCULAR_CAUSE_MARKER = "[circular cause]";
+
+/** Marker emitted when an error `.cause` chain exceeds the depth budget. */
+export const CAUSE_DEPTH_LIMIT_MARKER = "[cause depth limit]";
+
 /**
  * Values registered at runtime (config secrets) in addition to the shape rules.
  *
@@ -154,6 +169,17 @@ export interface RedactOptions {
   secrets?: readonly string[];
   /** Hard cap on the returned length. */
   maxLen?: number;
+  /** Maximum `.cause` hops traversed after the root error (default `4`, max `16`). */
+  maxCauseDepth?: number;
+}
+
+export interface RedactedErrorSummary {
+  name: string;
+  message: string;
+  code?: string | number;
+  cause?: RedactedErrorSummary | string;
+  errors?: (RedactedErrorSummary | string)[];
+  summary: string;
 }
 
 /**
@@ -183,23 +209,351 @@ export function redactText(input: string, options: RedactOptions = {}): string {
   return clamp(out, options.maxLen);
 }
 
-/** Redacted, bounded text for anything thrown at us. */
-export function redactError(err: unknown, options: RedactOptions = {}): string {
-  let raw: string;
-  if (err instanceof Error) {
-    const name = err.name && err.name !== "Error" ? `${err.name}: ` : "";
-    raw = `${name}${err.message}`;
-  } else if (typeof err === "string") {
-    raw = err;
-  } else if (err === null || err === undefined) {
-    raw = String(err);
+const CAUSE_SEPARATOR = "; cause: ";
+const UNREADABLE_CAUSE_MARKER = "[unreadable cause]";
+const UNREADABLE_ERROR_MARKER = "[unreadable error]";
+
+function normalizeMaxCauseDepth(depth: number | undefined): number {
+  if (typeof depth !== "number" || !Number.isFinite(depth)) {
+    return MAX_ERROR_CAUSE_DEPTH;
+  }
+  return Math.min(HARD_MAX_ERROR_CAUSE_DEPTH, Math.max(0, Math.floor(depth)));
+}
+
+function safeReadProp(
+  target: object,
+  key: string,
+): { ok: true; value: unknown } | { ok: false } {
+  try {
+    return { ok: true, value: (target as Record<string, unknown>)[key] };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function redactHopText(
+  raw: string,
+  secrets: readonly string[] | undefined,
+  maxHopLen: number,
+): string {
+  // Bound raw input before regex passes so multi-megabyte remote payloads cannot
+  // stall redaction, while keeping plenty of headroom before clamping.
+  const preBounded = raw.length > 8_192 ? `${raw.slice(0, 8_191)}…` : raw;
+  const singleLine = preBounded.replace(/[\r\n]+/g, " ");
+  return redactText(singleLine, { secrets, maxLen: maxHopLen });
+}
+
+function formatErrorObjectLabel(
+  obj: object,
+  secrets: readonly string[] | undefined,
+  maxHopLen: number,
+  seen: Set<object>,
+  remainingDepth: number,
+): {
+  name: string;
+  message: string;
+  code?: string | number;
+  errors?: (RedactedErrorSummary | string)[];
+  label: string;
+} {
+  const isErrInstance = obj instanceof Error;
+  const nameProp = safeReadProp(obj, "name");
+  const rawName =
+    nameProp.ok && typeof nameProp.value === "string" && nameProp.value.trim().length > 0
+      ? nameProp.value.trim()
+      : isErrInstance
+        ? "Error"
+        : "Object";
+  const safeName = redactHopText(rawName, secrets, 64) || "Error";
+
+  const codeProp = safeReadProp(obj, "code");
+  const safeCode =
+    codeProp.ok && (typeof codeProp.value === "number" || typeof codeProp.value === "string")
+      ? typeof codeProp.value === "number"
+        ? codeProp.value
+        : redactHopText(codeProp.value, secrets, 64)
+      : undefined;
+
+  const msgProp = safeReadProp(obj, "message");
+  let safeMessage: string;
+  if (!msgProp.ok) {
+    safeMessage = UNREADABLE_ERROR_MARKER;
+  } else if (typeof msgProp.value === "string") {
+    safeMessage = redactHopText(msgProp.value, secrets, maxHopLen);
+  } else if (isErrInstance) {
+    safeMessage = "";
   } else {
+    try {
+      const json = JSON.stringify(obj);
+      safeMessage =
+        typeof json === "string"
+          ? redactHopText(json, secrets, maxHopLen)
+          : UNREADABLE_ERROR_MARKER;
+    } catch {
+      safeMessage = safeCode !== undefined ? `code ${String(safeCode)}` : "[object]";
+    }
+  }
+
+  let summarizedErrors: (RedactedErrorSummary | string)[] | undefined;
+  let aggregateSuffix = "";
+  const errorsProp = safeReadProp(obj, "errors");
+  if (errorsProp.ok && Array.isArray(errorsProp.value) && errorsProp.value.length > 0) {
+    const items = errorsProp.value;
+    const limit = Math.min(MAX_AGGREGATE_ERRORS, items.length);
+    const childLabels: string[] = [];
+    summarizedErrors = [];
+
+    for (let i = 0; i < limit; i += 1) {
+      let item: unknown;
+      try {
+        item = items[i];
+      } catch {
+        summarizedErrors.push(UNREADABLE_ERROR_MARKER);
+        childLabels.push(UNREADABLE_ERROR_MARKER);
+        continue;
+      }
+      if (item !== null && typeof item === "object") {
+        if (seen.has(item)) {
+          summarizedErrors.push(CIRCULAR_CAUSE_MARKER);
+          childLabels.push(CIRCULAR_CAUSE_MARKER);
+        } else if (remainingDepth <= 0) {
+          summarizedErrors.push(CAUSE_DEPTH_LIMIT_MARKER);
+          childLabels.push(CAUSE_DEPTH_LIMIT_MARKER);
+        } else {
+          const branchSeen = new Set(seen);
+          const childSummary = buildErrorChainInternal(
+            item,
+            { secrets, maxLen: Math.max(48, Math.floor(maxHopLen / 2)), maxCauseDepth: remainingDepth - 1 },
+            branchSeen,
+          );
+          summarizedErrors.push(childSummary);
+          childLabels.push(childSummary.summary);
+        }
+      } else {
+        const text = redactHopText(String(item), secrets, 80);
+        summarizedErrors.push(text);
+        childLabels.push(text);
+      }
+    }
+
+    if (items.length > MAX_AGGREGATE_ERRORS) {
+      const extraMarker = `+${items.length - MAX_AGGREGATE_ERRORS} more`;
+      summarizedErrors.push(extraMarker);
+      childLabels.push(extraMarker);
+    }
+    aggregateSuffix = ` [errors: ${childLabels.join(", ")}]`;
+  }
+
+  const namePrefix = isErrInstance
+    ? safeName && safeName !== "Error"
+      ? `${safeName}: `
+      : ""
+    : safeCode !== undefined && msgProp.ok && typeof msgProp.value === "string"
+      ? `${String(safeCode)}: `
+      : "";
+
+  const baseBody = safeMessage || (safeCode !== undefined ? String(safeCode) : "");
+  const combinedLabel = clamp(`${namePrefix}${baseBody}${aggregateSuffix}`, maxHopLen);
+
+  return {
+    name: safeName,
+    message: safeMessage,
+    ...(safeCode !== undefined ? { code: safeCode } : {}),
+    ...(summarizedErrors !== undefined ? { errors: summarizedErrors } : {}),
+    label: combinedLabel,
+  };
+}
+
+/**
+ * Fit multiple cause-chain segments into `maxLen` using water-filling budgets so
+ * an oversized outer message never slices off the terminal root cause or cycle marker.
+ */
+function joinCauseSegments(segments: readonly string[], maxLen: number): string {
+  if (segments.length === 0) return "";
+  if (segments.length === 1) return clamp(segments[0]!, maxLen);
+
+  const full = segments.join(CAUSE_SEPARATOR);
+  if (full.length <= maxLen) return full;
+
+  const sepTotal = (segments.length - 1) * CAUSE_SEPARATOR.length;
+  const available = maxLen - sepTotal;
+  if (available < segments.length * 4) {
+    return clamp(full, maxLen);
+  }
+
+  const budgets = new Array<number>(segments.length).fill(0);
+  const active = segments.map((_, idx) => idx);
+  let pool = available;
+
+  while (active.length > 0) {
+    const share = Math.floor(pool / active.length);
+    let locked = false;
+    for (let i = active.length - 1; i >= 0; i -= 1) {
+      const segIdx = active[i]!;
+      const len = segments[segIdx]!.length;
+      if (len <= share) {
+        budgets[segIdx] = len;
+        pool -= len;
+        active.splice(i, 1);
+        locked = true;
+      }
+    }
+    if (!locked) {
+      const baseShare = Math.floor(pool / active.length);
+      let remainder = pool - baseShare * active.length;
+      for (const segIdx of active) {
+        budgets[segIdx] = baseShare + (remainder > 0 ? 1 : 0);
+        if (remainder > 0) remainder -= 1;
+      }
+      break;
+    }
+  }
+
+  const fitted = segments.map((seg, idx) => clamp(seg, Math.max(1, budgets[idx]!)));
+  return clamp(fitted.join(CAUSE_SEPARATOR), maxLen);
+}
+
+interface ChainNodeDraft {
+  name: string;
+  message: string;
+  code?: string | number;
+  errors?: (RedactedErrorSummary | string)[];
+  label: string;
+}
+
+function buildErrorChainInternal(
+  err: unknown,
+  options: RedactOptions,
+  seen: Set<object>,
+): RedactedErrorSummary {
+  const maxLen = options.maxLen ?? DEFAULT_MAX_LEN;
+  const maxCauseDepth = normalizeMaxCauseDepth(options.maxCauseDepth);
+  const hopCap = Math.max(maxLen, DEFAULT_MAX_LEN);
+
+  if (err === null || typeof err !== "object") {
+    const text = redactHopText(String(err), options.secrets, maxLen);
+    return {
+      name: typeof err,
+      message: text,
+      summary: text,
+    };
+  }
+
+  // Plain object without Error prototype and without a `.cause` chain keeps
+  // `JSON.stringify` formatting so RPC `{ code, message }` payloads stay compatible.
+  const rootCauseProp = safeReadProp(err, "cause");
+  if (!(err instanceof Error) && rootCauseProp.ok && rootCauseProp.value === undefined) {
+    let raw: string;
     try {
       const json = JSON.stringify(err);
       raw = typeof json === "string" ? json : String(err);
     } catch {
-      raw = String(err);
+      raw = "[circular object]";
     }
+    const redacted = redactHopText(raw, options.secrets, maxLen);
+    return {
+      name: "Object",
+      message: redacted,
+      summary: redacted,
+    };
   }
-  return redactText(raw, options);
+
+  const drafts: ChainNodeDraft[] = [];
+  const segments: string[] = [];
+  let terminalCause: string | undefined;
+
+  let current: unknown = err;
+  let depth = 0;
+
+  while (current !== null && typeof current === "object") {
+    if (seen.has(current)) {
+      terminalCause = CIRCULAR_CAUSE_MARKER;
+      segments.push(CIRCULAR_CAUSE_MARKER);
+      break;
+    }
+    if (depth > maxCauseDepth) {
+      terminalCause = CAUSE_DEPTH_LIMIT_MARKER;
+      segments.push(CAUSE_DEPTH_LIMIT_MARKER);
+      break;
+    }
+
+    seen.add(current);
+    const nodeDraft = formatErrorObjectLabel(
+      current,
+      options.secrets,
+      hopCap,
+      seen,
+      maxCauseDepth - depth,
+    );
+    drafts.push(nodeDraft);
+    segments.push(nodeDraft.label);
+
+    const causeProp = safeReadProp(current, "cause");
+    if (!causeProp.ok) {
+      terminalCause = UNREADABLE_CAUSE_MARKER;
+      segments.push(UNREADABLE_CAUSE_MARKER);
+      break;
+    }
+    const nextCause = causeProp.value;
+    if (nextCause === undefined) {
+      break;
+    }
+    if (nextCause === null || typeof nextCause !== "object") {
+      const primText = redactHopText(String(nextCause), options.secrets, hopCap);
+      terminalCause = primText;
+      segments.push(primText);
+      break;
+    }
+
+    current = nextCause;
+    depth += 1;
+  }
+
+  const combinedSummary = joinCauseSegments(segments, maxLen);
+
+  // Assemble nested structured chain from tail back to root without recursion.
+  let tail: RedactedErrorSummary | string | undefined = terminalCause;
+  for (let i = drafts.length - 1; i >= 0; i -= 1) {
+    const d = drafts[i]!;
+    const summaryForNode = i === 0 ? combinedSummary : clamp(d.label, maxLen);
+    tail = {
+      name: d.name,
+      message: clamp(d.message, maxLen),
+      ...(d.code !== undefined ? { code: d.code } : {}),
+      ...(d.errors !== undefined ? { errors: d.errors } : {}),
+      ...(tail !== undefined ? { cause: tail } : {}),
+      summary: summaryForNode,
+    };
+  }
+
+  return (
+    (tail as RedactedErrorSummary | undefined) ?? {
+      name: "Error",
+      message: combinedSummary,
+      summary: combinedSummary,
+    }
+  );
+}
+
+/**
+ * Traverse an unknown error and its `.cause` / `AggregateError.errors` chain
+ * iteratively with cycle detection and a hard depth bound, returning a fixed-size
+ * structured summary with all secrets scrubbed.
+ */
+export function redactErrorChain(
+  err: unknown,
+  options: RedactOptions = {},
+): RedactedErrorSummary {
+  return buildErrorChainInternal(err, options, new Set<object>());
+}
+
+/** Redacted, bounded text for anything thrown at us, including cyclic or deep causes. */
+export function redactError(err: unknown, options: RedactOptions = {}): string {
+  if (typeof err === "string") {
+    return redactText(err, options);
+  }
+  if (err === null || err === undefined) {
+    return redactText(String(err), options);
+  }
+  return redactErrorChain(err, options).summary;
 }

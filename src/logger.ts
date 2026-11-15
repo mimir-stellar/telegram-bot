@@ -30,6 +30,13 @@
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import {
+  DEFAULT_MAX_LEN,
+  MAX_ERROR_CAUSE_DEPTH,
+  redactErrorChain,
+  redactText,
+  type RedactedErrorSummary,
+} from "./redact.js";
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -284,10 +291,10 @@ function defaultState(): LoggerState {
 let state = defaultState();
 
 function redactLogText(text: string): string {
-  let out = text;
-  for (const secret of state.secrets) {
-    if (secret.length > 0) out = out.split(secret).join(LOG_REDACTED);
-  }
+  const out = redactText(text, {
+    secrets: state.secrets,
+    maxLen: Number.MAX_SAFE_INTEGER,
+  });
   return out.replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED);
 }
 
@@ -295,10 +302,60 @@ function boundField(text: string): string {
   return text.length <= MAX_LOG_FIELD_CHARS ? text : `${text.slice(0, MAX_LOG_FIELD_CHARS - 1)}…`;
 }
 
+function scrubErrorSummary(summary: RedactedErrorSummary): RedactedErrorSummary {
+  const cause =
+    typeof summary.cause === "string"
+      ? boundField(redactLogText(summary.cause))
+      : summary.cause !== undefined
+        ? scrubErrorSummary(summary.cause)
+        : undefined;
+  const errors = summary.errors?.map((item) =>
+    typeof item === "string" ? boundField(redactLogText(item)) : scrubErrorSummary(item),
+  );
+  return {
+    name: boundField(redactLogText(summary.name)),
+    message: boundField(redactLogText(summary.message)),
+    ...(summary.code !== undefined
+      ? {
+          code:
+            typeof summary.code === "string"
+              ? boundField(redactLogText(summary.code))
+              : summary.code,
+        }
+      : {}),
+    ...(cause !== undefined ? { cause } : {}),
+    ...(errors !== undefined ? { errors } : {}),
+    summary: boundField(redactLogText(summary.summary)),
+  };
+}
+
+function isCauseBearingErrorLike(value: object): boolean {
+  if (value instanceof Error) return true;
+  try {
+    const rec = value as Record<string, unknown>;
+    return (
+      "cause" in rec &&
+      rec.cause !== undefined &&
+      (typeof rec.message === "string" || Array.isArray(rec.errors))
+    );
+  } catch {
+    return false;
+  }
+}
+
 function sanitize(value: unknown, depth: number): unknown {
   if (typeof value === "string") return boundField(redactLogText(value));
   if (typeof value === "bigint") return value.toString();
   if (value === null || typeof value !== "object") return value;
+  if (isCauseBearingErrorLike(value)) {
+    return scrubErrorSummary(
+      redactErrorChain(value, {
+        secrets: state.secrets,
+        maxLen: DEFAULT_MAX_LEN,
+        maxCauseDepth: MAX_ERROR_CAUSE_DEPTH,
+      }),
+    );
+  }
   if (depth >= MAX_FIELD_DEPTH) return "[depth-limit]";
   if (Array.isArray(value)) return value.map((item) => sanitize(item, depth + 1));
   const out: Record<string, unknown> = {};

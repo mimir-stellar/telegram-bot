@@ -116,6 +116,7 @@ Emitted by top-level Node.js error listeners.
 To protect log aggregators and prevent denial-of-service via massive RPC payloads:
 - **String length truncation**: Any string field value longer than `MAX_LOG_FIELD_CHARS` (`1,000` characters) is truncated to 999 characters and suffixed with an ellipsis (`…`).
 - **Object depth limit**: Deeply nested JSON structures are traversed up to `MAX_FIELD_DEPTH` (`4` levels). Anything deeper is replaced with `"[depth-limit]"`, protecting against circular references.
+- **Bounded error cause traversal**: `Error` instances (and cause-bearing error objects) passed to `redactError`, `redactErrorChain`, or `Logger` structured fields traverse `.cause` iteratively up to `MAX_ERROR_CAUSE_DEPTH` (`4` hops, hard ceiling `16`) and `AggregateError.errors` up to `MAX_AGGREGATE_ERRORS` (`3` items). Cycles stop immediately with `"[circular cause]"`, deeper chains stop with `"[cause depth limit]"`, throwing getters degrade safely without throwing, and `summary` fits within `DEFAULT_MAX_LEN` (`240` chars) using proportional per-hop budgets so oversized outer messages do not truncate the root cause.
 - **BigInt serialization**: `BigInt` values are converted to standard numeric strings (`value.toString()`).
 - **Undefined & Functions**: Object keys whose values are `undefined` or functions are stripped before JSON serialization.
 - **Fail-safe fallback**: If serializing `fields` throws unexpectedly, the logger emits the bare sanitized `msg` string so the process never crashes on logging.
