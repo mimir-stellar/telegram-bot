@@ -184,6 +184,13 @@ Thin wrapper around Stellar SDK's `rpc.Server` with explorer URL helpers.
 - **Unauthenticated**: Public Testnet RPC requires no keys
 - **HTTP-aware**: Allows HTTP for local quickstart containers
 
+### Atom and JSON Feed Exports (`src/stellar/feed.ts`)
+
+Maps decoded Mimir events through a single canonical mapper (`buildCanonicalFeedRecord`) into two bounded syndication formats:
+
+- **Atom 1.0 (`buildAtomFeed`) and JSON Feed 1.1 (`buildJsonFeed`)**: Share identical entry ordering, item bounds (`FEED_DEFAULT_MAX_ITEMS` = 100, `FEED_HARD_MAX_ITEMS` = 500), C0 control stripping, and `FEED_CONTENT_MAX_CHARS` / `FEED_TITLE_MAX_CHARS` caps.
+- **Versioned JSON metadata & sanitized links**: JSON Feed exports carry `version: "https://jsonfeed.org/version/1.1"` and `_mimir.schemaVersion: "mimir-json-feed-v1"`, preserving validated `https:` explorer links and `appUrlFor` deep links (`src/notifications/app-links.ts`) across both formats.
+
 ## Data Flow
 
 ### Event Processing Pipeline
