@@ -24,7 +24,13 @@ import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
 import { attachConsole, createLogCapture, Logger, secretsFor } from "./logger.js";
-import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
+import {
+  CommandSurfaceValidationError,
+  createBot,
+  createNotifier,
+  registerCommands,
+  type SendExtra,
+} from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
@@ -431,10 +437,22 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  if (err instanceof ConfigError || err instanceof InstanceLockError) {
+  if (
+    err instanceof ConfigError ||
+    err instanceof InstanceLockError ||
+    err instanceof CommandSurfaceValidationError
+  ) {
     Logger.error("boot", `\n${err.message}\n`, {
-      action: "config_error",
-      problems: err instanceof ConfigError ? err.problems : undefined,
+      action:
+        err instanceof CommandSurfaceValidationError
+          ? "command_surface_error"
+          : "config_error",
+      problems:
+        err instanceof ConfigError || err instanceof CommandSurfaceValidationError
+          ? err.problems
+          : undefined,
+      missingCommands:
+        err instanceof CommandSurfaceValidationError ? err.missingCommands : undefined,
     });
     process.exit(1);
   }

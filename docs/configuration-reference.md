@@ -4,7 +4,7 @@ This document outlines the expected behavior of the Mimir Telegram bot under lon
 
 ## Guiding Principles
 - **Read-Only**: The bot strictly reads from the chain and writes to Telegram. It holds no signing keys and never signs or submits transactions. The blockchain is the sole source of truth.
-- **Fail Fast on Boot**: Configuration is validated synchronously on startup. If environment variables are missing, malformed, or internally inconsistent, the bot crashes immediately with a detailed error listing all problems, preventing silent failures.
+- **Fail Fast on Boot**: Configuration and command-surface invariants are validated synchronously on startup. If environment variables are missing, malformed, or internally inconsistent — or if any slash command advertised in the catalogue, `/help`, or Telegram's command menu lacks a live registered handler — the bot stops immediately with a detailed error naming every problem, preventing silent failures.
 - **Resilience During Operation**: Once running, the bot gracefully handles transient errors from the Stellar RPC and Telegram APIs. It will retry without crashing the process.
 
 ## Environment Variables (`.env`)

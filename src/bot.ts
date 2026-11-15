@@ -30,6 +30,7 @@ import {
   isOperator,
   operatorAllowed,
   registeredCommands,
+  validateCommandSurface,
   visibleCommandMetadata,
   type CommandDeps,
   type CommandModule,
@@ -65,14 +66,18 @@ export {
 } from "./commands/keyboards.js";
 export { TELEGRAM_OPTIONS, isChatAllowed, isOperator } from "./commands/runtime.js";
 export {
+  CommandSurfaceValidationError,
   aboutMessage,
-  helpMessage,
   contractsMessage,
+  extractHelpOverviewCommands,
   healthMessage,
+  helpMessage,
   lastEventMessage,
   pauseMessage,
   resumeMessage,
   statusMessage,
+  validateCommandSurface,
+  type CommandSurfaceInput,
 } from "./commands/index.js";
 export {
   CALLBACK_FALLBACK_FEEDBACK,
@@ -235,13 +240,18 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
     return false;
   };
 
+  const boundHandlers = new Set<string>();
   const modules = registeredCommands();
   for (const module of modules) {
-    registrar.command(module.command, async (ctx) => {
+    const result = registrar.command(module.command, async (ctx) => {
       if (!withinRateLimit(ctx, module.command)) return;
       await dispatch(module, ctx, deps);
     });
+    if (result !== false) {
+      boundHandlers.add(module.command);
+    }
   }
+  validateCommandSurface({ config: deps.config, modules, boundHandlers });
 
   // The pause confirmation prompt is produced by /pause, so its buttons are
   // registered alongside it rather than with the generic action callbacks.
@@ -375,6 +385,7 @@ export {
 
 /** Registers the command list so Telegram's UI offers autocompletion. */
 export async function registerCommands(bot: Bot, config?: BotConfig): Promise<void> {
+  validateCommandSurface({ config });
   try {
     await bot.api.setMyCommands(
       visibleCommandMetadata(config).map(({ command, description }) => ({ command, description })),

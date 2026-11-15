@@ -65,3 +65,9 @@ export { previewCommand } from "./preview.js";
 export { resumeCommand, resumeMessage } from "./resume.js";
 export { lastEventMessage, statusCommand, statusMessage } from "./status.js";
 export { logExportCommand } from "./log-export.js";
+export {
+  CommandSurfaceValidationError,
+  extractHelpOverviewCommands,
+  validateCommandSurface,
+  type CommandSurfaceInput,
+} from "./surface.js";
