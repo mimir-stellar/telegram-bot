@@ -173,6 +173,13 @@ A single poll cycle executes four distinct phases ([`src/poller.ts`](../src/poll
   - Because `saveCursors`, `deadLetter.persist`, and `writeStatusFile` all write to `<file>.tmp` and call `fs.rename(<file>.tmp, <file>)` ([`src/poller.ts`](../src/poller.ts#L1443-L1445), [`src/deadLetter.ts`](../src/deadLetter.ts#L146-L148), [`src/poller.ts`](../src/poller.ts#L1479-L1480)), an abrupt exit during a write never leaves a half-written live JSON file.
   - Either the rename completed (new cursor is live) or it did not (previous cycle's cursor remains intact and a leftover `.tmp` file is overwritten on the next save).
 
+### Crash Point G: Multi-Page Scheduled Digest Crash or Timeout (`deliverMultiPageDigest` / `recoverPartialDigests`)
+- **Effect**: Multi-page scheduled digests (`src/notifications/digest-grouping.ts` + `FileDigestRecoveryStore` in `src/notifications/schedule.ts`) persist page-level outcomes per destination (`pending` → `in_flight` → `confirmed` / `uncertain` / `failed`) via fsynced atomic writes before and after every page send.
+- **Outcome on restart**:
+  - `confirmed` pages are **never resent** (`skippedConfirmedPages`).
+  - Pages left `in_flight` across an abrupt crash (or rejected with a send timeout) transition to `uncertain` and are **reported explicitly** (`uncertainPages` / `formatDigestRecoveryReport`) without blindly resending or claiming exactly-once delivery.
+  - Remaining `pending` and deterministically `failed` pages are delivered on recovery, after which stored page text is scrubbed while compact page-hash receipts remain bounded (`DEFAULT_DIGEST_RECOVERY_MAX_RUNS = 32`).
+
 ---
 
 ## 6. Failure & Crash Scenarios Matrix
@@ -214,8 +221,10 @@ A single poll cycle executes four distinct phases ([`src/poller.ts`](../src/poll
 - [`src/deadLetter.ts`](../src/deadLetter.ts) — `createDeadLetterQueue`, `makeEntryId`, `DEAD_LETTER_MAX_ENTRIES`, `DEAD_LETTER_MAX_ATTEMPTS`
 - [`src/instanceLock.ts`](../src/instanceLock.ts) — `acquireInstanceLock`, `InstanceLockError`, `isProcessAlive`
 - [`src/index.ts`](../src/index.ts) — `SIGINT` / `SIGTERM` graceful shutdown and force-exit handlers
+- [`src/notifications/digest-grouping.ts`](../src/notifications/digest-grouping.ts) & [`src/notifications/schedule.ts`](../src/notifications/schedule.ts) — `deliverMultiPageDigest`, `recoverPartialDigests`, `FileDigestRecoveryStore`
 
 ### Verification Test Suites
+- [`tests/digest-restart-recovery.test.mjs`](../tests/digest-restart-recovery.test.mjs) — Multi-page digest per-destination outcome persistence, confirmed-page skip, uncertain-page crash/timeout reporting, and corrupt state quarantine
 - [`tests/ordering.test.mjs`](../tests/ordering.test.mjs) — Deterministic comparator (`ledger`, `transactionIndex`, `operationIndex`, `eventId`, `txHash`, stability, TOID parsing)
 - [`tests/dedup.test.mjs`](../tests/dedup.test.mjs) — `eventKey` derivation hierarchy, `EventDedupWindow` FIFO eviction, capacity `0`, oversized keys, and `recentEventIds` persistence across restarts
 - [`tests/page-dedup.test.mjs`](../tests/page-dedup.test.mjs) — Cross-page and cross-cycle deduplication in `readContractEvents` / `paginatedGetEvents`

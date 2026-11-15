@@ -138,6 +138,177 @@ export class FileLastRunStore implements LastRunStore {
   }
 }
 
+export type DigestPageStatus =
+  | "pending"
+  | "in_flight"
+  | "confirmed"
+  | "uncertain"
+  | "failed";
+
+export interface DigestPageOutcome {
+  digestId: string;
+  destination: string;
+  pageIndex: number;
+  totalPages: number;
+  pageHash: string;
+  status: DigestPageStatus;
+  attempts: number;
+  updatedAt: number;
+  error?: string;
+}
+
+export interface PersistedDigestRun {
+  digestId: string;
+  scheduledAtMs?: number;
+  totalPages: number;
+  pageHashes: string[];
+  /** Retained only while `pending` or `failed` pages remain for crash recovery. */
+  pages?: string[];
+  destinations: Record<string, DigestPageOutcome[]>;
+  uncertainReported?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface DigestRecoveryStore {
+  loadRuns(): Promise<PersistedDigestRun[]>;
+  /**
+   * Load runs on process startup, promoting any interrupted `in_flight` page
+   * outcomes to `uncertain` and persisting the transition before returning.
+   */
+  loadForRecovery(nowMs?: number): Promise<PersistedDigestRun[]>;
+  saveRun(run: PersistedDigestRun): Promise<void>;
+}
+
+export const DEFAULT_DIGEST_RECOVERY_MAX_RUNS = 32;
+
+function isSettledDigestRun(run: PersistedDigestRun): boolean {
+  for (const outcomes of Object.values(run.destinations)) {
+    for (const outcome of outcomes) {
+      if (
+        outcome.status === "pending" ||
+        outcome.status === "in_flight" ||
+        outcome.status === "failed"
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+export class FileDigestRecoveryStore implements DigestRecoveryStore {
+  private readonly maxRuns: number;
+
+  constructor(
+    private readonly filePath: string,
+    options: { maxRuns?: number } = {},
+  ) {
+    this.maxRuns = Math.max(1, options.maxRuns ?? DEFAULT_DIGEST_RECOVERY_MAX_RUNS);
+  }
+
+  async loadRuns(): Promise<PersistedDigestRun[]> {
+    let raw: string;
+    try {
+      raw = await fs.readFile(this.filePath, "utf-8");
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+      throw err;
+    }
+    const trimmed = raw.trim();
+    if (trimmed === "") return [];
+    try {
+      const parsed = JSON.parse(trimmed) as { version?: unknown; runs?: unknown };
+      if (parsed?.version !== 1 || !Array.isArray(parsed.runs)) {
+        await this.quarantineCorrupt();
+        return [];
+      }
+      return parsed.runs as PersistedDigestRun[];
+    } catch {
+      await this.quarantineCorrupt();
+      return [];
+    }
+  }
+
+  async loadForRecovery(nowMs: number = Date.now()): Promise<PersistedDigestRun[]> {
+    const runs = await this.loadRuns();
+    let mutated = false;
+    for (const run of runs) {
+      for (const outcomes of Object.values(run.destinations)) {
+        for (const outcome of outcomes) {
+          if (outcome.status === "in_flight") {
+            outcome.status = "uncertain";
+            outcome.updatedAt = nowMs;
+            outcome.error =
+              outcome.error ?? "process restarted before send confirmation";
+            run.uncertainReported = false;
+            run.updatedAt = nowMs;
+            mutated = true;
+          }
+        }
+      }
+    }
+    if (mutated) {
+      await this.persistRuns(runs);
+    }
+    return runs;
+  }
+
+  async saveRun(run: PersistedDigestRun): Promise<void> {
+    const runs = await this.loadRuns();
+    const idx = runs.findIndex((existing) => existing.digestId === run.digestId);
+    if (idx >= 0) {
+      runs[idx] = run;
+    } else {
+      runs.push(run);
+    }
+    const bounded = this.compactRuns(runs);
+    await this.persistRuns(bounded);
+  }
+
+  private compactRuns(runs: PersistedDigestRun[]): PersistedDigestRun[] {
+    if (runs.length <= this.maxRuns) return runs;
+    const result = [...runs];
+    while (result.length > this.maxRuns) {
+      const settledIdx = result.findIndex((candidate) => isSettledDigestRun(candidate));
+      if (settledIdx >= 0) {
+        result.splice(settledIdx, 1);
+      } else {
+        result.shift();
+      }
+    }
+    return result;
+  }
+
+  private async persistRuns(runs: PersistedDigestRun[]): Promise<void> {
+    const dir = dirname(this.filePath);
+    await fs.mkdir(dir, { recursive: true });
+    const tmp = `${this.filePath}.tmp`;
+    const payload = `${JSON.stringify({ version: 1, runs }, null, 2)}\n`;
+    const handle = await fs.open(tmp, "w");
+    try {
+      await handle.writeFile(payload, "utf-8");
+      await handle.sync();
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+    await fs.rename(tmp, this.filePath);
+  }
+
+  private async quarantineCorrupt(): Promise<void> {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const target = `${this.filePath}.corrupt.${stamp}`;
+    try {
+      await fs.rename(this.filePath, target);
+      console.warn(
+        `[digest-recovery] quarantined unreadable state file to ${target}; starting empty`,
+      );
+    } catch {
+      // Ignore race if file disappeared before quarantine rename.
+    }
+  }
+}
+
 export interface SchedulerClock {
   now(): number;
   setTimeout(callback: () => void, delayMs: number): unknown;
