@@ -249,6 +249,26 @@ curl -s http://127.0.0.1:8787/metrics
 
 ---
 
+### `GET /feed.atom` (alias: `GET /feed`, when a feed provider is attached)
+
+Serves the Atom 1.0 syndication feed (`application/atom+xml; charset=utf-8`)
+with deterministic conditional HTTP validation (`ETag` and `Last-Modified` per
+RFC 9110):
+
+- **Deterministic metadata**: `ETag` (`"sha256-…"`) is hashed from canonical
+  feed options and retained event identities/payloads; `Last-Modified` is
+  derived from the latest event ledger close timestamp (whole-second HTTP-date)
+  or epoch when empty.
+- **Conditional `304 Not Modified`**: Requests carrying a matching
+  `If-None-Match` (including weak `W/` tags, comma-separated tag lists, or `*`)
+  or, when `If-None-Match` is absent, an `If-Modified-Since` header at or after
+  `Last-Modified`, receive `304 Not Modified` immediately without rebuilding an
+  unchanged XML document.
+- **Read-only**: Accepts `GET` and `HEAD`; non-read methods receive `405` with
+  `Allow: GET, HEAD`.
+
+---
+
 ### `POST /telegram-webhook` (webhook mode only)
 
 Receives Telegram update payloads when `TELEGRAM_WEBHOOK_URL` is set. The

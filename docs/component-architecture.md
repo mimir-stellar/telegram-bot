@@ -184,6 +184,13 @@ Thin wrapper around Stellar SDK's `rpc.Server` with explorer URL helpers.
 - **Unauthenticated**: Public Testnet RPC requires no keys
 - **HTTP-aware**: Allows HTTP for local quickstart containers
 
+### Conditional Event Feed Responses (`src/stellar/feed.ts`, `src/health.ts`)
+
+Supports RFC 9110 conditional HTTP validation for the Atom event feed:
+
+- **Deterministic metadata**: `computeFeedConditionalMetadata` computes a strong `ETag` (`"sha256-…"`) and `Last-Modified` HTTP-date directly from retained event metadata and feed options before any XML serialization.
+- **Zero-rebuild `304 Not Modified`**: `createConditionalFeedResponder` evaluates `If-None-Match` and `If-Modified-Since` up front, returning `304` (and serving repeat unconditional `200`/`HEAD` requests from cache) without rebuilding an unchanged feed.
+
 ## Data Flow
 
 ### Event Processing Pipeline

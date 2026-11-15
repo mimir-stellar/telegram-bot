@@ -11,7 +11,10 @@
  *   https://www.rfc-editor.org/rfc/rfc4287
  */
 
+import { createHash } from "node:crypto";
+import type http from "node:http";
 import { formatPlainTextEvent, eventExplorerUrl } from "../notifications/format.js";
+import { appUrlFor } from "../notifications/app-links.js";
 import type { DecodedEvent } from "./decode.js";
 import type { StellarConfig } from "../config.js";
 
@@ -94,6 +97,8 @@ export interface AtomEntry {
   content: string | null;
   /** RFC 4287 §4.2.7: alternate link (explorer URL), or null when absent. */
   link: string | null;
+  /** Optional sanitized HTTPS Mimir web-app deep link when configured. */
+  appLink?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,19 +120,15 @@ export interface AtomFeedOptions {
   updatedAt?: string;
   /** Optional subtitle / description for the feed. */
   subtitle?: string;
+  /** Optional Mimir web-app base URL (`MIMIR_APP_URL`). */
+  mimirAppUrl?: string | null;
 }
 
-/**
- * Build one `<entry>` element from a decoded event.
- *
- * The entry id is a stable tag URI derived from the event id so it is both
- * unique and dereferenceable: `tag:mimir,event:<eventId>`.
- * The title is the event name (payload.name).
- * The content is the plain-text rendering, bounded to {@link FEED_CONTENT_MAX_CHARS}.
- * The link is the explorer URL when one exists.
- * The updated timestamp comes from `event.at` (ledger close time).
- */
-export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): AtomEntry {
+export function buildAtomEntry(
+  event: DecodedEvent,
+  config: StellarConfig,
+  mimirAppUrl?: string | null,
+): AtomEntry {
   const eventName =
     event.payload.name === "unknown"
       ? (event.payload.eventName ?? "unknown")
@@ -152,13 +153,22 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
   const explorerUrl = eventExplorerUrl(config, event);
   const link = explorerUrl ? safeHttpsUrl(explorerUrl) : null;
 
-  return {
+  const resolvedAppBase =
+    mimirAppUrl ?? (config as { mimirAppUrl?: string | null }).mimirAppUrl ?? null;
+  const rawAppUrl = appUrlFor(event, resolvedAppBase);
+  const appLink = rawAppUrl ? safeHttpsUrl(rawAppUrl) : null;
+
+  const entry: AtomEntry = {
     id: `tag:mimir,event:${event.eventId}`,
     title,
     updated,
     content,
     link,
   };
+  if (appLink !== null) {
+    entry.appLink = appLink;
+  }
+  return entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +185,11 @@ function renderEntry(entry: AtomEntry): string {
       ? `    <link rel="alternate" type="text/html" href="${escapeXml(entry.link)}"/>`
       : "";
 
+  const appLinkEl =
+    entry.appLink
+      ? `    <link rel="related" type="text/html" href="${escapeXml(entry.appLink)}"/>`
+      : "";
+
   const contentEl =
     entry.content !== null
       ? `    <content type="text">${xmlText(entry.content, FEED_CONTENT_MAX_CHARS)}</content>`
@@ -186,6 +201,7 @@ function renderEntry(entry: AtomEntry): string {
     idEl,
     updatedEl,
     linkEl,
+    appLinkEl,
     contentEl,
     "  </entry>",
   ]
@@ -246,10 +262,292 @@ export function buildAtomFeed(
   }
 
   for (const event of events) {
-    const entry = buildAtomEntry(event, config);
+    const entry = buildAtomEntry(event, config, options.mimirAppUrl);
     lines.push(renderEntry(entry));
   }
 
   lines.push("</feed>");
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic ETag / Last-Modified & conditional HTTP responder (RFC 9110)
+// ---------------------------------------------------------------------------
+
+export interface FeedConditionalMetadata {
+  /** Strong quoted entity-tag (`"sha256-<hex>"`) derived deterministically from events + options. */
+  etag: string;
+  /** RFC 9110 IMF-fixdate (`toUTCString()`) at 1-second HTTP-date precision. */
+  lastModified: string;
+  /** Epoch milliseconds corresponding to `lastModified` (whole-second precision). */
+  lastModifiedMs: number;
+  /** ISO 8601 representation of `lastModifiedMs` for deterministic `<updated>` rendering. */
+  lastModifiedIso: string;
+}
+
+function feedBigIntReplacer(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? value.toString() : value;
+}
+
+/**
+ * Compute deterministic `ETag` and `Last-Modified` metadata from retained
+ * events and feed options without serializing XML.
+ */
+export function computeFeedConditionalMetadata(
+  events: readonly DecodedEvent[],
+  options: AtomFeedOptions,
+): FeedConditionalMetadata {
+  let lastModifiedMs = 0;
+  if (options.updatedAt !== undefined) {
+    const parsed = Date.parse(options.updatedAt);
+    if (!Number.isNaN(parsed) && parsed >= 0) {
+      lastModifiedMs = Math.floor(parsed / 1000) * 1000;
+    }
+  } else if (events.length > 0) {
+    let maxAt = 0;
+    for (const event of events) {
+      if (typeof event.at === "number" && Number.isFinite(event.at) && event.at > maxAt) {
+        maxAt = event.at;
+      }
+    }
+    if (maxAt > 0) {
+      lastModifiedMs = Math.floor(maxAt) * 1000;
+    }
+  }
+
+  const lastModifiedDate = new Date(lastModifiedMs);
+  const lastModified = lastModifiedDate.toUTCString();
+  const lastModifiedIso = lastModifiedDate.toISOString();
+
+  const resolvedAppUrl =
+    options.mimirAppUrl ??
+    (options.config as { mimirAppUrl?: string | null }).mimirAppUrl ??
+    null;
+
+  const hash = createHash("sha256");
+  hash.update(
+    JSON.stringify({
+      v: 1,
+      title: options.title,
+      subtitle: options.subtitle ?? null,
+      selfUrl: options.selfUrl,
+      updatedAt: options.updatedAt ?? lastModifiedIso,
+      locale: options.config.locale ?? "en",
+      networkPassphrase: options.config.networkPassphrase,
+      explorerBaseUrl: options.config.explorerBaseUrl,
+      mimirAppUrl: resolvedAppUrl,
+      count: events.length,
+    }),
+  );
+  hash.update("\n");
+
+  for (const event of events) {
+    hash.update(
+      JSON.stringify(
+        [
+          event.source,
+          event.contractId,
+          event.version,
+          event.ledger,
+          event.txHash,
+          event.eventId,
+          event.at ?? 0,
+          event.transactionIndex ?? null,
+          event.operationIndex ?? null,
+          event.payload,
+        ],
+        feedBigIntReplacer,
+      ),
+    );
+    hash.update("\n");
+  }
+
+  const etag = `"sha256-${hash.digest("hex")}"`;
+  return {
+    etag,
+    lastModified,
+    lastModifiedMs,
+    lastModifiedIso,
+  };
+}
+
+function normalizeOpaqueTag(tag: string): string | null {
+  const trimmed = tag.trim();
+  if (!trimmed) return null;
+  if (trimmed === "*") return "*";
+  const withoutWeak = trimmed.startsWith("W/") ? trimmed.slice(2).trim() : trimmed;
+  if (withoutWeak.length >= 2 && withoutWeak.startsWith('"') && withoutWeak.endsWith('"')) {
+    return withoutWeak;
+  }
+  return null;
+}
+
+function headerString(
+  headers: http.IncomingHttpHeaders | Readonly<Record<string, string | string[] | undefined>>,
+  name: string,
+): string | undefined {
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === lower) {
+      if (Array.isArray(v)) return v.join(", ");
+      return v;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Evaluate `If-None-Match` and `If-Modified-Since` preconditions per RFC 9110
+ * §13.1.2 / §13.1.3 / §13.2.2 (`If-None-Match` takes precedence over `If-Modified-Since`).
+ *
+ * Returns `true` when the client's cached representation is still fresh (`304 Not Modified`).
+ */
+export function isFeedNotModified(
+  headers: http.IncomingHttpHeaders | Readonly<Record<string, string | string[] | undefined>>,
+  metadata: FeedConditionalMetadata,
+): boolean {
+  const rawInm = headerString(headers, "if-none-match");
+  if (rawInm !== undefined && rawInm.trim().length > 0) {
+    const targetOpaque = normalizeOpaqueTag(metadata.etag);
+    // Match `*` or comma-separated entity-tags (weak comparison per RFC 9110 §13.1.2)
+    if (rawInm.trim() === "*") return true;
+    const candidates = rawInm.match(/(?:W\/)?"[^"]*"|\*/g) ?? [];
+    for (const candidate of candidates) {
+      const opaque = normalizeOpaqueTag(candidate);
+      if (opaque === "*" || (opaque !== null && opaque === targetOpaque)) {
+        return true;
+      }
+    }
+    // RFC 9110 §13.2.2: ignore If-Modified-Since when If-None-Match is present
+    return false;
+  }
+
+  const rawIms = headerString(headers, "if-modified-since");
+  if (rawIms !== undefined && rawIms.trim().length > 0) {
+    const parsedIms = Date.parse(rawIms.trim());
+    if (!Number.isNaN(parsedIms)) {
+      return parsedIms >= metadata.lastModifiedMs;
+    }
+  }
+
+  return false;
+}
+
+export interface ConditionalFeedResponderOptions {
+  /** Reader returning the current retained decoded events. */
+  getEvents: () => readonly DecodedEvent[];
+  /** Reader returning the `AtomFeedOptions` for a given request. */
+  getOptions: (req?: http.IncomingMessage) => AtomFeedOptions;
+  /** Optional custom renderer (defaults to {@link buildAtomFeed}; handy for build-count tests). */
+  renderFeed?: (events: readonly DecodedEvent[], options: AtomFeedOptions) => string;
+}
+
+export interface FeedHttpResult {
+  statusCode: 200 | 304 | 405;
+  headers: Record<string, string>;
+  body: string;
+  rebuilt: boolean;
+}
+
+export interface ConditionalFeedResponder {
+  evaluate(
+    method: string,
+    headers: http.IncomingHttpHeaders | Readonly<Record<string, string | string[] | undefined>>,
+    req?: http.IncomingMessage,
+  ): FeedHttpResult;
+  handle(req: http.IncomingMessage, res: http.ServerResponse): void;
+  buildCount(): number;
+}
+
+/**
+ * Create a stateful HTTP responder for the Atom event feed that computes
+ * deterministic `ETag` and `Last-Modified` metadata up front, answers matching
+ * conditional requests with `304 Not Modified` without rebuilding XML, and
+ * reuses the cached XML across unconditional requests while events are unchanged.
+ */
+export function createConditionalFeedResponder(
+  config: ConditionalFeedResponderOptions,
+): ConditionalFeedResponder {
+  const render = config.renderFeed ?? buildAtomFeed;
+  let cached: { etag: string; xml: string } | null = null;
+  let builds = 0;
+
+  function evaluate(
+    method: string,
+    headers: http.IncomingHttpHeaders | Readonly<Record<string, string | string[] | undefined>>,
+    req?: http.IncomingMessage,
+  ): FeedHttpResult {
+    const upperMethod = method.toUpperCase();
+    if (upperMethod !== "GET" && upperMethod !== "HEAD") {
+      const errBody = `${JSON.stringify({ ok: false, error: "method_not_allowed" })}\n`;
+      return {
+        statusCode: 405,
+        headers: {
+          allow: "GET, HEAD",
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+          "content-length": String(Buffer.byteLength(errBody)),
+        },
+        body: errBody,
+        rebuilt: false,
+      };
+    }
+
+    const events = config.getEvents();
+    const options = config.getOptions(req);
+    const meta = computeFeedConditionalMetadata(events, options);
+
+    if (isFeedNotModified(headers, meta)) {
+      return {
+        statusCode: 304,
+        headers: {
+          etag: meta.etag,
+          "last-modified": meta.lastModified,
+          "cache-control": "private, no-cache",
+        },
+        body: "",
+        rebuilt: false,
+      };
+    }
+
+    let xml: string;
+    let rebuilt = false;
+    if (cached !== null && cached.etag === meta.etag) {
+      xml = cached.xml;
+    } else {
+      xml = render(events, {
+        ...options,
+        updatedAt: options.updatedAt ?? meta.lastModifiedIso,
+      });
+      cached = { etag: meta.etag, xml };
+      builds += 1;
+      rebuilt = true;
+    }
+
+    const byteLength = Buffer.byteLength(xml, "utf8");
+    return {
+      statusCode: 200,
+      headers: {
+        "content-type": "application/atom+xml; charset=utf-8",
+        etag: meta.etag,
+        "last-modified": meta.lastModified,
+        "cache-control": "private, no-cache",
+        "content-length": String(byteLength),
+      },
+      body: upperMethod === "HEAD" ? "" : xml,
+      rebuilt,
+    };
+  }
+
+  return {
+    evaluate,
+    handle(req: http.IncomingMessage, res: http.ServerResponse): void {
+      const result = evaluate(req.method ?? "GET", req.headers, req);
+      res.writeHead(result.statusCode, result.headers);
+      res.end(result.body);
+    },
+    buildCount(): number {
+      return builds;
+    },
+  };
 }

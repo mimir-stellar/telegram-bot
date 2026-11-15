@@ -21,6 +21,12 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import type { DecodedEvent } from "./stellar/decode.js";
+import {
+  createConditionalFeedResponder,
+  type AtomFeedOptions,
+  type ConditionalFeedResponder,
+} from "./stellar/feed.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -36,6 +42,12 @@ export interface HealthDeps {
    * {@link configProvenance}; either way only key names and origins are served.
    */
   provenance?: () => ConfigProvenance;
+  /** Optional retained-event provider enabling `GET /feed.atom` with ETag / 304 support. */
+  feedEvents?: () => readonly DecodedEvent[];
+  /** Optional Atom feed metadata overrides when `feedEvents` is supplied. */
+  feedOptions?: Partial<Omit<AtomFeedOptions, "config">>;
+  /** Optional pre-built conditional feed responder for `GET /feed.atom`. */
+  feedResponder?: ConditionalFeedResponder;
 }
 
 export interface HealthServer {
@@ -485,6 +497,22 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     return { url: null, port: 0, close: async () => undefined };
   }
 
+  const activeFeedResponder: ConditionalFeedResponder | null =
+    deps.feedResponder ??
+    (deps.feedEvents
+      ? createConditionalFeedResponder({
+          getEvents: deps.feedEvents,
+          getOptions: () => ({
+            title: deps.feedOptions?.title ?? "Mimir Events",
+            selfUrl: deps.feedOptions?.selfUrl ?? "https://mimir.local/feed.atom",
+            subtitle: deps.feedOptions?.subtitle,
+            updatedAt: deps.feedOptions?.updatedAt,
+            mimirAppUrl: deps.feedOptions?.mimirAppUrl ?? config.mimirAppUrl ?? null,
+            config,
+          }),
+        })
+      : null);
+
   const server = http.createServer((req, res) => {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
@@ -522,6 +550,11 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         "content-length": Buffer.byteLength(metrics),
       });
       res.end(metrics);
+      return;
+    }
+
+    if (activeFeedResponder !== null && (url.pathname === "/feed.atom" || url.pathname === "/feed")) {
+      activeFeedResponder.handle(req, res);
       return;
     }
 
