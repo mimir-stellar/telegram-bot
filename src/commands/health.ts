@@ -35,6 +35,7 @@ export function healthMessage(
     `Uptime: ${report.uptimeMs > 0 ? ago(nowMs - report.uptimeMs, nowMs) : "0s"}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
     `Last successful poll: ${ago(status.lastSuccessAt, nowMs)}`,
+    `RPC: \`${report.poller.rpcStatus}\` · Persistence: \`${report.poller.persistence.status}\` \\(last flush ${ago(status.lastFlushAt ?? null, nowMs)}\\)`,
     `Chain tip: ${report.poller.latestLedger ?? "unknown"}`,
     `Chain clock skew: ${escapeMd(chainClockLabel(status.chainClockAt, nowMs))}`,
     `Cycles: ${report.poller.cycles} · consecutive failures: ${report.poller.consecutiveFailures}`,
@@ -86,6 +87,18 @@ export function healthMessage(
     lines.push(
       "",
       `Last error \\(${ago(status.lastError?.at ?? null, nowMs)}\\): ${escapeMd(report.poller.lastError.message)}`,
+    );
+  }
+
+  if (report.poller.persistence.lastFlushError) {
+    lines.push(
+      "",
+      `Cursor persistence error \\(${ago(status.cursorPersistError?.at ?? (status.startedAt > 0 ? status.startedAt : null), nowMs)}\\): ${escapeMd(report.poller.persistence.lastFlushError.message)}`,
+    );
+  } else if (report.poller.persistence.stateFileError) {
+    lines.push(
+      "",
+      `State file error: ${escapeMd(report.poller.persistence.stateFileError.message)}`,
     );
   }
 

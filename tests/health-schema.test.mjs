@@ -293,6 +293,7 @@ test("adding a field anywhere in the report fails validation", () => {
   const places = [
     ["$", (r) => r],
     ["$.poller", (r) => r.poller],
+    ["$.poller.persistence", (r) => r.poller.persistence],
     ["$.poller.deadLetter", (r) => r.poller.deadLetter],
     ["$.poller.lastError", (r) => r.poller.lastError],
     ["$.poller.lastRestartGap", (r) => r.poller.lastRestartGap],

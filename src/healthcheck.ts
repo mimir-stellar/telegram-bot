@@ -39,7 +39,23 @@ function main() {
           console.log("[healthcheck] OK");
           process.exit(0);
         } else {
-          console.error(`[healthcheck] Failed: HTTP ${res.statusCode} - ${body.trim()}`);
+          let detail = body.trim();
+          try {
+            const parsed = JSON.parse(detail) as {
+              status?: string;
+              poller?: {
+                rpcStatus?: string;
+                persistence?: { status?: string; cursorWritable?: boolean };
+              };
+            };
+            if (parsed.poller?.persistence?.status === "degraded") {
+              const rpcLabel = parsed.poller.rpcStatus ?? parsed.status ?? "unknown";
+              detail = `rpc=${rpcLabel} persistence=degraded (cursorWritable=${String(parsed.poller.persistence.cursorWritable)}) ${detail}`;
+            }
+          } catch {
+            // Non-JSON error body; fall back to raw trimmed body.
+          }
+          console.error(`[healthcheck] Failed: HTTP ${res.statusCode} - ${detail}`);
           process.exit(1);
         }
       });

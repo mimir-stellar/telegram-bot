@@ -351,6 +351,14 @@ export interface PollerStatus {
   /** Result of the startup persistent-volume probe, when reported. */
   persistentVolumeAvailable?: boolean;
   persistentVolumeError?: string | null;
+  /** Consecutive failed cursor-file flushes (`0` when writable). */
+  cursorPersistFailures?: number;
+  /** Most recent redacted cursor-file write error, cleared on the next successful flush. */
+  cursorPersistError?: { at: number; message: string } | null;
+  /** Most recent redacted status-file write error, cleared on the next successful write. */
+  statusPersistError?: { at: number; message: string } | null;
+  /** Most recent redacted counters-file write error, cleared on the next successful write. */
+  countersPersistError?: { at: number; message: string } | null;
   targets: TargetState[];
   /** SHA-256 digest of the SBOM generated for this deployment image. */
   sbomDigest: string | null;
@@ -1521,6 +1529,10 @@ export function createPoller(deps: PollerDeps) {
     lockPid: null,
     pendingFlush: false,
     lastFlushAt: null,
+    cursorPersistFailures: 0,
+    cursorPersistError: null,
+    statusPersistError: null,
+    countersPersistError: null,
     suppressedLogs: 0,
     targets: [],
     sbomDigest: null,
@@ -1701,12 +1713,15 @@ export function createPoller(deps: PollerDeps) {
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, countersFile);
       countersDirty = false;
+      status.countersPersistError = null;
       return true;
     } catch (err) {
+      const msg = errorMessage(err);
+      status.countersPersistError = { at: now(), message: msg };
       Logger.error(
         "poller",
-        `[poller] could not persist counters (${reason}): ${errorMessage(err)}`,
-        { action: "counters_persist_failed", reason, countersFile, error: errorMessage(err) },
+        `[poller] could not persist counters (${reason}): ${msg}`,
+        { action: "counters_persist_failed", reason, countersFile, error: msg },
       );
       return false;
     }
@@ -1824,6 +1839,12 @@ export function createPoller(deps: PollerDeps) {
       await copyFile(config.cursorFile, backupFile);
       status.pendingFlush = false;
       status.lastFlushAt = now();
+      status.cursorPersistFailures = 0;
+      status.cursorPersistError = null;
+      if (status.persistentVolumeAvailable === false) {
+        status.persistentVolumeAvailable = true;
+        status.persistentVolumeError = null;
+      }
       pendingRewrite = false;
       return true;
     } catch (err) {
@@ -1831,10 +1852,13 @@ export function createPoller(deps: PollerDeps) {
       // the file it stays ahead, so a later cycle — or the shutdown flush —
       // retries. If nothing had changed, write-then-rename left the old file
       // intact and there is still nothing to flush.
+      const msg = errorMessage(err);
+      status.cursorPersistFailures = (status.cursorPersistFailures ?? 0) + 1;
+      status.cursorPersistError = { at: now(), message: msg };
       Logger.error(
         "poller",
-        `[poller] could not persist cursor (${reason}): ${errorMessage(err)}`,
-        { action: "cursor_persist_failed", reason, error: errorMessage(err) },
+        `[poller] could not persist cursor (${reason}): ${msg}`,
+        { action: "cursor_persist_failed", reason, error: msg },
       );
       audit.recordError(err, "cursor_persist_failed");
       return false;
@@ -1896,7 +1920,15 @@ export function createPoller(deps: PollerDeps) {
   async function persistStatus(): Promise<void> {
     // Hand-built configs (tests, embedders) may not set a status file.
     if (!config.statusFile) return;
-    await writeStatusFile(config.statusFile, snapshot());
+    const ok = await writeStatusFile(config.statusFile, snapshot());
+    if (ok) {
+      status.statusPersistError = null;
+    } else {
+      status.statusPersistError = {
+        at: now(),
+        message: "status snapshot write failed",
+      };
+    }
   }
 
   function snapshot(): StatusSnapshot {

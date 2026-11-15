@@ -64,3 +64,13 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+---
+
+## Unwritable State Files and Health Reporting
+
+An unwritable cursor or state file never crashes the poll loop — in-memory cursors keep advancing and notifications keep sending — while `GET /health` and `/health` report persistence degradation **separately** from RPC health:
+
+- `poller.rpcStatus` reflects Soroban RPC scan health (`"ok" | "degraded" | "stopped"`).
+- `poller.lastFlushAgeMs` and `poller.persistence.lastFlushAgeMs` report the age in milliseconds of the last successful cursor flush (`null` before the first flush).
+- `poller.persistence` (`status`, `cursorWritable`, `consecutiveFlushFailures`, `lastFlushError`, `stateFileError`) surfaces unwritable cursor or state-file errors and flips top-level `status` to `"degraded"` (HTTP `503`) until a subsequent flush succeeds.

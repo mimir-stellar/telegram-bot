@@ -72,6 +72,7 @@ is the machine-readable signal; the JSON body adds detail.
 | Poller running but paused by operator | `"ok"` | `true` | 200 |
 | Poller draining (graceful shutdown) | `"ok"` | `true` | 200 |
 | Too many consecutive failures, stale, stale/stalled cursor | `"degraded"` | `false` | 503 |
+| Unwritable cursor or state-file persistence failure (even while RPC polling succeeds) | `"degraded"` | `false` | 503 |
 | Poller not running | `"stopped"` | `false` | 503 |
 
 **Response body fields**
@@ -117,6 +118,18 @@ is the machine-readable signal; the JSON body adds detail.
     "lastRestartGap": null,            // { at, source, cursorLedger, oldestLedger, missedLedgers } or null
     "pendingFlush": false,
     "lastFlushAt": "2026-10-19T09:59:55.000Z",
+    "lastFlushAgeMs": 5000,            // checkedAt - lastFlushAt; null before first flush
+    "rpcStatus": "ok",                 // "ok" | "degraded" | "stopped" (RPC health only)
+    "persistence": {
+      "status": "ok",                  // "ok" | "degraded" (state-file health, independent of RPC)
+      "cursorWritable": true,          // false when cursor flush or volume probe failed
+      "pendingFlush": false,
+      "lastFlushAt": "2026-10-19T09:59:55.000Z",
+      "lastFlushAgeMs": 5000,
+      "consecutiveFlushFailures": 0,
+      "lastFlushError": null,          // { at: ISO8601, message: string } or null
+      "stateFileError": null           // { at: ISO8601, message: string } or null
+    },
     "targets": [
       {
         "source": "market",

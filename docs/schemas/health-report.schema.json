@@ -50,6 +50,9 @@
         "lastRestartGap",
         "pendingFlush",
         "lastFlushAt",
+        "lastFlushAgeMs",
+        "rpcStatus",
+        "persistence",
         "targets",
         "persistentVolumeAvailable",
         "persistentVolumeError"
@@ -148,6 +151,77 @@
         },
         "pendingFlush": { "type": "boolean", "description": "In-memory cursor state that is not on disk yet." },
         "lastFlushAt": { "type": ["string", "null"], "format": "date-time" },
+        "lastFlushAgeMs": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Age in milliseconds of the last successful cursor flush, or null before the first flush."
+        },
+        "rpcStatus": {
+          "enum": ["ok", "degraded", "stopped"],
+          "description": "RPC polling health evaluated independently of on-disk state-file persistence."
+        },
+        "persistence": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "State-file persistence health reported separately from RPC polling health.",
+          "required": [
+            "status",
+            "cursorWritable",
+            "pendingFlush",
+            "lastFlushAt",
+            "lastFlushAgeMs",
+            "consecutiveFlushFailures",
+            "lastFlushError",
+            "stateFileError"
+          ],
+          "properties": {
+            "status": {
+              "enum": ["ok", "degraded"],
+              "description": "Degraded when cursor or state-file writes are failing, even while RPC polling continues."
+            },
+            "cursorWritable": {
+              "type": "boolean",
+              "description": "False when the persistent volume probe failed or the latest cursor flush failed."
+            },
+            "pendingFlush": {
+              "type": "boolean",
+              "description": "True when in-memory cursor state is newer than the persisted file."
+            },
+            "lastFlushAt": {
+              "type": ["string", "null"],
+              "format": "date-time",
+              "description": "Timestamp of the most recent successful cursor flush."
+            },
+            "lastFlushAgeMs": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "description": "Age in milliseconds of the most recent successful cursor flush, or null before the first flush."
+            },
+            "consecutiveFlushFailures": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Consecutive failed attempts to persist the cursor file."
+            },
+            "lastFlushError": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "required": ["at", "message"],
+              "properties": {
+                "at": { "type": "string", "format": "date-time" },
+                "message": { "type": "string", "description": "Redacted cursor-file write error." }
+              }
+            },
+            "stateFileError": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "required": ["at", "message"],
+              "properties": {
+                "at": { "type": "string", "format": "date-time" },
+                "message": { "type": "string", "description": "Redacted status or counters file write error." }
+              }
+            }
+          }
+        },
         "targets": {
           "type": "array",
           "items": {

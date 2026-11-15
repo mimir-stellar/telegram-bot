@@ -122,6 +122,25 @@ export interface HealthReport {
      */
     pendingFlush: boolean;
     lastFlushAt: string | null;
+    /** Age in ms of the most recent successful cursor flush, or `null` before the first flush. */
+    lastFlushAgeMs: number | null;
+    /** RPC polling health reported independently of on-disk state persistence. */
+    rpcStatus: "ok" | "degraded" | "stopped";
+    /**
+     * On-disk cursor and state-file persistence health, tracked independently of
+     * RPC reachability so an unwritable cursor is surfaced even while in-memory
+     * polling continues.
+     */
+    persistence: {
+      status: "ok" | "degraded";
+      cursorWritable: boolean;
+      pendingFlush: boolean;
+      lastFlushAt: string | null;
+      lastFlushAgeMs: number | null;
+      consecutiveFlushFailures: number;
+      lastFlushError: { at: string; message: string } | null;
+      stateFileError: { at: string; message: string } | null;
+    };
     targets: Array<{
       source: string;
       version: string;
@@ -258,17 +277,45 @@ export function buildHealthReport(
       ? poller.chainClockAt
       : null;
 
-  let status: HealthReport["status"];
+  const lastFlushMs =
+    typeof poller.lastFlushAt === "number" && Number.isFinite(poller.lastFlushAt)
+      ? poller.lastFlushAt
+      : null;
+  const lastFlushAgeMs = lastFlushMs === null ? null : Math.max(0, nowMs - lastFlushMs);
+  const volumeAvailable = poller.persistentVolumeAvailable ?? true;
+  const redactedVolumeError =
+    typeof poller.persistentVolumeError === "string" && poller.persistentVolumeError.length > 0
+      ? redactText(poller.persistentVolumeError)
+      : null;
+  const consecutiveFlushFailures = Math.max(0, poller.cursorPersistFailures ?? 0);
+  const lastFlushError = poller.cursorPersistError
+    ? {
+        at: new Date(poller.cursorPersistError.at).toISOString(),
+        message: redactText(poller.cursorPersistError.message),
+      }
+    : !volumeAvailable && redactedVolumeError !== null
+      ? {
+          at: new Date(poller.startedAt > 0 ? poller.startedAt : nowMs).toISOString(),
+          message: redactedVolumeError,
+        }
+      : null;
+  const rawStateError = poller.statusPersistError ?? poller.countersPersistError ?? null;
+  const stateFileError = rawStateError
+    ? {
+        at: new Date(rawStateError.at).toISOString(),
+        message: redactText(rawStateError.message),
+      }
+    : null;
+  const cursorWritable =
+    volumeAvailable && consecutiveFlushFailures === 0 && poller.cursorPersistError == null;
+  const persistenceStatus: "ok" | "degraded" =
+    !cursorWritable || stateFileError !== null ? "degraded" : "ok";
+
+  let rpcStatus: "ok" | "degraded" | "stopped";
   if (!poller.running) {
-    status = "stopped";
-  } else if (poller.stopping === true) {
-    // A deliberate drain is doing exactly what it was asked to do. It is not a
-    // stale or failing poller, and `poller.stopping` is how clients tell the
-    // difference from an operator pause.
-    status = "ok";
-  } else if (poller.paused) {
-    // A deliberate operator pause is healthy, not a stale or failing poller.
-    status = "ok";
+    rpcStatus = "stopped";
+  } else if (poller.stopping === true || poller.paused) {
+    rpcStatus = "ok";
   } else {
     const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
     const tooManyFailures = poller.consecutiveFailures >= failureBudget;
@@ -281,7 +328,19 @@ export function buildHealthReport(
       hasEverSucceeded &&
       config.healthStaleMs > 0 &&
       nowMs - (poller.lastSuccessAt as number) > config.healthStaleMs;
-    status = tooManyFailures || stale || hasStaleCursor || hasStalledCursor ? "degraded" : "ok";
+    rpcStatus = tooManyFailures || stale || hasStaleCursor || hasStalledCursor ? "degraded" : "ok";
+  }
+
+  let status: HealthReport["status"];
+  if (!poller.running) {
+    status = "stopped";
+  } else if (poller.stopping === true) {
+    // A deliberate drain is doing exactly what it was asked to do. It is not a
+    // stale or failing poller, and `poller.stopping` is how clients tell the
+    // difference from an operator pause.
+    status = persistenceStatus === "degraded" ? "degraded" : "ok";
+  } else {
+    status = rpcStatus === "degraded" || persistenceStatus === "degraded" ? "degraded" : "ok";
   }
 
   return {
@@ -337,7 +396,19 @@ export function buildHealthReport(
           }
         : null,
       pendingFlush: poller.pendingFlush === true,
-      lastFlushAt: iso(poller.lastFlushAt ?? null),
+      lastFlushAt: iso(lastFlushMs),
+      lastFlushAgeMs,
+      rpcStatus,
+      persistence: {
+        status: persistenceStatus,
+        cursorWritable,
+        pendingFlush: poller.pendingFlush === true,
+        lastFlushAt: iso(lastFlushMs),
+        lastFlushAgeMs,
+        consecutiveFlushFailures,
+        lastFlushError,
+        stateFileError,
+      },
       targets: poller.targets.map((t) => ({
         source: t.source,
         version: t.version ?? "v1",
@@ -355,8 +426,8 @@ export function buildHealthReport(
         cyclesWithoutAdvance: t.cyclesWithoutAdvance,
         hasError: t.lastError !== null,
       })),
-      persistentVolumeAvailable: poller.persistentVolumeAvailable ?? true,
-      persistentVolumeError: poller.persistentVolumeError ?? null,
+      persistentVolumeAvailable: volumeAvailable,
+      persistentVolumeError: redactedVolumeError,
     },
     config: provenance,
   };
