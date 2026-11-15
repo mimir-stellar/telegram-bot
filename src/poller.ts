@@ -53,7 +53,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, mkdir, readFile, rename, writeFile, unlink } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rename, stat, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
@@ -1019,6 +1019,755 @@ export function buildCursorFile(
       ]),
     ),
   };
+}
+
+export type CursorConsistencySeverity = "gap" | "contradiction";
+
+export type CursorConsistencyIssueCode =
+  | "empty_archive"
+  | "malformed_archive_line"
+  | "multiple_archive_contracts"
+  | "contract_mismatch"
+  | "missing_cursor_target"
+  | "missing_archive_target"
+  | "archive_window_gap"
+  | "opaque_cursor_unverifiable"
+  | "cursor_behind_last_event_ledger"
+  | "uninitialized_cursor_with_archive_events"
+  | "cursor_behind_archive"
+  | "missing_last_event_ledger"
+  | "cursor_contradicts_empty_archive_window"
+  | "last_event_missing_in_archive_span"
+  | "archive_behind_cursor"
+  | "rewind_gap_after_archive";
+
+export interface CursorConsistencyIssue {
+  severity: CursorConsistencySeverity;
+  code: CursorConsistencyIssueCode;
+  target: string | null;
+  message: string;
+  fromLedger?: number | null;
+  toLedger?: number | null;
+}
+
+export interface CursorTargetConsistency {
+  target: string;
+  inCursor: boolean;
+  inArchive: boolean;
+  expectedContractId: string | null;
+  archiveContractIds: string[];
+  cursorLedger: number | null;
+  cursorOpaque: boolean;
+  lastEventLedger: number | null;
+  rewindFromLedger: number | null;
+  archiveEventCount: number;
+  archiveMinLedger: number | null;
+  archiveMaxLedger: number | null;
+  archiveWindowStart: number | null;
+  archiveWindowEnd: number | null;
+  status: "consistent" | "gap" | "contradiction";
+}
+
+export interface CursorArchiveConsistencyReport {
+  consistent: boolean;
+  cursorSchemaSource: CursorSchemaSource;
+  archiveFilesScanned: number;
+  archiveEventsScanned: number;
+  malformedArchiveLines: number;
+  targets: CursorTargetConsistency[];
+  gaps: CursorConsistencyIssue[];
+  contradictions: CursorConsistencyIssue[];
+  issues: CursorConsistencyIssue[];
+}
+
+export interface ArchiveScanWindow {
+  from: number;
+  to: number;
+  eventCount: number;
+}
+
+export interface ArchiveTargetObservation {
+  target: string;
+  contractIds: string[];
+  eventCount: number;
+  minEventLedger: number | null;
+  maxEventLedger: number | null;
+  observedEventLedgers?: Iterable<number>;
+  hasCompleteEventList?: boolean;
+  windows?: ArchiveScanWindow[];
+}
+
+export interface CheckCursorArchiveOptions {
+  cursorFile: string;
+  archivePath: string;
+  /** Optional expected contract IDs keyed by target (`market`, `squad`, etc.). */
+  expectedContracts?: Partial<Record<string, string>>;
+}
+
+interface MutableArchiveObservation {
+  target: string;
+  contractIds: Set<string>;
+  eventCount: number;
+  minEventLedger: number | null;
+  maxEventLedger: number | null;
+  observedEventLedgers: Set<number>;
+  hasCompleteEventList: boolean;
+  windows: ArchiveScanWindow[];
+}
+
+function getOrCreateObservation(
+  map: Map<string, MutableArchiveObservation>,
+  target: string,
+): MutableArchiveObservation {
+  let existing = map.get(target);
+  if (!existing) {
+    existing = {
+      target,
+      contractIds: new Set<string>(),
+      eventCount: 0,
+      minEventLedger: null,
+      maxEventLedger: null,
+      observedEventLedgers: new Set<number>(),
+      hasCompleteEventList: true,
+      windows: [],
+    };
+    map.set(target, existing);
+  }
+  return existing;
+}
+
+function recordObservedLedger(obs: MutableArchiveObservation, ledger: number): void {
+  obs.observedEventLedgers.add(ledger);
+  obs.minEventLedger = obs.minEventLedger === null ? ledger : Math.min(obs.minEventLedger, ledger);
+  obs.maxEventLedger = obs.maxEventLedger === null ? ledger : Math.max(obs.maxEventLedger, ledger);
+}
+
+/**
+ * Pure read-only consistency comparison between a parsed cursor document and
+ * observations collected from scan archives. Never mutates `cursorFile`.
+ */
+export function compareCursorWithArchive(
+  cursorFile: CursorFile,
+  observations: Iterable<ArchiveTargetObservation>,
+  options: {
+    expectedContracts?: Partial<Record<string, string>>;
+    cursorSchemaSource?: CursorSchemaSource;
+    archiveFilesScanned?: number;
+    archiveEventsScanned?: number;
+    malformedArchiveLines?: number;
+    hasTargetManifest?: boolean;
+    initialIssues?: CursorConsistencyIssue[];
+  } = {},
+): CursorArchiveConsistencyReport {
+  const issues: CursorConsistencyIssue[] = [...(options.initialIssues ?? [])];
+  const expectedContracts = options.expectedContracts ?? {};
+  const archiveFilesScanned = options.archiveFilesScanned ?? 1;
+  const hasTargetManifest = options.hasTargetManifest ?? false;
+
+  const obsMap = new Map<string, MutableArchiveObservation>();
+  let computedEvents = 0;
+  for (const item of observations) {
+    const obs = getOrCreateObservation(obsMap, item.target);
+    for (const id of item.contractIds) {
+      if (typeof id === "string" && id.trim().length > 0) obs.contractIds.add(id.trim());
+    }
+    obs.eventCount += item.eventCount;
+    computedEvents += item.eventCount;
+    if (item.minEventLedger !== null) {
+      obs.minEventLedger =
+        obs.minEventLedger === null
+          ? item.minEventLedger
+          : Math.min(obs.minEventLedger, item.minEventLedger);
+    }
+    if (item.maxEventLedger !== null) {
+      obs.maxEventLedger =
+        obs.maxEventLedger === null
+          ? item.maxEventLedger
+          : Math.max(obs.maxEventLedger, item.maxEventLedger);
+    }
+    if (item.observedEventLedgers) {
+      for (const l of item.observedEventLedgers) obs.observedEventLedgers.add(l);
+    }
+    if (item.hasCompleteEventList === false) {
+      obs.hasCompleteEventList = false;
+    }
+    if (item.windows) {
+      obs.windows.push(...item.windows);
+    }
+  }
+
+  const allTargets = new Set<string>([
+    ...Object.keys(cursorFile.targets),
+    ...obsMap.keys(),
+  ]);
+  const sortedTargetNames = [...allTargets].sort((a, b) => a.localeCompare(b));
+
+  const anyCursorProgress = Object.values(cursorFile.targets).some(
+    (entry) =>
+      entry.cursor !== null ||
+      entry.lastEventLedger !== null ||
+      (entry.rewindFromLedger !== undefined && entry.rewindFromLedger !== null),
+  );
+  if (archiveFilesScanned === 0 && anyCursorProgress) {
+    issues.push({
+      severity: "gap",
+      code: "empty_archive",
+      target: null,
+      message: "scan archive contains no archive files while cursor file holds resumed progress",
+    });
+  }
+
+  const targetReports: CursorTargetConsistency[] = [];
+
+  for (const targetName of sortedTargetNames) {
+    const cursorEntry = cursorFile.targets[targetName];
+    const obs = obsMap.get(targetName);
+    const expectedRaw = expectedContracts[targetName];
+    const expectedContractId =
+      typeof expectedRaw === "string" && expectedRaw.trim().length > 0 ? expectedRaw.trim() : null;
+    const archiveContractIds = obs ? [...obs.contractIds].sort() : [];
+
+    const cursorLedger =
+      cursorEntry && cursorEntry.cursor !== null ? eventCursorLedger(cursorEntry.cursor) : null;
+    const cursorOpaque = Boolean(cursorEntry && cursorEntry.cursor !== null && cursorLedger === null);
+    const lastEventLedger = cursorEntry ? cursorEntry.lastEventLedger : null;
+    const rewindFromLedger = cursorEntry ? (cursorEntry.rewindFromLedger ?? null) : null;
+
+    let archiveWindowStart: number | null = obs?.minEventLedger ?? null;
+    let archiveWindowEnd: number | null = obs?.maxEventLedger ?? null;
+    if (obs && obs.windows.length > 0) {
+      for (const w of obs.windows) {
+        archiveWindowStart =
+          archiveWindowStart === null ? w.from : Math.min(archiveWindowStart, w.from);
+        archiveWindowEnd = archiveWindowEnd === null ? w.to : Math.max(archiveWindowEnd, w.to);
+      }
+    }
+
+    const beforeIssueCount = issues.length;
+
+    // 1. Target identity checks
+    if (archiveContractIds.length > 1) {
+      issues.push({
+        severity: "contradiction",
+        code: "multiple_archive_contracts",
+        target: targetName,
+        message: `scan archive records multiple contract IDs for ${targetName}: ${archiveContractIds.join(", ")}`,
+      });
+    }
+
+    if (expectedContractId !== null && archiveContractIds.length > 0) {
+      const mismatched = archiveContractIds.filter((id) => id !== expectedContractId);
+      if (mismatched.length > 0) {
+        issues.push({
+          severity: "contradiction",
+          code: "contract_mismatch",
+          target: targetName,
+          message:
+            `scan archive contract ID (${mismatched.join(", ")}) for ${targetName} ` +
+            `does not match expected contract ID (${expectedContractId})`,
+        });
+      }
+    } else if (/^C[A-Z2-7]{55}$/.test(targetName) && archiveContractIds.length > 0) {
+      if (!archiveContractIds.includes(targetName)) {
+        issues.push({
+          severity: "contradiction",
+          code: "contract_mismatch",
+          target: targetName,
+          message:
+            `scan archive contract ID (${archiveContractIds.join(", ")}) ` +
+            `does not match cursor target contract key (${targetName})`,
+        });
+      }
+    }
+
+    if (!cursorEntry && obs) {
+      issues.push({
+        severity: "gap",
+        code: "missing_cursor_target",
+        target: targetName,
+        fromLedger: archiveWindowStart,
+        toLedger: archiveWindowEnd,
+        message: `target ${targetName} appears in scan archive (${obs.eventCount} event(s)) but is missing from cursor file`,
+      });
+    }
+
+    if (cursorEntry && !obs && archiveFilesScanned > 0) {
+      if (lastEventLedger !== null || (hasTargetManifest && cursorEntry.cursor !== null)) {
+        issues.push({
+          severity: "gap",
+          code: "missing_archive_target",
+          target: targetName,
+          fromLedger: lastEventLedger ?? cursorLedger,
+          toLedger: lastEventLedger ?? cursorLedger,
+          message: `target ${targetName} has persisted cursor state but is absent from scan archive`,
+        });
+      }
+    }
+
+    // 2. Archive scan-window continuity check
+    if (obs && obs.windows.length > 1) {
+      const sortedWindows = [...obs.windows].sort((a, b) => a.from - b.from || a.to - b.to);
+      let currentEnd = sortedWindows[0]!.to;
+      for (let i = 1; i < sortedWindows.length; i += 1) {
+        const next = sortedWindows[i]!;
+        if (next.from > currentEnd + 1) {
+          issues.push({
+            severity: "gap",
+            code: "archive_window_gap",
+            target: targetName,
+            fromLedger: currentEnd + 1,
+            toLedger: next.from - 1,
+            message:
+              `scan archive for ${targetName} has an unarchived ledger gap ` +
+              `from ${currentEnd + 1} to ${next.from - 1}`,
+          });
+        }
+        currentEnd = Math.max(currentEnd, next.to);
+      }
+    }
+
+    // 3. Cursor vs archive ledger range checks
+    if (cursorEntry) {
+      if (cursorLedger !== null && lastEventLedger !== null && cursorLedger < lastEventLedger) {
+        issues.push({
+          severity: "contradiction",
+          code: "cursor_behind_last_event_ledger",
+          target: targetName,
+          fromLedger: cursorLedger,
+          toLedger: lastEventLedger,
+          message:
+            `cursor ledger (${cursorLedger}) for ${targetName} sits behind ` +
+            `its own lastEventLedger (${lastEventLedger})`,
+        });
+      }
+
+      if (cursorOpaque && lastEventLedger === null) {
+        issues.push({
+          severity: "gap",
+          code: "opaque_cursor_unverifiable",
+          target: targetName,
+          message:
+            `cursor for ${targetName} uses an opaque token with no lastEventLedger; ` +
+            `ledger range cannot be verified without guessing`,
+        });
+      }
+
+      if (obs) {
+        const archiveMin = obs.minEventLedger;
+        const archiveMax = obs.maxEventLedger;
+
+        if (
+          cursorEntry.cursor === null &&
+          lastEventLedger === null &&
+          rewindFromLedger === null &&
+          obs.eventCount > 0
+        ) {
+          issues.push({
+            severity: "contradiction",
+            code: "uninitialized_cursor_with_archive_events",
+            target: targetName,
+            fromLedger: archiveMin,
+            toLedger: archiveMax,
+            message:
+              `cursor for ${targetName} is null/cold while scan archive recorded ` +
+              `${obs.eventCount} event(s) through ledger ${archiveMax ?? "unknown"}`,
+          });
+        } else if (archiveMax !== null) {
+          if (lastEventLedger !== null && lastEventLedger < archiveMax) {
+            issues.push({
+              severity: "contradiction",
+              code: "cursor_behind_archive",
+              target: targetName,
+              fromLedger: lastEventLedger,
+              toLedger: archiveMax,
+              message:
+                `cursor lastEventLedger (${lastEventLedger}) for ${targetName} lags behind ` +
+                `archived events up to ledger ${archiveMax}`,
+            });
+          } else if (cursorLedger !== null && cursorLedger < archiveMax) {
+            issues.push({
+              severity: "contradiction",
+              code: "cursor_behind_archive",
+              target: targetName,
+              fromLedger: cursorLedger,
+              toLedger: archiveMax,
+              message:
+                `cursor ledger (${cursorLedger}) for ${targetName} lags behind ` +
+                `archived events up to ledger ${archiveMax}`,
+            });
+          } else if (lastEventLedger === null && cursorLedger !== null && obs.eventCount > 0) {
+            issues.push({
+              severity: "contradiction",
+              code: "missing_last_event_ledger",
+              target: targetName,
+              fromLedger: archiveMin,
+              toLedger: archiveMax,
+              message:
+                `cursor for ${targetName} advanced to ledger ${cursorLedger} with lastEventLedger=null, ` +
+                `contradicting ${obs.eventCount} archived event(s) up to ledger ${archiveMax}`,
+            });
+          }
+        }
+
+        if (lastEventLedger !== null) {
+          const emptyCoveringWindow = obs.windows.find(
+            (w) => w.eventCount === 0 && w.from <= lastEventLedger && lastEventLedger <= w.to,
+          );
+          if (emptyCoveringWindow) {
+            issues.push({
+              severity: "contradiction",
+              code: "cursor_contradicts_empty_archive_window",
+              target: targetName,
+              fromLedger: lastEventLedger,
+              toLedger: lastEventLedger,
+              message:
+                `cursor claims lastEventLedger=${lastEventLedger} for ${targetName}, ` +
+                `but scan archive window ${emptyCoveringWindow.from}..${emptyCoveringWindow.to} observed 0 events`,
+            });
+          } else if (
+            obs.hasCompleteEventList &&
+            archiveMin !== null &&
+            archiveMax !== null &&
+            archiveMin <= lastEventLedger &&
+            lastEventLedger <= archiveMax &&
+            !obs.observedEventLedgers.has(lastEventLedger)
+          ) {
+            issues.push({
+              severity: "contradiction",
+              code: "last_event_missing_in_archive_span",
+              target: targetName,
+              fromLedger: lastEventLedger,
+              toLedger: lastEventLedger,
+              message:
+                `cursor claims lastEventLedger=${lastEventLedger} for ${targetName}, ` +
+                `but no archived event exists at ledger ${lastEventLedger} within span ${archiveMin}..${archiveMax}`,
+            });
+          }
+        }
+
+        if (archiveWindowEnd !== null) {
+          if (lastEventLedger !== null && lastEventLedger > archiveWindowEnd) {
+            issues.push({
+              severity: "gap",
+              code: "archive_behind_cursor",
+              target: targetName,
+              fromLedger: archiveWindowEnd + 1,
+              toLedger: lastEventLedger,
+              message:
+                `scan archive for ${targetName} ends at ledger ${archiveWindowEnd}, ` +
+                `leaving ledgers ${archiveWindowEnd + 1}..${lastEventLedger} unarchived before cursor lastEventLedger`,
+            });
+          } else if (
+            obs.windows.length > 0 &&
+            cursorLedger !== null &&
+            cursorLedger > archiveWindowEnd
+          ) {
+            issues.push({
+              severity: "gap",
+              code: "archive_behind_cursor",
+              target: targetName,
+              fromLedger: archiveWindowEnd + 1,
+              toLedger: cursorLedger,
+              message:
+                `scan archive window for ${targetName} ends at ledger ${archiveWindowEnd}, ` +
+                `leaving ledgers ${archiveWindowEnd + 1}..${cursorLedger} unarchived before cursor position`,
+            });
+          }
+
+          if (rewindFromLedger !== null && rewindFromLedger > archiveWindowEnd + 1) {
+            issues.push({
+              severity: "gap",
+              code: "rewind_gap_after_archive",
+              target: targetName,
+              fromLedger: archiveWindowEnd + 1,
+              toLedger: rewindFromLedger - 1,
+              message:
+                `pending floor rewind (${rewindFromLedger}) for ${targetName} leaves unarchived gap ` +
+                `${archiveWindowEnd + 1}..${rewindFromLedger - 1} after archive end ${archiveWindowEnd}`,
+            });
+          }
+        }
+      }
+    }
+
+    const targetIssues = issues.slice(beforeIssueCount);
+    const hasContradiction = targetIssues.some((i) => i.severity === "contradiction");
+    const hasGap = targetIssues.some((i) => i.severity === "gap");
+
+    targetReports.push({
+      target: targetName,
+      inCursor: Boolean(cursorEntry),
+      inArchive: Boolean(obs),
+      expectedContractId,
+      archiveContractIds,
+      cursorLedger,
+      cursorOpaque,
+      lastEventLedger,
+      rewindFromLedger,
+      archiveEventCount: obs?.eventCount ?? 0,
+      archiveMinLedger: obs?.minEventLedger ?? null,
+      archiveMaxLedger: obs?.maxEventLedger ?? null,
+      archiveWindowStart,
+      archiveWindowEnd,
+      status: hasContradiction ? "contradiction" : hasGap ? "gap" : "consistent",
+    });
+  }
+
+  const gaps = issues.filter((i) => i.severity === "gap");
+  const contradictions = issues.filter((i) => i.severity === "contradiction");
+
+  return {
+    consistent: issues.length === 0,
+    cursorSchemaSource: options.cursorSchemaSource ?? "v1",
+    archiveFilesScanned,
+    archiveEventsScanned: options.archiveEventsScanned ?? computedEvents,
+    malformedArchiveLines: options.malformedArchiveLines ?? 0,
+    targets: targetReports,
+    gaps,
+    contradictions,
+    issues,
+  };
+}
+
+function parseScanArchiveContent(
+  content: string,
+  fileLabel: string,
+  obsMap: Map<string, MutableArchiveObservation>,
+  issues: CursorConsistencyIssue[],
+): { eventsScanned: number; malformedLines: number; hasTargetManifest: boolean } {
+  const trimmedWhole = content.trim();
+  if (trimmedWhole.length === 0) {
+    return { eventsScanned: 0, malformedLines: 0, hasTargetManifest: false };
+  }
+
+  // Check for `mimir-scan-v1` JSON report first when document starts with `{`
+  if (trimmedWhole.startsWith("{")) {
+    try {
+      const whole = JSON.parse(trimmedWhole) as unknown;
+      if (isPlainObject(whole) && whole.format === "mimir-scan-v1" && Array.isArray(whole.targets)) {
+        const ledgersObj = isPlainObject(whole.ledgers) ? whole.ledgers : {};
+        const oldest =
+          typeof ledgersObj.oldest === "number" && Number.isSafeInteger(ledgersObj.oldest)
+            ? ledgersObj.oldest
+            : null;
+        const latest =
+          typeof ledgersObj.latest === "number" && Number.isSafeInteger(ledgersObj.latest)
+            ? ledgersObj.latest
+            : null;
+        let eventsScanned = 0;
+        for (const rawTarget of whole.targets) {
+          if (!isPlainObject(rawTarget) || typeof rawTarget.source !== "string") continue;
+          const obs = getOrCreateObservation(obsMap, rawTarget.source);
+          if (typeof rawTarget.contractId === "string" && rawTarget.contractId.trim().length > 0) {
+            obs.contractIds.add(rawTarget.contractId.trim());
+          }
+          const eventsArr = Array.isArray(rawTarget.events) ? rawTarget.events : [];
+          const count =
+            typeof rawTarget.eventCount === "number" &&
+            Number.isSafeInteger(rawTarget.eventCount) &&
+            rawTarget.eventCount >= 0
+              ? rawTarget.eventCount
+              : eventsArr.length;
+          obs.eventCount += count;
+          eventsScanned += count;
+          if (eventsArr.length < count) {
+            obs.hasCompleteEventList = false;
+          }
+          for (const ev of eventsArr) {
+            if (
+              isPlainObject(ev) &&
+              typeof ev.ledger === "number" &&
+              Number.isSafeInteger(ev.ledger) &&
+              ev.ledger > 0
+            ) {
+              recordObservedLedger(obs, ev.ledger);
+            }
+          }
+          if (
+            typeof rawTarget.lastEventLedger === "number" &&
+            Number.isSafeInteger(rawTarget.lastEventLedger) &&
+            rawTarget.lastEventLedger > 0
+          ) {
+            recordObservedLedger(obs, rawTarget.lastEventLedger);
+          }
+          const startLedger =
+            typeof rawTarget.startLedger === "number" &&
+            Number.isSafeInteger(rawTarget.startLedger) &&
+            rawTarget.startLedger > 0
+              ? rawTarget.startLedger
+              : oldest;
+          const targetCursorLedger =
+            typeof rawTarget.cursor === "string" ? eventCursorLedger(rawTarget.cursor) : null;
+          const endLedger = targetCursorLedger ?? latest;
+          if (
+            rawTarget.truncated !== true &&
+            startLedger !== null &&
+            endLedger !== null &&
+            startLedger <= endLedger
+          ) {
+            obs.windows.push({ from: startLedger, to: endLedger, eventCount: count });
+          }
+        }
+        return { eventsScanned, malformedLines: 0, hasTargetManifest: true };
+      }
+    } catch {
+      // Not a single JSON object (e.g. multi-line NDJSON); parse line-by-line below.
+    }
+  }
+
+  let eventsScanned = 0;
+  let malformedLines = 0;
+  const lines = content.split(/\r?\n/);
+
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const line = lines[idx]!.trim();
+    if (line.length === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      malformedLines += 1;
+      issues.push({
+        severity: "contradiction",
+        code: "malformed_archive_line",
+        target: null,
+        message: `malformed JSON at ${fileLabel}:${idx + 1}`,
+      });
+      continue;
+    }
+
+    if (!isPlainObject(parsed)) {
+      malformedLines += 1;
+      issues.push({
+        severity: "contradiction",
+        code: "malformed_archive_line",
+        target: null,
+        message: `non-object archive entry at ${fileLabel}:${idx + 1}`,
+      });
+      continue;
+    }
+
+    // `formatScanJsonl` appends a trailing `{ type: "summary", ... }` record.
+    if (parsed.type === "summary") continue;
+
+    if (
+      typeof parsed.source !== "string" ||
+      parsed.source.trim().length === 0 ||
+      typeof parsed.ledger !== "number" ||
+      !Number.isSafeInteger(parsed.ledger) ||
+      parsed.ledger <= 0
+    ) {
+      malformedLines += 1;
+      issues.push({
+        severity: "contradiction",
+        code: "malformed_archive_line",
+        target: null,
+        message: `archive event missing valid source or ledger at ${fileLabel}:${idx + 1}`,
+      });
+      continue;
+    }
+
+    const obs = getOrCreateObservation(obsMap, parsed.source.trim());
+    if (typeof parsed.contractId === "string" && parsed.contractId.trim().length > 0) {
+      obs.contractIds.add(parsed.contractId.trim());
+    }
+    obs.eventCount += 1;
+    eventsScanned += 1;
+    recordObservedLedger(obs, parsed.ledger);
+  }
+
+  return { eventsScanned, malformedLines, hasTargetManifest: false };
+}
+
+const NON_ARCHIVE_STATE_FILENAMES = new Set([
+  "cursor.json",
+  "counters.json",
+  "status.json",
+  "dead-letter.json",
+  "audit.jsonl",
+  "poller.lock",
+]);
+
+/**
+ * Read-only consistency check comparing a persisted cursor file against a scan
+ * archive directory (`events-*.jsonl` / `*.jsonl` / `mimir-scan-v1` JSON) or a
+ * single scan archive file. Never modifies or locks the cursor file.
+ */
+export async function checkCursorArchiveConsistency(
+  options: CheckCursorArchiveOptions,
+): Promise<CursorArchiveConsistencyReport> {
+  const rawCursor = await readFile(options.cursorFile, "utf8");
+  const migrated = parseAndMigrateCursorFile(rawCursor);
+
+  let archiveStat: Awaited<ReturnType<typeof stat>>;
+  try {
+    archiveStat = await stat(options.archivePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+      throw new Error(`scan archive path does not exist: ${options.archivePath}`);
+    }
+    throw err;
+  }
+
+  const archiveFiles: string[] = [];
+  if (archiveStat.isDirectory()) {
+    const entries = (await readdir(options.archivePath)).sort();
+    for (const entry of entries) {
+      if (NON_ARCHIVE_STATE_FILENAMES.has(entry)) continue;
+      if (entry.startsWith("cursor.json.")) continue;
+      if (entry.endsWith(".jsonl") || entry.endsWith(".json")) {
+        archiveFiles.push(path.join(options.archivePath, entry));
+      }
+    }
+  } else if (archiveStat.isFile()) {
+    archiveFiles.push(options.archivePath);
+  } else {
+    throw new Error(`scan archive path must be a file or directory: ${options.archivePath}`);
+  }
+
+  const obsMap = new Map<string, MutableArchiveObservation>();
+  const initialIssues: CursorConsistencyIssue[] = [];
+  let totalEventsScanned = 0;
+  let totalMalformedLines = 0;
+  let anyTargetManifest = false;
+
+  for (const filePath of archiveFiles) {
+    const content = await readFile(filePath, "utf8");
+    const parsed = parseScanArchiveContent(
+      content,
+      path.basename(filePath),
+      obsMap,
+      initialIssues,
+    );
+    totalEventsScanned += parsed.eventsScanned;
+    totalMalformedLines += parsed.malformedLines;
+    if (parsed.hasTargetManifest) anyTargetManifest = true;
+  }
+
+  return compareCursorWithArchive(
+    migrated.file,
+    [...obsMap.values()].map((obs) => ({
+      target: obs.target,
+      contractIds: [...obs.contractIds],
+      eventCount: obs.eventCount,
+      minEventLedger: obs.minEventLedger,
+      maxEventLedger: obs.maxEventLedger,
+      observedEventLedgers: obs.observedEventLedgers,
+      hasCompleteEventList: obs.hasCompleteEventList,
+      windows: obs.windows,
+    })),
+    {
+      ...(options.expectedContracts !== undefined
+        ? { expectedContracts: options.expectedContracts }
+        : {}),
+      cursorSchemaSource: migrated.source,
+      archiveFilesScanned: archiveFiles.length,
+      archiveEventsScanned: totalEventsScanned,
+      malformedArchiveLines: totalMalformedLines,
+      hasTargetManifest: anyTargetManifest,
+      initialIssues,
+    },
+  );
 }
 
 function isNonNegativeSafeInteger(value: unknown): value is number {

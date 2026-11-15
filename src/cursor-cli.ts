@@ -10,7 +10,14 @@ import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import {
+  checkCursorArchiveConsistency,
+  parseAndMigrateCursorFile,
+  type CheckCursorArchiveOptions,
+  type CursorArchiveConsistencyReport,
+} from "./poller.js";
+
+export type { CheckCursorArchiveOptions, CursorArchiveConsistencyReport };
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -20,6 +27,12 @@ export interface BackupCursorOptions {
 
 export interface RestoreCursorOptions extends BackupCursorOptions {
   lockFile: string;
+}
+
+export interface CheckCursorOptions {
+  cursorFile: string;
+  archivePath: string;
+  expectedContracts?: Partial<Record<string, string>>;
 }
 
 async function exists(filePath: string): Promise<boolean> {
@@ -97,15 +110,69 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
   }
 }
 
+/**
+ * Format a cursor-vs-archive consistency report for human operators without
+ * exposing raw cursor tokens or remote event payloads.
+ */
+export function formatCursorConsistencyReport(report: CursorArchiveConsistencyReport): string {
+  const lines: string[] = [];
+  const verdict = report.consistent ? "CONSISTENT" : "INCONSISTENT";
+  lines.push(
+    `[cursor] consistency=${verdict} files=${report.archiveFilesScanned} ` +
+      `events=${report.archiveEventsScanned} gaps=${report.gaps.length} ` +
+      `contradictions=${report.contradictions.length}`,
+  );
+  for (const target of report.targets) {
+    const cursorPos = target.cursorOpaque
+      ? "opaque"
+      : target.cursorLedger !== null
+        ? String(target.cursorLedger)
+        : "none";
+    const archiveRange =
+      target.archiveWindowStart !== null && target.archiveWindowEnd !== null
+        ? `${target.archiveWindowStart}..${target.archiveWindowEnd}`
+        : "none";
+    const contracts =
+      target.archiveContractIds.length > 0 ? target.archiveContractIds.join(",") : "none";
+    lines.push(
+      `  target=${target.target} status=${target.status} cursorLedger=${cursorPos} ` +
+        `lastEventLedger=${target.lastEventLedger ?? "none"} ` +
+        `archiveEvents=${target.archiveEventCount} archiveRange=${archiveRange} ` +
+        `archiveContracts=${contracts}`,
+    );
+  }
+  for (const issue of report.issues) {
+    const scope = issue.target ? ` target=${issue.target}` : "";
+    lines.push(`  [${issue.severity.toUpperCase()}] code=${issue.code}${scope}: ${issue.message}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Perform a strictly read-only cursor consistency check against scan archives.
+ * Never locks, writes, or advances the cursor file.
+ */
+export async function checkCursorConsistency(
+  options: CheckCursorOptions,
+): Promise<CursorArchiveConsistencyReport> {
+  const raw = await readFile(options.cursorFile, "utf8");
+  validateCursor(raw);
+  return checkCursorArchiveConsistency(options);
+}
+
 interface CliOptions {
   file?: string;
   out?: string;
   from?: string;
+  archive?: string;
+  marketContract?: string;
+  squadContract?: string;
   force: boolean;
+  json: boolean;
 }
 
 function parseOptions(args: string[]): CliOptions {
-  const options: CliOptions = { force: false };
+  const options: CliOptions = { force: false, json: false };
   const seen = new Set<string>();
 
   for (let index = 0; index < args.length; index += 1) {
@@ -116,14 +183,36 @@ function parseOptions(args: string[]): CliOptions {
       options.force = true;
       continue;
     }
-    if (arg !== "--file" && arg !== "--out" && arg !== "--from") {
+    if (arg === "--json") {
+      if (seen.has(arg)) throw new Error("duplicate --json option");
+      seen.add(arg);
+      options.json = true;
+      continue;
+    }
+    if (
+      arg !== "--file" &&
+      arg !== "--out" &&
+      arg !== "--from" &&
+      arg !== "--archive" &&
+      arg !== "--market-contract" &&
+      arg !== "--squad-contract"
+    ) {
       throw new Error(`unknown option: ${arg}`);
     }
     if (seen.has(arg)) throw new Error(`duplicate ${arg} option`);
     seen.add(arg);
     const value = args[index + 1];
-    if (value === undefined || value.startsWith("--")) throw new Error(`${arg} requires a path`);
-    options[arg.slice(2) as "file" | "out" | "from"] = value;
+    if (value === undefined || value.startsWith("--")) {
+      const noun = arg.endsWith("-contract") ? "a contract id" : "a path";
+      throw new Error(`${arg} requires ${noun}`);
+    }
+    if (arg === "--market-contract") {
+      options.marketContract = value;
+    } else if (arg === "--squad-contract") {
+      options.squadContract = value;
+    } else {
+      options[arg.slice(2) as "file" | "out" | "from" | "archive"] = value;
+    }
     index += 1;
   }
 
@@ -145,8 +234,10 @@ function assertDifferentPaths(left: string, right: string): void {
 async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
-  if (action !== "backup" && action !== "restore") {
-    throw new Error("usage: npm run cursor -- <backup|restore> [--file PATH] [--out PATH|--from PATH] [--force]");
+  if (action !== "backup" && action !== "restore" && action !== "check") {
+    throw new Error(
+      "usage: npm run cursor -- <backup|restore|check> [--file PATH] [--out PATH|--from PATH|--archive PATH] [--force] [--json]",
+    );
   }
 
   const options = parseOptions(args);
@@ -157,6 +248,35 @@ async function main(): Promise<void> {
     );
     assertDifferentPaths(cursorFile, backupFile);
     await backupCursor({ cursorFile, backupFile, force: options.force });
+    return;
+  }
+
+  if (action === "check") {
+    const archiveRaw = options.archive ?? process.env.EVENT_ARCHIVE_DIR;
+    if (!archiveRaw) throw new Error("check requires --archive PATH");
+    const archivePath = resolvePath(archiveRaw);
+    const expectedContracts: Partial<Record<string, string>> = {};
+    const marketContract = options.marketContract ?? process.env.MARKET_CONTRACT_ID;
+    const squadContract = options.squadContract ?? process.env.SQUAD_CONTRACT_ID;
+    if (marketContract && marketContract.trim().length > 0) {
+      expectedContracts.market = marketContract.trim();
+    }
+    if (squadContract && squadContract.trim().length > 0) {
+      expectedContracts.squad = squadContract.trim();
+    }
+    const report = await checkCursorConsistency({
+      cursorFile,
+      archivePath,
+      expectedContracts,
+    });
+    if (options.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log(formatCursorConsistencyReport(report));
+    }
+    if (!report.consistent) {
+      process.exitCode = 1;
+    }
     return;
   }
 

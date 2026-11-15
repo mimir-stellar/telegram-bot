@@ -31,6 +31,11 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Non-atomic `copyFile` immediately following atomic commit of primary cursor file.
 - **Recovery Role**: Acts as an offline recovery snapshot one generation older than the live cursor.
 
+### 2b. Read-Only Cursor Consistency Check (`npm run cursor -- check`)
+- **Reader Modules**: [`src/cursor-cli.ts`](../src/cursor-cli.ts) (`checkCursorConsistency`), [`src/poller.ts`](../src/poller.ts) (`checkCursorArchiveConsistency`, `compareCursorWithArchive`)
+- **Usage**: `npm run cursor -- check --archive <PATH> [--file PATH] [--market-contract ID] [--squad-contract ID] [--json]`
+- **Read-Only Guarantee**: Compares persisted target identities and observed ledger ranges against scan archives (`events-*.jsonl` directories, `--jsonl` files, or `mimir-scan-v1` JSON reports) and reports `gaps` and `contradictions` (exiting `1` on mismatch) without acquiring the poller lock, rewriting legacy files, or advancing any cursor.
+
 ### 3. Cursor Quarantine Copy
 - **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`quarantineCorruptCursorFile`)
 - **Default Path**: `${cursorFile}.corrupt.<YYYY-MM-DDTHH-mm-ss-sssZ>`
