@@ -13,19 +13,32 @@
  *   npm run replay -- --from 4226500 --mock        # local mock profile
  *   npm run replay -- --from 4226500 --progress-file progress.json # resumable
  *   npm run replay -- --from 4226500 --rpm 120     # rate-limited RPC budget
+ *   npm run replay -- --merge-chunks c1.jsonl c2.jsonl --output merged.jsonl
  *
  * Needs no Telegram credentials in dry-run mode (the default). Pass --send to
  * load a full bot config (BOT_TOKEN + TELEGRAM_CHAT_ID) and deliver events.
  *
  * Exit codes:
  *   0 — scan completed (even if some events were skipped or capped)
- *   1 — fatal runtime error (RPC failure, config error)
+ *   1 — fatal runtime error (RPC failure, config error, malformed/unsorted chunk)
  *   2 — usage error (bad flags)
  */
 
 import { pathToFileURL } from "node:url";
 
-import { runReplayCli } from "./stellar/replay.js";
+import {
+  ReplayChunkMergeError,
+  mergeReplayChunkFiles,
+  mergeReplayScanChunks,
+  runReplayCli,
+} from "./stellar/replay.js";
+
+export {
+  ReplayChunkMergeError,
+  mergeReplayChunkFiles,
+  mergeReplayScanChunks,
+  runReplayCli,
+};
 
 const invokedPath = process.argv[1];
 if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {

@@ -74,6 +74,33 @@ import {
   EVENT_MAX_PAGES,
   EVENT_PAGE_LIMIT,
 } from "./events.js";
+import {
+  MAX_CHUNK_LINE_BYTES,
+  MAX_JSON_CHUNK_FILE_BYTES,
+  MAX_MERGE_HISTOGRAM_KEYS,
+  ReplayChunkMergeError,
+  compareReplayChunkEvents,
+  mergeReplayChunkFiles,
+  mergeReplayScanChunks,
+  type ReplayChunkMergeErrorCode,
+  type ReplayChunkMergeOptions,
+  type ReplayChunkMergeResult,
+  type ReplayMergedSummaryLine,
+} from "./replay-merge.js";
+
+export {
+  MAX_CHUNK_LINE_BYTES,
+  MAX_JSON_CHUNK_FILE_BYTES,
+  MAX_MERGE_HISTOGRAM_KEYS,
+  ReplayChunkMergeError,
+  compareReplayChunkEvents,
+  mergeReplayChunkFiles,
+  mergeReplayScanChunks,
+  type ReplayChunkMergeErrorCode,
+  type ReplayChunkMergeOptions,
+  type ReplayChunkMergeResult,
+  type ReplayMergedSummaryLine,
+};
 
 // ── Replay report types ───────────────────────────────────────────────────────
 
@@ -266,6 +293,8 @@ export interface ReplayDeps {
   sleep?: ((ms: number) => Promise<void>) | undefined;
   /** Timestamp provider for deterministic rate-limit / delay tests. */
   now?: (() => number) | undefined;
+  /** Output stream for streaming JSONL / `--json` reports (defaults to `process.stdout`). */
+  stdout?: NodeJS.WritableStream | undefined;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -764,7 +793,11 @@ async function replayContract(
 export async function runReplayCli(opts: {
   argv?: string[];
   deps?: Partial<ReplayDeps>;
-} = {}): Promise<{ report: ReplayReport | null; exitCode: 0 | 1 | 2 }> {
+} = {}): Promise<{
+  report: ReplayReport | null;
+  mergeSummary?: ReplayChunkMergeResult | undefined;
+  exitCode: 0 | 1 | 2;
+}> {
   const argv = opts.argv ?? process.argv;
   const overrideDeps = opts.deps ?? {};
 
@@ -781,6 +814,28 @@ export async function runReplayCli(opts: {
     return argv.includes(`--${name}`);
   }
 
+  function collectChunkPaths(): { requested: boolean; paths: string[] } {
+    let requested = false;
+    const collected: string[] = [];
+    for (let i = 0; i < argv.length; i++) {
+      const arg = argv[i];
+      if (arg === "--merge-chunks" || arg === "--chunk") {
+        requested = true;
+        while (i + 1 < argv.length) {
+          const next = argv[i + 1];
+          if (!next || next.startsWith("--")) break;
+          i += 1;
+          for (const part of next.split(",")) {
+            const trimmed = part.trim();
+            if (trimmed !== "") collected.push(trimmed);
+          }
+          if (arg === "--chunk") break;
+        }
+      }
+    }
+    return { requested, paths: collected };
+  }
+
   const fromRaw = flag("from");
   const toRaw = flag("to");
   const contractFilter = flag("contract") as ContractSource | undefined;
@@ -791,14 +846,15 @@ export async function runReplayCli(opts: {
   const asJson = boolFlag("json");
   const progressFile = flag("progress-file");
   const rpmRaw = flag("rpm");
-  const progress = overrideDeps.progress ?? (asJson ? console.error.bind(console) : console.log.bind(console));
+  const outputPath = flag("output");
+  const dedupWindowRaw = flag("dedup-window");
+  const chunkArgs = collectChunkPaths();
+  const stdoutStream = overrideDeps.stdout ?? process.stdout;
+  const isStreamingStdout = asJson || (chunkArgs.requested && !outputPath);
+  const progress =
+    overrideDeps.progress ??
+    (isStreamingStdout ? console.error.bind(console) : console.log.bind(console));
   const safeErr = (err: unknown): string => safeErrorMessage(err, []);
-
-  if (!fromRaw) {
-    console.error("[replay] error: --from <ledger|cursor> is required");
-    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N]");
-    return { report: null, exitCode: 2 };
-  }
 
   // Validate --contract
   if (contractFilter && contractFilter !== "market" && contractFilter !== "squad") {
@@ -815,6 +871,69 @@ export async function runReplayCli(opts: {
       return { report: null, exitCode: 2 };
     }
     toLedger = n;
+  }
+
+  // Validate --dedup-window
+  let dedupWindow: number | undefined;
+  if (dedupWindowRaw !== undefined) {
+    const n = Number(dedupWindowRaw);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+      console.error(
+        `[replay] error: --dedup-window must be a non-negative integer, got "${dedupWindowRaw}"`,
+      );
+      return { report: null, exitCode: 2 };
+    }
+    dedupWindow = n;
+  }
+
+  // ── Offline streaming JSONL chunk merge mode ───────────────────────────────
+  if (chunkArgs.requested) {
+    if (chunkArgs.paths.length === 0) {
+      console.error("[replay] error: --merge-chunks requires at least one chunk file path");
+      return { report: null, exitCode: 2 };
+    }
+
+    let mergeFromLedger: number | undefined;
+    if (fromRaw !== undefined) {
+      const n = Number(fromRaw);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) {
+        console.error(
+          `[replay] error: --from with --merge-chunks must be a positive integer ledger, got "${fromRaw}"`,
+        );
+        return { report: null, exitCode: 2 };
+      }
+      mergeFromLedger = n;
+    }
+
+    if (mergeFromLedger !== undefined && toLedger !== undefined && toLedger < mergeFromLedger) {
+      console.error(`[replay] error: --to ${toLedger} is before --from ${mergeFromLedger}`);
+      return { report: null, exitCode: 2 };
+    }
+
+    try {
+      const mergeSummary = await mergeReplayChunkFiles(chunkArgs.paths, {
+        output: outputPath ? undefined : stdoutStream,
+        outputFile: outputPath,
+        dedupWindow,
+        contract: contractFilter,
+        fromLedger: mergeFromLedger,
+        toLedger,
+      });
+      progress(
+        `[replay] merged chunks=${mergeSummary.chunksMerged} events=${mergeSummary.eventCount} ` +
+          `duplicates=${mergeSummary.duplicates} range=${mergeSummary.firstLedger ?? "none"}..${mergeSummary.lastLedger ?? "none"}`,
+      );
+      return { report: null, mergeSummary, exitCode: 0 };
+    } catch (err) {
+      console.error(`[replay] chunk merge failed: ${safeErr(err)}`);
+      return { report: null, exitCode: 1 };
+    }
+  }
+
+  if (!fromRaw) {
+    console.error("[replay] error: --from <ledger|cursor> is required");
+    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N] | --merge-chunks <paths...> [--output <path>]");
+    return { report: null, exitCode: 2 };
   }
 
   // Validate --rpm
@@ -1055,7 +1174,7 @@ export async function runReplayCli(opts: {
   };
 
   if (asJson) {
-    process.stdout.write(JSON.stringify(report, scanJsonReplacer, 2) + "\n");
+    stdoutStream.write(JSON.stringify(report, scanJsonReplacer, 2) + "\n");
   } else {
     progress(
       `[replay] done  events=${totals.events} sent=${totals.sent} skipped=${totals.skipped} ` +

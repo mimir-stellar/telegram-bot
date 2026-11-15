@@ -74,6 +74,10 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
+| `--merge-chunks` | `<file1> [file2 ...]` | Offline streaming k-way merge of ordered `.jsonl` or `mimir-scan-v1` scan chunks into a canonical JSONL report. | None |
+| `--chunk` | `<file>` | Repeatable alias for passing individual chunk files to offline streaming merge. | None |
+| `--output` | `<path>` | Destination file path for `--merge-chunks` (written atomically via temporary sibling file). Defaults to `stdout`. | `stdout` |
+| `--dedup-window` | `<number>` | Per-contract recent event ID capacity during `--merge-chunks` (`0` disables deduplication). | `256` |
 
 ### Exit Codes
 
@@ -223,3 +227,18 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Merging Replay Scan Chunks into Streaming JSONL
+
+Long historical ranges split across bounded scan windows can be merged offline into a single canonical JSONL stream without holding the full event history in memory:
+
+```bash
+npm run replay -- --merge-chunks chunk-1.jsonl chunk-2.jsonl --output merged.jsonl
+```
+
+* **Canonical ordering:** Events are merged via a streaming k-way merge ordered by `ledger`, `transactionIndex`, `operationIndex`, `eventId`, `txHash`, and `source` (`market` before `squad`), producing identical output regardless of chunk argument order.
+* **Duplicate policy:** Overlapping page/chunk boundary duplicates are suppressed per contract using `eventKey` and a bounded `EventDedupWindow` (default `256`, configurable via `--dedup-window`; `0` disables deduplication). Events without an identifiable `eventId` are never assigned synthetic identities and pass through preserved.
+* **Bounded memory:** Only one head event per active chunk stream, a bounded deduplication window, and bounded histogram counters stay resident in RAM while backpressure is honored on the output stream.
+* **Atomic file output:** When `--output <path>` is specified, merged lines are written to a temporary file and renamed atomically only after all chunks validate cleanly. Malformed, oversized, or out-of-order chunks abort with exit code `1` without leaving partial output files.
