@@ -53,7 +53,18 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, mkdir, readFile, rename, writeFile, unlink } from "node:fs/promises";
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  readFile,
+  readlink,
+  realpath,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
@@ -718,6 +729,141 @@ function withinDeadline(promise: Promise<void>, timeoutMs: number): Promise<bool
   });
 }
 
+
+const MAX_CURSOR_SYMLINK_HOPS = 32;
+
+export class CursorPathAliasError extends Error {
+  readonly code = "CURSOR_PATH_ALIAS" as const;
+  readonly leftPath: string;
+  readonly rightPath: string;
+  readonly canonicalPath: string;
+
+  constructor(leftPath: string, rightPath: string, canonicalPath: string) {
+    super(
+      `backup and live cursor paths must be different (both resolve to ${canonicalPath})`,
+    );
+    this.name = "CursorPathAliasError";
+    this.leftPath = leftPath;
+    this.rightPath = rightPath;
+    this.canonicalPath = canonicalPath;
+  }
+}
+
+/**
+ * Resolve a cursor or backup path to its canonical target path, expanding
+ * file symlinks, dangling symlinks, and parent-directory symlinks/junctions
+ * even when the leaf file does not exist yet.
+ */
+export async function resolveCanonicalCursorPath(
+  targetPath: string,
+  depth: number = 0,
+): Promise<string> {
+  if (depth > MAX_CURSOR_SYMLINK_HOPS) {
+    throw new Error(`symbolic-link loop detected while resolving cursor path ${targetPath}`);
+  }
+  let current = path.resolve(targetPath);
+  const suffix: string[] = [];
+
+  while (true) {
+    try {
+      const real = await realpath(current);
+      return suffix.length > 0 ? path.join(real, ...suffix) : real;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ELOOP") {
+        throw new Error(`symbolic-link loop detected while resolving cursor path ${targetPath}`);
+      }
+      if (code !== "ENOENT") {
+        throw err;
+      }
+    }
+
+    // `realpath` failed with ENOENT: check whether `current` itself is a dangling symlink.
+    try {
+      const linkInfo = await lstat(current);
+      if (linkInfo.isSymbolicLink()) {
+        const rawTarget = await readlink(current);
+        const resolvedTarget = path.resolve(path.dirname(current), rawTarget);
+        const combined =
+          suffix.length > 0 ? path.join(resolvedTarget, ...suffix) : resolvedTarget;
+        return await resolveCanonicalCursorPath(combined, depth + 1);
+      }
+    } catch (lstatErr) {
+      const lcode = (lstatErr as NodeJS.ErrnoException).code;
+      if (lcode === "ELOOP") {
+        throw new Error(`symbolic-link loop detected while resolving cursor path ${targetPath}`);
+      }
+      if (lcode !== "ENOENT") {
+        throw lstatErr;
+      }
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return suffix.length > 0 ? path.join(current, ...suffix) : current;
+    }
+    suffix.unshift(path.basename(current));
+    current = parent;
+  }
+}
+
+function normalizeComparablePath(canonicalPath: string): string {
+  const normalized = path.normalize(canonicalPath);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+/**
+ * Determine whether two cursor paths refer to the same underlying file via
+ * lexical normalization, file/directory symbolic links, junctions, or hard links.
+ */
+export async function areSameCursorFile(
+  leftPath: string,
+  rightPath: string,
+): Promise<{ same: boolean; canonicalPath: string }> {
+  const [leftCanonical, rightCanonical] = await Promise.all([
+    resolveCanonicalCursorPath(leftPath),
+    resolveCanonicalCursorPath(rightPath),
+  ]);
+  if (normalizeComparablePath(leftCanonical) === normalizeComparablePath(rightCanonical)) {
+    return { same: true, canonicalPath: leftCanonical };
+  }
+
+  try {
+    const [leftStat, rightStat] = await Promise.all([
+      stat(leftPath, { bigint: true }),
+      stat(rightPath, { bigint: true }),
+    ]);
+    if (
+      leftStat.ino > 0n &&
+      leftStat.ino === rightStat.ino &&
+      leftStat.dev === rightStat.dev
+    ) {
+      return { same: true, canonicalPath: leftCanonical };
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") {
+      throw new Error(`symbolic-link loop detected while comparing cursor paths`);
+    }
+    // Missing endpoint(s) already handled by canonical ancestor resolution above.
+  }
+
+  return { same: false, canonicalPath: leftCanonical };
+}
+
+/**
+ * Reject if `leftPath` and `rightPath` resolve to the same file. Must be called
+ * before opening or replacing either cursor path.
+ */
+export async function assertDistinctCursorPaths(
+  leftPath: string,
+  rightPath: string,
+): Promise<void> {
+  const verdict = await areSameCursorFile(leftPath, rightPath);
+  if (verdict.same) {
+    throw new CursorPathAliasError(leftPath, rightPath, verdict.canonicalPath);
+  }
+}
 
 /** Stable quarantine path next to the live cursor file (never overwrites). */
 export function cursorQuarantinePath(cursorFile: string, at: Date = new Date()): string {
@@ -1812,15 +1958,20 @@ export function createPoller(deps: PollerDeps) {
 
     try {
       await mkdir(path.dirname(config.cursorFile), { recursive: true });
+      const tmp = `${config.cursorFile}.tmp`;
+      const backupFile = `${config.cursorFile}.bak`;
+      // Resolve symlink/junction/hardlink aliases before opening `.tmp` or `.bak`
+      // for writing so a symlinked backup or temp path never truncates the live cursor.
+      await assertDistinctCursorPaths(config.cursorFile, tmp);
+      await assertDistinctCursorPaths(config.cursorFile, backupFile);
+      await assertDistinctCursorPaths(tmp, backupFile);
       // Write-then-rename: a crash mid-write must not leave a truncated file
       // that sends the next start back to the beginning of the retained window.
-      const tmp = `${config.cursorFile}.tmp`;
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       await rename(tmp, config.cursorFile);
       // Copy the committed file to the backup. `copyFile` is not atomic
       // cross-filesystem, but the backup is always at least one generation
       // older than the primary — a crash here leaves the primary intact.
-      const backupFile = `${config.cursorFile}.bak`;
       await copyFile(config.cursorFile, backupFile);
       status.pendingFlush = false;
       status.lastFlushAt = now();

@@ -10,7 +10,20 @@ import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import {
+  areSameCursorFile,
+  assertDistinctCursorPaths,
+  CursorPathAliasError,
+  parseAndMigrateCursorFile,
+  resolveCanonicalCursorPath,
+} from "./poller.js";
+
+export {
+  areSameCursorFile,
+  assertDistinctCursorPaths,
+  CursorPathAliasError,
+  resolveCanonicalCursorPath,
+};
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -65,11 +78,13 @@ async function writeAtomic(filePath: string, contents: string, replace: boolean)
 
 /** Copy a validated supported cursor snapshot without exposing cursor values. */
 export async function backupCursor(options: BackupCursorOptions): Promise<void> {
+  await assertDistinctCursorPaths(options.cursorFile, options.backupFile);
   const raw = await readFile(options.cursorFile, "utf8");
   const parsed = validateCursor(raw);
   if (!options.force && (await exists(options.backupFile))) {
     throw new Error(`backup already exists at ${options.backupFile}; pass --force to overwrite`);
   }
+  await assertDistinctCursorPaths(options.cursorFile, options.backupFile);
   await writeAtomic(options.backupFile, raw, options.force === true);
   console.log(
     `[cursor] backed up schema=v` + `${parsed.file.version} targets=${Object.keys(parsed.file.targets).length} ` +
@@ -79,8 +94,10 @@ export async function backupCursor(options: BackupCursorOptions): Promise<void> 
 
 /** Restore a compatible cursor while holding the poller's exclusive lock. */
 export async function restoreCursor(options: RestoreCursorOptions): Promise<void> {
+  await assertDistinctCursorPaths(options.cursorFile, options.backupFile);
   const lock = await acquireInstanceLock(options.lockFile);
   try {
+    await assertDistinctCursorPaths(options.cursorFile, options.backupFile);
     const raw = await readFile(options.backupFile, "utf8");
     const parsed = validateCursor(raw);
     if (!options.force && (await exists(options.cursorFile))) {
@@ -134,14 +151,6 @@ function resolvePath(value: string): string {
   return path.resolve(process.cwd(), value);
 }
 
-function assertDifferentPaths(left: string, right: string): void {
-  const normalize = (value: string) =>
-    process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
-  if (normalize(left) === normalize(right)) {
-    throw new Error("backup and live cursor paths must be different");
-  }
-}
-
 async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
@@ -155,14 +164,14 @@ async function main(): Promise<void> {
     const backupFile = resolvePath(
       options.out ?? `${cursorFile}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`,
     );
-    assertDifferentPaths(cursorFile, backupFile);
+    await assertDistinctCursorPaths(cursorFile, backupFile);
     await backupCursor({ cursorFile, backupFile, force: options.force });
     return;
   }
 
   if (!options.from) throw new Error("restore requires --from PATH");
   const backupFile = resolvePath(options.from);
-  assertDifferentPaths(cursorFile, backupFile);
+  await assertDistinctCursorPaths(cursorFile, backupFile);
   const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
   await restoreCursor({
     cursorFile,
