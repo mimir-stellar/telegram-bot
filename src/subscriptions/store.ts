@@ -16,6 +16,30 @@ export interface StoreFile {
 
 export const STORE_VERSION = 1;
 
+export const CHAT_FOLLOW_EXPORT_VERSION = 1;
+
+export interface ChatFollowExport {
+  version: number;
+  follows: string[];
+}
+
+export type ChatRestoreMode = "replace" | "merge";
+
+export interface ChatRestoreOptions {
+  /**
+   * "replace" (default) replaces only the target chat's follows with the
+   * validated export; "merge" appends missing entries onto the target chat.
+   */
+  mode?: ChatRestoreMode;
+}
+
+export interface ChatRestoreResult {
+  restored: number;
+  added: number;
+  removed: number;
+  follows: string[];
+}
+
 export const DEFAULT_MAX_PER_CHAT = 50;
 
 export const DEFAULT_MAX_TOTAL = 5000;
@@ -36,8 +60,71 @@ export interface FollowStoreOptions {
   maxTotalEntries?: number;
 }
 
+const FORBIDDEN_CHAT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function assertValidChatId(chatId: string): void {
+  if (typeof chatId !== "string" || chatId.length === 0 || FORBIDDEN_CHAT_KEYS.has(chatId)) {
+    throw new FollowStoreError("chatId must be a non-empty string");
+  }
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validate and normalize a portable single-chat follow export payload (either
+ * parsed object or raw JSON text). Rejects unknown versions, multi-chat store
+ * maps, unexpected top-level keys, and any malformed follow reference.
+ */
+export function parseChatExport(input: unknown): ChatFollowExport {
+  let rawObj: unknown = input;
+  if (typeof input === "string") {
+    try {
+      rawObj = JSON.parse(input);
+    } catch {
+      throw new FollowStoreError("chat export is not valid JSON");
+    }
+  }
+  if (!isPlainObject(rawObj)) {
+    throw new FollowStoreError("chat export payload must be an object");
+  }
+  for (const key of Object.keys(rawObj)) {
+    if (key !== "version" && key !== "follows") {
+      throw new FollowStoreError(`unexpected field in chat export: ${key}`);
+    }
+  }
+  if (rawObj.version !== CHAT_FOLLOW_EXPORT_VERSION) {
+    throw new FollowStoreError(`unsupported chat export version: ${String(rawObj.version)}`);
+  }
+  if (!Array.isArray(rawObj.follows)) {
+    throw new FollowStoreError("chat export follows must be an array of references");
+  }
+  const seen = new Set<string>();
+  const validated: string[] = [];
+  for (const entry of rawObj.follows) {
+    if (typeof entry !== "string") {
+      throw new FollowStoreError("invalid ref in chat export: non-string entry");
+    }
+    const parsed = parseRef(entry);
+    if (parsed === null) {
+      throw new FollowStoreError(`invalid ref in chat export: ${entry}`);
+    }
+    const canonical = formatRef(parsed.kind, parsed.id);
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      validated.push(canonical);
+    }
+  }
+  return {
+    version: CHAT_FOLLOW_EXPORT_VERSION,
+    follows: validated,
+  };
+}
+
+export function serializeChatExport(payload: ChatFollowExport): string {
+  const validated = parseChatExport(payload);
+  return JSON.stringify(validated, null, 2) + "\n";
 }
 
 export function parseRef(ref: string): Ref | null {
@@ -225,6 +312,86 @@ export class FollowStore {
       if (list.includes(ref)) result.push(chatId);
     }
     return result;
+  }
+
+  /**
+   * Export a portable, versioned snapshot of a single chat's subscriptions
+   * without exposing any other chat's identifiers or follows.
+   */
+  exportChat(chatId: string): ChatFollowExport {
+    assertValidChatId(chatId);
+    const data = this.read();
+    return {
+      version: CHAT_FOLLOW_EXPORT_VERSION,
+      follows: [...(data.follows[chatId] ?? [])],
+    };
+  }
+
+  /**
+   * Atomically restore a single chat's subscriptions from a versioned portable
+   * export, validating every reference upfront, preserving all other chats,
+   * and enforcing per-chat and global quotas before writing to disk.
+   */
+  restoreChat(
+    chatId: string,
+    payload: unknown,
+    options: ChatRestoreOptions = {},
+  ): ChatRestoreResult {
+    assertValidChatId(chatId);
+    const mode: ChatRestoreMode = options.mode ?? "replace";
+    if (mode !== "replace" && mode !== "merge") {
+      throw new FollowStoreError(`invalid restore mode: ${String(mode)}`);
+    }
+    const exported = parseChatExport(payload);
+    const data = this.read();
+    const existing = data.follows[chatId] ?? [];
+
+    let nextForChat: string[];
+    if (mode === "merge") {
+      const seen = new Set<string>(existing);
+      nextForChat = [...existing];
+      for (const ref of exported.follows) {
+        if (!seen.has(ref)) {
+          seen.add(ref);
+          nextForChat.push(ref);
+        }
+      }
+    } else {
+      nextForChat = [...exported.follows];
+    }
+
+    if (nextForChat.length > this.maxPerChat) {
+      throw new FollowStoreError(`per-chat follow limit reached (${this.maxPerChat})`);
+    }
+    const otherChatsTotal = this.totalCount(data) - existing.length;
+    if (otherChatsTotal + nextForChat.length > this.maxTotal) {
+      throw new FollowStoreError(`total follow limit reached (${this.maxTotal})`);
+    }
+
+    const existingSet = new Set<string>(existing);
+    const nextSet = new Set<string>(nextForChat);
+    let added = 0;
+    for (const ref of nextForChat) {
+      if (!existingSet.has(ref)) added += 1;
+    }
+    let removed = 0;
+    for (const ref of existing) {
+      if (!nextSet.has(ref)) removed += 1;
+    }
+
+    if (nextForChat.length === 0) {
+      delete data.follows[chatId];
+    } else {
+      data.follows[chatId] = nextForChat;
+    }
+    this.write(data);
+
+    return {
+      restored: nextForChat.length,
+      added,
+      removed,
+      follows: [...nextForChat],
+    };
   }
 }
 
