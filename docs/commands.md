@@ -12,6 +12,9 @@
 | `/contracts` | Contract ids and explorer links | No | Yes |
 | `/health` | Health assessment and operational readiness | No | Yes |
 | `/preview` | Preview channel notification formatting | No | Yes |
+| `/follow` | Subscribe this chat to a market or squad | No | Yes |
+| `/unfollow` | Unsubscribe this chat from a market or squad | No | Yes |
+| `/following` | List markets and squads followed in this chat | No | Yes |
 | `/pause` | Operator only: pause new scans | Yes | No |
 | `/resume` | Operator only: resume polling now | Yes | No |
 

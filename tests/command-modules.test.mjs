@@ -37,6 +37,9 @@ const MENU = [
   "contracts",
   "health",
   "preview",
+  "follow",
+  "unfollow",
+  "following",
   "pause",
   "resume",
 ];
