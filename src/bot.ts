@@ -100,6 +100,21 @@ export {
   sendBroadcast,
 } from "./commands/broadcast.js";
 export { clearHintState } from "./commands/unknown.js";
+export {
+  DEFAULT_MAX_PER_CHAT,
+  DEFAULT_MAX_TOTAL,
+  FollowStore,
+  FollowStoreError,
+  STORE_VERSION,
+  createFollowStore,
+  deduplicateFollowRefs,
+  formatRef,
+  parseRef,
+  type FollowImportResult,
+  type FollowStoreOptions,
+  type ImportOptions,
+  type StoreImportResult,
+} from "./subscriptions/store.js";
 
 /** Older names for the pause-confirmation helpers, kept for existing imports. */
 export const validatePauseCallbackData = validatePauseConfirmData;

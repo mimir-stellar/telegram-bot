@@ -36,6 +36,23 @@ export interface FollowStoreOptions {
   maxTotalEntries?: number;
 }
 
+export interface ImportOptions {
+  /** Replace existing subscriptions instead of merging with them. */
+  replace?: boolean;
+}
+
+export interface FollowImportResult {
+  added: number;
+  duplicatesSkipped: number;
+  totalForChat: number;
+}
+
+export interface StoreImportResult {
+  added: number;
+  duplicatesSkipped: number;
+  totalEntries: number;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -58,6 +75,33 @@ export function formatRef(kind: RefKind, id: string): string {
   return `${kind}:${id}`;
 }
 
+/**
+ * Validate and deduplicate a list of follow references in first-seen order.
+ * Throws FollowStoreError if the input is not an array or contains any invalid ref.
+ */
+export function deduplicateFollowRefs(refs: readonly unknown[], context = "import"): string[] {
+  if (!Array.isArray(refs)) {
+    throw new FollowStoreError(`${context} must be an array`);
+  }
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const entry of refs) {
+    if (typeof entry !== "string") {
+      throw new FollowStoreError(`invalid ref in ${context}`);
+    }
+    const parsed = parseRef(entry);
+    if (parsed === null) {
+      throw new FollowStoreError(`invalid ref in ${context}: ${entry}`);
+    }
+    const canonical = formatRef(parsed.kind, parsed.id);
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      unique.push(canonical);
+    }
+  }
+  return unique;
+}
+
 function emptyStore(): StoreFile {
   return { version: STORE_VERSION, follows: {} };
 }
@@ -77,14 +121,10 @@ function validateStoreFile(data: unknown): StoreFile {
     if (!Array.isArray(list)) {
       throw new FollowStoreError(`follows[${chatId}] is not an array`);
     }
-    const cleaned: string[] = [];
-    for (const entry of list) {
-      if (typeof entry !== "string" || parseRef(entry) === null) {
-        throw new FollowStoreError(`invalid ref in follows[${chatId}]`);
-      }
-      cleaned.push(entry);
+    const cleaned = deduplicateFollowRefs(list, `follows[${chatId}]`);
+    if (cleaned.length > 0) {
+      follows[chatId] = cleaned;
     }
-    follows[chatId] = cleaned;
   }
   return { version: STORE_VERSION, follows };
 }
@@ -225,6 +265,128 @@ export class FollowStore {
       if (list.includes(ref)) result.push(chatId);
     }
     return result;
+  }
+
+  /**
+   * Import a batch of follow references for a single chat, normalizing and
+   * deduplicating both within the batch and against existing entries before
+   * checking per-chat and global subscription limits.
+   */
+  importFollows(
+    chatId: string,
+    refs: readonly string[],
+    options: ImportOptions = {},
+  ): FollowImportResult {
+    if (typeof chatId !== "string" || chatId.length === 0) {
+      throw new FollowStoreError("chatId must be a non-empty string");
+    }
+    if (!Array.isArray(refs)) {
+      throw new FollowStoreError("refs must be an array");
+    }
+    const incomingUnique = deduplicateFollowRefs(refs, `importFollows(${chatId})`);
+    const data = this.read();
+    const existing = data.follows[chatId] ?? [];
+    const base = options.replace === true ? [] : existing;
+
+    const mergedSet = new Set<string>(base);
+    const merged = [...base];
+    let added = 0;
+    for (const ref of incomingUnique) {
+      if (!mergedSet.has(ref)) {
+        mergedSet.add(ref);
+        merged.push(ref);
+        added += 1;
+      }
+    }
+    const duplicatesSkipped = refs.length - added;
+
+    if (merged.length > this.maxPerChat) {
+      throw new FollowStoreError(`per-chat follow limit reached (${this.maxPerChat})`);
+    }
+    const otherTotal = this.totalCount(data) - existing.length;
+    if (otherTotal + merged.length > this.maxTotal) {
+      throw new FollowStoreError(`total follow limit reached (${this.maxTotal})`);
+    }
+
+    if (merged.length === 0) {
+      delete data.follows[chatId];
+    } else {
+      data.follows[chatId] = merged;
+    }
+    this.write(data);
+
+    return {
+      added,
+      duplicatesSkipped,
+      totalForChat: merged.length,
+    };
+  }
+
+  /**
+   * Import follow references across multiple chats atomically, deduplicating
+   * each chat's entries before enforcing per-chat and global limits.
+   */
+  importStore(
+    followsByChat: Record<string, readonly string[]>,
+    options: ImportOptions = {},
+  ): StoreImportResult {
+    if (!isPlainObject(followsByChat)) {
+      throw new FollowStoreError("followsByChat must be an object");
+    }
+    const data = options.replace === true ? emptyStore() : this.read();
+    const nextFollows: Record<string, string[]> = {};
+    for (const [chatId, list] of Object.entries(data.follows)) {
+      nextFollows[chatId] = [...list];
+    }
+
+    let added = 0;
+    let duplicatesSkipped = 0;
+
+    for (const [chatId, rawList] of Object.entries(followsByChat)) {
+      if (typeof chatId !== "string" || chatId.length === 0) {
+        throw new FollowStoreError("chatId must be a non-empty string");
+      }
+      if (!Array.isArray(rawList)) {
+        throw new FollowStoreError(`follows[${chatId}] must be an array`);
+      }
+      const incomingUnique = deduplicateFollowRefs(rawList, `follows[${chatId}]`);
+      const base = nextFollows[chatId] ?? [];
+      const mergedSet = new Set<string>(base);
+      const merged = [...base];
+      let chatAdded = 0;
+      for (const ref of incomingUnique) {
+        if (!mergedSet.has(ref)) {
+          mergedSet.add(ref);
+          merged.push(ref);
+          chatAdded += 1;
+        }
+      }
+      if (merged.length > this.maxPerChat) {
+        throw new FollowStoreError(`per-chat follow limit reached (${this.maxPerChat})`);
+      }
+      added += chatAdded;
+      duplicatesSkipped += rawList.length - chatAdded;
+      if (merged.length > 0) {
+        nextFollows[chatId] = merged;
+      } else {
+        delete nextFollows[chatId];
+      }
+    }
+
+    let totalEntries = 0;
+    for (const list of Object.values(nextFollows)) {
+      totalEntries += list.length;
+    }
+    if (totalEntries > this.maxTotal) {
+      throw new FollowStoreError(`total follow limit reached (${this.maxTotal})`);
+    }
+
+    this.write({ version: STORE_VERSION, follows: nextFollows });
+    return {
+      added,
+      duplicatesSkipped,
+      totalEntries,
+    };
   }
 }
 
