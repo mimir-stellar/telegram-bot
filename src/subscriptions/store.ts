@@ -36,6 +36,15 @@ export interface FollowStoreOptions {
   maxTotalEntries?: number;
 }
 
+export interface SubscriptionMatchPreview {
+  ref: string;
+  kind: RefKind;
+  id: string;
+  matchingChatCount: number;
+  totalTrackedChats: number;
+  totalFollowEntries: number;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -225,6 +234,37 @@ export class FollowStore {
       if (list.includes(ref)) result.push(chatId);
     }
     return result;
+  }
+
+  /**
+   * Read-only delivery match preview for an event reference.
+   *
+   * Returns aggregate match counts without exposing subscriber chat IDs and
+   * without mutating the store or triggering notifications.
+   */
+  previewMatches(ref: string): SubscriptionMatchPreview {
+    const parsed = parseRef(ref);
+    if (parsed === null) {
+      throw new FollowStoreError(`invalid ref: ${ref}`);
+    }
+    const canonicalRef = formatRef(parsed.kind, parsed.id);
+    const data = this.read();
+    let matchingChatCount = 0;
+    let totalTrackedChats = 0;
+    let totalFollowEntries = 0;
+    for (const list of Object.values(data.follows)) {
+      if (list.length > 0) totalTrackedChats += 1;
+      totalFollowEntries += list.length;
+      if (list.includes(canonicalRef)) matchingChatCount += 1;
+    }
+    return {
+      ref: canonicalRef,
+      kind: parsed.kind,
+      id: parsed.id,
+      matchingChatCount,
+      totalTrackedChats,
+      totalFollowEntries,
+    };
   }
 }
 

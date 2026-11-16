@@ -26,6 +26,7 @@ import "./preview.js";
 import "./pause.js";
 import "./resume.js";
 import "./log-export.js"; // hidden: operator log export
+import "./sub-preview.js"; // hidden: operator subscription delivery match preview
 
 export {
   commandMetadata,
@@ -65,3 +66,8 @@ export { previewCommand } from "./preview.js";
 export { resumeCommand, resumeMessage } from "./resume.js";
 export { lastEventMessage, statusCommand, statusMessage } from "./status.js";
 export { logExportCommand } from "./log-export.js";
+export {
+  parseSubscriptionPreviewRef,
+  subPreviewCommand,
+  subscriptionPreviewMessage,
+} from "./sub-preview.js";

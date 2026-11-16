@@ -70,10 +70,20 @@ export {
   contractsMessage,
   healthMessage,
   lastEventMessage,
+  parseSubscriptionPreviewRef,
   pauseMessage,
   resumeMessage,
   statusMessage,
+  subPreviewCommand,
+  subscriptionPreviewMessage,
 } from "./commands/index.js";
+export {
+  FollowStore,
+  FollowStoreError,
+  createFollowStore,
+  type FollowStoreOptions,
+  type SubscriptionMatchPreview,
+} from "./subscriptions/store.js";
 export {
   CALLBACK_FALLBACK_FEEDBACK,
   CALLBACK_FALLBACK_PAYLOAD,
