@@ -20,6 +20,26 @@ export const DEFAULT_MAX_PER_CHAT = 50;
 
 export const DEFAULT_MAX_TOTAL = 5000;
 
+/** Maximum Soroban u64 identifier accepted in market/squad follow references. */
+export const MAX_FOLLOW_ID = 18_446_744_073_709_551_615n;
+
+const CANONICAL_U64_DECIMAL = /^(?:0|[1-9][0-9]{0,19})$/;
+
+/**
+ * Return true iff `id` is a canonical base-10 unsigned 64-bit integer string
+ * (`"0"` or `[1-9][0-9]*` <= 2^64 - 1) with no sign, leading zero, whitespace,
+ * radix prefix, decimal point, or exponent notation.
+ */
+export function isCanonicalFollowId(id: string): boolean {
+  if (typeof id !== "string" || !CANONICAL_U64_DECIMAL.test(id)) {
+    return false;
+  }
+  if (id.length < 20) {
+    return true;
+  }
+  return BigInt(id) <= MAX_FOLLOW_ID;
+}
+
 export class FollowStoreError extends Error {
   constructor(message: string) {
     super(message);
@@ -47,10 +67,7 @@ export function parseRef(ref: string): Ref | null {
   const kind = ref.slice(0, idx);
   const id = ref.slice(idx + 1);
   if (kind !== "market" && kind !== "squad") return null;
-  if (!id) return null;
-  // Reject whitespace, control characters and a second ':' in id, so a ref
-  // always splits into exactly one kind and one id.
-  if (/[\s\u0000-\u001F:]/.test(id)) return null;
+  if (!isCanonicalFollowId(id)) return null;
   return { kind, id };
 }
 
