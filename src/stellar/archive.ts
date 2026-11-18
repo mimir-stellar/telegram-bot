@@ -14,6 +14,28 @@ export interface EventArchive {
   close(): Promise<void>;
 }
 
+export interface ReadArchiveOptions {
+  /** Yield valid records before a malformed record instead of discarding them. Defaults to false. */
+  retainCommitted?: boolean;
+}
+
+export class MalformedArchiveRecordError extends Error {
+  readonly fileName: string;
+  readonly lineNumber: number;
+
+  constructor(fileName: string, lineNumber: number) {
+    const safeFileName = path
+      .basename(fileName)
+      .replace(/[\x00-\x1f\x7f]/g, " ")
+      .slice(0, 128);
+    const displayedFileName = safeFileName || "<unknown>";
+    super(`Malformed archive record at ${displayedFileName}:${lineNumber}`);
+    this.name = "MalformedArchiveRecordError";
+    this.fileName = displayedFileName;
+    this.lineNumber = lineNumber;
+  }
+}
+
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
 const DEFAULT_MAX_FILES = 10;
 const FILE_MODE = 0o600;
@@ -137,22 +159,43 @@ async function listArchiveFiles(dir: string): Promise<string[]> {
   }
 }
 
-export async function* readArchive(dir: string): AsyncGenerator<DecodedEvent, void, unknown> {
+export async function* readArchive(
+  dir: string,
+  options: ReadArchiveOptions = {},
+): AsyncGenerator<DecodedEvent, void, unknown> {
   const files = await listArchiveFiles(dir);
+  const stagedEvents: DecodedEvent[] = [];
+  const retainCommitted = options.retainCommitted === true;
+
   for (const file of files) {
     const filePath = path.join(dir, file);
     const handle = await open(filePath, "r");
     try {
       const content = await handle.readFile({ encoding: "utf8" });
       const lines = content.split("\n");
-      for (const line of lines) {
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index]!;
         const trimmed = line.trim();
         if (!trimmed) continue;
-        const parsed = JSON.parse(trimmed);
-        yield parsed as DecodedEvent;
+        let parsed: DecodedEvent;
+        try {
+          parsed = JSON.parse(trimmed) as DecodedEvent;
+        } catch {
+          throw new MalformedArchiveRecordError(file, index + 1);
+        }
+
+        if (retainCommitted) {
+          yield parsed;
+        } else {
+          stagedEvents.push(parsed);
+        }
       }
     } finally {
       await handle.close();
     }
+  }
+
+  for (const event of stagedEvents) {
+    yield event;
   }
 }

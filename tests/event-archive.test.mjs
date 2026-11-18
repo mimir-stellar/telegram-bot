@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { stat } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
-import { createEventArchive, readArchive } from "../dist/stellar/archive.js";
+import {
+  createEventArchive,
+  MalformedArchiveRecordError,
+  readArchive,
+} from "../dist/stellar/archive.js";
 import { withTempDataDir } from "./helpers/temp-data.mjs";
 
 function makeDummyEvent(id, amountBigInt = 10000000n) {
@@ -162,5 +166,51 @@ test("archive rotation never loses or duplicates a line", async () => {
       assert.equal(readBack[i].eventId, `event-${i + 1}`);
       assert.equal(readBack[i].payload.stake, String((i + 1) * 12345));
     }
+  });
+});
+
+test("archive reports malformed record line without payload and retains valid prefix only on request", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-archive");
+    const fileName = "events-malformed.jsonl";
+    const payload = "PRIVATE_PAYLOAD_SHOULD_NOT_APPEAR";
+    await mkdir(archiveDir, { recursive: true });
+    await writeFile(
+      path.join(archiveDir, fileName),
+      `{"eventId":"event-1"}\n\n{"payload":"${payload}",}\n`,
+      "utf8",
+    );
+
+    const defaultEvents = [];
+    let defaultError;
+    try {
+      for await (const event of readArchive(archiveDir)) {
+        defaultEvents.push(event);
+      }
+    } catch (error) {
+      defaultError = error;
+    }
+
+    assert.ok(defaultError instanceof MalformedArchiveRecordError);
+    assert.equal(defaultError.fileName, fileName);
+    assert.equal(defaultError.lineNumber, 3);
+    assert.equal(defaultError.message, `Malformed archive record at ${fileName}:3`);
+    assert.equal(String(defaultError).includes(payload), false);
+    assert.deepEqual(defaultEvents, []);
+
+    const retainedEvents = [];
+    let retainedError;
+    try {
+      for await (const event of readArchive(archiveDir, { retainCommitted: true })) {
+        retainedEvents.push(event);
+      }
+    } catch (error) {
+      retainedError = error;
+    }
+
+    assert.ok(retainedError instanceof MalformedArchiveRecordError);
+    assert.equal(retainedError.lineNumber, 3);
+    assert.equal(retainedEvents.length, 1);
+    assert.equal(retainedEvents[0].eventId, "event-1");
   });
 });
