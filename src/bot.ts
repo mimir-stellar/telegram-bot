@@ -369,7 +369,10 @@ export function createBot(deps: BotDeps): Bot {
 export {
   createNotifier,
   isMarkdownParseError,
+  notifierDiagnostics,
   notifierSkips,
+  resetNotifierDiagnostics,
+  type ParseFallbackDiagnostic,
   type SendExtra,
 } from "./notifications/notifier.js";
 

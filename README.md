@@ -90,6 +90,7 @@ deployments continue unchanged and the operator commands are ignored.
 cp .env.example .env     # then fill in BOT_TOKEN and TELEGRAM_CHAT_ID
 npm install
 npm run doctor           # verify environment and .env configuration
+npm run support-bundle   # print a redacted JSON bundle for support requests
 npm run dev              # tsx, restarts on change
 ```
 

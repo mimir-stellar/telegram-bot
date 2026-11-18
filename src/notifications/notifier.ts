@@ -51,17 +51,22 @@ export interface SendExtra {
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
 
 /**
- * True when a Telegram send failed because the message text could not be
- * parsed as MarkdownV2 entities.
+ * True when a Telegram send failed because the requested parse mode could not
+ * be used for the message.
+ *
+ * Two response families qualify:
+ *  - entity/parse failures for MarkdownV2 (`can't parse entities`,
+ *    `can't find end of the entity`);
+ *  - an unsupported or unknown parse mode (`unsupported parse_mode`,
+ *    `parse_mode is not supported`, `unknown parse mode`), which a Telegram
+ *    deployment or proxy may return when it rejects the configured renderer.
  *
  * grammy (1.x) surfaces Bot API failures as `GrammyError` with `error_code`
- * and `description` straight from Telegram, e.g. error 400 with
- * `"Bad Request: can't parse entities: …"` or `"… can't find end of the
- * entity …"`. The classifier matches that shape — error 400 plus the
- * entity-parse phrasing — so rate limits (429), auth failures (401), chat
- * errors, and network `HttpError`s never qualify. Duck-typed errors carrying
- * the same Telegram description (mocks, wrapped rejections) match on the
- * phrasing alone when no numeric `error_code` is present.
+ * and `description` straight from Telegram. The classifier requires error 400
+ * when a numeric code is present, so rate limits (429), auth failures (401),
+ * chat errors, and network `HttpError`s never qualify. Duck-typed errors
+ * carrying the same Telegram description (mocks, wrapped rejections) match on
+ * the phrasing alone when no numeric `error_code` is present.
  */
 export function isMarkdownParseError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
@@ -69,9 +74,39 @@ export function isMarkdownParseError(err: unknown): boolean {
   const text = [record.description, record.message]
     .filter((part): part is string => typeof part === "string" && part !== "")
     .join(" ");
-  if (!/can't parse entities|can't find end of the entity/i.test(text)) return false;
+  const parseFailure =
+    /can't parse entities|can't find end of the entity/i.test(text) ||
+    /unsupported parse[_ ]mode|unknown parse[_ ]mode|parse[_ ]mode (?:is )?(?:unsupported|not supported)/i.test(
+      text,
+    );
+  if (!parseFailure) return false;
   if (typeof record.error_code === "number") return record.error_code === 400;
   return true;
+}
+
+/**
+ * The most recent parse-mode fallback, for diagnostics and tests.
+ *
+ * `selectedMode` records which renderer actually delivered the event:
+ * `markdown-v2` for the first attempt, `plain-text` for the fallback. Only
+ * bounded, redacted values are stored — never message text, a token, or a raw
+ * remote payload.
+ */
+export interface ParseFallbackDiagnostic {
+  at: number;
+  source: string;
+  selectedMode: "plain-text";
+  error: string;
+  eventRef?: SendExtra["eventRef"];
+}
+
+export const notifierDiagnostics: { lastParseFallback: ParseFallbackDiagnostic | null } = {
+  lastParseFallback: null,
+};
+
+/** Test helper — resets the recorded fallback diagnostic. */
+export function resetNotifierDiagnostics(): void {
+  notifierDiagnostics.lastParseFallback = null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -200,12 +235,20 @@ export function createNotifier(
       // Only bounded metadata is logged: the fallback outcome, the safe error
       // category, and the caller-supplied event reference — never message
       // text, tokens, or remote payloads.
+      const diagnosticError = safeErrorMessage(
+        err,
+        typeof config.botToken === "string" ? [config.botToken] : [],
+      );
+      notifierDiagnostics.lastParseFallback = {
+        at: Date.now(),
+        source: typeof source === "string" && source ? source.slice(0, 32) : "default",
+        selectedMode: "plain-text",
+        error: diagnosticError,
+        ...(extra?.eventRef ? { eventRef: extra.eventRef } : {}),
+      };
       console.warn(
         `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
-          `retrying as plain text: ${safeErrorMessage(
-            err,
-            typeof config.botToken === "string" ? [config.botToken] : [],
-          )}`,
+          `selected_mode=plain-text retrying as plain text: ${diagnosticError}`,
       );
       // Plain text (no parse mode), same per-source link preview setting.
       await bot.api.sendMessage(chatId, fallback, {

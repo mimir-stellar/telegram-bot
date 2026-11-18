@@ -36,6 +36,7 @@
     "replay:mock": "tsx src/replay-cli.ts --mock",
     "decode": "tsx src/decode-cli.ts",
     "doctor": "tsx src/doctor-cli.ts",
+    "support-bundle": "tsx src/support-bundle.ts",
     "rpc-compare": "tsx src/rpc-compare-cli.ts"
   },
   "c8": {
