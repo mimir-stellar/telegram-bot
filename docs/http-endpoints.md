@@ -66,6 +66,12 @@ Readiness probe. Returns the full `HealthReport` object. Use this for deploy
 smoke-tests, Kubernetes readiness probes, and dashboards. The HTTP status code
 is the machine-readable signal; the JSON body adds detail.
 
+The published response contract is [health-report v1](schemas/health-report.schema.json).
+The contract version is independent of the application `version` field. Adding
+response fields is backward-compatible with v1; removing or renaming a v1 field,
+changing its type, or changing a fixed enum requires a new contract version.
+The v1 fixture remains the compatibility baseline for future response shapes.
+
 | Condition | `status` | `ok` | HTTP |
 |---|---|---|---|
 | Poller running, recent successful poll | `"ok"` | `true` | 200 |

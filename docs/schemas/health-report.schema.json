@@ -1,9 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Health report",
-  "description": "Body of GET /health and GET /healthz: the object buildHealthReport in src/health.ts returns, serialised with JSON.stringify. HTTP 200 when ok is true, 503 otherwise. Every object is closed (additionalProperties: false), so a field added to or renamed in the report must be changed here too; tests/health-schema.test.mjs fails until it is.",
+  "$id": "health-report.v1.schema.json",
+  "title": "Health report v1",
+  "description": "Version 1 baseline for GET /health and GET /healthz. Fields in this schema are required and typed; additional fields are compatible additions. Removing or changing a declared field's type is breaking and requires a new contract version.",
   "type": "object",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "required": ["ok", "status", "service", "version", "network", "uptimeMs", "checkedAt", "poller", "config"],
   "properties": {
     "ok": { "type": "boolean", "description": "True exactly when status is \"ok\"." },
@@ -21,7 +22,7 @@
     "checkedAt": { "type": "string", "format": "date-time" },
     "poller": {
       "type": "object",
-      "additionalProperties": false,
+      "additionalProperties": true,
       "required": [
         "running",
         "paused",
@@ -80,7 +81,7 @@
         "eventsDeduplicated": { "type": "integer", "minimum": 0, "description": "Events suppressed as already seen across overlapping pages and resumes." },
         "activity": {
           "type": "object",
-          "additionalProperties": false,
+          "additionalProperties": true,
           "description": "Comparison of the latest complete cycle's event count with a rolling baseline of recent complete cycles. Counts only.",
           "required": [
             "windowSize",
@@ -111,7 +112,7 @@
         "cursorRewinds": { "type": "integer", "minimum": 0, "description": "Cursors rewound to the RPC's retained floor this run." },
         "deadLetter": {
           "type": "object",
-          "additionalProperties": false,
+          "additionalProperties": true,
           "description": "Sends that exhausted their retries and wait to be replayed. Counts only: no message text, no destination.",
           "required": ["depth", "enqueued", "replayed", "dropped"],
           "properties": {
@@ -125,7 +126,7 @@
         "suppressedLogs": { "type": "integer", "minimum": 0, "description": "Repeated error lines summarised instead of printed since start." },
         "lastError": {
           "type": ["object", "null"],
-          "additionalProperties": false,
+          "additionalProperties": true,
           "required": ["at", "message"],
           "properties": {
             "at": { "type": "string", "format": "date-time" },
@@ -135,7 +136,7 @@
         "restartGaps": { "type": "integer", "minimum": 0, "description": "Restart gaps detected since this process started." },
         "lastRestartGap": {
           "type": ["object", "null"],
-          "additionalProperties": false,
+          "additionalProperties": true,
           "description": "The most recent resume position that fell below the RPC's retained window. Ledger numbers only.",
           "required": ["at", "source", "cursorLedger", "oldestLedger", "missedLedgers"],
           "properties": {
@@ -152,7 +153,7 @@
           "type": "array",
           "items": {
             "type": "object",
-            "additionalProperties": false,
+            "additionalProperties": true,
             "required": [
               "source",
               "version",
@@ -198,14 +199,14 @@
     },
     "config": {
       "type": "object",
-      "additionalProperties": false,
+      "additionalProperties": true,
       "description": "Where configuration came from: setting names and sources, never a value.",
       "required": ["profile", "envFile", "entries", "counts", "warnings"],
       "properties": {
         "profile": { "type": ["string", "null"], "description": "Active MIMIR_PROFILE, or null when unset." },
         "envFile": {
           "type": "object",
-          "additionalProperties": false,
+          "additionalProperties": true,
           "required": ["present", "suppliedKeys"],
           "properties": {
             "present": { "type": "boolean" },
@@ -217,7 +218,7 @@
           "description": "Every setting the bot reads, in a stable order.",
           "items": {
             "type": "object",
-            "additionalProperties": false,
+            "additionalProperties": true,
             "required": ["key", "source", "secret"],
             "properties": {
               "key": { "type": "string", "description": "Variable name, e.g. BOT_TOKEN. A name is not a value." },
@@ -230,7 +231,7 @@
         },
         "counts": {
           "type": "object",
-          "additionalProperties": false,
+          "additionalProperties": true,
           "description": "How many settings each source supplied.",
           "required": ["process-env", "env-file", "profile-default", "built-in-default", "derived", "unset"],
           "properties": {
