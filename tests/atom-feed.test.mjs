@@ -190,11 +190,48 @@ test("safeHttpsUrl: rejects empty string", () => {
 // buildAtomEntry
 // ---------------------------------------------------------------------------
 
-test("buildAtomEntry: id is a tag URI containing the eventId", () => {
-  const event = makeEvent();
+test("buildAtomEntry: id is scoped to the network, contract, and chain event", () => {
+  const event = makeEvent({ eventId: "ledger-1000:0" });
   const entry = buildAtomEntry(event, BASE_CONFIG);
-  assert.ok(entry.id.startsWith("tag:mimir,event:"), `id was "${entry.id}"`);
-  assert.ok(entry.id.includes(event.eventId), "id should contain eventId");
+  assert.equal(
+    entry.id,
+    `tag:mimir,event:${encodeURIComponent(BASE_CONFIG.networkPassphrase)}:${encodeURIComponent(event.contractId)}:ledger-1000%3A0`,
+  );
+});
+
+test("buildAtomEntry: id is independent of presentation wording", () => {
+  const event = makeEvent();
+  const reworded = {
+    ...event,
+    payload: { name: "unknown", eventName: "claim_opened" },
+  };
+
+  const originalEntry = buildAtomEntry(event, BASE_CONFIG);
+  const rewordedEntry = buildAtomEntry(reworded, BASE_CONFIG);
+
+  assert.notEqual(originalEntry.title, rewordedEntry.title);
+  assert.equal(rewordedEntry.id, originalEntry.id);
+});
+
+test("buildAtomEntry: id differs when network, contract, or chain event differs", () => {
+  const event = makeEvent({ eventId: "same-event" });
+  const originalId = buildAtomEntry(event, BASE_CONFIG).id;
+
+  assert.notEqual(
+    buildAtomEntry(event, { ...BASE_CONFIG, networkPassphrase: "Public Global Stellar Network ; September 2015" }).id,
+    originalId,
+    "network must scope the id",
+  );
+  assert.notEqual(
+    buildAtomEntry({ ...event, contractId: VALID_SQUAD }, BASE_CONFIG).id,
+    originalId,
+    "contract must scope the id",
+  );
+  assert.notEqual(
+    buildAtomEntry({ ...event, eventId: "another-event" }, BASE_CONFIG).id,
+    originalId,
+    "chain event must scope the id",
+  );
 });
 
 test("buildAtomEntry: title contains source and event name", () => {

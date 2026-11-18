@@ -84,7 +84,10 @@ export function safeHttpsUrl(url: string): string | null {
 // ---------------------------------------------------------------------------
 
 export interface AtomEntry {
-  /** RFC 4287 §4.1.2: unique, permanent IRI for the entry. */
+  /**
+   * RFC 4287 §4.1.2: permanent IRI derived from network, contract, and chain
+   * event identity; it is independent of the entry's presentation text.
+   */
   id: string;
   /** RFC 4287 §4.2.14: human-readable title. */
   title: string;
@@ -120,8 +123,9 @@ export interface AtomFeedOptions {
 /**
  * Build one `<entry>` element from a decoded event.
  *
- * The entry id is a stable tag URI derived from the event id so it is both
- * unique and dereferenceable: `tag:mimir,event:<eventId>`.
+ * The entry id is a stable tag URI derived from the network passphrase,
+ * emitting contract id, and Soroban event id. Presentation text is excluded so
+ * template changes do not create new entries.
  * The title is the event name (payload.name).
  * The content is the plain-text rendering, bounded to {@link FEED_CONTENT_MAX_CHARS}.
  * The link is the explorer URL when one exists.
@@ -153,7 +157,12 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
   const link = explorerUrl ? safeHttpsUrl(explorerUrl) : null;
 
   return {
-    id: `tag:mimir,event:${event.eventId}`,
+    id: [
+      "tag:mimir,event",
+      encodeURIComponent(config.networkPassphrase),
+      encodeURIComponent(event.contractId),
+      encodeURIComponent(event.eventId),
+    ].join(":"),
     title,
     updated,
     content,
