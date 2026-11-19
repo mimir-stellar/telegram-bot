@@ -140,6 +140,7 @@ The bot uses grammy for Telegram integration with a thin command layer and a sin
 - `/health`: Health assessment and operational readiness
 - `/contracts`: Contract IDs and explorer links
 - `/preview`: Preview notification formatting
+- `/stats`: Live notification and Soroban RPC counters plus process uptime
 - `/pause`, `/resume`: Operator-only controls (requires `OPERATOR_TELEGRAM_USER_ID`)
 
 **Send path:**

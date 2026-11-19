@@ -130,6 +130,7 @@ looks healthy but notifies nobody.
 | `/audit` | Operator only. The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
+| `/stats` | Reads the live in-process metrics registry and reports notification sent/failed/skipped counters, Soroban RPC call and error counts, and process uptime. Read-only; no chain calls or state changes |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
 | `npm run cursor -- backup` | Backs up the validated cursor file without contacting Stellar or Telegram |
@@ -139,9 +140,11 @@ looks healthy but notifies nobody.
 command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
 the help and menu omit `/audit`, `/pause`, and `/resume`; configured operator
 commands are labelled "Operator only". Help uses static metadata, so it remains
-available when the poller or RPC is unhealthy. Adding a command requires its
-metadata and handler in `src/bot.ts`; TypeScript checks that every registry entry
-has a handler. This changes no cursor files or deployment settings.
+available when the poller or RPC is unhealthy. Adding a command requires a module
+in `src/commands/`, an import in `src/commands/index.ts`, metadata in `src/i18n.ts`
+and `src/commands/help-detail.ts`, and regenerating `docs/commands.md`; the shared
+registrar applies each module's gates. This changes no cursor files or deployment
+settings.
 
 Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
 response and cannot mutate poller state — this includes `/audit`, whose report

@@ -76,6 +76,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     description: "Preview Telegram channel notification formatting and verify link preview settings for market or squad contracts.",
     examples: ["/preview", "/preview market", "/preview squad"],
   },
+  stats: {
+    usage: "/stats",
+    arguments: "None",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Display live notification delivery counters, Soroban RPC call and error counts, and process uptime.",
+    examples: ["/stats"],
+  },
   pause: {
     usage: "/pause",
     arguments: "None",

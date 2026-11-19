@@ -21,6 +21,7 @@ import type { AuditLog } from "../audit.js";
 import type { BotConfig } from "../config.js";
 import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
+import type { Metrics } from "../metrics.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
 import type { BroadcastStore } from "./broadcast.js";
 
@@ -36,6 +37,8 @@ export interface CommandDeps {
   audit?: AuditLog | undefined;
   /** Where the audit JSONL file lives, for the file-backed report. */
   auditFile?: string | undefined;
+  /** Live in-process metrics registry backing /stats; absent for minimal harnesses. */
+  metrics?: Metrics | undefined;
   /**
    * Pre-populated bot info. When provided (e.g. in tests) grammy skips the
    * getMe() call so `bot.handleUpdate()` works without a real Telegram token.
