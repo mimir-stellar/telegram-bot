@@ -24,6 +24,9 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { Socket } from "node:net";
+
+import { DEFAULT_HEALTH_SHUTDOWN_GRACE_MS } from "./config.js";
 
 // ── Metric types ──────────────────────────────────────────────────────────────
 
@@ -41,12 +44,29 @@ export interface Gauge {
   value(): number;
 }
 
+export interface MetricsServerOptions {
+  /**
+   * Milliseconds to wait for active or stalled client sockets to close during
+   * shutdown before force-closing them. Defaults to
+   * {@link DEFAULT_HEALTH_SHUTDOWN_GRACE_MS}; `0` force-closes immediately.
+   */
+  shutdownGraceMs?: number;
+}
+
+export interface MetricsCloseOptions {
+  /**
+   * Milliseconds to wait for active or stalled client sockets to close during
+   * shutdown before force-closing them. Overrides `shutdownGraceMs`.
+   */
+  gracePeriodMs?: number;
+}
+
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
 export interface MetricsServer {
   /** The port the server is actually listening on. */
   port: number;
   /** Gracefully close the server. Resolves when the socket is released. */
-  close(): Promise<void>;
+  close(options?: MetricsCloseOptions): Promise<void>;
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -109,8 +129,9 @@ export interface MetricsRegistry {
    * @param port TCP port (1–65535). Caller is responsible for validating this
    *             before calling startServer (see config.ts).
    * @param host Bind address (default: "127.0.0.1").
+   * @param options Optional server lifecycle tuning (such as `shutdownGraceMs`).
    */
-  startServer(port: number, host?: string): Promise<MetricsServer>;
+  startServer(port: number, host?: string, options?: MetricsServerOptions): Promise<MetricsServer>;
 }
 
 // ── Implementation ────────────────────────────────────────────────────────────
@@ -228,13 +249,31 @@ export function createMetrics(): MetricsRegistry {
     return lines.join("\n") + "\n";
   }
 
-  function handleRequest(req: IncomingMessage, res: ServerResponse): void {
+  function resolveGraceMs(overrideMs: number | undefined, defaultMs: number | undefined): number {
+    if (typeof overrideMs === "number" && Number.isFinite(overrideMs)) {
+      return Math.max(0, Math.trunc(overrideMs));
+    }
+    if (typeof defaultMs === "number" && Number.isFinite(defaultMs)) {
+      return Math.max(0, Math.trunc(defaultMs));
+    }
+    return DEFAULT_HEALTH_SHUTDOWN_GRACE_MS;
+  }
+
+  function handleRequest(req: IncomingMessage, res: ServerResponse, closing = false): void {
+    if (closing) {
+      res.setHeader("Connection", "close");
+    }
+
     const method = req.method ?? "GET";
     const url = req.url ?? "/";
 
     // Only GET is meaningful for a read-only metrics endpoint.
     if (method !== "GET") {
-      res.writeHead(405, { "Content-Type": "text/plain", Allow: "GET" });
+      res.writeHead(405, {
+        "Content-Type": "text/plain",
+        Allow: "GET",
+        ...(closing ? { Connection: "close" } : {}),
+      });
       res.end("Method Not Allowed\n");
       return;
     }
@@ -249,24 +288,55 @@ export function createMetrics(): MetricsRegistry {
         "Content-Length": Buffer.byteLength(body),
         // Instruct proxies not to cache — stale metrics are misleading.
         "Cache-Control": "no-store",
+        ...(closing ? { Connection: "close" } : {}),
       });
       res.end(body);
       return;
     }
 
     if (path === "/health") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.writeHead(200, {
+        "Content-Type": "text/plain",
+        ...(closing ? { Connection: "close" } : {}),
+      });
       res.end("OK\n");
       return;
     }
 
-    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.writeHead(404, {
+      "Content-Type": "text/plain",
+      ...(closing ? { Connection: "close" } : {}),
+    });
     res.end("Not Found\n");
   }
 
-  function startServer(port: number, host = "127.0.0.1"): Promise<MetricsServer> {
+  function startServer(
+    port: number,
+    host = "127.0.0.1",
+    options?: MetricsServerOptions,
+  ): Promise<MetricsServer> {
     return new Promise((resolve, reject) => {
-      const server = createServer(handleRequest);
+      const sockets = new Set<Socket>();
+      let closing = false;
+      let closePromise: Promise<void> | null = null;
+
+      const server = createServer((req, res) => {
+        handleRequest(req, res, closing);
+      });
+
+      server.on("connection", (socket: Socket) => {
+        sockets.add(socket);
+        socket.once("close", () => {
+          sockets.delete(socket);
+        });
+      });
+
+      const forceDestroySockets = (): void => {
+        server.closeAllConnections?.();
+        for (const socket of sockets) {
+          if (!socket.destroyed) socket.destroy();
+        }
+      };
 
       server.once("error", reject);
 
@@ -278,13 +348,43 @@ export function createMetrics(): MetricsRegistry {
 
         const metricsServer: MetricsServer = {
           port: actualPort,
-          close(): Promise<void> {
-            return new Promise((res, rej) => {
+          close(closeOptions?: MetricsCloseOptions): Promise<void> {
+            if (closePromise !== null) return closePromise;
+            closing = true;
+            const graceMs = resolveGraceMs(
+              closeOptions?.gracePeriodMs,
+              options?.shutdownGraceMs,
+            );
+
+            closePromise = new Promise((res, rej) => {
+              let timer: NodeJS.Timeout | null = null;
+              const clearTimer = (): void => {
+                if (timer !== null) {
+                  clearTimeout(timer);
+                  timer = null;
+                }
+              };
+
               server.close((err) => {
+                clearTimer();
                 if (err) rej(err);
                 else res();
               });
+
+              server.closeIdleConnections?.();
+
+              if (graceMs <= 0) {
+                forceDestroySockets();
+              } else if (sockets.size > 0) {
+                timer = setTimeout(() => {
+                  timer = null;
+                  forceDestroySockets();
+                }, graceMs);
+                timer.unref();
+              }
             });
+
+            return closePromise;
           },
         };
 
