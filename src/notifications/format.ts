@@ -27,7 +27,7 @@ import {
 import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
 import { iconForCategory } from "./category-icons.js";
-import { groupDigestEvents } from "./digest-grouping.js";
+import { groupDigestEvents, sortDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
@@ -322,8 +322,12 @@ export interface FormatDigestOptions {
    * Multi-event groups get an escaped Group_Key header and indented sub-lines;
    * singletons are rendered exactly like the flat layout.
    *
-   * Defaults to `false` — the existing flat layout is unchanged when this
-   * option is omitted or set to `false`.
+   * Defaults to `false` — the existing one-bullet-per-event flat layout is
+   * unchanged when this option is omitted or set to `false`.
+   *
+   * Both layouts order events via {@link sortDigestEvents}: chain close time,
+   * then canonical chain identity when timestamps are equal. This makes replay
+   * and live processing emit byte-identical digests for the same event set.
    */
   grouped?: boolean;
 }
@@ -369,6 +373,8 @@ function renderGroupedDigest(events: readonly DecodedEvent[]): string {
  *
  * Pass `{ grouped: true }` to group consecutive events by claim / squad market.
  * The default (`{}` or no second argument) produces the unchanged flat layout.
+ * Both layouts use deterministic chain-time + canonical-identity ordering, so
+ * equal timestamps never make replay output depend on arrival order.
  */
 export function formatDigest(
   events: readonly DecodedEvent[],
@@ -376,7 +382,7 @@ export function formatDigest(
 ): string | null {
   if (events.length === 0) return null;
   if (options.grouped) return renderGroupedDigest(events);
-  const lines = events.map(flatLine);
+  const lines = sortDigestEvents(events).map(flatLine);
   return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
 }
 
