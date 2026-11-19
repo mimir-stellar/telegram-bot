@@ -34,6 +34,7 @@ import { redactText } from "../redact.js";
 import { peekEventName } from "./peek.js";
 
 export { peekEventName };
+export { adaptArchivedTypedEvent } from "./archive.js";
 
 /** Which of the two Mimir contracts an event came from. */
 export type ContractSource = "market" | "squad";
@@ -81,6 +82,8 @@ export const SQUAD_SIDE: Record<number, string> = {
 };
 
 export interface EventMeta {
+  /** Optional archive record schema version, present on archived/migrated records. */
+  schemaVersion?: number;
   source: ContractSource;
   contractId: string;
   version: string;

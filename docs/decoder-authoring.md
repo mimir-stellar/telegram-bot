@@ -345,7 +345,39 @@ Every decoder PR must add or update tests in [`tests/version-decoders.test.mjs`]
 
 ---
 
-## 8. Contributor PR Checklist
+## 8. Archived Decoded Event Schema & Migration Adapters
+
+Decoded events can be archived to rotating JSON Lines (`JSONL`) files via [`src/stellar/archive.ts`](../src/stellar/archive.ts).
+
+### 8.1 Explicit Schema Versioning
+
+All newly archived records are explicitly stamped with `schemaVersion: ARCHIVE_SCHEMA_VERSION` (currently `1`).
+
+```ts
+import { ARCHIVE_SCHEMA_VERSION, toArchivedRecord } from "./archive.js";
+
+const record = toArchivedRecord(decodedEvent);
+// record.schemaVersion === 1
+```
+
+### 8.2 Migration Adapters
+
+When replaying or inspecting event archives, [`readArchive`](../src/stellar/archive.ts) and migration adapter functions (`migrateArchivedRecord`, `adaptArchivedTypedEvent`, `adaptArchivedGenericEvent`) handle historical schema evolution:
+
+1. **Current Schema (`schemaVersion: 1`)**: Validated and returned in canonical form.
+2. **Historical Versions (`legacy-unversioned`, `legacy-blocktime`, `legacy-envelope`)**:
+   - `blockTime` mapped to canonical `at`
+   - `txIndex` mapped to canonical `transactionIndex`
+   - Envelopes (`{ event: { ... } }`) unpacked
+   - Preserves backward-compatible legacy accessors while enforcing notification-safe metadata.
+3. **Unknown Versions**:
+   - Explicitly rejected with `UnsupportedArchiveVersionError`.
+   - Never echoes sensitive payload data in error messages.
+   - Respects `retainCommitted: true` to yield prior valid events before failing.
+
+---
+
+## 9. Contributor PR Checklist
 
 Contributors submitting decoder changes should copy and complete this checklist in their PR description:
 

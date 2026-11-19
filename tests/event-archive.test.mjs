@@ -49,6 +49,7 @@ test("archive creates files with 0o600 permissions and appends events", async ()
     }
 
     assert.equal(readBack.length, 1);
+    assert.equal(readBack[0].schemaVersion, 1);
     assert.equal(readBack[0].eventId, "event-1");
     // Verify bigint round-trip as string
     assert.equal(readBack[0].payload.stake, "5000000000000000000");
