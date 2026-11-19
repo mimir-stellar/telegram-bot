@@ -26,11 +26,11 @@ import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
   chatAllowed,
+  commandMenus,
   commandMetadata,
   isOperator,
   operatorAllowed,
   registeredCommands,
-  visibleCommandMetadata,
   type CommandDeps,
   type CommandModule,
 } from "./commands/index.js";
@@ -373,14 +373,25 @@ export {
   type SendExtra,
 } from "./notifications/notifier.js";
 
-/** Registers the command list so Telegram's UI offers autocompletion. */
+/**
+ * Register Telegram's autocompletion menus.
+ *
+ * The default menu is public; operator commands are advertised only in the
+ * configured operator's private chat. A Telegram cache can keep showing a menu
+ * after configuration changes, so dispatch gates above remain the authority.
+ */
 export async function registerCommands(bot: Bot, config?: BotConfig): Promise<void> {
-  try {
-    await bot.api.setMyCommands(
-      visibleCommandMetadata(config).map(({ command, description }) => ({ command, description })),
-    );
-  } catch (err) {
-    // Cosmetic. Never worth failing a boot over, and never log an unbounded API error.
-    console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);
+  for (const menu of commandMenus(config)) {
+    try {
+      await bot.api.setMyCommands(
+        menu.commands,
+        menu.scope === undefined ? undefined : { scope: menu.scope },
+      );
+    } catch (err) {
+      // Cosmetic. One scope failing must not stop the other, and neither an
+      // unbounded API error nor the operator id belongs in the log.
+      const scope = menu.scope === undefined ? "" : " (operator)";
+      console.warn(`[bot] setMyCommands failed${scope}: ${safeErrorMessage(err)}`);
+    }
   }
 }

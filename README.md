@@ -79,7 +79,9 @@ which covers `/status` and the operator controls below.
 ### 3. Choose an operator (optional)
 
 Set `OPERATOR_TELEGRAM_USER_ID` to the numeric **user** id returned by
-`@userinfobot` to enable `/audit`, `/pause`, and `/resume`. The notification
+`@userinfobot` to enable `/audit`, `/pause`, and `/resume`. A user's private chat
+id is their user id, so the bot also uses this value to scope the privileged
+command menu to the operator's private chat. The notification
 `TELEGRAM_CHAT_ID` is intentionally not accepted as authorization: in a group,
 everyone can send messages from that chat. If this variable is omitted, existing
 deployments continue unchanged and the operator commands are ignored.
@@ -138,10 +140,16 @@ looks healthy but notifies nobody.
 `/start`, `/help`, and Telegram's command menu are generated from the same
 command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
 the help and menu omit `/audit`, `/pause`, and `/resume`; configured operator
-commands are labelled "Operator only". Help uses static metadata, so it remains
-available when the poller or RPC is unhealthy. Adding a command requires its
-metadata and handler in `src/bot.ts`; TypeScript checks that every registry entry
-has a handler. This changes no cursor files or deployment settings.
+commands are labelled "Operator only". With an operator configured, the default
+menu stays public and the full menu is registered with a Telegram `chat` scope
+for that operator's private chat, so unrelated chats never see the privileged
+entries. Telegram caches menus per chat and may keep showing a stale one after a
+configuration change; that is only advertising. Every command is still checked
+by the central operator/allowlist gates on receipt, so a cached menu cannot
+grant access. Help uses static metadata, so it remains available when the poller
+or RPC is unhealthy. Adding a command requires a module in `src/commands/` plus
+its metadata; TypeScript checks that every registry entry has a handler. This
+changes no cursor files or deployment settings.
 
 Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
 response and cannot mutate poller state — this includes `/audit`, whose report

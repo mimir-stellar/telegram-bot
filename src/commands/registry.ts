@@ -15,7 +15,7 @@
  */
 
 import type { CommandContext, Context } from "grammy";
-import type { UserFromGetMe } from "grammy/types";
+import type { BotCommand, UserFromGetMe } from "grammy/types";
 
 import type { AuditLog } from "../audit.js";
 import type { BotConfig } from "../config.js";
@@ -62,9 +62,11 @@ export interface CommandModule {
    */
   readonly command: string;
   /**
-   * Operator-only commands answer only the configured operator and are hidden
-   * from the menu when no operator is configured. Non-operators are ignored
-   * silently: an error reply would confirm the command exists.
+   * Operator-only commands answer only the configured operator. They are kept
+   * out of the default Telegram menu and advertised only in the operator's
+   * private chat; with no operator configured they are omitted entirely.
+   * Non-operators are ignored silently: an error reply would confirm the
+   * command exists, and a cached Telegram menu is never an authorization gate.
    */
   readonly operatorOnly?: boolean;
   /**
@@ -158,4 +160,46 @@ export function visibleCommandMetadata(config?: BotConfig): CommandMetadata[] {
         descriptionFor(module.command),
       operatorOnly: module.operatorOnly === true,
     }));
+}
+
+/** One Telegram `setMyCommands` payload and the scope where it should apply. */
+export interface CommandMenu {
+  /** Commands to advertise, in registration (menu) order. */
+  readonly commands: readonly BotCommand[];
+  /** Absent means Telegram's default scope: every chat that has not got a narrower menu. */
+  readonly scope?: {
+    readonly type: "chat";
+    /** `OPERATOR_TELEGRAM_USER_ID`; a user's private chat id is their user id. */
+    readonly chat_id: string;
+  };
+}
+
+/**
+ * Build the menus `registerCommands` sends to Telegram.
+ *
+ * The default menu deliberately excludes operator-only commands: Telegram
+ * caches menus per chat and may keep showing them after configuration changes,
+ * so a menu entry is advertising, not authorization. When an operator is
+ * configured, the full menu is registered for that operator's private chat so
+ * they keep every command they can already run. Runtime gates in `src/bot.ts`
+ * continue to decide who may actually execute a command.
+ */
+export function commandMenus(config?: BotConfig): readonly CommandMenu[] {
+  const visible = visibleCommandMetadata(config);
+  const telegramCommands = (items: readonly CommandMetadata[]): readonly BotCommand[] =>
+    items.map(({ command, description }) => ({ command, description }));
+
+  const menus: CommandMenu[] = [
+    { commands: telegramCommands(visible.filter(({ operatorOnly }) => !operatorOnly)) },
+  ];
+
+  const operatorChatId = config?.operatorTelegramUserId;
+  if (operatorChatId !== null && operatorChatId !== undefined && operatorChatId.length > 0) {
+    menus.push({
+      commands: telegramCommands(visible),
+      scope: { type: "chat", chat_id: operatorChatId },
+    });
+  }
+
+  return menus;
 }
