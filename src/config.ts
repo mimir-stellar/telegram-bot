@@ -188,6 +188,12 @@ export interface StellarConfig {
 export interface TelegramRoute {
   chatId: string;
   channelPreviewMode: boolean;
+  /**
+   * Optional per-route notification language preference (e.g. `"en"`, `"es"`, `"es-MX"`).
+   * When omitted or unsupported, notification renderers fall back deterministically
+   * to the global config locale (or {@link DEFAULT_LOCALE}).
+   */
+  locale?: string;
 }
 
 export interface BotConfig extends StellarConfig {

@@ -22,6 +22,7 @@ import {
   shortAddress,
   squadSideLabel,
   winnerSideLabel,
+  type ContractSource,
   type DecodedEvent,
 } from "../stellar/decode.js";
 import { normalizeCategory } from "../stellar/category.js";
@@ -32,8 +33,14 @@ import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
 import { formatSquadResolution, renderSquadResolution } from "./squad-resolution.js";
-import type { StellarConfig } from "../config.js";
-import { messagesFor, type Messages } from "../i18n.js";
+import type { StellarConfig, TelegramRoute } from "../config.js";
+import {
+  DEFAULT_LOCALE,
+  messagesFor,
+  normalizeLocale,
+  type Locale,
+  type Messages,
+} from "../i18n.js";
 import { formatDeadline } from "./time.js";
 import {
   highlightLevel,
@@ -265,12 +272,77 @@ export interface ExplorerKeyboard {
 }
 
 /**
+ * Optional routing fields that let notification renderers resolve a per-route
+ * language preference when `routes` is configured.
+ */
+export interface RouteLocaleConfig {
+  locale?: string | null;
+  chatId?: string;
+  chatIds?: readonly string[];
+  marketChatId?: string;
+  squadChatId?: string;
+  routes?: readonly TelegramRoute[];
+  /** Explicit route-level locale override for callers formatting a single route directly. */
+  routeLocale?: string | null;
+}
+
+/**
+ * Resolve the effective notification locale for a route/event.
+ *
+ * Precedence:
+ * 1. Explicit `options.locale` / `options.route.locale` / `config.routeLocale` when supported.
+ * 2. Matching `config.routes` entry for the resolved destination `chatId` when supported.
+ * 3. Global `config.locale` when supported.
+ * 4. {@link DEFAULT_LOCALE} (`"en"`).
+ *
+ * Unsupported or empty locale values deterministically fall back to the next
+ * level rather than throwing.
+ */
+export function resolveNotificationLocale(
+  config: RouteLocaleConfig,
+  options?: {
+    chatId?: string;
+    source?: ContractSource;
+    route?: Pick<TelegramRoute, "locale"> | null;
+    locale?: string | null;
+  },
+): Locale {
+  const tryLocale = (value: string | null | undefined): Locale | null =>
+    typeof value === "string" && value.trim() !== "" ? normalizeLocale(value) : null;
+
+  const explicit =
+    tryLocale(options?.locale) ??
+    tryLocale(options?.route?.locale) ??
+    tryLocale(config.routeLocale);
+  if (explicit !== null) return explicit;
+
+  if (Array.isArray(config.routes) && config.routes.length > 0) {
+    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
+    const targetChatId =
+      options?.chatId ??
+      (options?.source === "market"
+        ? config.marketChatId || defaultChat
+        : options?.source === "squad"
+          ? config.squadChatId || defaultChat
+          : defaultChat);
+    if (targetChatId) {
+      const matched = config.routes.find((route) => route.chatId === targetChatId);
+      const matchedLocale = tryLocale(matched?.locale);
+      if (matchedLocale !== null) return matchedLocale;
+    }
+  }
+
+  return tryLocale(config.locale) ?? DEFAULT_LOCALE;
+}
+
+/**
  * Config the keyboard builder reads: the chain fields `eventExplorerUrl`
  * needs, plus the optional Mimir web-app origin (`MIMIR_APP_URL`) that adds a
  * second button. Optional here so a chain-only config keeps building the
  * explorer-only keyboard it has always built.
  */
-export type KeyboardConfig = StellarConfig & { mimirAppUrl?: string | null };
+export type KeyboardConfig = StellarConfig &
+  RouteLocaleConfig & { mimirAppUrl?: string | null };
 
 /**
  * Telegram inline keyboard for an event notification.
@@ -287,7 +359,7 @@ export function explorerKeyboard(
   config: KeyboardConfig,
   event: DecodedEvent,
 ): ExplorerKeyboard | undefined {
-  const messages = messagesFor(config.locale);
+  const messages = messagesFor(resolveNotificationLocale(config, { source: event?.source }));
   const buttons: ExplorerButton[] = [];
   const explorerUrl = eventExplorerUrl(config, event);
   if (explorerUrl) buttons.push({ text: messages.explorerButtonText, url: explorerUrl });
@@ -540,12 +612,13 @@ export function eventAllowedByCategory(
 }
 
 export function formatEvent(
-  config: StellarConfig & {
-    channelPreviewMode?: boolean;
-    notificationCategories?: readonly string[];
-    highlightThresholds?: HighlightThresholds;
-    nowMs?: number;
-  },
+  config: StellarConfig &
+    RouteLocaleConfig & {
+      channelPreviewMode?: boolean;
+      notificationCategories?: readonly string[];
+      highlightThresholds?: HighlightThresholds;
+      nowMs?: number;
+    },
   event: DecodedEvent,
   nowMsOrThresholds?: number | HighlightThresholds,
 ): string | null {
@@ -557,7 +630,7 @@ export function formatEvent(
       : undefined;
   const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    const messages = messagesFor(config.locale);
+    const messages = messagesFor(resolveNotificationLocale(config, { source: event?.source }));
     let head = headline(messages, event, currentMs);
     if (head === null) return null;
     const effectiveThresholds = thresholds ?? config.highlightThresholds;
@@ -747,11 +820,11 @@ function clipPlainText(text: string, max = MAX_PLAIN_TEXT_LENGTH): string {
  * a minimal bounded line rather than crashing the notifier.
  */
 export function formatPlainTextEvent(
-  config: StellarConfig & { highlightThresholds?: HighlightThresholds; nowMs?: number },
+  config: StellarConfig & RouteLocaleConfig & { highlightThresholds?: HighlightThresholds; nowMs?: number },
   event: DecodedEvent,
   nowMsOrThresholds?: number | HighlightThresholds,
 ): string | null {
-  const messages = messagesFor(config.locale);
+  const messages = messagesFor(resolveNotificationLocale(config, { source: event?.source }));
   const nowMs = typeof nowMsOrThresholds === "number" ? nowMsOrThresholds : undefined;
   const thresholds =
     typeof nowMsOrThresholds === "object" && nowMsOrThresholds !== null
@@ -792,7 +865,7 @@ function minimalPlainTextEvent(messages: Messages, event: DecodedEvent): string 
  * Fallback message when an event payload is malformed or an error occurs during formatting.
  */
 export function formatFallbackEvent(
-  config: StellarConfig,
+  config: StellarConfig & RouteLocaleConfig,
   event: DecodedEvent,
   reason = "malformed payload",
 ): string {
@@ -801,7 +874,7 @@ export function formatFallbackEvent(
   const ledger = escapeMd(String(event.ledger ?? "unknown"));
   const safeReason = escapeMd(safeErrorMessage(reason));
   const txPart = event.txHash ? ` · [tx](${txExplorerUrl(config, event.txHash)})` : "";
-  return messagesFor(config.locale).notificationMd.fallbackEvent(
+  return messagesFor(resolveNotificationLocale(config, { source: event?.source })).notificationMd.fallbackEvent(
     source,
     contract,
     ledger,
