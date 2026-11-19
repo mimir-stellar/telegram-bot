@@ -234,7 +234,11 @@ export function createMetrics(): MetricsRegistry {
 
     // Only GET is meaningful for a read-only metrics endpoint.
     if (method !== "GET") {
-      res.writeHead(405, { "Content-Type": "text/plain", Allow: "GET" });
+      res.writeHead(405, {
+        "Content-Type": "text/plain",
+        Allow: "GET",
+        "Cache-Control": "no-store",
+      });
       res.end("Method Not Allowed\n");
       return;
     }
@@ -255,12 +259,18 @@ export function createMetrics(): MetricsRegistry {
     }
 
     if (path === "/health") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.writeHead(200, {
+        "Content-Type": "text/plain",
+        "Cache-Control": "no-store",
+      });
       res.end("OK\n");
       return;
     }
 
-    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.writeHead(404, {
+      "Content-Type": "text/plain",
+      "Cache-Control": "no-store",
+    });
     res.end("Not Found\n");
   }
 

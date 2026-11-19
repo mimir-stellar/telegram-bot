@@ -350,6 +350,26 @@ test("server: /metrics response includes Cache-Control: no-store", async () => {
   }
 });
 
+test("server: /health, 404, and 405 responses include Cache-Control: no-store", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const healthRes = await httpGet(`http://127.0.0.1:${srv.port}/health`);
+    assert.equal(healthRes.statusCode, 200);
+    assert.equal(healthRes.headers["cache-control"], "no-store");
+
+    const notFoundRes = await httpGet(`http://127.0.0.1:${srv.port}/unknown`);
+    assert.equal(notFoundRes.statusCode, 404);
+    assert.equal(notFoundRes.headers["cache-control"], "no-store");
+
+    const methodNotAllowedRes = await httpRequest("POST", `http://127.0.0.1:${srv.port}/metrics`);
+    assert.equal(methodNotAllowedRes.statusCode, 405);
+    assert.equal(methodNotAllowedRes.headers["cache-control"], "no-store");
+  } finally {
+    await srv.close();
+  }
+});
+
 test("server: live counter updates are reflected in subsequent /metrics responses", async () => {
   const m = createMetrics();
   const srv = await m.startServer(0);

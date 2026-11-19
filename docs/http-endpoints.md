@@ -34,6 +34,11 @@ that restricts who can reach the port. The health response includes
 configuration provenance (which env var supplied each setting) and poller
 counters. It contains no secrets, but it does confirm what is running.
 
+All operational HTTP responses on both listeners — including health, readiness,
+liveness, metrics, unauthorized (`401`), and error (`404`/`405`) responses —
+set `Cache-Control: no-store` so reverse proxies and intermediaries never cache
+live operational state.
+
 ---
 
 ## Health server — `HEALTH_PORT` (default 8787)
