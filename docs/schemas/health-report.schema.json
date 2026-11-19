@@ -214,39 +214,7 @@
           }
         },
         "entries": {
-          "type": "array",
-          "description": "Every setting the bot reads, in a stable order.",
-          "items": {
-            "type": "object",
-            "additionalProperties": true,
-            "required": ["key", "source", "secret"],
-            "properties": {
-              "key": { "type": "string", "description": "Variable name, e.g. BOT_TOKEN. A name is not a value." },
-              "source": { "enum": ["process-env", "env-file", "profile-default", "built-in-default", "derived", "unset"] },
-              "secret": { "type": "boolean" },
-              "derivedFrom": { "type": "string", "description": "Present only when source is derived: the setting this one inherited from." },
-              "emptyDeclaration": { "type": "boolean", "description": "Present (true) only when the variable is set but empty, so a fallback won." }
-            }
-          }
-        },
-        "counts": {
-          "type": "object",
-          "additionalProperties": true,
-          "description": "How many settings each source supplied.",
-          "required": ["process-env", "env-file", "profile-default", "built-in-default", "derived", "unset"],
-          "properties": {
-            "process-env": { "type": "integer", "minimum": 0 },
-            "env-file": { "type": "integer", "minimum": 0 },
-            "profile-default": { "type": "integer", "minimum": 0 },
-            "built-in-default": { "type": "integer", "minimum": 0 },
-            "derived": { "type": "integer", "minimum": 0 },
-            "unset": { "type": "integer", "minimum": 0 }
-          }
-        },
-        "warnings": {
-          "type": "array",
-          "description": "Actionable, value-free notes for boot logs and health checks.",
-          "items": { "type": "string" }
+          "type": "object"
         }
       }
     }
