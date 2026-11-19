@@ -26,6 +26,13 @@ export const FEED_CONTENT_MAX_CHARS = 2_000;
 export const FEED_TITLE_MAX_CHARS = 500;
 
 /**
+ * Explicit RFC 3339 timestamp used when an event or feed has no known ledger
+ * close time, avoiding assigning process startup / wall-clock time to
+ * historical or timeless entries.
+ */
+export const UNKNOWN_EVENT_TIMESTAMP = new Date(0).toISOString();
+
+/**
  * Escape the five XML predefined entities so a string is safe inside any
  * element text node or double-quoted attribute value.
  *
@@ -65,14 +72,17 @@ export function xmlText(text: string, max: number): string {
 }
 
 /**
- * Return `url` as-is if it is a valid `https:` URL string, otherwise return
- * `null`.  Only `https:` is allowed: `http:` and other schemes are not safe to
- * embed as Atom `href` / `uri` values without a trusted origin.
+ * Return `url` as-is if it is a valid `https:` URL string with a non-empty host
+ * and no userinfo (`username` / `password`), otherwise return `null`.
+ * Only `https:` is allowed and credential-bearing URLs are rejected so Atom
+ * `href` / `uri` values never leak or embed credentials.
  */
 export function safeHttpsUrl(url: string): string | null {
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== "https:") return null;
+    if (parsed.username !== "" || parsed.password !== "") return null;
+    if (!parsed.hostname) return null;
     return url;
   } catch {
     return null;
@@ -112,8 +122,9 @@ export interface AtomFeedOptions {
   config: StellarConfig;
   /**
    * Override the feed's `<updated>` timestamp (ISO 8601 / RFC 3339).
-   * Defaults to the `at` field of the most-recent event, or the current
-   * wall-clock time when the events array is empty.
+   * Defaults to the `at` field of the most-recent event, or
+   * {@link UNKNOWN_EVENT_TIMESTAMP} (`1970-01-01T00:00:00.000Z`) when no
+   * event has a valid ledger timestamp or the events array is empty.
    */
   updatedAt?: string;
   /** Optional subtitle / description for the feed. */
@@ -139,13 +150,12 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
 
   const title = `mimir-${event.source}: ${eventName}`;
 
-  // Use ledger close time if available and looks reasonable (> Unix epoch start),
-  // otherwise fall back to a synthetic epoch-based value.
-  const updatedDate =
-    typeof event.at === "number" && event.at > 0
-      ? new Date(event.at * 1000)
-      : new Date(0);
-  const updated = updatedDate.toISOString();
+  // Use ledger close time if available and finite (> Unix epoch start),
+  // otherwise represent unknown event time explicitly.
+  const updated =
+    typeof event.at === "number" && Number.isFinite(event.at) && event.at > 0
+      ? new Date(event.at * 1000).toISOString()
+      : UNKNOWN_EVENT_TIMESTAMP;
 
   const rawContent = formatPlainTextEvent(config, event);
   const content =
@@ -207,7 +217,8 @@ function renderEntry(entry: AtomEntry): string {
  *
  * - `<feed id>` is the `selfUrl`.
  * - `<updated>` is the most recent `event.at` timestamp, or `updatedAt` when
- *   provided, or the current time for an empty event array.
+ *   provided, or {@link UNKNOWN_EVENT_TIMESTAMP} (`1970-01-01T00:00:00.000Z`)
+ *   when no event has a valid ledger timestamp or the event array is empty.
  * - Each event becomes one `<entry>`.  Events with no plain-text rendering still
  *   get an entry (with an empty `<content/>`), so feed readers always see the
  *   full event count.
@@ -220,15 +231,16 @@ export function buildAtomFeed(
 ): string {
   const { title, selfUrl, config, subtitle } = options;
 
-  // Feed <updated>: caller override → latest event.at → now.
+  // Feed <updated>: caller override -> latest valid event.at -> explicit unknown timestamp.
   let feedUpdated: string;
   if (options.updatedAt) {
     feedUpdated = options.updatedAt;
-  } else if (events.length > 0) {
-    const maxAt = events.reduce((best, e) => Math.max(best, e.at ?? 0), 0);
-    feedUpdated = new Date(maxAt > 0 ? maxAt * 1000 : Date.now()).toISOString();
   } else {
-    feedUpdated = new Date().toISOString();
+    const maxAt = events.reduce(
+      (best, e) => (typeof e.at === "number" && Number.isFinite(e.at) && e.at > best ? e.at : best),
+      0,
+    );
+    feedUpdated = maxAt > 0 ? new Date(maxAt * 1000).toISOString() : UNKNOWN_EVENT_TIMESTAMP;
   }
 
   const validSelfUrl = safeHttpsUrl(selfUrl) ?? "";

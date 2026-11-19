@@ -23,6 +23,7 @@ import {
   buildAtomFeed,
   FEED_CONTENT_MAX_CHARS,
   FEED_TITLE_MAX_CHARS,
+  UNKNOWN_EVENT_TIMESTAMP,
 } from "../dist/stellar/feed.js";
 
 // ---------------------------------------------------------------------------
@@ -186,6 +187,12 @@ test("safeHttpsUrl: rejects empty string", () => {
   assert.equal(safeHttpsUrl(""), null);
 });
 
+test("safeHttpsUrl: rejects credential-bearing URLs (userinfo)", () => {
+  assert.equal(safeHttpsUrl("https://user:pass@example.com/feed"), null);
+  assert.equal(safeHttpsUrl("https://user@example.com/feed"), null);
+  assert.equal(safeHttpsUrl("https://:pass@example.com/feed"), null);
+});
+
 // ---------------------------------------------------------------------------
 // buildAtomEntry
 // ---------------------------------------------------------------------------
@@ -250,6 +257,13 @@ test("buildAtomEntry: updated is an ISO 8601 string derived from event.at", () =
   const parsed = new Date(entry.updated);
   assert.ok(!Number.isNaN(parsed.getTime()), "updated should parse as a valid date");
   assert.equal(parsed.getTime(), 1_700_000_000 * 1000);
+});
+
+test("buildAtomEntry: unknown or invalid event.at uses UNKNOWN_EVENT_TIMESTAMP", () => {
+  for (const at of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+    const entry = buildAtomEntry(makeEvent({ at }), BASE_CONFIG);
+    assert.equal(entry.updated, UNKNOWN_EVENT_TIMESTAMP);
+  }
 });
 
 test("buildAtomEntry: content is a non-empty string for a notifiable event", () => {
@@ -352,6 +366,38 @@ test("buildAtomFeed: <updated> reflects the most recent event.at", () => {
   // The feed's <updated> should be the ISO string of the max at (1_700_000_200)
   const expected = new Date(1_700_000_200 * 1000).toISOString();
   assert.ok(feed.includes(expected), `feed <updated> should be ${expected}`);
+});
+
+test("buildAtomFeed: <updated> uses UNKNOWN_EVENT_TIMESTAMP when events have no valid ledger time", () => {
+  const events = [
+    makeEvent({ at: 0 }),
+    makeEvent({ at: -5 }),
+    makeEvent({ at: Number.NaN }),
+  ];
+  const feed = buildAtomFeed(events, FEED_OPTS);
+  assert.ok(
+    feed.includes(`<updated>${UNKNOWN_EVENT_TIMESTAMP}</updated>`),
+    `feed <updated> should be ${UNKNOWN_EVENT_TIMESTAMP}, not wall-clock time`,
+  );
+});
+
+test("buildAtomFeed: <updated> uses UNKNOWN_EVENT_TIMESTAMP for empty events without updatedAt", () => {
+  const feed = buildAtomFeed([], FEED_OPTS);
+  assert.ok(
+    feed.includes(`<updated>${UNKNOWN_EVENT_TIMESTAMP}</updated>`),
+    `empty feed <updated> should be ${UNKNOWN_EVENT_TIMESTAMP}`,
+  );
+});
+
+test("buildAtomFeed: <updated> ignores invalid event.at when another event has a valid ledger time", () => {
+  const events = [
+    makeEvent({ at: Number.POSITIVE_INFINITY }),
+    makeEvent({ at: 1_700_000_123 }),
+    makeEvent({ at: 0 }),
+  ];
+  const feed = buildAtomFeed(events, FEED_OPTS);
+  const expected = new Date(1_700_000_123 * 1000).toISOString();
+  assert.ok(feed.includes(`<updated>${expected}</updated>`), `feed <updated> should be ${expected}`);
 });
 
 test("buildAtomFeed: updatedAt option overrides event timestamps", () => {
