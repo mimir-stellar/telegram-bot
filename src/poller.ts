@@ -2046,6 +2046,8 @@ export function createPoller(deps: PollerDeps) {
       if (!isNotificationAllowed(config.featureFlags, event.source, event.payload.name)) {
         recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
+        metrics?.eventsFiltered.inc();
+        metrics?.eventsFilteredFeatureFlag.inc();
         skipped += 1;
         console.log(
           `[poller] feature-flag skipped ${event.source} event "${boundedLabel(event.payload.name, 80)}" ` +
@@ -2105,6 +2107,8 @@ export function createPoller(deps: PollerDeps) {
       if (text === null) {
         recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
+        metrics?.eventsFiltered.inc();
+        metrics?.eventsFilteredRule.inc();
         skipped += 1;
         audit.record(
           auditEntry("event_skipped", {

@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 import { get } from "node:http";
 import test from "node:test";
 
-import { createMetrics } from "../dist/metrics.js";
+import { createMetrics, deliveryFailureRate } from "../dist/metrics.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -448,4 +448,52 @@ test("security: /health response does not echo request headers", async () => {
   } finally {
     await srv.close();
   }
+});
+
+// ── Filtered event counters & failure-rate denominator ────────────────────────
+
+test("filtered counters: start at zero and increment independently by reason", () => {
+  const m = createMetrics();
+  assert.equal(m.eventsFiltered.value(), 0);
+  assert.equal(m.eventsFilteredFeatureFlag.value(), 0);
+  assert.equal(m.eventsFilteredRule.value(), 0);
+
+  m.eventsFiltered.inc();
+  m.eventsFilteredFeatureFlag.inc();
+  assert.equal(m.eventsFiltered.value(), 1);
+  assert.equal(m.eventsFilteredFeatureFlag.value(), 1);
+  assert.equal(m.eventsFilteredRule.value(), 0);
+  assert.equal(m.notificationsFailed.value(), 0);
+
+  m.eventsFiltered.inc();
+  m.eventsFilteredRule.inc();
+  assert.equal(m.eventsFiltered.value(), 2);
+  assert.equal(m.eventsFilteredFeatureFlag.value(), 1);
+  assert.equal(m.eventsFilteredRule.value(), 1);
+});
+
+test("filtered counters: rendered output includes stable filtered metric names", () => {
+  const m = createMetrics();
+  m.eventsFiltered.inc(3);
+  m.eventsFilteredFeatureFlag.inc(2);
+  m.eventsFilteredRule.inc(1);
+  const out = m.render();
+  assert.ok(out.includes("mimir_bot_events_filtered_total 3"));
+  assert.ok(out.includes("mimir_bot_events_filtered_feature_flag_total 2"));
+  assert.ok(out.includes("mimir_bot_events_filtered_rule_total 1"));
+});
+
+test("deliveryFailureRate: excludes filtered events from denominator and handles zero attempts", () => {
+  assert.equal(deliveryFailureRate(0, 0), 0);
+  assert.equal(deliveryFailureRate(8, 2), 0.2);
+
+  // Filtered events do not affect the failure rate denominator
+  const m = createMetrics();
+  m.notificationsSent.inc(8);
+  m.notificationsFailed.inc(2);
+  m.eventsFiltered.inc(100);
+  assert.equal(
+    deliveryFailureRate(m.notificationsSent.value(), m.notificationsFailed.value()),
+    0.2,
+  );
 });

@@ -72,6 +72,13 @@ export interface MetricsRegistry {
   /** Total events the decoder handed back with payload.name === "unknown", plus
    *  those dropped by the MAX_NOTIFICATIONS_PER_CYCLE cap. */
   eventsSkipped: Counter;
+  /** Total events intentionally filtered out (e.g. feature flags or filter rules).
+   *  Excluded from the delivery failure-rate denominator. */
+  eventsFiltered: Counter;
+  /** Intentionally filtered events dropped by NOTIFY_* feature flags. */
+  eventsFilteredFeatureFlag: Counter;
+  /** Intentionally filtered events dropped by category/filter rules (null formatted text). */
+  eventsFilteredRule: Counter;
   /** Total Telegram messages successfully sent. */
   notificationsSent: Counter;
   /** Total Telegram sends that threw (the cursor still advances). */
@@ -167,6 +174,18 @@ export function createMetrics(): MetricsRegistry {
     `${METRICS_PREFIX}events_skipped_total`,
     "Total events not notified: unknown type, no formatter, or MAX_NOTIFICATIONS_PER_CYCLE cap.",
   );
+  const eventsFiltered = makeCounter(
+    `${METRICS_PREFIX}events_filtered_total`,
+    "Total events intentionally filtered out (excluded from failure-rate denominator).",
+  );
+  const eventsFilteredFeatureFlag = makeCounter(
+    `${METRICS_PREFIX}events_filtered_feature_flag_total`,
+    "Total events intentionally filtered out by NOTIFY_* feature flags.",
+  );
+  const eventsFilteredRule = makeCounter(
+    `${METRICS_PREFIX}events_filtered_rule_total`,
+    "Total events intentionally filtered out by category or filter rules.",
+  );
   const notificationsSent = makeCounter(
     `${METRICS_PREFIX}notifications_sent_total`,
     "Total Telegram messages successfully sent.",
@@ -202,6 +221,9 @@ export function createMetrics(): MetricsRegistry {
     rpcErrors,
     eventsDecoded,
     eventsSkipped,
+    eventsFiltered,
+    eventsFilteredFeatureFlag,
+    eventsFilteredRule,
     notificationsSent,
     notificationsFailed,
     staleCursorEvents,
@@ -299,6 +321,9 @@ export function createMetrics(): MetricsRegistry {
     rpcErrors,
     eventsDecoded,
     eventsSkipped,
+    eventsFiltered,
+    eventsFilteredFeatureFlag,
+    eventsFilteredRule,
     notificationsSent,
     notificationsFailed,
     staleCursorEvents,
@@ -312,3 +337,13 @@ export function createMetrics(): MetricsRegistry {
 }
 
 export type Metrics = ReturnType<typeof createMetrics>;
+
+/**
+ * Compute the delivery failure rate over actual delivery attempts (`sent + failed`).
+ * Intentionally filtered events are excluded from the denominator.
+ */
+export function deliveryFailureRate(sent: number, failed: number): number {
+  const attempts = sent + failed;
+  if (attempts <= 0 || !Number.isFinite(attempts)) return 0;
+  return failed / attempts;
+}
