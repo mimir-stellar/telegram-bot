@@ -372,6 +372,11 @@ export {
   notifierSkips,
   type SendExtra,
 } from "./notifications/notifier.js";
+export {
+  verifyRoutes,
+  type NotificationRoute,
+  type VerifyRoutesOptions,
+} from "./notifications/verify-routes.js";
 
 /** Registers the command list so Telegram's UI offers autocompletion. */
 export async function registerCommands(bot: Bot, config?: BotConfig): Promise<void> {

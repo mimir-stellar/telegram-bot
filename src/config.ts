@@ -188,6 +188,13 @@ export interface StellarConfig {
 export interface TelegramRoute {
   chatId: string;
   channelPreviewMode: boolean;
+  /**
+   * Optional Telegram forum topic id (`message_thread_id`). When set, every
+   * notification for this route is posted into that topic. Verified at startup
+   * by `verifyRoutes`; routes whose topic cannot be reached are disabled so
+   * the rest of the working chats are preserved.
+   */
+  topicId?: number | undefined;
 }
 
 export interface BotConfig extends StellarConfig {

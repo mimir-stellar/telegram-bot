@@ -13,7 +13,7 @@
 
 import type { Bot } from "grammy";
 
-import type { BotConfig } from "../config.js";
+import type { BotConfig, TelegramRoute } from "../config.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
   safeErrorMessage,
@@ -116,11 +116,48 @@ export const notifierSkips = { emptyText: 0 };
  * 400, and a formatters' `null` must never turn into a doomed send. The skip
  * is counted in {@link notifierSkips} and logged with bounded metadata.
  */
+/**
+ * Resolved destination for a single send: the chat id plus an optional forum
+ * topic id that threads the notification into a specific topic.
+ */
+interface ResolvedDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
+
+/**
+ * Resolve the send destination for `source` from the flat config fields.
+ * Returns `{ chatId, topicId: undefined }` — the topic comes only from
+ * explicit `routes` entries in `createNotifier`.
+ */
+function resolveDestination(
+  source: ContractSource | undefined,
+  config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId"> &
+    Partial<Pick<BotConfig, "chatIds">>,
+): ResolvedDestination {
+  const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
+  const chatId =
+    source === "market"
+      ? config.marketChatId || defaultChat
+      : source === "squad"
+        ? config.squadChatId || defaultChat
+        : defaultChat;
+  return { chatId };
+}
+
 export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
-    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents" | "routes">>,
 ) {
+  // Index verified routes by chatId for O(1) topic lookup at send time.
+  // Routes are verified before `createNotifier` is called; any route that
+  // survived verification may carry a topicId.
+  const routeMap = new Map<string, TelegramRoute>();
+  for (const route of config.routes ?? []) {
+    routeMap.set(route.chatId, route);
+  }
+
   return async (
     text: string | null,
     source?: ContractSource,
@@ -138,12 +175,14 @@ export function createNotifier(
       return;
     }
 
-    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
-    const chatId = source === "market"
-      ? config.marketChatId || defaultChat
-      : source === "squad"
-        ? config.squadChatId || defaultChat
-        : defaultChat;
+    const dest = resolveDestination(source, config);
+    const chatId = dest.chatId;
+
+    // A verified route entry may add a forum topic id; fall back to undefined
+    // so ordinary chats are unaffected.
+    const topicId = routeMap.get(chatId)?.topicId;
+    const threadOption =
+      topicId !== undefined ? { message_thread_id: topicId } : {};
 
     // Select link preview settings based on the contract source.
     // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
@@ -159,6 +198,7 @@ export function createNotifier(
     const notificationOptions = {
       parse_mode: "MarkdownV2" as const,
       link_preview_options: { is_disabled: linkPreviewDisabled },
+      ...threadOption,
       ...silentOption,
     };
 
@@ -210,6 +250,7 @@ export function createNotifier(
       // Plain text (no parse mode), same per-source link preview setting.
       await bot.api.sendMessage(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
+        ...threadOption,
         ...silentOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(extra?.replyToMessageId !== undefined
