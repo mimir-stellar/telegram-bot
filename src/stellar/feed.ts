@@ -54,14 +54,83 @@ export function stripXmlIllegal(text: string): string {
 
 /**
  * Clip and clean a string for use inside an XML element.
- * Strips XML-illegal control characters, clips to `max` Unicode code points,
- * then XML-escapes the result.
+ *
+ * Pipeline:
+ *   1. Strip XML-illegal control characters.
+ *   2. XML-escape the result (entities expand here, e.g. `&` → `&amp;`).
+ *   3. Clip the *escaped* string to `max` Unicode code points, never splitting
+ *      inside a `&…;` entity reference or a surrogate pair, then append `…`
+ *      when the string was truncated.
+ *
+ * Clipping after escaping means the final output is always ≤ `max` code
+ * points and no entity reference is left with a dangling `&` or missing `;`.
  */
 export function xmlText(text: string, max: number): string {
-  const cleaned = stripXmlIllegal(text);
-  const chars = Array.from(cleaned);
-  const clipped = chars.length <= max ? cleaned : `${chars.slice(0, max - 1).join("")}…`;
-  return escapeXml(clipped);
+  if (max < 1) return "";
+  const escaped = escapeXml(stripXmlIllegal(text));
+  return clipEscapedXml(escaped, max);
+}
+
+/**
+ * Clip an already-XML-escaped string to at most `max` Unicode code points.
+ *
+ * Rules:
+ * - Never splits inside a `&…;` entity reference (scans to the `;` before
+ *   deciding a cut is safe).
+ * - Never splits a surrogate pair.
+ * - Appends `…` (U+2026, one code point, valid XML) when any characters were
+ *   dropped.  The ellipsis itself counts toward `max`, so the last safe cut is
+ *   at `max − 1` code points of content.
+ * - If `max` is 1, the output is `…` (or the whole string when it already fits).
+ *
+ * @param escaped An already-XML-escaped string (no unescaped `<`, `>`, `&`, etc.)
+ * @param max     Maximum code points in the returned string, including any `…`.
+ */
+export function clipEscapedXml(escaped: string, max: number): string {
+  if (max < 1) return "";
+
+  // Count code points (not UTF-16 code units).  Array.from iterates by code
+  // point, handling surrogate pairs correctly.
+  const codePoints = Array.from(escaped);
+  if (codePoints.length <= max) return escaped;
+
+  // We need to append "…" (1 code point), so the content budget is max - 1.
+  const budget = max - 1;
+  if (budget <= 0) return "…";
+
+  // Walk the code-point array and find the last safe cut index where we are
+  // not mid-entity-reference.
+  let codePointCount = 0;
+  let charIndex = 0; // UTF-16 code unit index into `escaped`
+  let lastSafeCut = 0; // UTF-16 index of last confirmed safe cut
+
+  while (codePointCount < budget && charIndex < escaped.length) {
+    if (escaped[charIndex] === "&") {
+      // Scan ahead to find the closing `;`.  If not found, treat the whole
+      // tail as unsafe and stop here.
+      const semi = escaped.indexOf(";", charIndex);
+      if (semi === -1) break; // malformed — no cut inside a runaway entity
+
+      // The entity reference occupies (semi - charIndex + 1) UTF-16 units
+      // but counts as (semi - charIndex + 1) code points in this escaped
+      // string (all entity chars are BMP).  Check that the whole entity fits
+      // in the remaining budget.
+      const entityLen = semi - charIndex + 1; // e.g. "&amp;" = 5
+      if (codePointCount + entityLen > budget) break;
+
+      codePointCount += entityLen;
+      charIndex = semi + 1;
+    } else {
+      // Normal code point: may be a surrogate pair (2 UTF-16 units, 1 cp).
+      const cp = escaped.codePointAt(charIndex)!;
+      const units = cp > 0xffff ? 2 : 1;
+      codePointCount++;
+      charIndex += units;
+    }
+    lastSafeCut = charIndex;
+  }
+
+  return escaped.slice(0, lastSafeCut) + "…";
 }
 
 /**
@@ -127,7 +196,10 @@ export interface AtomFeedOptions {
  * emitting contract id, and Soroban event id. Presentation text is excluded so
  * template changes do not create new entries.
  * The title is the event name (payload.name).
- * The content is the plain-text rendering, bounded to {@link FEED_CONTENT_MAX_CHARS}.
+ * The content is the plain-text rendering. The cap ({@link FEED_CONTENT_MAX_CHARS})
+ * is applied during serialisation via {@link xmlText}, which counts code points
+ * in the already-escaped string so the truncation marker never lands inside an
+ * entity reference.
  * The link is the explorer URL when one exists.
  * The updated timestamp comes from `event.at` (ledger close time).
  */
@@ -148,10 +220,7 @@ export function buildAtomEntry(event: DecodedEvent, config: StellarConfig): Atom
   const updated = updatedDate.toISOString();
 
   const rawContent = formatPlainTextEvent(config, event);
-  const content =
-    rawContent !== null
-      ? Array.from(rawContent).slice(0, FEED_CONTENT_MAX_CHARS).join("")
-      : null;
+  const content = rawContent !== null ? rawContent : null;
 
   const explorerUrl = eventExplorerUrl(config, event);
   const link = explorerUrl ? safeHttpsUrl(explorerUrl) : null;
@@ -212,7 +281,9 @@ function renderEntry(entry: AtomEntry): string {
  *   get an entry (with an empty `<content/>`), so feed readers always see the
  *   full event count.
  * - All dynamic content is XML-escaped; XML-illegal control characters are
- *   stripped before escaping.
+ *   stripped before escaping.  Length limits are enforced by Unicode code-point
+ *   count *after* XML escaping so entity references (`&amp;`, `&lt;`, …) are
+ *   never split and the final output is always within the stated cap.
  */
 export function buildAtomFeed(
   events: readonly DecodedEvent[],
