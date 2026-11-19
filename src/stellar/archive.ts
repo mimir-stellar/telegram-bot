@@ -3,10 +3,17 @@ import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
 
+export interface ArchiveMetadata {
+  network?: string;
+  contractId?: string;
+}
+
 export interface EventArchiveOptions {
   dir: string;
   maxBytes?: number;
   maxFiles?: number;
+  /** Optional network and contract metadata written as a header record in new archive files. */
+  metadata?: ArchiveMetadata;
 }
 
 export interface EventArchive {
@@ -17,6 +24,17 @@ export interface EventArchive {
 export interface ReadArchiveOptions {
   /** Yield valid records before a malformed record instead of discarding them. Defaults to false. */
   retainCommitted?: boolean;
+  /** Expected network metadata; rejects archives with contradictory network metadata. */
+  expectedNetwork?: string;
+  /** Expected contractId metadata; rejects archives with contradictory contractId metadata or events. */
+  expectedContractId?: string;
+}
+
+export class ArchiveMetadataConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ArchiveMetadataConflictError";
+  }
 }
 
 export class MalformedArchiveRecordError extends Error {
@@ -47,9 +65,10 @@ function formatArchiveFilename(index: number, timestamp: number): string {
 }
 
 export function createEventArchive(options: EventArchiveOptions): EventArchive {
-  const { dir } = options;
+  const { dir, metadata } = options;
   const maxBytes = Math.max(1, options.maxBytes ?? DEFAULT_MAX_BYTES);
   const maxFiles = Math.max(1, options.maxFiles ?? DEFAULT_MAX_FILES);
+  const hasMetadata = Boolean(metadata && (metadata.network !== undefined || metadata.contractId !== undefined));
 
   let currentHandle: any = null;
   let currentFilePath: string | null = null;
@@ -102,6 +121,14 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
 
     const st = await currentHandle.stat();
     currentSize = st.size;
+
+    if (hasMetadata && currentSize === 0) {
+      const header = JSON.stringify({ type: "metadata", ...metadata }) + "\n";
+      const headerBuf = Buffer.from(header, "utf8");
+      await currentHandle.write(headerBuf);
+      await currentHandle.sync();
+      currentSize += headerBuf.byteLength;
+    }
   }
 
   async function doAppend(events: readonly DecodedEvent[]): Promise<void> {
@@ -159,10 +186,96 @@ async function listArchiveFiles(dir: string): Promise<string[]> {
   }
 }
 
+function isMetadataRecord(value: unknown): value is { type: "metadata"; network?: unknown; contractId?: unknown } {
+  return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "metadata";
+}
+
+/**
+ * Validate archive metadata across all files in `dir` before event iteration begins.
+ * Rejects archives with contradictory network or contractId metadata.
+ */
+export async function validateArchiveMetadata(
+  dir: string,
+  options: Pick<ReadArchiveOptions, "expectedNetwork" | "expectedContractId"> = {},
+): Promise<ArchiveMetadata> {
+  const files = await listArchiveFiles(dir);
+  let observedNetwork: string | undefined;
+  let observedContractId: string | undefined;
+
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    const handle = await open(filePath, "r");
+    try {
+      const content = await handle.readFile({ encoding: "utf8" });
+      const lines = content.split("\n");
+      for (let index = 0; index < lines.length; index += 1) {
+        const trimmed = lines[index]!.trim();
+        if (!trimmed) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          // Malformed JSON lines are handled during iteration so retainCommitted continues to work.
+          continue;
+        }
+
+        if (isMetadataRecord(parsed)) {
+          const net = typeof parsed.network === "string" ? parsed.network : undefined;
+          const cid = typeof parsed.contractId === "string" ? parsed.contractId : undefined;
+
+          if (options.expectedNetwork !== undefined && net !== undefined && net !== options.expectedNetwork) {
+            throw new ArchiveMetadataConflictError(
+              `Archive network "${net}" contradicts expected network "${options.expectedNetwork}"`,
+            );
+          }
+          if (options.expectedContractId !== undefined && cid !== undefined && cid !== options.expectedContractId) {
+            throw new ArchiveMetadataConflictError(
+              `Archive contractId "${cid}" contradicts expected contractId "${options.expectedContractId}"`,
+            );
+          }
+          if (observedNetwork !== undefined && net !== undefined && net !== observedNetwork) {
+            throw new ArchiveMetadataConflictError(
+              `Contradictory archive network metadata: "${observedNetwork}" vs "${net}"`,
+            );
+          }
+          if (observedContractId !== undefined && cid !== undefined && cid !== observedContractId) {
+            throw new ArchiveMetadataConflictError(
+              `Contradictory archive contractId metadata: "${observedContractId}" vs "${cid}"`,
+            );
+          }
+          if (net !== undefined) observedNetwork = net;
+          if (cid !== undefined) observedContractId = cid;
+        } else if (typeof parsed === "object" && parsed !== null) {
+          const eventContractId = (parsed as { contractId?: unknown }).contractId;
+          const expectedCid = options.expectedContractId ?? observedContractId;
+          if (
+            expectedCid !== undefined &&
+            typeof eventContractId === "string" &&
+            eventContractId !== expectedCid
+          ) {
+            throw new ArchiveMetadataConflictError(
+              `Event contractId "${eventContractId}" contradicts expected contractId "${expectedCid}"`,
+            );
+          }
+        }
+      }
+    } finally {
+      await handle.close();
+    }
+  }
+
+  return {
+    ...(observedNetwork !== undefined ? { network: observedNetwork } : {}),
+    ...(observedContractId !== undefined ? { contractId: observedContractId } : {}),
+  };
+}
+
 export async function* readArchive(
   dir: string,
   options: ReadArchiveOptions = {},
 ): AsyncGenerator<DecodedEvent, void, unknown> {
+  await validateArchiveMetadata(dir, options);
+
   const files = await listArchiveFiles(dir);
   const stagedEvents: DecodedEvent[] = [];
   const retainCommitted = options.retainCommitted === true;
@@ -177,17 +290,22 @@ export async function* readArchive(
         const line = lines[index]!;
         const trimmed = line.trim();
         if (!trimmed) continue;
-        let parsed: DecodedEvent;
+        let parsed: unknown;
         try {
-          parsed = JSON.parse(trimmed) as DecodedEvent;
+          parsed = JSON.parse(trimmed);
         } catch {
           throw new MalformedArchiveRecordError(file, index + 1);
         }
 
+        if (isMetadataRecord(parsed)) {
+          continue;
+        }
+
+        const event = parsed as DecodedEvent;
         if (retainCommitted) {
-          yield parsed;
+          yield event;
         } else {
-          stagedEvents.push(parsed);
+          stagedEvents.push(event);
         }
       }
     } finally {
