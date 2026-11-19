@@ -169,6 +169,12 @@ test("a non-https or unparseable base URL produces no link", () => {
   assert.equal(appUrlFor(event(CLAIM_EVENTS[0]), "not a url"), null);
 });
 
+test("a credential-bearing base URL (userinfo) produces no link", () => {
+  assert.equal(appUrlFor(event(CLAIM_EVENTS[0]), "https://user:pass@app.mimir.example"), null);
+  assert.equal(appUrlFor(event(CLAIM_EVENTS[0]), "https://user@app.mimir.example"), null);
+  assert.equal(appUrlFor(event(CLAIM_EVENTS[0]), "https://:pass@app.mimir.example"), null);
+});
+
 test("base URL trailing slashes and paths collapse to one separator", () => {
   assert.equal(appUrlFor(event(CLAIM_EVENTS[0]), `${APP}/`), `${APP}/claims/7`);
   assert.equal(appUrlFor(event(CLAIM_EVENTS[0]), `${APP}//`), `${APP}/claims/7`);
