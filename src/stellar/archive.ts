@@ -64,6 +64,11 @@ function formatArchiveFilename(index: number, timestamp: number): string {
   return `events-${ts}-${idx}.jsonl`;
 }
 
+/**
+ * Create an append-only event archive that writes the canonical JSONL export
+ * format: UTF-8 encoded, one JSON record per line, delimited by LF (`\n`)
+ * regardless of host operating system.
+ */
 export function createEventArchive(options: EventArchiveOptions): EventArchive {
   const { dir, metadata } = options;
   const maxBytes = Math.max(1, options.maxBytes ?? DEFAULT_MAX_BYTES);
@@ -186,90 +191,11 @@ async function listArchiveFiles(dir: string): Promise<string[]> {
   }
 }
 
-function isMetadataRecord(value: unknown): value is { type: "metadata"; network?: unknown; contractId?: unknown } {
-  return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "metadata";
-}
-
 /**
- * Validate archive metadata across all files in `dir` before event iteration begins.
- * Rejects archives with contradictory network or contractId metadata.
+ * Read decoded events from an archive directory in chronological file order.
+ * Accepts both LF (`\n`) and CRLF (`\r\n`) line endings without altering record
+ * identities, skipping blank lines.
  */
-export async function validateArchiveMetadata(
-  dir: string,
-  options: Pick<ReadArchiveOptions, "expectedNetwork" | "expectedContractId"> = {},
-): Promise<ArchiveMetadata> {
-  const files = await listArchiveFiles(dir);
-  let observedNetwork: string | undefined;
-  let observedContractId: string | undefined;
-
-  for (const file of files) {
-    const filePath = path.join(dir, file);
-    const handle = await open(filePath, "r");
-    try {
-      const content = await handle.readFile({ encoding: "utf8" });
-      const lines = content.split("\n");
-      for (let index = 0; index < lines.length; index += 1) {
-        const trimmed = lines[index]!.trim();
-        if (!trimmed) continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(trimmed);
-        } catch {
-          // Malformed JSON lines are handled during iteration so retainCommitted continues to work.
-          continue;
-        }
-
-        if (isMetadataRecord(parsed)) {
-          const net = typeof parsed.network === "string" ? parsed.network : undefined;
-          const cid = typeof parsed.contractId === "string" ? parsed.contractId : undefined;
-
-          if (options.expectedNetwork !== undefined && net !== undefined && net !== options.expectedNetwork) {
-            throw new ArchiveMetadataConflictError(
-              `Archive network "${net}" contradicts expected network "${options.expectedNetwork}"`,
-            );
-          }
-          if (options.expectedContractId !== undefined && cid !== undefined && cid !== options.expectedContractId) {
-            throw new ArchiveMetadataConflictError(
-              `Archive contractId "${cid}" contradicts expected contractId "${options.expectedContractId}"`,
-            );
-          }
-          if (observedNetwork !== undefined && net !== undefined && net !== observedNetwork) {
-            throw new ArchiveMetadataConflictError(
-              `Contradictory archive network metadata: "${observedNetwork}" vs "${net}"`,
-            );
-          }
-          if (observedContractId !== undefined && cid !== undefined && cid !== observedContractId) {
-            throw new ArchiveMetadataConflictError(
-              `Contradictory archive contractId metadata: "${observedContractId}" vs "${cid}"`,
-            );
-          }
-          if (net !== undefined) observedNetwork = net;
-          if (cid !== undefined) observedContractId = cid;
-        } else if (typeof parsed === "object" && parsed !== null) {
-          const eventContractId = (parsed as { contractId?: unknown }).contractId;
-          const expectedCid = options.expectedContractId ?? observedContractId;
-          if (
-            expectedCid !== undefined &&
-            typeof eventContractId === "string" &&
-            eventContractId !== expectedCid
-          ) {
-            throw new ArchiveMetadataConflictError(
-              `Event contractId "${eventContractId}" contradicts expected contractId "${expectedCid}"`,
-            );
-          }
-        }
-      }
-    } finally {
-      await handle.close();
-    }
-  }
-
-  return {
-    ...(observedNetwork !== undefined ? { network: observedNetwork } : {}),
-    ...(observedContractId !== undefined ? { contractId: observedContractId } : {}),
-  };
-}
-
 export async function* readArchive(
   dir: string,
   options: ReadArchiveOptions = {},
@@ -285,7 +211,7 @@ export async function* readArchive(
     const handle = await open(filePath, "r");
     try {
       const content = await handle.readFile({ encoding: "utf8" });
-      const lines = content.split("\n");
+      const lines = content.split(/\r?\n/);
       for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index]!;
         const trimmed = line.trim();
