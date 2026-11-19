@@ -28,8 +28,15 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Poller Tuning & Safeguards
 - `POLL_INTERVAL_MS`: How often to query the RPC for new events. Minimum is 5000ms. Testnet ledgers close roughly every 5 seconds.
 - `START_LOOKBACK_LEDGERS`: On a cold start (no cursor file), the number of recent ledgers to check for events. Defaults to 60. Limits unbounded backfilling.
-- `CURSOR_FILE`: Path to a persistent JSON file where the bot stores its last-seen ledger cursor. 
+- `CURSOR_FILE`: Path to a persistent JSON file where the bot stores its last-seen ledger cursor.
 - `MAX_NOTIFICATIONS_PER_CYCLE`: Operational safeguard. The maximum number of notifications to dispatch in a single poll cycle. Defaults to 20. Prevents Telegram rate limiting if a massive burst of events occurs on-chain. Additional events are skipped (logged), but the cursor advances.
+
+### Market Follow Expiry
+- `FOLLOW_EXPIRY_ENABLED`: Boolean. When `true`, market follows that have been inactive for longer than `FOLLOW_INACTIVITY_MS` are pruned. Defaults to `false`, which preserves the previous behavior of follows persisting indefinitely.
+- `FOLLOW_INACTIVITY_MS`: The inactivity window, in milliseconds, after which a follow expires. Required to be a positive integer when `FOLLOW_EXPIRY_ENABLED=true`; must be at least 60000ms. Ignored when expiry is disabled.
+- Each persisted follow records its `lastActivityAt` timestamp and derived `expiresAt` (`lastActivityAt + FOLLOW_INACTIVITY_MS`). Any user interaction that refers to the market (following, re-following, or viewing its status) refreshes `lastActivityAt` and therefore pushes `expiresAt` forward.
+- Pruning removes only follows whose `expiresAt` is at or before the current time. Active follows are never deleted by the pruning step, and the chain remains authoritative for market state; expiry only affects the bot's own subscription list.
+- Expiry is best-effort housekeeping: a follow may remain briefly after its `expiresAt` until the next prune pass, and notification delivery does not claim exactly-once guarantees.
 
 ### Notification Filtering
 - `NOTIFY_ENABLED`, `NOTIFY_MARKET`, `NOTIFY_SQUAD`: Coarse boolean kill switches for global or per-contract notifications (all default to `true`).
@@ -74,3 +81,4 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Rollback
 - Since the bot is read-only, rolling back to an older version requires no on-chain coordination or state migrations.
 - **Cursor Compatibility**: If a rollback happens, ensure the older version is compatible with the format in `CURSOR_FILE` (a JSON object with `ledger` and `id`). If incompatible, clear the cursor file for a cold start lookback.
+- **Follow Store Compatibility**: Follow records gained `lastActivityAt` and `expiresAt` fields. Older versions ignore these extra fields, so rolling back is safe; follows simply stop expiring until expiry is re-enabled.
