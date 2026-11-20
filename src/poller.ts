@@ -393,6 +393,25 @@ interface CursorTarget {
    * malformed value is dropped rather than costing an operator their position.
    */
   rewindFromLedger?: number | null;
+  /**
+   * SHA-256 fingerprint binding this target's cursor to a specific Stellar
+   * network passphrase and contract id. Additive: older cursor files without
+   * it are migrated on startup or via `npm run cursor -- migrate`.
+   */
+  fingerprint?: string;
+}
+
+/**
+ * Compute a deterministic SHA-256 fingerprint binding a persisted cursor target
+ * to its Stellar network passphrase and contract id.
+ */
+export function computeCursorTargetFingerprint(
+  networkPassphrase: string,
+  contractId: string,
+): string {
+  return createHash("sha256")
+    .update(`${networkPassphrase}\0${contractId}`)
+    .digest("hex");
 }
 
 export type CursorTargetEntry = CursorTarget;
@@ -751,6 +770,12 @@ export function isValidCursorFile(value: unknown): value is CursorFile {
     const saved = entry as Record<string, unknown>;
     if (!isNullOrString(saved.cursor)) return false;
     if (!isNullOrNumber(saved.lastEventLedger)) return false;
+    if (
+      saved.fingerprint !== undefined &&
+      (typeof saved.fingerprint !== "string" || saved.fingerprint.length === 0)
+    ) {
+      return false;
+    }
   }
   return true;
 }
@@ -793,6 +818,9 @@ export function parseCursorFile(raw: string): CursorFile {
       // Transient resume hint: carried through only when it parses.
       ...(parseRewindFromLedger(target.rewindFromLedger) !== null
         ? { rewindFromLedger: parseRewindFromLedger(target.rewindFromLedger) }
+        : {}),
+      ...(typeof target.fingerprint === "string" && target.fingerprint.length > 0
+        ? { fingerprint: target.fingerprint }
         : {}),
     };
   }
@@ -880,6 +908,13 @@ function normalizeTargetEntry(value: unknown, label: string): CursorTargetEntry 
   // only when the file had them.
   const recent = value.recentEventIds;
   const rewindFromLedger = parseRewindFromLedger(value.rewindFromLedger);
+  let fingerprint: string | undefined;
+  if (value.fingerprint !== undefined) {
+    if (typeof value.fingerprint !== "string" || value.fingerprint.length === 0) {
+      throw new Error(`${label}: fingerprint must be a non-empty string`);
+    }
+    fingerprint = value.fingerprint;
+  }
   return {
     cursor,
     lastEventLedger,
@@ -887,6 +922,7 @@ function normalizeTargetEntry(value: unknown, label: string): CursorTargetEntry 
       ? { recentEventIds: recent.filter((id): id is string => typeof id === "string") }
       : {}),
     ...(rewindFromLedger !== null ? { rewindFromLedger } : {}),
+    ...(fingerprint !== undefined ? { fingerprint } : {}),
   };
 }
 
@@ -995,6 +1031,7 @@ export function buildCursorFile(
     lastEventLedger: number | null;
     recentEventIds?: string[];
     rewindFromLedger?: number | null;
+    fingerprint?: string;
   }>,
   updatedAt: string,
   chainClockAt?: number | null,
@@ -1015,6 +1052,7 @@ export function buildCursorFile(
           ...(typeof t.rewindFromLedger === "number"
             ? { rewindFromLedger: t.rewindFromLedger }
             : {}),
+          ...(t.fingerprint !== undefined ? { fingerprint: t.fingerprint } : {}),
         } satisfies CursorTarget,
       ]),
     ),
@@ -1729,10 +1767,44 @@ export function createPoller(deps: PollerDeps) {
     try {
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
       const parsed = result.file;
+      let fingerprintMigrated = false;
       for (const [source, saved] of Object.entries(parsed.targets)) {
         const key = source as ContractSource;
         const target = state.get(key);
         if (!target) continue;
+        const expectedFingerprint = computeCursorTargetFingerprint(
+          config.networkPassphrase,
+          target.contractId,
+        );
+        if (saved.fingerprint !== undefined && saved.fingerprint !== expectedFingerprint) {
+          // Network or contract configuration changed: never silently reuse an
+          // incompatible cursor. Reset this target to cold start and rewrite
+          // the new fingerprint before the first poll cycle.
+          target.cursor = null;
+          target.lastEventLedger = null;
+          target.rewindFromLedger = null;
+          target.cursorStale = false;
+          dedup.set(key, new EventDedupWindow(config.dedupWindow));
+          fingerprintMigrated = true;
+          Logger.warn(
+            "poller",
+            `[poller] cursor target ${key} fingerprint mismatch ` +
+              `(persisted ${saved.fingerprint.slice(0, 12)} != expected ${expectedFingerprint.slice(0, 12)}); ` +
+              `ignoring incompatible cursor and starting cold (run 'npm run cursor -- migrate' for explicit migration)`,
+            {
+              action: "cursor_fingerprint_mismatch",
+              source: key,
+              contractId: target.contractId,
+              expectedFingerprint,
+              persistedFingerprint: saved.fingerprint,
+              cursorFile: config.cursorFile,
+            },
+          );
+          continue;
+        }
+        if (saved.fingerprint === undefined) {
+          fingerprintMigrated = true;
+        }
         target.cursor = saved.cursor ?? null;
         target.lastEventLedger = saved.lastEventLedger ?? null;
         // A rewind that was still pending when the process stopped resumes from
@@ -1744,15 +1816,24 @@ export function createPoller(deps: PollerDeps) {
         dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
       }
       // Memory now equals the file; nothing is waiting to be flushed — unless
-      // the file was a legacy shape, which start() rewrites before any cycle.
+      // the file was a legacy shape or missing target fingerprints, which
+      // start() rewrites before any cycle.
       status.pendingFlush = false;
-      if (result.migrated) {
+      if (result.migrated || fingerprintMigrated) {
         pendingRewrite = true;
         markDirty();
-        console.log(
-          `[poller] migrated cursor file from ${result.source} → ` +
-            `schema v${CURSOR_SCHEMA_VERSION} at ${config.cursorFile}`,
-        );
+        if (result.migrated) {
+          console.log(
+            `[poller] migrated cursor file from ${result.source} → ` +
+              `schema v${CURSOR_SCHEMA_VERSION} at ${config.cursorFile}`,
+          );
+        } else {
+          Logger.info(
+            "poller",
+            `[poller] bound cursor target fingerprints at ${config.cursorFile}`,
+            { action: "cursor_fingerprint_migrated", cursorFile: config.cursorFile },
+          );
+        }
       }
       // Resume the chain clock alongside the cursors. Without this a restart
       // between two quiet scans would report `unknown` until the next event
@@ -1805,6 +1886,7 @@ export function createPoller(deps: PollerDeps) {
         lastEventLedger: t.lastEventLedger,
         recentEventIds: dedup.get(t.source)?.toJSON() ?? [],
         rewindFromLedger: t.rewindFromLedger,
+        fingerprint: computeCursorTargetFingerprint(config.networkPassphrase, t.contractId),
       })),
       new Date(now()).toISOString(),
       status.chainClockAt,

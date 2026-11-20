@@ -134,6 +134,7 @@ looks healthy but notifies nobody.
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
 | `npm run cursor -- backup` | Backs up the validated cursor file without contacting Stellar or Telegram |
 | `npm run cursor -- restore --from PATH` | Restores a validated backup while holding the poller lock; replacing an existing cursor requires `--force` |
+| `npm run cursor -- migrate` | Binds legacy cursor targets to the current network and contract fingerprints while holding the poller lock; resetting mismatched targets requires `--force` |
 
 `/start`, `/help`, and Telegram's command menu are generated from the same
 command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
@@ -213,6 +214,8 @@ checkout; the Docker image already includes the compiled CLI.
 npm run cursor -- backup
 npm run cursor -- backup --out /safe-storage/cursor-before-deploy.json
 npm run cursor -- restore --from /safe-storage/cursor-before-deploy.json --force
+npm run cursor -- migrate
+npm run cursor -- migrate --force
 ```
 
 Restore validates and normalizes the backup to the current version-1 cursor
@@ -223,6 +226,17 @@ command fail; stale locks are handled by the same PID check used at startup.
 Restoring an existing cursor requires `--force`; malformed or future-version
 files are always rejected. The command prints only paths, schema version, and
 target count, never opaque cursor contents.
+
+Each persisted cursor target is bound to a SHA-256 fingerprint of
+`STELLAR_NETWORK_PASSPHRASE` and its contract id (`MARKET_CONTRACT_ID` /
+`SQUAD_CONTRACT_ID`). On startup, the poller detects a changed network or
+contract fingerprint and cold-starts the mismatched target instead of silently
+reusing an incompatible cursor. Legacy cursor files without fingerprints are
+bound automatically on startup, or explicitly offline with `npm run cursor -- migrate`
+(pass `--force` to reset targets whose fingerprint already points to a different
+network or contract). When `MARKET_CONTRACT_ID` and `SQUAD_CONTRACT_ID` are set,
+`restore` also rejects backups with mismatched target fingerprints unless `--force`
+is passed.
 
 Keep backups on persistent storage separate from the deployment's writable
 cursor when possible. On Railway, a one-off command must use the same attached

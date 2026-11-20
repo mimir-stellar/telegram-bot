@@ -9,8 +9,15 @@ import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
+import { NETWORK_PASSPHRASES } from "./config.js";
 import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import { computeCursorTargetFingerprint, parseAndMigrateCursorFile } from "./poller.js";
+
+export interface TargetFingerprintConfig {
+  networkPassphrase: string;
+  marketContractId: string;
+  squadContractId: string;
+}
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -20,6 +27,13 @@ export interface BackupCursorOptions {
 
 export interface RestoreCursorOptions extends BackupCursorOptions {
   lockFile: string;
+  targets?: TargetFingerprintConfig;
+}
+
+export interface MigrateCursorOptions extends TargetFingerprintConfig {
+  cursorFile: string;
+  lockFile: string;
+  force?: boolean;
 }
 
 async function exists(filePath: string): Promise<boolean> {
@@ -77,6 +91,15 @@ export async function backupCursor(options: BackupCursorOptions): Promise<void> 
   );
 }
 
+function expectedFingerprints(
+  config: TargetFingerprintConfig,
+): Record<string, string> {
+  return {
+    market: computeCursorTargetFingerprint(config.networkPassphrase, config.marketContractId),
+    squad: computeCursorTargetFingerprint(config.networkPassphrase, config.squadContractId),
+  };
+}
+
 /** Restore a compatible cursor while holding the poller's exclusive lock. */
 export async function restoreCursor(options: RestoreCursorOptions): Promise<void> {
   const lock = await acquireInstanceLock(options.lockFile);
@@ -86,12 +109,89 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
     if (!options.force && (await exists(options.cursorFile))) {
       throw new Error(`cursor already exists at ${options.cursorFile}; pass --force to replace it`);
     }
+    if (options.targets) {
+      const expected = expectedFingerprints(options.targets);
+      for (const [source, entry] of Object.entries(parsed.file.targets)) {
+        const expectedFp = expected[source];
+        if (!expectedFp) continue;
+        if (entry.fingerprint !== undefined && entry.fingerprint !== expectedFp) {
+          if (!options.force) {
+            throw new Error(
+              `backup target ${source} is bound to a different network or contract fingerprint; ` +
+                `pass --force to reset incompatible targets`,
+            );
+          }
+          parsed.file.targets[source] = {
+            cursor: null,
+            lastEventLedger: null,
+            fingerprint: expectedFp,
+          };
+        } else if (entry.fingerprint === undefined) {
+          entry.fingerprint = expectedFp;
+        }
+      }
+    }
     const normalized = `${JSON.stringify(parsed.file, null, 2)}\n`;
     await writeAtomic(options.cursorFile, normalized, options.force === true);
     console.log(
       `[cursor] restored schema=v${parsed.file.version} targets=${Object.keys(parsed.file.targets).length} ` +
         `from ${options.backupFile} to ${options.cursorFile}`,
     );
+  } finally {
+    await lock.release();
+  }
+}
+
+/**
+ * Explicitly migrate a persisted cursor file to the configured network and
+ * contract fingerprints while holding the poller's exclusive lock.
+ *
+ * Legacy targets without a fingerprint are bound in-place, preserving their
+ * cursor position. Targets bound to a different fingerprint are rejected
+ * unless `force` is true, in which case they are reset to a cold start.
+ */
+export async function migrateCursor(options: MigrateCursorOptions): Promise<{
+  bound: number;
+  reset: number;
+}> {
+  const lock = await acquireInstanceLock(options.lockFile);
+  try {
+    const raw = await readFile(options.cursorFile, "utf8");
+    const parsed = validateCursor(raw);
+    const expected = expectedFingerprints(options);
+    let bound = 0;
+    let reset = 0;
+
+    for (const [source, entry] of Object.entries(parsed.file.targets)) {
+      const expectedFp = expected[source];
+      if (!expectedFp) continue;
+      if (entry.fingerprint === undefined) {
+        entry.fingerprint = expectedFp;
+        bound += 1;
+      } else if (entry.fingerprint !== expectedFp) {
+        if (!options.force) {
+          throw new Error(
+            `cursor target ${source} is bound to a different network or contract fingerprint; ` +
+              `pass --force to reset incompatible targets`,
+          );
+        }
+        parsed.file.targets[source] = {
+          cursor: null,
+          lastEventLedger: null,
+          fingerprint: expectedFp,
+        };
+        reset += 1;
+      }
+    }
+
+    parsed.file.updatedAt = new Date().toISOString();
+    const normalized = `${JSON.stringify(parsed.file, null, 2)}\n`;
+    await writeAtomic(options.cursorFile, normalized, true);
+    console.log(
+      `[cursor] migrated schema=v${parsed.file.version} bound=${bound} reset=${reset} ` +
+        `at ${options.cursorFile}`,
+    );
+    return { bound, reset };
   } finally {
     await lock.release();
   }
@@ -142,11 +242,29 @@ function assertDifferentPaths(left: string, right: string): void {
   }
 }
 
+function resolveTargetConfigFromEnv(): TargetFingerprintConfig | undefined {
+  const marketContractId = process.env.MARKET_CONTRACT_ID?.trim();
+  const squadContractId = process.env.SQUAD_CONTRACT_ID?.trim();
+  if (!marketContractId || !squadContractId) return undefined;
+
+  const network = process.env.STELLAR_NETWORK?.trim().toLowerCase();
+  const defaultPassphrase =
+    network === "mainnet" || network === "futurenet" || network === "testnet"
+      ? NETWORK_PASSPHRASES[network]
+      : NETWORK_PASSPHRASES.testnet;
+  const networkPassphrase =
+    process.env.STELLAR_NETWORK_PASSPHRASE?.trim() || defaultPassphrase;
+
+  return { networkPassphrase, marketContractId, squadContractId };
+}
+
 async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
-  if (action !== "backup" && action !== "restore") {
-    throw new Error("usage: npm run cursor -- <backup|restore> [--file PATH] [--out PATH|--from PATH] [--force]");
+  if (action !== "backup" && action !== "restore" && action !== "migrate") {
+    throw new Error(
+      "usage: npm run cursor -- <backup|restore|migrate> [--file PATH] [--out PATH|--from PATH] [--force]",
+    );
   }
 
   const options = parseOptions(args);
@@ -160,15 +278,30 @@ async function main(): Promise<void> {
     return;
   }
 
+  const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
+  if (action === "migrate") {
+    const targets = resolveTargetConfigFromEnv();
+    if (!targets) {
+      throw new Error("migrate requires MARKET_CONTRACT_ID and SQUAD_CONTRACT_ID");
+    }
+    await migrateCursor({
+      cursorFile,
+      lockFile,
+      force: options.force,
+      ...targets,
+    });
+    return;
+  }
+
   if (!options.from) throw new Error("restore requires --from PATH");
   const backupFile = resolvePath(options.from);
   assertDifferentPaths(cursorFile, backupFile);
-  const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
   await restoreCursor({
     cursorFile,
     backupFile,
     lockFile,
     force: options.force,
+    targets: resolveTargetConfigFromEnv(),
   });
 }
 
