@@ -10,6 +10,8 @@
  *   npm run replay -- --from 4226500 --dry-run           # log only, no send
  *   npm run replay -- --from 4226500 --contract market   # one contract only
  *   npm run replay -- --from 4226500 --json              # machine-readable
+ *   npm run replay -- --from 4226500 --jsonl             # streaming JSONL
+ *   npm run replay -- --merge-chunks a.jsonl,b.jsonl     # merge chunks to JSONL
  *   npm run replay -- --from 4226500 --send              # send to Telegram
  *   npm run replay -- --from 4226500 --mock              # local mock profile
  *
@@ -36,8 +38,11 @@
  * that was within the range.
  */
 
+import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import readline from "node:readline";
+import type { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
 import type { rpc } from "@stellar/stellar-sdk";
@@ -49,7 +54,7 @@ import {
   type BotConfig,
   type StellarConfig,
 } from "../config.js";
-import { EventDedupWindow, eventKey } from "../dedup.js";
+import { DEFAULT_DEDUP_WINDOW, EventDedupWindow, eventKey } from "../dedup.js";
 import {
   formatEvent,
   safeErrorMessage,
@@ -79,6 +84,8 @@ import {
 
 export interface ReplayEventSummary {
   ledger: number;
+  transactionIndex?: number | null | undefined;
+  operationIndex?: number | null | undefined;
   txHash: string;
   eventId: string;
   name: string;
@@ -87,6 +94,48 @@ export interface ReplayEventSummary {
   skipped: boolean;
   skipReason?: string | undefined;
 }
+
+export interface ReplayJsonlHeader {
+  type: "header";
+  format: "mimir-replay-jsonl-v1";
+  version: 1;
+  network?: string | undefined;
+  rpcUrl?: string | undefined;
+  fromLedger?: number | undefined;
+  toLedger?: number | null | undefined;
+  dryRun?: boolean | undefined;
+  chunkCount?: number | undefined;
+}
+
+export interface ReplayJsonlEventRecord extends ReplayEventSummary {
+  type: "event";
+}
+
+export interface ReplayJsonlSummary {
+  type: "summary";
+  format: "mimir-replay-jsonl-v1";
+  version: 1;
+  totals: {
+    events: number;
+    sent: number;
+    skipped: number;
+    capped: number;
+    adminLogged: number;
+    duplicates: number;
+    resumedSkippedEvents?: number | undefined;
+    failedSends?: number | undefined;
+  };
+  targets?: ReplayTargetResult[] | undefined;
+}
+
+export type ReplayJsonlRecord =
+  | ReplayJsonlHeader
+  | ReplayJsonlEventRecord
+  | ReplayJsonlSummary;
+
+export type JsonlOutputSink =
+  | Writable
+  | ((line: string) => void | Promise<void>);
 
 export interface ReplayTargetResult {
   source: ContractSource;
@@ -242,6 +291,8 @@ export interface ReplayOptions {
   targetProgress?: ReplayProgressTarget | undefined;
   /** Called atomically after each page is processed. */
   onPageComplete?: ((targetUpdate: ReplayProgressTarget) => Promise<void>) | undefined;
+  /** Called for each processed event when streaming (e.g. --jsonl); avoids buffering eventLog in memory. */
+  onEvent?: ((entry: ReplayEventSummary) => void | Promise<void>) | undefined;
   /** Global RPC budget tracker. */
   budget?: RpcBudgetTracker | undefined;
 }
@@ -262,6 +313,8 @@ export interface ReplayDeps {
    * `--json` pipe. For human-readable mode it may be `console.log`.
    */
   progress?: ((...args: unknown[]) => void) | undefined;
+  /** Optional sink for streaming JSONL output (`--jsonl` / `--merge-chunks`). */
+  writeJsonl?: JsonlOutputSink | undefined;
   /** Sleeper function for deterministic rate-limit / delay tests. */
   sleep?: ((ms: number) => Promise<void>) | undefined;
   /** Timestamp provider for deterministic rate-limit / delay tests. */
@@ -364,6 +417,351 @@ export async function loadAndValidateProgressFile(
   return p as ReplayProgressFile;
 }
 
+// ── Streaming JSONL chunk merge ──────────────────────────────────────────────
+
+/** Rank a position for ordering: known indexes first (ascending), `null`/`undefined` last. */
+function rankReplayPosition(value: number | null | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Canonical deterministic ordering for replay event summaries, matching
+ * `compareEvents` in `decode.ts`:
+ * ledger → transactionIndex → operationIndex → eventId → txHash → source → name.
+ */
+export function compareReplayEvents(a: ReplayEventSummary, b: ReplayEventSummary): number {
+  if (a.ledger !== b.ledger) return a.ledger - b.ledger;
+  const txA = rankReplayPosition(a.transactionIndex);
+  const txB = rankReplayPosition(b.transactionIndex);
+  if (txA !== txB) return txA - txB;
+  const opA = rankReplayPosition(a.operationIndex);
+  const opB = rankReplayPosition(b.operationIndex);
+  if (opA !== opB) return opA - opB;
+  if (a.eventId !== b.eventId) return a.eventId < b.eventId ? -1 : 1;
+  if (a.txHash !== b.txHash) return a.txHash < b.txHash ? -1 : 1;
+  if (a.source !== b.source) return a.source < b.source ? -1 : 1;
+  if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+  return 0;
+}
+
+async function writeJsonlLine(sink: JsonlOutputSink, record: ReplayJsonlRecord): Promise<void> {
+  const line = `${JSON.stringify(record, scanJsonReplacer)}\n`;
+  if (typeof sink === "function") {
+    await sink(line);
+    return;
+  }
+  if (!sink.write(line)) {
+    await new Promise<void>((resolve, reject) => {
+      const onDrain = (): void => {
+        sink.off("error", onError);
+        resolve();
+      };
+      const onError = (err: Error): void => {
+        sink.off("drain", onDrain);
+        reject(err);
+      };
+      sink.once("drain", onDrain);
+      sink.once("error", onError);
+    });
+  }
+}
+
+function toReplayEventSummary(raw: unknown, location: string): ReplayEventSummary {
+  if (!raw || typeof raw !== "object") {
+    throw new Error(`invalid replay chunk record at ${location}: expected a JSON object`);
+  }
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.ledger !== "number" || !Number.isFinite(obj.ledger)) {
+    throw new Error(`invalid replay chunk record at ${location}: missing numeric ledger`);
+  }
+  if (typeof obj.name !== "string" || obj.name === "") {
+    throw new Error(`invalid replay chunk record at ${location}: missing event name`);
+  }
+  if (obj.source !== "market" && obj.source !== "squad") {
+    throw new Error(`invalid replay chunk record at ${location}: invalid source "${String(obj.source)}"`);
+  }
+
+  const entry: ReplayEventSummary = {
+    ledger: obj.ledger,
+    txHash: typeof obj.txHash === "string" ? obj.txHash : "",
+    eventId: typeof obj.eventId === "string" ? obj.eventId : "",
+    name: obj.name,
+    source: obj.source,
+    sent: Boolean(obj.sent),
+    skipped: Boolean(obj.skipped),
+  };
+  if (typeof obj.transactionIndex === "number" || obj.transactionIndex === null) {
+    entry.transactionIndex = obj.transactionIndex;
+  }
+  if (typeof obj.operationIndex === "number" || obj.operationIndex === null) {
+    entry.operationIndex = obj.operationIndex;
+  }
+  if (typeof obj.skipReason === "string" && obj.skipReason !== "") {
+    entry.skipReason = obj.skipReason;
+  }
+  return entry;
+}
+
+/**
+ * Stream `ReplayEventSummary` records from a replay chunk file.
+ *
+ * Supports:
+ * - Streaming JSONL (`mimir-replay-jsonl-v1` or raw `ReplayEventSummary` lines) in O(1) memory.
+ * - Legacy `mimir-replay-v1` JSON report files (extracts and sorts `targets[].eventLog`).
+ */
+export async function* readReplayChunkFile(filePath: string): AsyncGenerator<ReplayEventSummary> {
+  const stream = createReadStream(filePath, { encoding: "utf8" });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  let lineNo = 0;
+  let firstNonEmptySeen = false;
+
+  try {
+    for await (const rawLine of rl) {
+      lineNo += 1;
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      if (!firstNonEmptySeen) {
+        firstNonEmptySeen = true;
+        // Pretty-printed multi-line JSON report (e.g. output of `--json`)
+        if (line === "{") {
+          rl.close();
+          stream.destroy();
+          const fullText = await readFile(filePath, "utf8");
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(fullText);
+          } catch (err) {
+            throw new Error(
+              `malformed JSON in replay chunk "${filePath}": ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          if (!parsed || typeof parsed !== "object" || (parsed as { format?: unknown }).format !== "mimir-replay-v1") {
+            throw new Error(`unsupported JSON chunk format in "${filePath}" (expected mimir-replay-v1 or JSONL)`);
+          }
+          const report = parsed as Partial<ReplayReport>;
+          const collected: ReplayEventSummary[] = [];
+          for (const target of report.targets ?? []) {
+            for (const ev of target.eventLog ?? []) {
+              collected.push(toReplayEventSummary(ev, `${filePath} (target ${target.source})`));
+            }
+          }
+          collected.sort(compareReplayEvents);
+          for (const ev of collected) {
+            yield ev;
+          }
+          return;
+        }
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch (err) {
+        throw new Error(
+          `malformed JSON in replay chunk "${filePath}" at line ${lineNo}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      if (!parsed || typeof parsed !== "object") {
+        throw new Error(`invalid replay chunk record at ${filePath}:${lineNo}: expected a JSON object`);
+      }
+
+      const obj = parsed as Record<string, unknown>;
+
+      // Single-line mimir-replay-v1 JSON report
+      if (obj.format === "mimir-replay-v1" && Array.isArray(obj.targets)) {
+        const collected: ReplayEventSummary[] = [];
+        for (const target of obj.targets as ReplayTargetResult[]) {
+          for (const ev of target.eventLog ?? []) {
+            collected.push(toReplayEventSummary(ev, `${filePath}:${lineNo}`));
+          }
+        }
+        collected.sort(compareReplayEvents);
+        for (const ev of collected) {
+          yield ev;
+        }
+        continue;
+      }
+
+      // Skip JSONL header/summary envelope records
+      if (obj.type === "header" || obj.type === "summary") {
+        continue;
+      }
+
+      if (obj.type === undefined || obj.type === "event") {
+        yield toReplayEventSummary(obj, `${filePath}:${lineNo}`);
+        continue;
+      }
+
+      throw new Error(`unknown replay chunk record type "${String(obj.type)}" at ${filePath}:${lineNo}`);
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+}
+
+export interface MergeReplayChunksOptions {
+  /** Bounded dedup window capacity (default: DEFAULT_DEDUP_WINDOW = 256; 0 disables dedup). */
+  dedupWindow?: number | undefined;
+  /** Optional header metadata to include in the emitted header record. */
+  header?: Partial<Omit<ReplayJsonlHeader, "type" | "format" | "version">> | undefined;
+  /** Optional targets metadata to include in the summary record. */
+  targets?: ReplayTargetResult[] | undefined;
+}
+
+/**
+ * Merge multiple replay scan chunks into a single stable streaming JSONL report
+ * (`mimir-replay-jsonl-v1`).
+ *
+ * Uses a streaming k-way merge holding at most one head event per chunk (`O(k)`
+ * memory) and a bounded `EventDedupWindow` (`O(dedupWindow)` memory), so memory
+ * stays bounded on arbitrarily long histories.
+ *
+ * Preserves canonical ordering (`compareReplayEvents`) and the canonical
+ * duplicate policy (`eventKey` — first occurrence wins; events with `null` key
+ * are never suppressed).
+ */
+export async function mergeReplayChunksToJsonl(
+  chunks: ReadonlyArray<AsyncIterable<ReplayEventSummary> | Iterable<ReplayEventSummary>>,
+  sink: JsonlOutputSink,
+  options: MergeReplayChunksOptions = {},
+): Promise<ReplayJsonlSummary> {
+  const dedupCapacity = options.dedupWindow ?? DEFAULT_DEDUP_WINDOW;
+  const dedup = new EventDedupWindow(dedupCapacity);
+
+  const header: ReplayJsonlHeader = {
+    type: "header",
+    format: "mimir-replay-jsonl-v1",
+    version: 1,
+    chunkCount: chunks.length,
+    ...options.header,
+  };
+  await writeJsonlLine(sink, header);
+
+  const totals = {
+    events: 0,
+    sent: 0,
+    skipped: 0,
+    capped: 0,
+    adminLogged: 0,
+    duplicates: 0,
+    failedSends: 0,
+  };
+
+  type ChunkHead = {
+    iter: AsyncIterator<ReplayEventSummary> | Iterator<ReplayEventSummary>;
+    value: ReplayEventSummary | null;
+    done: boolean;
+  };
+
+  const heads: ChunkHead[] = [];
+
+  try {
+    for (const chunk of chunks) {
+      const iter =
+        Symbol.asyncIterator in chunk
+          ? chunk[Symbol.asyncIterator]()
+          : chunk[Symbol.iterator]();
+      const first = await iter.next();
+      heads.push({
+        iter,
+        value: first.done ? null : first.value,
+        done: Boolean(first.done),
+      });
+    }
+
+    for (;;) {
+      let minIdx = -1;
+      for (let i = 0; i < heads.length; i += 1) {
+        const h = heads[i]!;
+        if (h.done || h.value === null) continue;
+        if (minIdx === -1 || compareReplayEvents(h.value, heads[minIdx]!.value!) < 0) {
+          minIdx = i;
+        }
+      }
+
+      if (minIdx === -1) break;
+
+      const chosen = heads[minIdx]!;
+      const ev = chosen.value!;
+
+      const next = await chosen.iter.next();
+      chosen.done = Boolean(next.done);
+      chosen.value = next.done ? null : next.value;
+
+      const key = eventKey({
+        eventId: ev.eventId,
+        ledger: ev.ledger,
+        txHash: ev.txHash,
+        transactionIndex: ev.transactionIndex,
+        operationIndex: ev.operationIndex,
+      });
+
+      if (!dedup.add(key)) {
+        totals.duplicates += 1;
+        continue;
+      }
+
+      totals.events += 1;
+      if (ev.sent) {
+        totals.sent += 1;
+      }
+      if (ev.skipped) {
+        if (ev.skipReason === "admin") {
+          totals.adminLogged += 1;
+        } else if (ev.skipReason === "cap") {
+          totals.capped += 1;
+        } else {
+          totals.skipped += 1;
+          if (ev.skipReason === "send-error") {
+            totals.failedSends += 1;
+          }
+        }
+      }
+
+      const record: ReplayJsonlEventRecord = {
+        type: "event",
+        ...ev,
+      };
+      await writeJsonlLine(sink, record);
+    }
+  } finally {
+    for (const h of heads) {
+      if (!h.done && typeof h.iter.return === "function") {
+        try {
+          await h.iter.return();
+        } catch {
+          // Best-effort cleanup
+        }
+      }
+    }
+  }
+
+  const summary: ReplayJsonlSummary = {
+    type: "summary",
+    format: "mimir-replay-jsonl-v1",
+    version: 1,
+    totals,
+    ...(options.targets ? { targets: options.targets } : {}),
+  };
+  await writeJsonlLine(sink, summary);
+  return summary;
+}
+
+/**
+ * Merge replay scan chunk files on disk into a stable streaming JSONL report.
+ */
+export async function mergeReplayChunkFilesToJsonl(
+  chunkPaths: readonly string[],
+  sink: JsonlOutputSink,
+  options: MergeReplayChunksOptions = {},
+): Promise<ReplayJsonlSummary> {
+  const streams = chunkPaths.map((p) => readReplayChunkFile(p));
+  return mergeReplayChunksToJsonl(streams, sink, options);
+}
+
 function isBotConfig(config: StellarConfig | BotConfig): config is BotConfig {
   return "botToken" in config;
 }
@@ -384,7 +782,14 @@ async function replayContract(
   const pageLimit = opts.pageLimit ?? EVENT_PAGE_LIMIT;
   const toLedger = opts.to ?? null;
   const cap = opts.cap ?? (isBotConfig(config) ? config.maxNotificationsPerCycle : 20);
-  const showLog = (opts.show ?? 0) > 0 || opts.dryRun === true;
+  const showLog = !opts.onEvent && ((opts.show ?? 0) > 0 || opts.dryRun === true);
+  const recordEvent = async (entry: ReplayEventSummary): Promise<void> => {
+    if (opts.onEvent) {
+      await opts.onEvent(entry);
+    } else if (showLog) {
+      eventLog.push(entry);
+    }
+  };
 
   // If this target was already marked completed in the progress file, skip RPC walk entirely.
   if (opts.targetProgress?.completed) {
@@ -563,6 +968,8 @@ async function replayContract(
     for (const event of filteredPage) {
       const entry: ReplayEventSummary = {
         ledger: event.ledger,
+        transactionIndex: event.transactionIndex,
+        operationIndex: event.operationIndex,
         txHash: event.txHash,
         eventId: event.eventId,
         name: event.payload.name === "unknown" ? `unknown:${(event.payload as { eventName?: string }).eventName ?? "?"}` : event.payload.name,
@@ -578,7 +985,7 @@ async function replayContract(
         progress(
           `[replay] ${target.source}: logged admin event "${event.payload.name}" at ledger ${event.ledger}`,
         );
-        if (showLog) eventLog.push(entry);
+        await recordEvent(entry);
         continue;
       }
 
@@ -591,7 +998,7 @@ async function replayContract(
           `[replay] ${target.source}: skipped unknown event "${(event.payload as { eventName?: string }).eventName ?? "?"}" at ledger ${event.ledger}` +
             (reason ? ` (${reason})` : ""),
         );
-        if (showLog) eventLog.push(entry);
+        await recordEvent(entry);
         continue;
       }
 
@@ -602,7 +1009,7 @@ async function replayContract(
         progress(
           `[replay] ${target.source}: cap (${cap}) reached — skipping "${event.payload.name}" at ledger ${event.ledger}`,
         );
-        if (showLog) eventLog.push(entry);
+        await recordEvent(entry);
         continue;
       }
 
@@ -618,7 +1025,7 @@ async function replayContract(
         );
         sent += 1;
         entry.sent = true;
-        if (showLog) eventLog.push(entry);
+        await recordEvent(entry);
       } else if (send) {
         let text: string | null = null;
         try {
@@ -635,7 +1042,7 @@ async function replayContract(
             `[replay] ${target.source}: format failed for "${event.payload.name}" at ledger ${event.ledger}: ` +
               errorMsg(err),
           );
-          if (showLog) eventLog.push(entry);
+          await recordEvent(entry);
           continue;
         }
 
@@ -643,7 +1050,7 @@ async function replayContract(
           skipped += 1;
           entry.skipped = true;
           entry.skipReason = "null-format";
-          if (showLog) eventLog.push(entry);
+          await recordEvent(entry);
           continue;
         }
 
@@ -661,11 +1068,11 @@ async function replayContract(
               errorMsg(err),
           );
         }
-        if (showLog) eventLog.push(entry);
+        await recordEvent(entry);
       } else {
         sent += 1;
         entry.sent = true;
-        if (showLog) eventLog.push(entry);
+        await recordEvent(entry);
       }
 
       const evKey = event.eventId || eventKey(event);
@@ -777,6 +1184,22 @@ export async function runReplayCli(opts: {
     return next?.startsWith("--") ? undefined : next;
   }
 
+  function multiFlag(name: string): string[] {
+    const out: string[] = [];
+    for (let i = 0; i < argv.length; i += 1) {
+      if (argv[i] === `--${name}`) {
+        const next = argv[i + 1];
+        if (next && !next.startsWith("--")) {
+          for (const part of next.split(",")) {
+            const trimmed = part.trim();
+            if (trimmed) out.push(trimmed);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
   function boolFlag(name: string): boolean {
     return argv.includes(`--${name}`);
   }
@@ -789,14 +1212,94 @@ export async function runReplayCli(opts: {
   const show = flag("show") ? Math.max(0, Number(flag("show"))) : 0;
   const dryRun = !boolFlag("send"); // Default is dry-run; --send enables actual sending.
   const asJson = boolFlag("json");
+  const asJsonl = boolFlag("jsonl");
+  const mergeChunks = multiFlag("merge-chunks");
+  const outPath = flag("out");
+  const dedupWindowRaw = flag("dedup-window");
   const progressFile = flag("progress-file");
   const rpmRaw = flag("rpm");
-  const progress = overrideDeps.progress ?? (asJson ? console.error.bind(console) : console.log.bind(console));
+  const machineOutput = asJson || asJsonl || mergeChunks.length > 0;
+  const progress = overrideDeps.progress ?? (machineOutput ? console.error.bind(console) : console.log.bind(console));
   const safeErr = (err: unknown): string => safeErrorMessage(err, []);
 
+  if (asJson && asJsonl) {
+    console.error("[replay] error: --json and --jsonl are mutually exclusive");
+    return { report: null, exitCode: 2 };
+  }
+
+  // Validate --dedup-window
+  let dedupWindow: number | undefined;
+  if (dedupWindowRaw !== undefined) {
+    const n = parseInt(dedupWindowRaw, 10);
+    if (!Number.isFinite(n) || n < 0) {
+      console.error(`[replay] error: --dedup-window must be a non-negative integer, got "${dedupWindowRaw}"`);
+      return { report: null, exitCode: 2 };
+    }
+    dedupWindow = n;
+  }
+
+  // ── Merge-chunks mode (offline streaming JSONL merge) ─────────────────────
+
+  if (mergeChunks.length > 0) {
+    if (asJson) {
+      console.error("[replay] error: --merge-chunks outputs streaming JSONL and cannot be combined with --json");
+      return { report: null, exitCode: 2 };
+    }
+
+    let fileStream: ReturnType<typeof createWriteStream> | null = null;
+    try {
+      let sink: JsonlOutputSink;
+      if (outPath) {
+        await mkdir(path.dirname(outPath), { recursive: true });
+        fileStream = createWriteStream(outPath, { encoding: "utf8" });
+        sink = fileStream;
+      } else {
+        sink = overrideDeps.writeJsonl ?? ((line: string) => { process.stdout.write(line); });
+      }
+
+      const summary = await mergeReplayChunkFilesToJsonl(mergeChunks, sink, {
+        dedupWindow,
+      });
+
+      if (fileStream) {
+        await new Promise<void>((resolve, reject) => {
+          fileStream!.once("error", reject);
+          fileStream!.end(() => resolve());
+        });
+        fileStream = null;
+      }
+
+      progress(
+        `[replay] merged ${mergeChunks.length} chunk(s): events=${summary.totals.events} ` +
+          `sent=${summary.totals.sent} skipped=${summary.totals.skipped} ` +
+          `capped=${summary.totals.capped} admin=${summary.totals.adminLogged} ` +
+          `duplicates=${summary.totals.duplicates}`,
+      );
+
+      const report: ReplayReport = {
+        format: "mimir-replay-v1",
+        network: "merged",
+        rpcUrl: "",
+        fromLedger: 0,
+        toLedger: null,
+        dryRun: true,
+        targets: [],
+        totals: summary.totals,
+      };
+      return { report, exitCode: 0 };
+    } catch (err) {
+      if (fileStream) {
+        fileStream.destroy();
+      }
+      console.error(`[replay] merge error: ${safeErr(err)}`);
+      return { report: null, exitCode: 1 };
+    }
+  }
+
   if (!fromRaw) {
-    console.error("[replay] error: --from <ledger|cursor> is required");
-    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N]");
+    console.error("[replay] error: --from <ledger|cursor> is required (or pass --merge-chunks <paths>)");
+    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json|--jsonl] [--out <path>] [--mock] [--progress-file <path>] [--rpm N]");
+    console.error("       npm run replay -- --merge-chunks <file1,file2,...> [--out <path>] [--dedup-window N]");
     return { report: null, exitCode: 2 };
   }
 
@@ -955,6 +1458,41 @@ export async function runReplayCli(opts: {
 
   // ── Walk each target ───────────────────────────────────────────────────────
 
+  let jsonlFileStream: ReturnType<typeof createWriteStream> | null = null;
+  let jsonlSink: JsonlOutputSink | undefined;
+
+  if (asJsonl) {
+    try {
+      if (outPath) {
+        await mkdir(path.dirname(outPath), { recursive: true });
+        jsonlFileStream = createWriteStream(outPath, { encoding: "utf8" });
+        jsonlSink = jsonlFileStream;
+      } else {
+        jsonlSink = overrideDeps.writeJsonl ?? ((line: string) => { process.stdout.write(line); });
+      }
+      await writeJsonlLine(jsonlSink, {
+        type: "header",
+        format: "mimir-replay-jsonl-v1",
+        version: 1,
+        network,
+        rpcUrl: config.rpcUrl,
+        fromLedger: fromLedger ?? 0,
+        toLedger: toLedger ?? null,
+        dryRun,
+      });
+    } catch (err) {
+      if (jsonlFileStream) jsonlFileStream.destroy();
+      console.error(`[replay] output error: ${safeErr(err)}`);
+      return { report: null, exitCode: 1 };
+    }
+  }
+
+  const onEvent = jsonlSink
+    ? async (entry: ReplayEventSummary) => {
+        await writeJsonlLine(jsonlSink!, { type: "event", ...entry });
+      }
+    : undefined;
+
   const targetResults: ReplayTargetResult[] = [];
   let fatalError: string | undefined;
 
@@ -985,6 +1523,7 @@ export async function runReplayCli(opts: {
           rpm,
           targetProgress,
           onPageComplete,
+          onEvent,
           budget,
         },
         dryRun ? undefined : send,
@@ -1056,6 +1595,27 @@ export async function runReplayCli(opts: {
 
   if (asJson) {
     process.stdout.write(JSON.stringify(report, scanJsonReplacer, 2) + "\n");
+  } else if (asJsonl && jsonlSink) {
+    try {
+      await writeJsonlLine(jsonlSink, {
+        type: "summary",
+        format: "mimir-replay-jsonl-v1",
+        version: 1,
+        totals,
+        targets: targetResults,
+      });
+      if (jsonlFileStream) {
+        await new Promise<void>((resolve, reject) => {
+          jsonlFileStream!.once("error", reject);
+          jsonlFileStream!.end(() => resolve());
+        });
+        jsonlFileStream = null;
+      }
+    } catch (err) {
+      if (jsonlFileStream) jsonlFileStream.destroy();
+      console.error(`[replay] output error: ${safeErr(err)}`);
+      return { report, exitCode: 1 };
+    }
   } else {
     progress(
       `[replay] done  events=${totals.events} sent=${totals.sent} skipped=${totals.skipped} ` +

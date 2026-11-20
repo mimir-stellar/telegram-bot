@@ -10,6 +10,8 @@
  *   npm run replay -- --from 4226500 --to 4226800
  *   npm run replay -- --from 4226500 --send        # actually post to Telegram
  *   npm run replay -- --from 4226500 --json        # machine-readable report
+ *   npm run replay -- --from 4226500 --jsonl       # streaming JSONL report
+ *   npm run replay -- --merge-chunks a.jsonl,b.jsonl # merge chunks to JSONL
  *   npm run replay -- --from 4226500 --mock        # local mock profile
  *   npm run replay -- --from 4226500 --progress-file progress.json # resumable
  *   npm run replay -- --from 4226500 --rpm 120     # rate-limited RPC budget

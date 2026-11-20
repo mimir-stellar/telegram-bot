@@ -290,6 +290,8 @@ npm run replay -- --from 4226500 --to 4226800    # bounded range
 npm run replay -- --from 4226500 --send          # send to Telegram (needs BOT_TOKEN)
 npm run replay -- --from 4226500 --contract market  # one contract only
 npm run replay -- --from 4226500 --json          # machine-readable mimir-replay-v1
+npm run replay -- --from 4226500 --jsonl         # streaming mimir-replay-jsonl-v1
+npm run replay -- --merge-chunks c1.jsonl,c2.jsonl --out merged.jsonl  # merge chunks
 npm run replay -- --from 4226500 --pages 5       # walk at most 5 pages per contract
 npm run replay -- --from 4226500 --cap 10        # cap at 10 notifications per contract
 npm run replay:mock -- --from 4226500            # local mock profile, no credentials
@@ -307,6 +309,10 @@ npm run replay:mock -- --from 4226500            # local mock profile, no creden
 | `--cap <n>` | `MAX_NOTIFICATIONS_PER_CYCLE` | Maximum notifications per contract per run |
 | `--show <n>` | 0 | Include the last *n* decoded events per target in the report |
 | `--json` | off | Machine-readable `mimir-replay-v1` JSON on stdout; progress on stderr |
+| `--jsonl` | off | Streaming `mimir-replay-jsonl-v1` JSONL on stdout (or `--out`); bounded memory, progress on stderr |
+| `--merge-chunks <paths>` | — | Merge comma-separated or repeated replay chunk files (JSONL or `mimir-replay-v1` JSON) into a single canonical, deduplicated streaming JSONL report |
+| `--out <path>` | stdout | Write `--jsonl` or `--merge-chunks` output to a file instead of stdout |
+| `--dedup-window <n>` | 256 | Bounded deduplication window size for `--merge-chunks` (`0` disables dedup) |
 | `--mock` | off | `MIMIR_PROFILE=mock`: local RPC, fixture contracts, no credentials needed |
 
 **Default mode is dry-run.** Events are decoded and counted; nothing is posted to
