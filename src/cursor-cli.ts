@@ -10,7 +10,7 @@ import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import { DuplicateCursorTargetError, parseAndMigrateCursorFile } from "./poller.js";
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -35,7 +35,10 @@ async function exists(filePath: string): Promise<boolean> {
 function validateCursor(raw: string): ReturnType<typeof parseAndMigrateCursorFile> {
   try {
     return parseAndMigrateCursorFile(raw);
-  } catch {
+  } catch (err) {
+    if (err instanceof DuplicateCursorTargetError) {
+      throw err;
+    }
     throw new Error("cursor file is malformed or uses an unsupported schema");
   }
 }

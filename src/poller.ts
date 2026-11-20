@@ -755,6 +755,177 @@ export function isValidCursorFile(value: unknown): value is CursorFile {
   return true;
 }
 
+/**
+ * Raised when a raw JSON cursor file defines the same target key more than once.
+ * `JSON.parse()` silently uses last-key-wins semantics, which would otherwise
+ * drop an earlier target's cursor position without warning.
+ */
+export class DuplicateCursorTargetError extends Error {
+  readonly target: string;
+
+  constructor(target: string) {
+    super(`duplicate target definition in cursor file: "${target}"`);
+    this.name = "DuplicateCursorTargetError";
+    this.target = target;
+  }
+}
+
+function skipJsonWhitespace(raw: string, pos: number): number {
+  let i = pos;
+  while (i < raw.length) {
+    const ch = raw.charCodeAt(i);
+    if (ch === 0x20 || ch === 0x09 || ch === 0x0a || ch === 0x0d) {
+      i += 1;
+    } else {
+      break;
+    }
+  }
+  return i;
+}
+
+function readJsonString(raw: string, pos: number): { value: string; nextPos: number } {
+  let i = pos + 1;
+  while (i < raw.length) {
+    const ch = raw.charCodeAt(i);
+    if (ch === 0x5c) {
+      // Backslash escape: skip the escaped character.
+      i += 2;
+      continue;
+    }
+    if (ch === 0x22) {
+      const end = i + 1;
+      return { value: JSON.parse(raw.slice(pos, end)) as string, nextPos: end };
+    }
+    i += 1;
+  }
+  return { value: "", nextPos: i };
+}
+
+function skipJsonValue(raw: string, pos: number): number {
+  let i = skipJsonWhitespace(raw, pos);
+  if (i >= raw.length) return i;
+  const ch = raw[i];
+  if (ch === '"') {
+    return readJsonString(raw, i).nextPos;
+  }
+  if (ch === "{") {
+    i = skipJsonWhitespace(raw, i + 1);
+    if (raw[i] === "}") return i + 1;
+    while (i < raw.length) {
+      i = skipJsonWhitespace(raw, i);
+      i = readJsonString(raw, i).nextPos;
+      i = skipJsonWhitespace(raw, i);
+      if (raw[i] === ":") i += 1;
+      i = skipJsonValue(raw, i);
+      i = skipJsonWhitespace(raw, i);
+      if (raw[i] === ",") {
+        i += 1;
+        continue;
+      }
+      if (raw[i] === "}") return i + 1;
+      break;
+    }
+    return i;
+  }
+  if (ch === "[") {
+    i = skipJsonWhitespace(raw, i + 1);
+    if (raw[i] === "]") return i + 1;
+    while (i < raw.length) {
+      i = skipJsonValue(raw, i);
+      i = skipJsonWhitespace(raw, i);
+      if (raw[i] === ",") {
+        i += 1;
+        continue;
+      }
+      if (raw[i] === "]") return i + 1;
+      break;
+    }
+    return i;
+  }
+  // Number, true, false, or null.
+  while (i < raw.length) {
+    const c = raw[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "," || c === "}" || c === "]") {
+      break;
+    }
+    i += 1;
+  }
+  return i;
+}
+
+function scanJsonObjectEntries(
+  raw: string,
+  startPos: number,
+  onEntry: (key: string, valuePos: number) => void,
+): number {
+  let i = skipJsonWhitespace(raw, startPos);
+  if (raw[i] !== "{") return skipJsonValue(raw, i);
+  i = skipJsonWhitespace(raw, i + 1);
+  if (raw[i] === "}") return i + 1;
+
+  while (i < raw.length) {
+    i = skipJsonWhitespace(raw, i);
+    const { value: key, nextPos } = readJsonString(raw, i);
+    i = skipJsonWhitespace(raw, nextPos);
+    if (raw[i] === ":") i += 1;
+    const valuePos = skipJsonWhitespace(raw, i);
+    onEntry(key, valuePos);
+    i = skipJsonValue(raw, valuePos);
+    i = skipJsonWhitespace(raw, i);
+    if (raw[i] === ",") {
+      i += 1;
+      continue;
+    }
+    if (raw[i] === "}") return i + 1;
+    break;
+  }
+  return i;
+}
+
+/**
+ * Scan a valid JSON cursor document for duplicate target definitions before
+ * trusting the object produced by `JSON.parse()`.
+ *
+ * Covers:
+ * - Duplicate target keys inside the `targets` object (v1 and legacy-unversioned)
+ * - Duplicate `"targets"` blocks at the root object
+ * - Duplicate target keys at the root object in legacy flat / string-map files
+ */
+function assertNoDuplicateCursorTargets(raw: string, parsedRoot: Record<string, unknown>): void {
+  const rootPos = skipJsonWhitespace(raw, 0);
+  if (raw[rootPos] !== "{") return;
+
+  const hasTargetsKey = "targets" in parsedRoot;
+  const hasVersionKey = "version" in parsedRoot;
+  const seenRootKeys = new Set<string>();
+
+  scanJsonObjectEntries(raw, rootPos, (key, valuePos) => {
+    if (key === "targets") {
+      if (seenRootKeys.has("targets")) {
+        throw new DuplicateCursorTargetError("targets");
+      }
+      seenRootKeys.add("targets");
+      if (raw[valuePos] === "{") {
+        const seenTargets = new Set<string>();
+        scanJsonObjectEntries(raw, valuePos, (targetKey) => {
+          if (seenTargets.has(targetKey)) {
+            throw new DuplicateCursorTargetError(targetKey);
+          }
+          seenTargets.add(targetKey);
+        });
+      }
+      return;
+    }
+
+    if (!hasTargetsKey && !hasVersionKey && key !== "updatedAt") {
+      if (seenRootKeys.has(key)) {
+        throw new DuplicateCursorTargetError(key);
+      }
+    }
+    seenRootKeys.add(key);
+  });
+}
+
 /** Parse + validate a cursor file body; throws on JSON or schema failure. */
 export function parseCursorFile(raw: string): CursorFile {
   let parsed: unknown;
@@ -766,6 +937,7 @@ export function parseCursorFile(raw: string): CursorFile {
   if (!isValidCursorFile(parsed)) {
     throw new Error("failed schema validation (expected version 1 with targets map)");
   }
+  assertNoDuplicateCursorTargets(raw, parsed as unknown as Record<string, unknown>);
 
   const targets: Record<string, CursorTarget> = {};
   for (const [source, target] of Object.entries(parsed.targets)) {
@@ -933,6 +1105,7 @@ export function parseAndMigrateCursorFile(
     throw new Error("cursor file root must be a JSON object");
   }
   const parsed = parsedUnknown;
+  assertNoDuplicateCursorTargets(raw, parsed);
   const nowIso = (options.now ?? (() => new Date()))().toISOString();
 
   // ── Current versioned schema ───────────────────────────────────────────────
