@@ -179,6 +179,10 @@ export interface StellarConfig {
   marketContractVersion: string;
   squadContractVersion: string;
   rpcUrl: string;
+  /** Optional operator-configured RPC egress allowlist (hosts, wildcards, or origins). */
+  rpcEgressAllowlist?: string[];
+  /** Permit credential-free loopback RPC URLs (used in mock mode). */
+  allowLoopbackRpc?: boolean;
   horizonUrl: string;
   networkPassphrase: string;
   /** Optional override for stellar.expert (or compatible) explorer origin. */
@@ -836,6 +840,15 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     passphrase: DEFAULTS.networkPassphrase,
   };
 
+  const rawAllowlist = c.get("STELLAR_RPC_EGRESS_ALLOWLIST");
+  const rpcEgressAllowlist =
+    rawAllowlist !== undefined
+      ? rawAllowlist
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0)
+      : undefined;
+
   return {
     // Left unset when only a passphrase was given, so labels infer from it.
     ...(namedNetwork !== undefined ? { network: namedNetwork } : {}),
@@ -844,6 +857,8 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     marketContractVersion: c.contractVersion("MARKET_CONTRACT_VERSION", "v1"),
     squadContractVersion: c.contractVersion("SQUAD_CONTRACT_VERSION", "v1"),
     rpcUrl: c.url("STELLAR_RPC_URL", namedDefaults.rpcUrl),
+    ...(rpcEgressAllowlist !== undefined ? { rpcEgressAllowlist } : {}),
+    ...(activeProfileName() === MOCK_PROFILE_NAME ? { allowLoopbackRpc: true } : {}),
     horizonUrl: c.url("STELLAR_HORIZON_URL", namedDefaults.horizonUrl),
     networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? namedDefaults.passphrase,
     explorerBaseUrl: c.url(
@@ -1099,6 +1114,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "SQUAD_CONTRACT_VERSION", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_RPC_URL", secret: false, hasBuiltInDefault: true },
+  { key: "STELLAR_RPC_EGRESS_ALLOWLIST", secret: false },
   { key: "STELLAR_HORIZON_URL", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK_PASSPHRASE", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_EXPLORER_BASE_URL", secret: false, hasBuiltInDefault: true },

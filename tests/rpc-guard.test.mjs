@@ -2,10 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertAllowedRpcUrl,
   assertEventsResponse,
+  createEgressGuardedFetch,
   DEFAULT_MAX_EVENTS_PER_RESPONSE,
+  RpcEgressError,
   RpcResponseShapeError,
+  validateRpcRedirect,
 } from "../dist/stellar/rpc-guard.js";
+import { createRpcEgressFetch, createRpcServer } from "../dist/stellar/client.js";
 import { defaultMockScenario, startMockRpc } from "../dist/stellar/mock-rpc.js";
 import { paginatedGetEvents } from "../dist/stellar/events.js";
 
@@ -350,4 +355,143 @@ test("paginatedGetEvents rejects oversized RPC response at the boundary", async 
       return true;
     },
   );
+});
+
+// ── RPC egress allowlist & redirect guard tests ────────────────────────────────
+
+test("assertAllowedRpcUrl permits allowlisted hosts and wildcard domains over HTTPS", () => {
+  const opts = { allowlist: ["soroban-testnet.stellar.org", "*.rpc.example.invalid"] };
+  assert.equal(
+    assertAllowedRpcUrl("https://soroban-testnet.stellar.org/", opts).hostname,
+    "soroban-testnet.stellar.org",
+  );
+  assert.equal(
+    assertAllowedRpcUrl("https://eu.rpc.example.invalid/soroban", opts).hostname,
+    "eu.rpc.example.invalid",
+  );
+});
+
+test("assertAllowedRpcUrl rejects disallowed hosts, plain HTTP, and embedded credentials", () => {
+  const opts = { allowlist: ["soroban-testnet.stellar.org"], allowLoopback: true };
+
+  assert.throws(
+    () => assertAllowedRpcUrl("https://evil.example.invalid/", opts),
+    (err) => err instanceof RpcEgressError && err.problem === "host-not-allowed",
+  );
+  assert.throws(
+    () => assertAllowedRpcUrl("http://soroban-testnet.stellar.org/", opts),
+    (err) => err instanceof RpcEgressError && err.problem === "protocol-not-allowed",
+  );
+  assert.throws(
+    () => assertAllowedRpcUrl("https://user:pass@soroban-testnet.stellar.org/", opts),
+    (err) =>
+      err instanceof RpcEgressError &&
+      err.problem === "credentials-not-allowed" &&
+      !err.message.includes("pass"),
+  );
+  // Loopback with embedded credentials must still be rejected
+  assert.throws(
+    () => assertAllowedRpcUrl("http://admin:secret@127.0.0.1:8420/", opts),
+    (err) =>
+      err instanceof RpcEgressError &&
+      err.problem === "credentials-not-allowed" &&
+      !err.message.includes("secret"),
+  );
+});
+
+test("assertAllowedRpcUrl retains credential-free loopback exception for mock mode", () => {
+  const opts = { allowlist: ["soroban-testnet.stellar.org"], allowLoopback: true };
+  assert.equal(assertAllowedRpcUrl("http://127.0.0.1:8420/", opts).hostname, "127.0.0.1");
+  assert.equal(assertAllowedRpcUrl("http://localhost:8420/rpc", opts).hostname, "localhost");
+  assert.equal(assertAllowedRpcUrl("http://[::1]:8420/", opts).hostname, "[::1]");
+});
+
+test("createEgressGuardedFetch validates redirect destinations and blocks disallowed hops", async () => {
+  const calls = [];
+  const fakeFetch = async (url) => {
+    calls.push(String(url));
+    if (String(url) === "https://rpc.example.invalid/v1") {
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://mirror.example.invalid/v1" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  // Allowed redirect succeeds
+  const guardedOk = createEgressGuardedFetch({
+    allowlist: ["rpc.example.invalid", "mirror.example.invalid"],
+    fetchImpl: fakeFetch,
+  });
+  const res = await guardedOk("https://rpc.example.invalid/v1");
+  assert.equal(res.status, 200);
+  assert.deepEqual(calls, [
+    "https://rpc.example.invalid/v1",
+    "https://mirror.example.invalid/v1",
+  ]);
+
+  // Redirect to non-allowlisted destination is blocked before second request
+  const blockedCalls = [];
+  const guardedBlocked = createEgressGuardedFetch({
+    allowlist: ["rpc.example.invalid"],
+    fetchImpl: async (url) => {
+      blockedCalls.push(String(url));
+      return new Response(null, {
+        status: 307,
+        headers: { location: "https://attacker.example.invalid/steal" },
+      });
+    },
+  });
+  await assert.rejects(
+    () => guardedBlocked("https://rpc.example.invalid/v1"),
+    (err) => err instanceof RpcEgressError && err.problem === "redirect-disallowed",
+  );
+  assert.deepEqual(blockedCalls, ["https://rpc.example.invalid/v1"]);
+
+  // Redirect loop exceeding maxRedirects is rejected
+  const guardedLoop = createEgressGuardedFetch({
+    allowlist: ["rpc.example.invalid"],
+    maxRedirects: 2,
+    fetchImpl: async () =>
+      new Response(null, { status: 302, headers: { location: "https://rpc.example.invalid/v1" } }),
+  });
+  await assert.rejects(
+    () => guardedLoop("https://rpc.example.invalid/v1"),
+    (err) => err instanceof RpcEgressError && err.problem === "redirect-limit-exceeded",
+  );
+
+  // Relative redirect to disallowed credentialed target is rejected
+  assert.throws(
+    () => validateRpcRedirect("https://rpc.example.invalid/a", "https://u:p@rpc.example.invalid/b", { allowlist: ["rpc.example.invalid"] }),
+    (err) => err instanceof RpcEgressError && err.problem === "credentials-not-allowed",
+  );
+});
+
+test("createRpcServer & createRpcEgressFetch enforce configured allowlist with mock loopback", () => {
+  const baseConfig = {
+    marketContractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    squadContractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    marketContractVersion: "v1",
+    squadContractVersion: "v1",
+    rpcUrl: "https://evil.example.invalid",
+    rpcEgressAllowlist: ["soroban-testnet.stellar.org"],
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://stellar.expert/explorer",
+  };
+
+  assert.throws(
+    () => createRpcServer(baseConfig),
+    (err) => err instanceof RpcEgressError && err.problem === "host-not-allowed",
+  );
+
+  const mockConfig = {
+    ...baseConfig,
+    rpcUrl: "http://127.0.0.1:8420",
+    allowLoopbackRpc: true,
+  };
+  const server = createRpcServer(mockConfig);
+  assert.ok(server);
+  assert.equal(typeof createRpcEgressFetch(mockConfig), "function");
 });

@@ -139,3 +139,251 @@ export function assertEventsResponse(
 
   return value as unknown as rpc.Api.GetEventsResponse;
 }
+
+// ── RPC egress allowlist & redirect guard ────────────────────────────────────
+
+export type RpcEgressProblem =
+  | "invalid-url"
+  | "credentials-not-allowed"
+  | "protocol-not-allowed"
+  | "host-not-allowed"
+  | "redirect-disallowed"
+  | "redirect-limit-exceeded";
+
+/**
+ * Error thrown when an RPC URL or HTTP redirect destination violates the
+ * operator-configured egress allowlist or security policy.
+ *
+ * Messages never include embedded URL credentials or query strings.
+ */
+export class RpcEgressError extends Error {
+  readonly problem: RpcEgressProblem;
+
+  constructor(problem: RpcEgressProblem, message: string) {
+    super(message);
+    this.name = "RpcEgressError";
+    this.problem = problem;
+  }
+}
+
+export interface RpcEgressAllowlistOptions {
+  /** Operator-configured allowlist entries (host, host:port, *.domain, or full origin URL). */
+  allowlist?: readonly string[] | undefined;
+  /** Permit credential-free loopback URLs (127.0.0.1, localhost, ::1) for mock mode. */
+  allowLoopback?: boolean | undefined;
+  /** Permit plain http: for non-loopback allowlisted entries (default false: https: required). */
+  allowHttp?: boolean | undefined;
+}
+
+export interface EgressGuardedFetchOptions extends RpcEgressAllowlistOptions {
+  /** Underlying fetch implementation (defaults to globalThis.fetch). */
+  fetchImpl?: typeof fetch | undefined;
+  /** Maximum redirect hops to follow after validating each destination (defaults to 5). */
+  maxRedirects?: number | undefined;
+}
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Parse a comma-separated string or array of RPC egress allowlist entries. */
+export function parseRpcEgressAllowlist(
+  raw: string | readonly string[] | undefined,
+): string[] {
+  if (!raw) return [];
+  const items = typeof raw === "string" ? raw.split(",") : raw;
+  return items.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+}
+
+/** True when `hostname` refers to a local loopback address. */
+export function isLoopbackHost(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  return LOOPBACK_HOSTS.has(normalized);
+}
+
+function safeOriginLabel(url: URL): string {
+  return `${url.protocol}//${url.host}`;
+}
+
+function matchesAllowlistEntry(url: URL, rawEntry: string): boolean {
+  const entry = rawEntry.trim();
+  if (!entry) return false;
+
+  if (entry.includes("://")) {
+    let parsed: URL;
+    try {
+      parsed = new URL(entry);
+    } catch {
+      return false;
+    }
+    return url.origin.toLowerCase() === parsed.origin.toLowerCase();
+  }
+
+  const lowerEntry = entry.toLowerCase();
+  const host = url.host.toLowerCase();
+  const hostname = url.hostname.toLowerCase();
+
+  if (lowerEntry.startsWith("*.")) {
+    const suffix = lowerEntry.slice(1); // ".example.com"
+    return hostname.endsWith(suffix) && hostname.length > suffix.length;
+  }
+
+  if (lowerEntry.includes(":")) {
+    return host === lowerEntry;
+  }
+
+  return hostname === lowerEntry;
+}
+
+function entryAllowsHttpOrigin(url: URL, rawEntry: string): boolean {
+  if (!rawEntry.includes("://")) return false;
+  try {
+    const parsed = new URL(rawEntry);
+    return (
+      parsed.protocol === "http:" &&
+      url.origin.toLowerCase() === parsed.origin.toLowerCase()
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Validate an RPC URL against the operator-configured egress allowlist.
+ *
+ * - Rejects malformed URLs.
+ * - Rejects embedded username/password credentials (even on loopback).
+ * - Retains a credential-free loopback exception when `options.allowLoopback` is true.
+ * - Requires `https:` unless credential-free loopback, `allowHttp: true`, or an
+ *   explicit `http://` origin entry in `allowlist`.
+ */
+export function assertAllowedRpcUrl(
+  rawUrl: string,
+  options: RpcEgressAllowlistOptions = {},
+): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new RpcEgressError("invalid-url", "RPC URL is not a valid URL");
+  }
+
+  if (parsed.username !== "" || parsed.password !== "") {
+    throw new RpcEgressError(
+      "credentials-not-allowed",
+      `RPC URL for ${safeOriginLabel(parsed)} must not contain embedded credentials`,
+    );
+  }
+
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new RpcEgressError(
+      "protocol-not-allowed",
+      `RPC URL protocol "${parsed.protocol}" is not allowed`,
+    );
+  }
+
+  const loopback = isLoopbackHost(parsed.hostname);
+  if (options.allowLoopback && loopback) {
+    return parsed;
+  }
+
+  const allowlist = parseRpcEgressAllowlist(options.allowlist);
+  const matchedEntry = allowlist.find((entry) => matchesAllowlistEntry(parsed, entry));
+  if (!matchedEntry) {
+    throw new RpcEgressError(
+      "host-not-allowed",
+      `RPC egress destination ${safeOriginLabel(parsed)} is not in the configured allowlist`,
+    );
+  }
+
+  if (
+    parsed.protocol === "http:" &&
+    !options.allowHttp &&
+    !entryAllowsHttpOrigin(parsed, matchedEntry)
+  ) {
+    throw new RpcEgressError(
+      "protocol-not-allowed",
+      `Plain HTTP is not allowed for RPC egress destination ${safeOriginLabel(parsed)}`,
+    );
+  }
+
+  return parsed;
+}
+
+/**
+ * Resolve and validate an HTTP redirect `Location` target against the egress allowlist.
+ */
+export function validateRpcRedirect(
+  currentUrl: string,
+  locationHeader: string,
+  options: RpcEgressAllowlistOptions = {},
+): URL {
+  let target: URL;
+  try {
+    target = new URL(locationHeader, currentUrl);
+  } catch {
+    throw new RpcEgressError("redirect-disallowed", "RPC redirect Location is not a valid URL");
+  }
+  try {
+    return assertAllowedRpcUrl(target.toString(), options);
+  } catch (err) {
+    if (err instanceof RpcEgressError) {
+      throw new RpcEgressError(
+        err.problem === "credentials-not-allowed" ? "credentials-not-allowed" : "redirect-disallowed",
+        `RPC redirect blocked (${err.problem}): ${err.message}`,
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * Create a `fetch` wrapper that validates both the initial RPC URL and every
+ * HTTP redirect destination against the configured egress allowlist.
+ */
+export function createEgressGuardedFetch(
+  options: EgressGuardedFetchOptions = {},
+): typeof fetch {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const maxRedirects = options.maxRedirects ?? 5;
+
+  return async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ): Promise<Response> => {
+    const initialUrl =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+
+    let currentUrl = assertAllowedRpcUrl(initialUrl, options).toString();
+    let redirects = 0;
+
+    for (;;) {
+      const response = await fetchImpl(currentUrl, {
+        ...init,
+        redirect: "manual",
+      });
+
+      if (!REDIRECT_STATUSES.has(response.status)) {
+        return response;
+      }
+
+      const location = response.headers.get("location");
+      if (!location) {
+        return response;
+      }
+
+      redirects++;
+      if (redirects > maxRedirects) {
+        throw new RpcEgressError(
+          "redirect-limit-exceeded",
+          `RPC egress exceeded maximum redirect hops (${maxRedirects})`,
+        );
+      }
+
+      currentUrl = validateRpcRedirect(currentUrl, location, options).toString();
+    }
+  };
+}
