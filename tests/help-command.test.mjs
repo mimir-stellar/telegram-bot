@@ -48,10 +48,21 @@ for (const operatorId of [null, "42"]) {
       assert.deepEqual(replies, [[INTRO + lines.join("\n"), OPTIONS]]);
       assert.ok(replies[0][0].length < 4096);
     }
-    assert.deepEqual(menus[0].map(({ command }) => command), lines.map((line) => line.split(" ")[0].slice(1)));
-    for (const { command, description } of menus[0]) {
-      assert.ok(handlers.has(command), `${command} has a handler`);
-      assert.ok(description.length >= 1 && description.length <= 256);
+    const publicNames = PUBLIC_LINES.map((line) => line.split(" ")[0].slice(1));
+    assert.equal(menus.length, operatorId === null ? 1 : 2);
+    assert.deepEqual(menus[0].map(({ command }) => command), publicNames);
+    if (operatorId !== null) {
+      assert.deepEqual(
+        menus[1].map(({ command }) => command),
+        lines.map((line) => line.split(" ")[0].slice(1)),
+      );
+      assert.equal(menus[1].some(({ command }) => command === "audit"), true);
+    }
+    for (const menu of menus) {
+      for (const { command, description } of menu) {
+        assert.ok(handlers.has(command), `${command} has a handler`);
+        assert.ok(description.length >= 1 && description.length <= 256);
+      }
     }
     assert.equal(handlers.size, 11, "disabled operator handlers still enforce authorization");
   });
@@ -62,7 +73,10 @@ test("a new registration reflects operator configuration after restart", async (
   await registerCommands(first.bot, first.config);
   const restarted = fixture(null);
   await registerCommands(restarted.bot, restarted.config);
-  assert.equal(first.menus[0].some(({ command }) => command === "audit"), true);
+  assert.equal(first.menus.length, 2);
+  assert.equal(first.menus[0].some(({ command }) => command === "audit"), false);
+  assert.equal(first.menus[1].some(({ command }) => command === "audit"), true);
+  assert.equal(restarted.menus.length, 1);
   assert.equal(restarted.menus[0].some(({ command }) => ["audit", "pause", "resume"].includes(command)), false);
 });
 

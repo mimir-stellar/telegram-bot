@@ -255,7 +255,11 @@ export interface BotConfig extends StellarConfig {
   squadChatId?: string;
   /** Chats allowed to use /status. Empty array means no restriction. */
   allowedChatIds: string[];
-  /** Telegram user id allowed to run operator-only commands. Null disables them. */
+  /**
+   * Telegram user id allowed to run operator-only commands. Null disables them.
+   * It also scopes the privileged command menu to that user's private chat;
+   * authorization is still checked on every update.
+   */
   operatorTelegramUserId: string | null;
   pollIntervalMs: number;
   startLookbackLedgers: number;

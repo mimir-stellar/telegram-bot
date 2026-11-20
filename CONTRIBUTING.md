@@ -183,8 +183,13 @@ rarely conflicts with another in-flight branch):
    (both locales) in `src/i18n.ts` and its entry to `COMMAND_DETAILS` in
    `src/commands/help-detail.ts`. `/help`, the Telegram menu and the detail pages
    are generated from those tables.
-4. Cover the handler in `tests/` like any other command; `tests/command-modules.test.mjs`
-   checks the registry invariants (unique names, menu parity, central authorization).
+4. `commandMenus()` in `src/commands/registry.ts` keeps `operatorOnly` modules out
+   of the default Telegram menu and advertises them only in the configured
+   operator's private chat. Do not treat that as authorization: Telegram caches
+   menus, and the registrar's gates run on every update.
+5. Cover the handler in `tests/` like any other command; `tests/command-modules.test.mjs`
+   checks the registry invariants (unique names, menu parity, central authorization),
+   and `tests/command-menu-scope.test.mjs` covers menu scoping.
 
 ## Where things live
 

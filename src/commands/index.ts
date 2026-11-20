@@ -13,6 +13,8 @@
  *      `COMMAND_DETAILS` in `src/commands/help-detail.ts`
  *
  * `src/bot.ts` never needs editing: it registers whatever the registry holds.
+ * `commandMenus()` derives the default public menu and the operator-chat menu
+ * from these modules; declared authorization gates still run on every update.
  */
 
 // Registration order = menu order. Keep this list in sync with the menu.
@@ -28,6 +30,7 @@ import "./resume.js";
 import "./log-export.js"; // hidden: operator log export
 
 export {
+  commandMenus,
   commandMetadata,
   commandModule,
   defineCommand,
@@ -35,6 +38,7 @@ export {
   visibleCommandMetadata,
   type CommandDeps,
   type CommandHandler,
+  type CommandMenu,
   type CommandMetadata,
   type CommandModule,
 } from "./registry.js";

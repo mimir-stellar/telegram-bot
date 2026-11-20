@@ -205,7 +205,8 @@ export const COMMAND_DESCRIPTIONS = {
 Each entry in `COMMAND_DESCRIPTIONS` is used in two places in [`src/bot.ts`](../src/bot.ts):
 
 1. **Telegram UI Autocomplete Menu (`registerCommands`)**: Sent to Telegram via `bot.api.setMyCommands(...)` at startup so users see a command pop-up menu when they type `/` in the chat.
-   * When `OPERATOR_TELEGRAM_USER_ID` is unset (`null`), operator-only commands (`audit`, `pause`, `resume`) are filtered out by `visibleCommands()` and omitted from both the autocomplete menu and `/help`.
+   * `commandMenus()` builds a public default menu and, when `OPERATOR_TELEGRAM_USER_ID` is set, a second full menu scoped to that operator's private chat. Operator-only commands (`audit`, `pause`, `resume`) never appear in the default menu. Telegram caches menus per chat, so the runtime authorization gates remain the authority.
+   * When `OPERATOR_TELEGRAM_USER_ID` is unset (`null`), operator-only commands are omitted from both the autocomplete menu and `/help`.
 2. **`/help` and `/start` Replies (`helpMessage`)**: Rendered as `/command — description` and passed through `escapeMd(...)` before being sent in `MarkdownV2` mode.
 
 ### Rules & Constraints for `COMMAND_DESCRIPTIONS`
