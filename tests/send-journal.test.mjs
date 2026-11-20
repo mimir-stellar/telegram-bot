@@ -240,6 +240,7 @@ test("poller: a crash mid-send leaves an intent without a done, recoverable on r
 
     // The intent must be durable before the send returns.
     await waitFor(async () => {
+      if (sendCalls < 1) return false;
       const raw = await readFile(journalFile, "utf8").catch(() => "");
       return raw.includes('"kind":"intent"');
     });
@@ -258,6 +259,153 @@ test("poller: a crash mid-send leaves an intent without a done, recoverable on r
   } finally {
     // Unblock the dangling cycle so nothing lingers after the test.
     if (sendResolve) sendResolve();
+    await dir.cleanup();
+  }
+});
+
+// ── Orphaned journal recovery after configuration changes ────────────────────
+
+test("send journal: classifyPending identifies removed routes, changed networks, and legacy entries", async () => {
+  const dir = await createTempDataDir("mimir-journal-orphan-classify-");
+  try {
+    const journal = createSendJournal({
+      filePath: dir.file("journal.jsonl"),
+      now: () => 1_700_000_000_000,
+    });
+
+    // Legacy entry without route/network metadata stays valid for compatibility.
+    await journal.recordIntent({
+      id: "legacy-1",
+      source: "market",
+      ledger: 100,
+      eventName: "claim_created",
+      at: 100,
+    });
+    // Entry matching current config stays valid.
+    await journal.recordIntent({
+      id: "valid-1",
+      source: "market",
+      ledger: 101,
+      eventName: "claim_created",
+      chatId: "-100111",
+      networkPassphrase: "Test SDF Network ; September 2015",
+      at: 101,
+    });
+    // Entry whose route was removed/changed.
+    await journal.recordIntent({
+      id: "removed-route-1",
+      source: "squad",
+      ledger: 102,
+      eventName: "claim_created",
+      chatId: "-100999",
+      networkPassphrase: "Test SDF Network ; September 2015",
+      at: 102,
+    });
+    // Entry from a different network identity.
+    await journal.recordIntent({
+      id: "net-changed-1",
+      source: "market",
+      ledger: 103,
+      eventName: "claim_created",
+      chatId: "-100111",
+      networkPassphrase: "Public Global Stellar Network ; September 2015",
+      at: 103,
+    });
+
+    const { valid, orphaned } = await journal.classifyPending({
+      resolveRouteChatId: (source) => (source === "market" ? "-100111" : ""),
+      networkPassphrase: "Test SDF Network ; September 2015",
+    });
+
+    assert.deepEqual(
+      valid.map((e) => e.id),
+      ["legacy-1", "valid-1"],
+    );
+    assert.deepEqual(
+      orphaned.map((o) => ({ id: o.entry.id, reason: o.reason })),
+      [
+        { id: "removed-route-1", reason: "removed_route" },
+        { id: "net-changed-1", reason: "network_changed" },
+      ],
+    );
+  } finally {
+    await dir.cleanup();
+  }
+});
+
+test("send journal: recoverOrphans applies explicit discard/reroute decisions and rejects empty reroutes", async () => {
+  const dir = await createTempDataDir("mimir-journal-orphan-recover-");
+  const file = dir.file("journal.jsonl");
+  try {
+    const journal = createSendJournal({
+      filePath: file,
+      now: () => 1_700_000_000_500,
+    });
+
+    await journal.recordIntent({
+      id: "orphan-discard",
+      source: "market",
+      ledger: 200,
+      eventName: "claim_created",
+      chatId: "-100old",
+      networkPassphrase: "Old Net",
+      at: 200,
+    });
+    await journal.recordIntent({
+      id: "orphan-reroute",
+      source: "squad",
+      ledger: 201,
+      eventName: "claim_created",
+      chatId: "-100old-squad",
+      networkPassphrase: "Test SDF Network ; September 2015",
+      at: 201,
+    });
+
+    const context = {
+      resolveRouteChatId: (source) => (source === "squad" ? "-100new-squad" : "-100new-market"),
+      networkPassphrase: "Test SDF Network ; September 2015",
+    };
+
+    const result = await journal.recoverOrphans(context, (orphan) => {
+      if (orphan.entry.id === "orphan-discard") return { action: "discard" };
+      return { action: "reroute" };
+    });
+
+    assert.equal(result.discarded, 1);
+    assert.equal(result.rerouted, 1);
+    assert.equal(result.reroutedEntries[0].id, "orphan-reroute");
+    assert.equal(result.reroutedEntries[0].chatId, "-100new-squad");
+
+    const after = await journal.classifyPending(context);
+    assert.deepEqual(
+      after.valid.map((e) => e.id),
+      ["orphan-reroute"],
+      "rerouted entry is now valid under the new config and discarded entry is gone",
+    );
+    assert.deepEqual(after.orphaned, []);
+
+    // Boundary case: rerouting to an empty route throws instead of silently dropping/replaying.
+    await journal.recordIntent({
+      id: "orphan-empty-target",
+      source: "squad",
+      ledger: 202,
+      eventName: "claim_created",
+      chatId: "-100gone",
+      networkPassphrase: "Test SDF Network ; September 2015",
+      at: 202,
+    });
+    await assert.rejects(
+      () =>
+        journal.recoverOrphans(
+          {
+            resolveRouteChatId: () => "",
+            networkPassphrase: "Test SDF Network ; September 2015",
+          },
+          () => ({ action: "reroute" }),
+        ),
+      /target route is empty/,
+    );
+  } finally {
     await dir.cleanup();
   }
 });

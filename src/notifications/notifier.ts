@@ -96,6 +96,21 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
  */
 export const notifierSkips = { emptyText: 0 };
 
+/**
+ * Resolve the target Telegram chat ID for a given contract source, falling back
+ * to the configured default chat.
+ */
+export function resolveRouteChatId(
+  config: Pick<BotConfig, "chatId"> &
+    Partial<Pick<BotConfig, "marketChatId" | "squadChatId" | "chatIds">>,
+  source?: ContractSource,
+): string {
+  const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
+  if (source === "market") return config.marketChatId || defaultChat;
+  if (source === "squad") return config.squadChatId || defaultChat;
+  return defaultChat;
+}
+
 // ── createNotifier ───────────────────────────────────────────────────────────
 
 /**
@@ -138,12 +153,7 @@ export function createNotifier(
       return;
     }
 
-    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
-    const chatId = source === "market"
-      ? config.marketChatId || defaultChat
-      : source === "squad"
-        ? config.squadChatId || defaultChat
-        : defaultChat;
+    const chatId = resolveRouteChatId(config, source);
 
     // Select link preview settings based on the contract source.
     // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
