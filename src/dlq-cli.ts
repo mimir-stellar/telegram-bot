@@ -9,6 +9,7 @@
  *   list [--file PATH] [--json]
  *   show <id> [--file PATH] [--json]
  *   purge [--older-than <dur>] [--yes] [--file PATH] [--json]
+ *   replay [--file PATH] [--json]
  *
  * Safety rules:
  *   - Chat ids from the environment or embedded in entries/errors are redacted
@@ -16,6 +17,9 @@
  *   - Secrets are scrubbed via `safeErrorMessage` / `redactText`.
  *   - `purge` without `--yes` performs a dry run and never modifies disk.
  *   - `purge --yes` writes atomically via the queue's persistence functions.
+ *   - `replay` always performs a dry-run plan: no Telegram requests or queue
+ *     mutations are made. It groups eligible entries by destination (redacted
+ *     chat id) so operators can confirm what would be resent.
  *   - Unknown subcommands or bad arguments print usage and exit 2.
  */
 
@@ -33,7 +37,7 @@ import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
 export const USAGE =
-  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
+  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]|replay> [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
   readonly exitCode = 2;
@@ -75,6 +79,40 @@ export interface PurgeDlqResult {
   entries: DlqEntryView[];
   chatId: string;
 }
+
+/** One entry in a replay plan group, with its eligibility reason. */
+export interface ReplayPlanEntry extends DlqEntryView {
+  /** true when attempts < maxAttempts, false when the entry is exhausted. */
+  eligible: boolean;
+  /** Human-readable reason for eligibility or ineligibility. */
+  reason: string;
+}
+
+/** A group of entries sharing the same destination (redacted chat id). */
+export interface ReplayPlanDestination {
+  /** Redacted destination chat id. */
+  chatId: string;
+  /** Entries that would be replayed (attempts < maxAttempts). */
+  eligible: ReplayPlanEntry[];
+  /** Entries that would not be replayed (attempts >= maxAttempts). */
+  ineligible: ReplayPlanEntry[];
+}
+
+/** Result of {@link planReplay}. Always a dry-run; no Telegram calls are made. */
+export interface ReplayPlanResult {
+  /** Always true: replay never mutates the queue or contacts Telegram. */
+  dryRun: true;
+  /** Total entries in the queue. */
+  total: number;
+  /** Entries that could be replayed. */
+  eligibleCount: number;
+  /** Entries that have exhausted their attempt budget. */
+  ineligibleCount: number;
+  /** Groups, one per distinct destination, in source-alphabetical order. */
+  destinations: ReplayPlanDestination[];
+}
+
+export interface ReplayPlanOptions extends ListDlqOptions {}
 
 const DURATION_UNITS: Readonly<Record<string, number>> = {
   ms: 1,
@@ -350,6 +388,67 @@ export async function purgeDeadLetters(options: PurgeDlqOptions): Promise<PurgeD
 }
 
 /**
+ * Build a dry-run replay plan grouped by destination.
+ *
+ * Reads the queue from disk, classifies every entry as eligible (attempts <
+ * maxAttempts) or ineligible (exhausted), and groups the results by redacted
+ * destination chat id. Makes no Telegram requests and does not mutate the queue.
+ */
+export async function planReplay(options: ReplayPlanOptions): Promise<ReplayPlanResult> {
+  const maxAttempts =
+    options.maxAttempts ??
+    (Number.isInteger(Number(process.env.DEAD_LETTER_MAX_ATTEMPTS)) &&
+    Number(process.env.DEAD_LETTER_MAX_ATTEMPTS) >= 1
+      ? Number(process.env.DEAD_LETTER_MAX_ATTEMPTS)
+      : DEAD_LETTER_MAX_ATTEMPTS);
+
+  const queue = openQueue(options);
+  await queue.load();
+  const entries = queue.snapshot();
+
+  // Group by destination (resolved from source + explicit chatId).
+  const groups = new Map<string, { eligible: ReplayPlanEntry[]; ineligible: ReplayPlanEntry[] }>();
+
+  for (const entry of entries) {
+    const view = toEntryView(entry, options);
+    const dest = view.chatId;
+
+    if (!groups.has(dest)) {
+      groups.set(dest, { eligible: [], ineligible: [] });
+    }
+    const group = groups.get(dest)!;
+
+    const eligible = entry.attempts < maxAttempts;
+    const reason = eligible
+      ? `attempt ${entry.attempts}/${maxAttempts - 1} remaining`
+      : `exhausted after ${entry.attempts} attempt(s) (max ${maxAttempts})`;
+
+    const planEntry: ReplayPlanEntry = { ...view, eligible, reason };
+    if (eligible) {
+      group.eligible.push(planEntry);
+    } else {
+      group.ineligible.push(planEntry);
+    }
+  }
+
+  // Sort destination groups by chatId for deterministic output.
+  const destinations: ReplayPlanDestination[] = Array.from(groups.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([chatId, group]) => ({ chatId, ...group }));
+
+  const eligibleCount = destinations.reduce((s, d) => s + d.eligible.length, 0);
+  const ineligibleCount = destinations.reduce((s, d) => s + d.ineligible.length, 0);
+
+  return {
+    dryRun: true,
+    total: entries.length,
+    eligibleCount,
+    ineligibleCount,
+    destinations,
+  };
+}
+
+/**
  * Atomically persist the post-purge entry set using `createDeadLetterQueue`'s
  * built-in persistence functions (`load` / `flush` / `enqueue`).
  */
@@ -392,7 +491,7 @@ async function persistPurgedQueue(
 }
 
 interface ParsedCliArgs {
-  subcommand: "list" | "show" | "purge";
+  subcommand: "list" | "show" | "purge" | "replay";
   file?: string;
   id?: string;
   olderThan?: string;
@@ -403,7 +502,7 @@ interface ParsedCliArgs {
 
 export function parseDlqArgs(argv: string[]): ParsedCliArgs {
   const [subcommand, ...rest] = argv;
-  if (subcommand !== "list" && subcommand !== "show" && subcommand !== "purge") {
+  if (subcommand !== "list" && subcommand !== "show" && subcommand !== "purge" && subcommand !== "replay") {
     throw new DlqUsageError(USAGE);
   }
 
@@ -539,6 +638,45 @@ function formatPurgeOutput(
   );
 }
 
+function formatReplayPlanOutput(
+  plan: ReplayPlanResult,
+  filePath: string,
+  asJson: boolean,
+): string {
+  if (asJson) {
+    return `${JSON.stringify({ file: filePath, ...plan }, null, 2)}\n`;
+  }
+  if (plan.total === 0) {
+    return `[dlq] replay plan (dry-run): 0 entries in ${filePath}`;
+  }
+  const lines: string[] = [
+    `[dlq] replay plan (dry-run): ${plan.eligibleCount} eligible, ` +
+      `${plan.ineligibleCount} ineligible, ${plan.total} total — no Telegram requests made`,
+  ];
+  for (const dest of plan.destinations) {
+    lines.push(`\n  destination: ${dest.chatId}`);
+    if (dest.eligible.length > 0) {
+      lines.push(`    eligible (${dest.eligible.length}):`);
+      for (const e of dest.eligible) {
+        lines.push(
+          `      ${e.id}  source=${e.source}  ledger=${e.ledger}  event=${e.eventName}  ` +
+            `attempts=${e.attempts}  reason=${e.reason}`,
+        );
+      }
+    }
+    if (dest.ineligible.length > 0) {
+      lines.push(`    ineligible (${dest.ineligible.length}):`);
+      for (const e of dest.ineligible) {
+        lines.push(
+          `      ${e.id}  source=${e.source}  ledger=${e.ledger}  event=${e.eventName}  ` +
+            `attempts=${e.attempts}  reason=${e.reason}`,
+        );
+      }
+    }
+  }
+  return lines.join("\n");
+}
+
 export interface RunDlqCliOptions {
   argv?: string[];
   now?: () => number;
@@ -582,6 +720,12 @@ export async function runDlqCli(
     if (parsed.subcommand === "show") {
       const entry = await showDeadLetter({ ...commonOptions, id: parsed.id! });
       out(formatShowOutput(entry, parsed.json).trimEnd());
+      return { exitCode: 0 };
+    }
+
+    if (parsed.subcommand === "replay") {
+      const plan = await planReplay(commonOptions);
+      out(formatReplayPlanOutput(plan, filePath, parsed.json).trimEnd());
       return { exitCode: 0 };
     }
 
