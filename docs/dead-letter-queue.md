@@ -96,6 +96,18 @@ The queue is strictly bounded across every dimension:
 
 ---
 
+## Operator Inspection CLI (`src/dlq-cli.ts`)
+
+Operators can inspect queue status and entries offline without editing JSON by hand:
+
+```bash
+# Destination-safe summary (counts and reason categories only; omits message text and chat ids)
+npx tsx src/dlq-cli.ts status [--file PATH] [--json]
+
+# List parked entries (chat ids redacted)
+npx tsx src/dlq-cli.ts list [--file PATH] [--json]
+```
+
 ## Operator Inspection with `jq`
 
 Because the file contains standard JSON, operators can safely inspect queue status and contents on host or container storage using `jq`.

@@ -16,8 +16,9 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { createDeadLetterQueue } from "../dist/deadLetter.js";
+import { classifyDeadLetterReason, createDeadLetterQueue } from "../dist/deadLetter.js";
 import {
+  getDeadLetterStatus,
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
@@ -380,4 +381,85 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.equal(parseDurationMs("1h30m"), 5_400_000);
   assert.throws(() => parseDurationMs(""), /requires a duration/);
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
+});
+
+// ── status subcommand ─────────────────────────────────────────────────────────
+
+test("status reports counts and reason categories without raw message text or destinations", async () => {
+  const RAW_BODY = "RAW-NOTIFICATION-BODY-12345";
+  await withTempDlq(
+    async ({ filePath }) => {
+      const io = captureIo();
+      const { exitCode } = await runDlqCli({
+        argv: ["status", "--file", filePath],
+        stdout: io.out,
+        stderr: io.err,
+      });
+
+      assert.equal(exitCode, 0);
+      assert.equal(io.stderr.length, 0);
+      const output = io.stdout.join("\n");
+      assert.match(output, /depth=3/);
+      assert.match(output, /rate_limited=2/);
+      assert.match(output, /network=1/);
+      assert.equal(output.includes(RAW_BODY), false, "raw message text must not appear in status");
+      assert.equal(output.includes(RAW_CHAT_ID), false, "raw chat id must not appear in status");
+      assert.equal(output.includes(BOT_TOKEN), false, "bot token must not appear in status");
+
+      const jsonIo = captureIo();
+      const jsonRes = await runDlqCli({
+        argv: ["status", "--file", filePath, "--json"],
+        stdout: jsonIo.out,
+        stderr: jsonIo.err,
+      });
+      assert.equal(jsonRes.exitCode, 0);
+      const jsonRaw = jsonIo.stdout.join("\n");
+      assert.equal(jsonRaw.includes(RAW_BODY), false);
+      assert.equal(jsonRaw.includes(RAW_CHAT_ID), false);
+      assert.equal(jsonRaw.includes(BOT_TOKEN), false);
+      const parsed = JSON.parse(jsonRaw);
+      assert.equal(parsed.depth, 3);
+      assert.deepEqual(parsed.bySource, { market: 2, squad: 1 });
+      assert.deepEqual(parsed.byReason, { rate_limited: 2, network: 1 });
+      assert.equal(parsed.maxAttemptsSeen, 1);
+
+      const summary = await getDeadLetterStatus({ filePath });
+      assert.equal(summary.depth, 3);
+    },
+    [
+      {
+        ledger: 101,
+        source: "market",
+        text: `${RAW_BODY} for ${RAW_CHAT_ID}`,
+        error: `Telegram 429 Too Many Requests for chat ${RAW_CHAT_ID} bot${BOT_TOKEN}`,
+      },
+      {
+        ledger: 102,
+        source: "market",
+        text: `${RAW_BODY} second`,
+        error: "429 retry after 5",
+      },
+      {
+        ledger: 103,
+        source: "squad",
+        text: `${RAW_BODY} third`,
+        error: "ECONNREFUSED 127.0.0.1:443",
+      },
+    ],
+  );
+});
+
+test("status on an empty or missing queue reports depth=0", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    const io = captureIo();
+    const { exitCode } = await runDlqCli({
+      argv: ["status", "--file", filePath],
+      stdout: io.out,
+      stderr: io.err,
+    });
+    assert.equal(exitCode, 0);
+    assert.match(io.stdout.join("\n"), /depth=0/);
+    assert.equal(classifyDeadLetterReason(null), "unknown");
+    assert.equal(classifyDeadLetterReason("503 Service Unavailable"), "server_error");
+  });
 });

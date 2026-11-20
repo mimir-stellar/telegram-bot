@@ -28,12 +28,13 @@ import {
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
   type DeadLetterEntry,
+  type DeadLetterStatusSummary,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
 export const USAGE =
-  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
+  "usage: npm run dlq -- <status|list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
   readonly exitCode = 2;
@@ -269,6 +270,15 @@ function openQueue(options: ListDlqOptions) {
   });
 }
 
+/** Load and return a destination-safe dead-letter summary (counts and reason categories only). */
+export async function getDeadLetterStatus(
+  options: ListDlqOptions,
+): Promise<DeadLetterStatusSummary> {
+  const queue = openQueue(options);
+  await queue.load();
+  return queue.summary();
+}
+
 /** Load and return all dead-letter entries with redacted chat ids. */
 export async function listDeadLetters(options: ListDlqOptions): Promise<DlqEntryView[]> {
   const queue = openQueue(options);
@@ -392,7 +402,7 @@ async function persistPurgedQueue(
 }
 
 interface ParsedCliArgs {
-  subcommand: "list" | "show" | "purge";
+  subcommand: "status" | "list" | "show" | "purge";
   file?: string;
   id?: string;
   olderThan?: string;
@@ -403,7 +413,12 @@ interface ParsedCliArgs {
 
 export function parseDlqArgs(argv: string[]): ParsedCliArgs {
   const [subcommand, ...rest] = argv;
-  if (subcommand !== "list" && subcommand !== "show" && subcommand !== "purge") {
+  if (
+    subcommand !== "status" &&
+    subcommand !== "list" &&
+    subcommand !== "show" &&
+    subcommand !== "purge"
+  ) {
     throw new DlqUsageError(USAGE);
   }
 
@@ -476,6 +491,32 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
 
 function resolvePath(value: string): string {
   return path.resolve(process.cwd(), value);
+}
+
+function formatStatusOutput(
+  summary: DeadLetterStatusSummary,
+  filePath: string,
+  asJson: boolean,
+): string {
+  if (asJson) {
+    return `${JSON.stringify({ file: filePath, ...summary }, null, 2)}\n`;
+  }
+  if (summary.depth === 0) {
+    return `[dlq] status: depth=0 (empty) in ${filePath}`;
+  }
+  const sources = Object.entries(summary.bySource)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, count]) => `${key}=${count}`)
+    .join(", ");
+  const reasons = Object.entries(summary.byReason)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, count]) => `${key}=${count}`)
+    .join(", ");
+  return (
+    `[dlq] status: depth=${summary.depth} sources=[${sources}] reasons=[${reasons}] ` +
+    `maxAttempts=${summary.maxAttemptsSeen} oldest=${summary.oldestEnqueuedAt ?? "none"} ` +
+    `newest=${summary.newestEnqueuedAt ?? "none"} in ${filePath}`
+  );
 }
 
 function formatListOutput(
@@ -572,6 +613,12 @@ export async function runDlqCli(
   };
 
   try {
+    if (parsed.subcommand === "status") {
+      const summary = await getDeadLetterStatus(commonOptions);
+      out(formatStatusOutput(summary, filePath, parsed.json).trimEnd());
+      return { exitCode: 0 };
+    }
+
     if (parsed.subcommand === "list") {
       const entries = await listDeadLetters(commonOptions);
       const chatId = resolveChatIdForSource("default", parsed.chatId);

@@ -55,6 +55,97 @@ export interface DeadLetterStats {
   dropped: number;
 }
 
+export type DeadLetterReasonCategory =
+  | "rate_limited"
+  | "auth_error"
+  | "bad_request"
+  | "timeout"
+  | "network"
+  | "server_error"
+  | "unknown";
+
+export interface DeadLetterStatusSummary {
+  depth: number;
+  bySource: Record<string, number>;
+  byReason: Record<string, number>;
+  oldestEnqueuedAt: string | null;
+  newestEnqueuedAt: string | null;
+  maxAttemptsSeen: number;
+}
+
+/**
+ * Map a persisted error string to a stable, destination-safe reason category
+ * so operator status never leaks raw error payloads or chat identifiers.
+ */
+export function classifyDeadLetterReason(
+  lastError: string | null | undefined,
+): DeadLetterReasonCategory {
+  if (!lastError || lastError.trim().length === 0) return "unknown";
+  const lower = lastError.toLowerCase();
+  if (/\b429\b|too many requests|retry after|rate[- ]limit/.test(lower)) {
+    return "rate_limited";
+  }
+  if (/\b40[13]\b|unauthorized|forbidden|blocked|kicked/.test(lower)) {
+    return "auth_error";
+  }
+  if (/\b40[04]\b|bad request|chat not found|can't parse|markdown|entity/.test(lower)) {
+    return "bad_request";
+  }
+  if (/timed? ?out|etimedout|esockettimedout|aborterror|\b408\b/.test(lower)) {
+    return "timeout";
+  }
+  if (/econnrefused|econnreset|enotfound|ehostunreach|eai_again|fetch failed|network|socket/.test(lower)) {
+    return "network";
+  }
+  if (/\b50[0234]\b|internal server error|bad gateway|service unavailable/.test(lower)) {
+    return "server_error";
+  }
+  return "unknown";
+}
+
+/**
+ * Build a destination-safe summary of dead-letter entries containing counts
+ * and reason categories only (never raw message text or destination ids).
+ */
+export function summarizeDeadLetters(
+  entries: readonly DeadLetterEntry[],
+): DeadLetterStatusSummary {
+  const bySource: Record<string, number> = {};
+  const byReason: Record<string, number> = {};
+  let oldestEnqueuedAt: string | null = null;
+  let newestEnqueuedAt: string | null = null;
+  let maxAttemptsSeen = 0;
+
+  for (const entry of entries) {
+    const source = entry.source || "unknown";
+    bySource[source] = (bySource[source] ?? 0) + 1;
+
+    const reason = classifyDeadLetterReason(entry.lastError);
+    byReason[reason] = (byReason[reason] ?? 0) + 1;
+
+    if (entry.attempts > maxAttemptsSeen) {
+      maxAttemptsSeen = entry.attempts;
+    }
+    if (typeof entry.enqueuedAt === "string" && entry.enqueuedAt.length > 0) {
+      if (oldestEnqueuedAt === null || entry.enqueuedAt < oldestEnqueuedAt) {
+        oldestEnqueuedAt = entry.enqueuedAt;
+      }
+      if (newestEnqueuedAt === null || entry.enqueuedAt > newestEnqueuedAt) {
+        newestEnqueuedAt = entry.enqueuedAt;
+      }
+    }
+  }
+
+  return {
+    depth: entries.length,
+    bySource,
+    byReason,
+    oldestEnqueuedAt,
+    newestEnqueuedAt,
+    maxAttemptsSeen,
+  };
+}
+
 export interface DeadLetterQueueOptions {
   /**
    * Where the queue lives. `null` disables persistence and loading: the queue
@@ -325,6 +416,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     flush,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
+    },
+    summary(): DeadLetterStatusSummary {
+      return summarizeDeadLetters(entries);
     },
     /** Test helper — snapshot of current entries. */
     snapshot(): DeadLetterEntry[] {
