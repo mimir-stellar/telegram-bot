@@ -18,6 +18,7 @@ import {
 } from "./activity-baseline.js";
 import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
 import type { LogCapture } from "./logger.js";
+import { formatMetricLabels } from "./metrics.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
@@ -381,52 +382,53 @@ export function buildMetricsReport(
 ): string {
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
   const network = networkLabel(config);
+  const netLabels = formatMetricLabels({ network });
   const activity = poller.activityBaseline ?? emptyActivityBaseline();
 
   const lines: string[] = [
     `# HELP mimir_telegram_uptime_ms Uptime in milliseconds`,
     `# TYPE mimir_telegram_uptime_ms gauge`,
-    `mimir_telegram_uptime_ms{network="${network}"} ${uptimeMs}`,
+    `mimir_telegram_uptime_ms${netLabels} ${uptimeMs}`,
     ``,
     `# HELP mimir_telegram_poller_running Whether the poller is currently running (1) or stopped/paused (0)`,
     `# TYPE mimir_telegram_poller_running gauge`,
-    `mimir_telegram_poller_running{network="${network}"} ${poller.running && !poller.paused ? 1 : 0}`,
+    `mimir_telegram_poller_running${netLabels} ${poller.running && !poller.paused ? 1 : 0}`,
     ``,
     `# HELP mimir_telegram_poller_cycles_total Total number of completed poll cycles`,
     `# TYPE mimir_telegram_poller_cycles_total counter`,
-    `mimir_telegram_poller_cycles_total{network="${network}"} ${poller.cycles}`,
+    `mimir_telegram_poller_cycles_total${netLabels} ${poller.cycles}`,
     ``,
     `# HELP mimir_telegram_notifications_sent_total Total number of Telegram messages successfully sent`,
     `# TYPE mimir_telegram_notifications_sent_total counter`,
-    `mimir_telegram_notifications_sent_total{network="${network}"} ${poller.notificationsSent}`,
+    `mimir_telegram_notifications_sent_total${netLabels} ${poller.notificationsSent}`,
     ``,
     `# HELP mimir_telegram_notifications_failed_total Total number of Telegram messages that failed to send after retries`,
     `# TYPE mimir_telegram_notifications_failed_total counter`,
-    `mimir_telegram_notifications_failed_total{network="${network}"} ${poller.notificationsFailed}`,
+    `mimir_telegram_notifications_failed_total${netLabels} ${poller.notificationsFailed}`,
     ``,
     `# HELP mimir_telegram_events_skipped_total Total number of events skipped (unrecognized, unformatted, or rate-limited)`,
     `# TYPE mimir_telegram_events_skipped_total counter`,
-    `mimir_telegram_events_skipped_total{network="${network}"} ${poller.eventsSkipped}`,
+    `mimir_telegram_events_skipped_total${netLabels} ${poller.eventsSkipped}`,
     ``,
     `# HELP mimir_telegram_consecutive_failures Current number of consecutive failed poll cycles`,
     `# TYPE mimir_telegram_consecutive_failures gauge`,
-    `mimir_telegram_consecutive_failures{network="${network}"} ${poller.consecutiveFailures}`,
+    `mimir_telegram_consecutive_failures${netLabels} ${poller.consecutiveFailures}`,
     ``,
     `# HELP mimir_telegram_activity_last_cycle_events Events observed in the most recent complete poll cycle`,
     `# TYPE mimir_telegram_activity_last_cycle_events gauge`,
-    `mimir_telegram_activity_last_cycle_events{network="${network}"} ${activity.lastValue ?? 0}`,
+    `mimir_telegram_activity_last_cycle_events${netLabels} ${activity.lastValue ?? 0}`,
     ``,
     `# HELP mimir_telegram_activity_baseline_events Mean events per cycle in the rolling baseline (0 while warming up)`,
     `# TYPE mimir_telegram_activity_baseline_events gauge`,
-    `mimir_telegram_activity_baseline_events{network="${network}"} ${activity.baselineMean ?? 0}`,
+    `mimir_telegram_activity_baseline_events${netLabels} ${activity.baselineMean ?? 0}`,
     ``,
     `# HELP mimir_telegram_activity_deviation Z-score of the latest complete cycle against the rolling baseline (0 while warming up)`,
     `# TYPE mimir_telegram_activity_deviation gauge`,
-    `mimir_telegram_activity_deviation{network="${network}"} ${activity.zScore ?? 0}`,
+    `mimir_telegram_activity_deviation${netLabels} ${activity.zScore ?? 0}`,
     ``,
     `# HELP mimir_telegram_activity_anomalies_total Complete cycles classified as a spike or drop against the rolling baseline`,
     `# TYPE mimir_telegram_activity_anomalies_total counter`,
-    `mimir_telegram_activity_anomalies_total{network="${network}"} ${activity.anomalies}`,
+    `mimir_telegram_activity_anomalies_total${netLabels} ${activity.anomalies}`,
   ];
 
   if (poller.latestLedger !== null) {
@@ -434,7 +436,7 @@ export function buildMetricsReport(
       ``,
       `# HELP mimir_telegram_latest_ledger Highest ledger seen by the poller`,
       `# TYPE mimir_telegram_latest_ledger gauge`,
-      `mimir_telegram_latest_ledger{network="${network}"} ${poller.latestLedger}`
+      `mimir_telegram_latest_ledger${netLabels} ${poller.latestLedger}`
     );
   }
 
@@ -446,8 +448,13 @@ export function buildMetricsReport(
       `# TYPE mimir_telegram_target_last_event_ledger gauge`,
     );
     for (const target of targetsWithLedgers) {
+      const targetLabels = formatMetricLabels({
+        network,
+        source: String(target.source),
+        contract: String(target.contractId),
+      });
       lines.push(
-        `mimir_telegram_target_last_event_ledger{network="${network}",source="${target.source}",contract="${target.contractId}"} ${target.lastEventLedger}`
+        `mimir_telegram_target_last_event_ledger${targetLabels} ${target.lastEventLedger}`
       );
     }
   }
