@@ -16,11 +16,16 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { createDeadLetterQueue } from "../dist/deadLetter.js";
+import {
+  createDeadLetterQueue,
+  loadRecoveryCheckpoint,
+  saveRecoveryCheckpoint,
+} from "../dist/deadLetter.js";
 import {
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
+  recoverDeadLetters,
   runDlqCli,
   showDeadLetter,
   USAGE,
@@ -380,4 +385,153 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.equal(parseDurationMs("1h30m"), 5_400_000);
   assert.throws(() => parseDurationMs(""), /requires a duration/);
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
+});
+
+// ── recover subcommand ────────────────────────────────────────────────────────
+
+test("recover persists a bounded checkpoint and resumes without reprocessing acknowledged entries", async () => {
+  await withTempDlq(
+    async ({ directory, filePath }) => {
+      const checkpointFile = path.join(directory, "recovery-checkpoint.json");
+      const processedLedgers = [];
+
+      // Dry run leaves queue and checkpoint untouched.
+      const dryRun = await recoverDeadLetters({
+        filePath,
+        checkpointFile,
+        limit: 2,
+        chatId: RAW_CHAT_ID,
+      });
+      assert.equal(dryRun.dryRun, true);
+      assert.equal(dryRun.recovered, 2);
+      assert.equal(dryRun.interrupted, true);
+      assert.equal(await loadRecoveryCheckpoint(checkpointFile), null);
+
+      // First run: bounded to 2 entries (interrupted before processing all 4).
+      const firstRun = await recoverDeadLetters({
+        filePath,
+        checkpointFile,
+        limit: 2,
+        maxAcknowledgedIds: 3,
+        yes: true,
+        chatId: RAW_CHAT_ID,
+        send: async (_text, entry) => {
+          processedLedgers.push(entry.ledger);
+        },
+      });
+      assert.equal(firstRun.dryRun, false);
+      assert.equal(firstRun.recovered, 2);
+      assert.equal(firstRun.interrupted, true);
+      assert.equal(firstRun.completed, false);
+      assert.equal(firstRun.remaining, 2);
+      assert.deepEqual(processedLedgers, [101, 102]);
+
+      const checkpointAfterFirst = await loadRecoveryCheckpoint(checkpointFile, 3);
+      assert.ok(checkpointAfterFirst);
+      assert.equal(checkpointAfterFirst.completed, false);
+      assert.equal(checkpointAfterFirst.acknowledgedIds.length, 2);
+
+      // Re-add ledger 101 to simulate an interruption before queue persistence
+      // or a stale copy; resuming must skip already-acknowledged entries.
+      const queue = createDeadLetterQueue({ filePath, maxEntries: 50, maxAttempts: 10 });
+      await queue.load();
+      await queue.enqueue({
+        source: "market",
+        ledger: 101,
+        eventName: "claim_created",
+        text: "Notification @ ledger 101",
+        error: "re-injected",
+      });
+
+      const secondRun = await recoverDeadLetters({
+        filePath,
+        checkpointFile,
+        maxAcknowledgedIds: 3,
+        yes: true,
+        chatId: RAW_CHAT_ID,
+        send: async (_text, entry) => {
+          processedLedgers.push(entry.ledger);
+        },
+      });
+      assert.equal(secondRun.skippedAcknowledged, 1, "already-acknowledged entry 101 must be skipped");
+      assert.equal(secondRun.recovered, 2);
+      assert.equal(secondRun.interrupted, false);
+      assert.equal(secondRun.completed, true);
+      assert.equal(secondRun.remaining, 0);
+      assert.deepEqual(processedLedgers, [101, 102, 103, 104]);
+
+      // Checkpoint is bounded to maxAcknowledgedIds (3 of 4).
+      const finalCheckpoint = await loadRecoveryCheckpoint(checkpointFile, 3);
+      assert.ok(finalCheckpoint);
+      assert.equal(finalCheckpoint.completed, true);
+      assert.equal(finalCheckpoint.acknowledgedIds.length, 3);
+    },
+    [
+      { ledger: 101 },
+      { ledger: 102 },
+      { ledger: 103 },
+      { ledger: 104 },
+    ],
+  );
+});
+
+test("recover respects AbortSignal interruption and CLI --source / --limit / --reset-checkpoint", async () => {
+  await withTempDlq(
+    async ({ directory, filePath }) => {
+      const checkpointFile = path.join(directory, "abort-checkpoint.json");
+      await saveRecoveryCheckpoint(checkpointFile, {
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        acknowledgedIds: ["stale:0:none:00000000"],
+        completed: false,
+      });
+
+      const controller = new AbortController();
+      const processed = [];
+      const res = await recoverDeadLetters({
+        filePath,
+        checkpointFile,
+        source: "market",
+        resetCheckpoint: true,
+        yes: true,
+        signal: controller.signal,
+        send: async (_text, entry) => {
+          processed.push(entry.ledger);
+          controller.abort();
+        },
+      });
+      assert.equal(res.recovered, 1);
+      assert.equal(res.interrupted, true);
+      assert.equal(res.remaining, 2); // 1 market left + 1 squad untouched
+      assert.deepEqual(processed, [10]);
+
+      // CLI invocation completes the remaining market entry without touching squad.
+      const io = captureIo();
+      const cliRes = await runDlqCli({
+        argv: [
+          "recover",
+          "--file",
+          filePath,
+          "--checkpoint",
+          checkpointFile,
+          "--source",
+          "market",
+          "--yes",
+          "--json",
+        ],
+        stdout: io.out,
+        stderr: io.err,
+      });
+      assert.equal(cliRes.exitCode, 0);
+      const parsed = JSON.parse(io.stdout.join("\n"));
+      assert.equal(parsed.recovered, 1);
+      assert.equal(parsed.completed, true);
+      assert.equal(parsed.remaining, 1);
+    },
+    [
+      { ledger: 10, source: "market" },
+      { ledger: 20, source: "market" },
+      { ledger: 30, source: "squad" },
+    ],
+  );
 });

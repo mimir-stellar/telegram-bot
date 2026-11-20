@@ -96,6 +96,20 @@ The queue is strictly bounded across every dimension:
 
 ---
 
+## Resumable Operator Recovery (`src/dlq-cli.ts`)
+
+Operators can run bounded, interruptible dead-letter recovery using a persisted checkpoint:
+
+```bash
+# Dry-run recovery plan (no disk writes)
+npx tsx src/dlq-cli.ts recover --file data/dead-letter.json --source market --limit 10
+
+# Execute bounded recovery and persist a checkpoint
+npx tsx src/dlq-cli.ts recover --file data/dead-letter.json --source market --limit 10 --yes
+```
+
+If interrupted (by `--limit`, `AbortSignal`, or process exit), the checkpoint stores a bounded list of acknowledged entry IDs (`DEAD_LETTER_CHECKPOINT_MAX_IDS = 500`) so subsequent runs resume without reprocessing already-acknowledged entries.
+
 ## Operator Inspection with `jq`
 
 Because the file contains standard JSON, operators can safely inspect queue status and contents on host or container storage using `jq`.
