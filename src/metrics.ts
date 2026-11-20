@@ -24,6 +24,33 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  DEFAULT_SERVICE_LEVEL_WINDOW_SIZE,
+  type ServiceLevelCompleteness,
+  type ServiceLevelDataGap,
+  type ServiceLevelDeliverySuccess,
+  type ServiceLevelIncompleteReason,
+  type ServiceLevelLag,
+  type ServiceLevelSample,
+  type ServiceLevelWindowOptions,
+  type ServiceLevelWindowReport,
+  ServiceLevelWindow,
+  formatServiceLevelWindow,
+} from "./stellar/metrics.js";
+
+export {
+  DEFAULT_SERVICE_LEVEL_WINDOW_SIZE,
+  type ServiceLevelCompleteness,
+  type ServiceLevelDataGap,
+  type ServiceLevelDeliverySuccess,
+  type ServiceLevelIncompleteReason,
+  type ServiceLevelLag,
+  type ServiceLevelSample,
+  type ServiceLevelWindowOptions,
+  type ServiceLevelWindowReport,
+  ServiceLevelWindow,
+  formatServiceLevelWindow,
+};
 
 // ── Metric types ──────────────────────────────────────────────────────────────
 
@@ -115,6 +142,29 @@ export interface MetricsRegistry {
    */
   recordNotificationAge(ageMs: number | null): void;
 
+  /** Bounded rolling service-level window tracker. */
+  serviceLevel: ServiceLevelWindow;
+
+  /**
+   * Generate the machine-readable service-level window report from bounded local samples.
+   */
+  serviceLevelReport(): ServiceLevelWindowReport;
+
+  /**
+   * Record a delivery attempt into the service-level window.
+   */
+  recordDelivery(
+    success: boolean,
+    ageMs?: number | null,
+    dataGap?: boolean,
+    gapReason?: ServiceLevelIncompleteReason,
+  ): void;
+
+  /**
+   * Record a data gap event into the service-level window.
+   */
+  recordDataGap(reason?: ServiceLevelIncompleteReason): void;
+
   /**
    * Render the registry as a Prometheus text exposition string.
    * Includes HELP and TYPE comment lines so Prometheus autodiscovery works.
@@ -171,7 +221,15 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
-export function createMetrics(): MetricsRegistry {
+export interface MetricsOptions {
+  /** Optional capacity of the bounded rolling service-level window. */
+  serviceLevelWindowSize?: number | undefined;
+}
+
+export function createMetrics(options?: MetricsOptions): MetricsRegistry {
+  const serviceLevel = new ServiceLevelWindow({
+    windowSize: options?.serviceLevelWindowSize,
+  });
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -278,9 +336,26 @@ export function createMetrics(): MetricsRegistry {
     maxNotificationAgeMs,
   ];
 
+  const baseFailedInc = notificationsFailed.inc;
+  notificationsFailed.inc = (delta = 1) => {
+    baseFailedInc(delta);
+    for (let i = 0; i < delta; i += 1) {
+      serviceLevel.recordDelivery(false, null);
+    }
+  };
+
+  const baseStaleCursorInc = staleCursorEvents.inc;
+  staleCursorEvents.inc = (delta = 1) => {
+    baseStaleCursorInc(delta);
+    for (let i = 0; i < delta; i += 1) {
+      serviceLevel.recordDataGap("stale_cursor");
+    }
+  };
+
   function recordNotificationAge(ageMs: number | null): void {
     if (ageMs === null || typeof ageMs !== "number" || !Number.isFinite(ageMs)) {
       notificationAgeMissingLedgerTime.inc();
+      serviceLevel.recordDelivery(true, null, true, "missing_ledger_time");
       return;
     }
     const clampedMs = Math.max(0, Math.round(ageMs));
@@ -290,6 +365,7 @@ export function createMetrics(): MetricsRegistry {
     if (clampedMs > maxNotificationAgeMs.value()) {
       maxNotificationAgeMs.set(clampedMs);
     }
+    serviceLevel.recordDelivery(true, clampedMs, false);
   }
 
   function render(): string {
@@ -347,6 +423,18 @@ export function createMetrics(): MetricsRegistry {
         "Cache-Control": "no-store",
       });
       res.end("OK\n");
+      return;
+    }
+
+    if (path === "/service-level") {
+      const report = serviceLevel.report();
+      const body = JSON.stringify(report, null, 2) + "\n";
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": Buffer.byteLength(body),
+        "Cache-Control": "no-store",
+      });
+      res.end(body);
       return;
     }
 
@@ -408,6 +496,21 @@ export function createMetrics(): MetricsRegistry {
     lastNotificationAgeMs,
     maxNotificationAgeMs,
     recordNotificationAge,
+    serviceLevel,
+    serviceLevelReport(): ServiceLevelWindowReport {
+      return serviceLevel.report();
+    },
+    recordDelivery(
+      success: boolean,
+      ageMs?: number | null,
+      dataGap?: boolean,
+      gapReason?: ServiceLevelIncompleteReason,
+    ): void {
+      serviceLevel.recordDelivery(success, ageMs, dataGap, gapReason);
+    },
+    recordDataGap(reason?: ServiceLevelIncompleteReason): void {
+      serviceLevel.recordDataGap(reason);
+    },
     render,
     startServer,
   };
