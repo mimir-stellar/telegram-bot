@@ -62,6 +62,111 @@ function isKnownAction(val: string): val is CallbackActionType {
   return ["status", "contracts", "help", "pause", "resume", "broadcast"].includes(val);
 }
 
+/** Maximum digits for JavaScript Number.MAX_SAFE_INTEGER (9,007,199,254,740,991 has 16 digits). */
+export const MAX_CANONICAL_NUMERIC_DIGITS = 16;
+
+/**
+ * Returns true if a value represents a canonical non-negative decimal numeric identifier:
+ * - Pure decimal digits without leading signs ('+123' and '-123' are rejected)
+ * - No redundant leading zeros ('0' is allowed; '01', '00' are rejected)
+ * - Safe integer range: 0 <= n <= Number.MAX_SAFE_INTEGER (9,007,199,254,740,991)
+ * - At most 16 decimal digits (avoiding overlong decimal IDs)
+ */
+export function isCanonicalNumericId(value: unknown): boolean {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0);
+  }
+  if (typeof value === "bigint") {
+    return value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER);
+  }
+  if (typeof value !== "string") {
+    return false;
+  }
+  if (!/^\d+$/.test(value)) {
+    return false;
+  }
+  if (value.length > 1 && value.startsWith("0")) {
+    return false;
+  }
+  if (value.length > MAX_CANONICAL_NUMERIC_DIGITS) {
+    return false;
+  }
+  const num = Number(value);
+  return Number.isSafeInteger(num) && num >= 0 && String(num) === value;
+}
+
+/**
+ * Returns true if a value represents a noncanonical numeric identifier:
+ * - Leading signs ('+123', '-123', '+0', '-0')
+ * - Overlong decimal IDs with redundant leading zeros ('0123', '00')
+ * - Unsafe integers exceeding Number.MAX_SAFE_INTEGER ('9007199254740992')
+ * - Overlong decimal strings exceeding 16 digits ('99999999999999999999999999999')
+ * - Non-decimal representations like scientific notation, hex, octal, binary, or floats
+ *   ('1e5', '0x10', '1.5')
+ *
+ * Returns false for:
+ * - Canonical decimal IDs ('0', '42', '9007199254740991')
+ * - Non-numeric strings that do not represent numbers ('refresh', 'view', 'lx9abc_1_def')
+ */
+export function isNoncanonicalNumericId(value: unknown): boolean {
+  if (typeof value === "number") {
+    return !Number.isSafeInteger(value) || value < 0 || Object.is(value, -0);
+  }
+  if (typeof value === "bigint") {
+    return value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER);
+  }
+  if (typeof value !== "string") {
+    return false;
+  }
+  if (value.length === 0) {
+    return false;
+  }
+  // Disallow leading signs (+ or -)
+  if (/^[+-]/.test(value)) {
+    return true;
+  }
+  // Pure digits: check if it violates canonical decimal rules
+  if (/^\d+$/.test(value)) {
+    return !isCanonicalNumericId(value);
+  }
+  // Disallow hex, octal, binary prefixes when digits/hex follow
+  if (/^0[xXbBoO][0-9a-zA-Z]+$/.test(value)) {
+    return true;
+  }
+  // Disallow floating point decimal representations
+  if (/^\d+\.\d+$/.test(value)) {
+    return true;
+  }
+  // Disallow scientific notation
+  if (/^\d+[eE][+-]?\d+$/.test(value)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Recursively inspect an object or array for any noncanonical numeric identifier values.
+ */
+export function hasNoncanonicalNumericField(obj: unknown): boolean {
+  if (obj === null || typeof obj !== "object") {
+    return false;
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      if (hasNoncanonicalNumericField(item)) return true;
+    }
+    return false;
+  }
+  for (const value of Object.values(obj as Record<string, unknown>)) {
+    if (typeof value === "number" || typeof value === "bigint" || typeof value === "string") {
+      if (isNoncanonicalNumericId(value)) return true;
+    } else if (typeof value === "object" && value !== null) {
+      if (hasNoncanonicalNumericField(value)) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Validate untrusted callback-query data before any action is executed.
  * Treats all callback data as untrusted external user input.
@@ -102,11 +207,27 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
     };
   }
 
+  // Reject top-level noncanonical numeric identifiers
+  if (isNoncanonicalNumericId(trimmed)) {
+    return {
+      ok: false,
+      reason: "noncanonical-numeric-id",
+      fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+    };
+  }
+
   // 1. JSON payload: e.g. {"action":"status"}
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
     try {
-      const parsed = JSON.parse(trimmed) as { action?: unknown };
+      const parsed = JSON.parse(trimmed) as { action?: unknown; [key: string]: unknown };
       if (typeof parsed?.action === "string" && isKnownAction(parsed.action)) {
+        if (hasNoncanonicalNumericField(parsed)) {
+          return {
+            ok: false,
+            reason: "noncanonical-numeric-id",
+            fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+          };
+        }
         return {
           ok: true,
           action: { type: parsed.action, raw },
@@ -129,6 +250,15 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
   // 2. Colon-delimited: e.g. "status:refresh", "mimir:contracts", etc.
   if (trimmed.includes(":")) {
     const parts = trimmed.split(":");
+    for (const part of parts) {
+      if (isNoncanonicalNumericId(part)) {
+        return {
+          ok: false,
+          reason: "noncanonical-numeric-id",
+          fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+        };
+      }
+    }
     if (parts[0] === "mimir" && parts[1] && isKnownAction(parts[1])) {
       return {
         ok: true,

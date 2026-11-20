@@ -13,6 +13,7 @@ import type { BotConfig } from "../config.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
+import { isNoncanonicalNumericId } from "../callbacks.js";
 
 /** Telegram Bot API maximum message length limit. */
 export const MAX_BROADCAST_LENGTH = 4096;
@@ -123,11 +124,13 @@ export class BroadcastStore {
   }
 
   get(id: string, now: number = Date.now()): PendingBroadcast | undefined {
+    if (isNoncanonicalNumericId(id)) return undefined;
     this.cleanup(now);
     return this.items.get(id);
   }
 
   delete(id: string): boolean {
+    if (isNoncanonicalNumericId(id)) return false;
     return this.items.delete(id);
   }
 
@@ -151,6 +154,9 @@ export class BroadcastStore {
 export const defaultBroadcastStore = new BroadcastStore();
 
 export function broadcastKeyboard(id: string): InlineKeyboard {
+  if (isNoncanonicalNumericId(id)) {
+    throw new Error(`Invalid broadcast ID: noncanonical numeric identifier "${id}"`);
+  }
   return new InlineKeyboard()
     .text("✅ Confirm", `broadcast:confirm:${id}`)
     .text("❌ Cancel", `broadcast:cancel:${id}`);
@@ -313,7 +319,12 @@ export async function handleBroadcastCallback(
   const subAction = parts[1];
   const broadcastId = parts[2];
 
-  if (!broadcastId || (subAction !== "confirm" && subAction !== "cancel")) {
+  if (
+    parts.length !== 3 ||
+    !broadcastId ||
+    (subAction !== "confirm" && subAction !== "cancel") ||
+    isNoncanonicalNumericId(broadcastId)
+  ) {
     await safeAnswerCallback(ctx, config, { text: "Invalid broadcast action" });
     return;
   }
