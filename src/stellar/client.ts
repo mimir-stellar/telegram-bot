@@ -15,6 +15,61 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  classifyRpcFailure,
+  formatClassifiedRpcFailure,
+  isRetryableRpcFailure,
+  type RpcFailureCategory,
+  type RpcFailureClassification,
+  type RpcFailureReasonCode,
+} from "./rpc-guard.js";
+
+export {
+  classifyRpcFailure,
+  formatClassifiedRpcFailure,
+  isRetryableRpcFailure,
+  type RpcFailureCategory,
+  type RpcFailureClassification,
+  type RpcFailureReasonCode,
+};
+
+/**
+ * Redacted RPC failure annotated with its separated failure category, stable
+ * reason code, and preserved retryability flag. The `cause` chain is kept for
+ * in-process callers; only `message` is constructed from safe enum codes.
+ */
+export class RpcClassifiedError extends Error {
+  readonly category: RpcFailureCategory;
+  readonly reasonCode: RpcFailureReasonCode;
+  readonly retryable: boolean;
+  readonly httpStatus: number | null;
+
+  constructor(classification: RpcFailureClassification, options?: ErrorOptions) {
+    super(classification.summary, options);
+    this.name = "RpcClassifiedError";
+    this.category = classification.category;
+    this.reasonCode = classification.reasonCode;
+    this.retryable = classification.retryable;
+    this.httpStatus = classification.httpStatus;
+  }
+
+  static from(err: unknown): RpcClassifiedError {
+    if (err instanceof RpcClassifiedError) return err;
+    return new RpcClassifiedError(classifyRpcFailure(err), err instanceof Error ? { cause: err } : undefined);
+  }
+}
+
+/**
+ * Run an async RPC call and normalize any thrown failure into a redacted
+ * {@link RpcClassifiedError}, keeping the original error as `cause`.
+ */
+export async function withClassifiedRpcFailure<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    throw RpcClassifiedError.from(err);
+  }
+}
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {

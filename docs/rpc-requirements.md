@@ -80,6 +80,17 @@ An endpoint with insufficient retention, rate limits, lagging synchronization, o
 | **Malformed Ledger Window Errors** | The endpoint omits `oldestLedger`/`latestLedger` or reports inverted values (`oldest > latest`). | Poller raises `LedgerWindowError` (`malformed-window`), aborting the cycle. |
 | **Inverted or Stalled Ledgers** | The RPC endpoint serves requests from an out-of-sync backend node or a pool of load-balanced nodes with drifting ledger tips. | `latestLedger` oscillates backwards or fails to advance, resulting in duplicate query retries, cursor stalls, or `cursor-after-tip` errors. |
 | **Frequent Timeouts / Rate Limits (HTTP 429 / 504)** | Public shared endpoints often enforce strict rate limits or experience high load during peak testnet activity. | Poller enters exponential backoff, health status degrades, and notification latency increases. |
+| **DNS, TLS, and HTTP Failure Separation** | Misconfigured hostnames (`ENOTFOUND`), transient DNS hiccups (`EAI_AGAIN`), expired/self-signed TLS certificates (`CERT_HAS_EXPIRED`, `SELF_SIGNED_CERT_IN_CHAIN`), or upstream HTTP errors (`401`, `429`, `503`). | `classifyRpcFailure` and `RpcClassifiedError` (`src/stellar/rpc-guard.ts`, `src/stellar/client.ts`) separate `dns`, `tls`, `http`, `timeout`, and `transport` categories with fixed redacted reason codes (never echoing URLs, tokens, or payloads) and preserve retryability (`EAI_AGAIN`, `408`, `429`, `5xx`, and timeouts retry; `ENOTFOUND`, TLS certificate errors, and other `4xx` responses are non-retryable). |
+
+### Failure classification interface
+
+`src/stellar/client.ts` re-exports the boundary helpers from `src/stellar/rpc-guard.ts`:
+
+- `classifyRpcFailure(err)` → `{ category, reasonCode, retryable, httpStatus, summary }`. Codes are stable (for example `dns_not_found`, `dns_temp_failure`, `tls_cert_expired`, `http_rate_limited`, `http_server_error`, `request_timeout`, `transport_error`) and `summary` is built only from those codes plus the numeric status, so it is safe to log.
+- `isRetryableRpcFailure(err)` and `formatClassifiedRpcFailure(err)` are convenience wrappers over the same classification.
+- `RpcClassifiedError.from(err)` / `withClassifiedRpcFailure(fn)` normalize a thrown error into a redacted `RpcClassifiedError` while retaining the original as `cause`. They are opt-in helpers; existing callers and their error handling remain unchanged.
+
+No configuration keys are added or changed by this classification; `STELLAR_RPC_URL` continues to be the only RPC endpoint setting. Classification is applied only where a caller opts in, so it does not alter existing retry, cursor, or notification behavior.
 
 ---
 
