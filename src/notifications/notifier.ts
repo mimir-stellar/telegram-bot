@@ -74,6 +74,39 @@ export function isMarkdownParseError(err: unknown): boolean {
   return true;
 }
 
+// ── isForumTopicClosed ───────────────────────────────────────────────────────
+
+/**
+ * True when a Telegram send failed because the target forum topic is closed.
+ *
+ * Telegram returns HTTP 400 with one of two descriptions for a closed topic:
+ *
+ *  - `"Bad Request: TOPIC_CLOSED"` — the topic exists but has been locked by
+ *    an admin; no new messages may be posted until it is re-opened.
+ *  - `"Bad Request: message thread not found"` — the topic was deleted or the
+ *    `message_thread_id` never referred to a valid topic in this supergroup.
+ *
+ * Both are permanent route failures: retrying the same send will keep failing
+ * until an operator re-opens or recreates the topic. The classifier matches
+ * the shape grammy surfaces (error_code + description on `GrammyError`) and
+ * also duck-typed errors that carry only a description string, so mocks in
+ * tests do not need the full grammy class.
+ *
+ * Rate limits (429), auth failures (401), network errors, and every other
+ * 400-level Bot API error (bad parse, chat not found, …) are intentionally
+ * excluded so only this specific permanent condition is caught.
+ */
+export function isForumTopicClosed(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const record = err as { error_code?: unknown; description?: unknown; message?: unknown };
+  const text = [record.description, record.message]
+    .filter((part): part is string => typeof part === "string" && part !== "")
+    .join(" ");
+  if (!/TOPIC_CLOSED|message thread not found/i.test(text)) return false;
+  if (typeof record.error_code === "number") return record.error_code === 400;
+  return true;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Bounded log fragment identifying which event a fallback send belongs to. */
