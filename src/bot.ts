@@ -367,9 +367,14 @@ export function createBot(deps: BotDeps): Bot {
 // Notifier moved to src/notifications/notifier.ts — re-exported here so all
 // existing imports from "bot.js" keep resolving without modification.
 export {
+  classifyPermanentSendError,
   createNotifier,
+  isBotBlockedError,
+  isChatNotFoundError,
   isMarkdownParseError,
   notifierSkips,
+  PERMANENT_SEND_ERROR_CODES,
+  type PermanentSendErrorReason,
   type SendExtra,
 } from "./notifications/notifier.js";
 

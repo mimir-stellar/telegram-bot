@@ -93,6 +93,7 @@ import {
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
+import { classifyPermanentSendError } from "./notifications/notifier.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
@@ -1268,6 +1269,9 @@ async function sendWithRetry(
       );
       return;
     } catch (err) {
+      if (classifyPermanentSendError(err) !== null) {
+        throw err; // Permanent Telegram error: bypass transient retry loop
+      }
       attempt++;
       const retryAfterMs = extractRetryAfterMs(err);
       if (attempt >= maxRetries || !shouldRetry()) {
@@ -2229,9 +2233,11 @@ export function createPoller(deps: PollerDeps) {
           (event.source === "market" ? config.marketChatId : config.squadChatId) ||
           config.chatId ||
           config.chatIds?.[0];
+        const permanentReason = classifyPermanentSendError(err);
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}` +
-            `${chat ? ` to chat ${chat}` : ""} after retries: ` +
+            `${chat ? ` to chat ${chat}` : ""}` +
+            `${permanentReason ? ` (reason=${permanentReason})` : " after retries"}: ` +
             `${errorMessage(err)} correlation=${correlationId}`,
         );
         if (deadLetterEnabled) {

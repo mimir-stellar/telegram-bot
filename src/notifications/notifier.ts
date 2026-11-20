@@ -5,10 +5,14 @@
  * command-handling changes no longer touch the same file.
  *
  * Public API (all re-exported from `src/bot.ts` for backwards compatibility):
- *   - {@link SendExtra}         — extra options a caller attaches to a send
- *   - {@link isMarkdownParseError} — classifier for Telegram entity-parse failures
- *   - {@link notifierSkips}    — counters for suppressed sends
- *   - {@link createNotifier}   — factory that returns the poller's send function
+ *   - {@link SendExtra}                   — extra options a caller attaches to a send
+ *   - {@link PERMANENT_SEND_ERROR_CODES}  — stable reason codes for permanent send failures
+ *   - {@link isBotBlockedError}           — classifier for Telegram 403 bot-blocked failures
+ *   - {@link isChatNotFoundError}         — classifier for Telegram 400 chat-not-found failures
+ *   - {@link classifyPermanentSendError}  — unified permanent-error classifier
+ *   - {@link isMarkdownParseError}        — classifier for Telegram entity-parse failures
+ *   - {@link notifierSkips}               — counters for suppressed sends
+ *   - {@link createNotifier}              — factory that returns the poller's send function
  */
 
 import type { Bot } from "grammy";
@@ -72,6 +76,62 @@ export function isMarkdownParseError(err: unknown): boolean {
   if (!/can't parse entities|can't find end of the entity/i.test(text)) return false;
   if (typeof record.error_code === "number") return record.error_code === 400;
   return true;
+}
+
+// ── Permanent send error classifiers ─────────────────────────────────────────
+
+/**
+ * Stable reason codes for permanent Telegram delivery failures that must not
+ * enter the transient retry loop.
+ */
+export const PERMANENT_SEND_ERROR_CODES = {
+  BOT_BLOCKED: "BOT_BLOCKED",
+  CHAT_NOT_FOUND: "CHAT_NOT_FOUND",
+} as const;
+
+export type PermanentSendErrorReason =
+  (typeof PERMANENT_SEND_ERROR_CODES)[keyof typeof PERMANENT_SEND_ERROR_CODES];
+
+function extractTelegramErrorText(err: unknown): { errorCode?: number; text: string } | null {
+  if (!err || typeof err !== "object") return null;
+  const record = err as { error_code?: unknown; description?: unknown; message?: unknown };
+  const text = [record.description, record.message]
+    .filter((part): part is string => typeof part === "string" && part !== "")
+    .join(" ");
+  return {
+    errorCode: typeof record.error_code === "number" ? record.error_code : undefined,
+    text,
+  };
+}
+
+/**
+ * True when Telegram rejected a send because the user blocked the bot (403).
+ */
+export function isBotBlockedError(err: unknown): boolean {
+  const info = extractTelegramErrorText(err);
+  if (!info || !/bot was blocked/i.test(info.text)) return false;
+  if (info.errorCode !== undefined) return info.errorCode === 403;
+  return true;
+}
+
+/**
+ * True when Telegram rejected a send because the target chat does not exist (400).
+ */
+export function isChatNotFoundError(err: unknown): boolean {
+  const info = extractTelegramErrorText(err);
+  if (!info || !/chat not found/i.test(info.text)) return false;
+  if (info.errorCode !== undefined) return info.errorCode === 400;
+  return true;
+}
+
+/**
+ * Classify a Telegram send failure into a stable permanent reason code, or
+ * return `null` for transient / unrecognized errors.
+ */
+export function classifyPermanentSendError(err: unknown): PermanentSendErrorReason | null {
+  if (isBotBlockedError(err)) return PERMANENT_SEND_ERROR_CODES.BOT_BLOCKED;
+  if (isChatNotFoundError(err)) return PERMANENT_SEND_ERROR_CODES.CHAT_NOT_FOUND;
+  return null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
