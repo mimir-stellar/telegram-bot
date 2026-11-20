@@ -9,13 +9,24 @@ export interface Ref {
   id: string;
 }
 
-export interface StoreFile {
-  version: number;
-  // chatId -> array of ref strings (e.g. "market:123")
+/** Version 1 on-disk layout: no network identity. */
+interface StoreFileV1 {
+  version: 1;
   follows: Record<string, string[]>;
 }
 
-export const STORE_VERSION = 1;
+/** Version 2 on-disk layout: includes the Stellar network passphrase. */
+interface StoreFileV2 {
+  version: 2;
+  network: string;
+  follows: Record<string, string[]>;
+}
+
+/** Union of all recognised on-disk shapes. */
+export type StoreFile = StoreFileV1 | StoreFileV2;
+
+/** Current store version written by this code. */
+export const STORE_VERSION = 2;
 
 export const DEFAULT_MAX_PER_CHAT = 50;
 
@@ -38,6 +49,11 @@ export interface FollowStoreFs {
  * Configuration for `FollowStore`. Corrupt or unreadable files are moved to
  * `${filePath}.corrupt.<timestamp>`; if quarantine `rename` fails, source bytes
  * are retained in place (never unlinked) and a redacted `FollowStoreError` is thrown.
+ *
+ * When `network` is supplied, the store records it in every new file (version 2)
+ * and refuses to open an existing file that was written for a different network.
+ * An existing version-1 file (no network) must be migrated explicitly via
+ * {@link FollowStore.migrateToNetwork} before the network check can be enforced.
  */
 export interface FollowStoreOptions {
   filePath: string;
@@ -46,6 +62,18 @@ export interface FollowStoreOptions {
   // Aliases for API compatibility.
   maxFollowsPerChat?: number;
   maxTotalEntries?: number;
+  /**
+   * Stellar network passphrase (or any stable network identifier) that this
+   * store is bound to. When set:
+   * - new files are written at version 2 with this value
+   * - existing version-2 files must carry the same value or the store throws
+   * - existing version-1 files (no network field) trigger a `FollowStoreError`
+   *   until `migrateToNetwork()` is called
+   *
+   * When absent, the store operates without network enforcement (backwards
+   * compatible with callers that do not have a passphrase available).
+   */
+  network?: string | undefined;
   fs?: Partial<FollowStoreFs>;
   now?: () => number;
 }
@@ -72,35 +100,54 @@ export function formatRef(kind: RefKind, id: string): string {
   return `${kind}:${id}`;
 }
 
-function emptyStore(): StoreFile {
-  return { version: STORE_VERSION, follows: {} };
+function emptyStore(network?: string): StoreFile {
+  if (network !== undefined) {
+    return { version: 2, network, follows: {} };
+  }
+  return { version: 1, follows: {} };
+}
+
+function validateFollows(
+  follows: unknown,
+  context: string,
+): Record<string, string[]> {
+  if (!isPlainObject(follows)) {
+    throw new FollowStoreError(`${context} follows is not an object`);
+  }
+  const result: Record<string, string[]> = {};
+  for (const [chatId, list] of Object.entries(follows as Record<string, unknown>)) {
+    if (!Array.isArray(list)) {
+      throw new FollowStoreError(`${context} follows[${chatId}] is not an array`);
+    }
+    const cleaned: string[] = [];
+    for (const entry of list) {
+      if (typeof entry !== "string" || parseRef(entry) === null) {
+        throw new FollowStoreError(`${context} invalid ref in follows[${chatId}]`);
+      }
+      cleaned.push(entry);
+    }
+    result[chatId] = cleaned;
+  }
+  return result;
 }
 
 function validateStoreFile(data: unknown): StoreFile {
   if (!isPlainObject(data)) {
     throw new FollowStoreError("store file is not an object");
   }
-  if (data.version !== STORE_VERSION) {
-    throw new FollowStoreError(`unsupported store version: ${String(data.version)}`);
+  const version = data.version;
+  if (version === 1) {
+    const follows = validateFollows(data.follows, "");
+    return { version: 1, follows };
   }
-  if (!isPlainObject(data.follows)) {
-    throw new FollowStoreError("follows is not an object");
-  }
-  const follows: Record<string, string[]> = {};
-  for (const [chatId, list] of Object.entries(data.follows as Record<string, unknown>)) {
-    if (!Array.isArray(list)) {
-      throw new FollowStoreError(`follows[${chatId}] is not an array`);
+  if (version === 2) {
+    if (typeof data.network !== "string" || data.network.trim() === "") {
+      throw new FollowStoreError("store file version 2 is missing a valid network field");
     }
-    const cleaned: string[] = [];
-    for (const entry of list) {
-      if (typeof entry !== "string" || parseRef(entry) === null) {
-        throw new FollowStoreError(`invalid ref in follows[${chatId}]`);
-      }
-      cleaned.push(entry);
-    }
-    follows[chatId] = cleaned;
+    const follows = validateFollows(data.follows, "");
+    return { version: 2, network: data.network as string, follows };
   }
-  return { version: STORE_VERSION, follows };
+  throw new FollowStoreError(`unsupported store version: ${String(version)}`);
 }
 
 function quarantineFile(
@@ -127,6 +174,7 @@ export class FollowStore {
   private readonly filePath: string;
   private readonly maxPerChat: number;
   private readonly maxTotal: number;
+  private readonly network: string | undefined;
   private readonly readFileSync: FollowStoreFs["readFileSync"];
   private readonly renameSync: FollowStoreFs["renameSync"];
   private readonly now: () => number;
@@ -136,6 +184,7 @@ export class FollowStore {
     this.maxPerChat =
       options.maxPerChat ?? options.maxFollowsPerChat ?? DEFAULT_MAX_PER_CHAT;
     this.maxTotal = options.maxTotal ?? options.maxTotalEntries ?? DEFAULT_MAX_TOTAL;
+    this.network = options.network;
     this.readFileSync =
       options.fs?.readFileSync ?? ((p, enc) => fs.readFileSync(p, enc));
     this.renameSync = options.fs?.renameSync ?? fs.renameSync;
@@ -144,31 +193,55 @@ export class FollowStore {
 
   private read(): StoreFile {
     if (!fs.existsSync(this.filePath)) {
-      return emptyStore();
+      return emptyStore(this.network);
     }
     let raw: string;
     try {
       raw = this.readFileSync(this.filePath, "utf8");
     } catch (err) {
       quarantineFile(this.renameSync, this.now, this.filePath, redactError(err));
-      return emptyStore();
+      return emptyStore(this.network);
     }
     if (raw.trim() === "") {
-      return emptyStore();
+      return emptyStore(this.network);
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch (err) {
       quarantineFile(this.renameSync, this.now, this.filePath, redactError(err));
-      return emptyStore();
+      return emptyStore(this.network);
     }
+    let data: StoreFile;
     try {
-      return validateStoreFile(parsed);
+      data = validateStoreFile(parsed);
     } catch (err) {
       quarantineFile(this.renameSync, this.now, this.filePath, redactError(err));
-      return emptyStore();
+      return emptyStore(this.network);
     }
+
+    // ── Network enforcement ───────────────────────────────────────────────────
+    if (this.network !== undefined) {
+      if (data.version === 1) {
+        // Version-1 files predate network identity. Refuse to use them until
+        // the operator explicitly migrates via migrateToNetwork(). This prevents
+        // a file created on mainnet from being silently reused on testnet after
+        // the operator adds a STELLAR_NETWORK_PASSPHRASE.
+        throw new FollowStoreError(
+          `follow store at ${redactText(this.filePath)} has no network identity (version 1). ` +
+            `Call migrateToNetwork() to bind it to the configured network before use, ` +
+            `or delete the file to start fresh.`,
+        );
+      }
+      if (data.version === 2 && data.network !== this.network) {
+        throw new FollowStoreError(
+          `follow store at ${redactText(this.filePath)} is bound to a different network. ` +
+            `Delete the file or use a separate filePath for each network.`,
+        );
+      }
+    }
+
+    return data;
   }
 
   private write(data: StoreFile): void {
@@ -184,6 +257,68 @@ export class FollowStore {
     let total = 0;
     for (const list of Object.values(data.follows)) total += list.length;
     return total;
+  }
+
+  /**
+   * Explicitly migrate a version-1 (network-less) store file to version 2 by
+   * binding it to `network`. Throws when:
+   * - the file does not exist (nothing to migrate)
+   * - the file is already at version 2 (no migration needed)
+   * - `network` is empty
+   *
+   * This is a one-way, non-destructive operation: the existing follows are
+   * preserved and the network field is added atomically.
+   */
+  migrateToNetwork(network: string): void {
+    if (typeof network !== "string" || network.trim() === "") {
+      throw new FollowStoreError("network must be a non-empty string");
+    }
+
+    if (!fs.existsSync(this.filePath)) {
+      throw new FollowStoreError(
+        `cannot migrate: follow store at ${redactText(this.filePath)} does not exist`,
+      );
+    }
+
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.filePath, "utf8");
+    } catch (err) {
+      throw new FollowStoreError(
+        `cannot migrate: failed to read ${redactText(this.filePath)}: ${redactError(err)}`,
+      );
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new FollowStoreError(
+        `cannot migrate: ${redactText(this.filePath)} is not valid JSON: ${redactError(err)}`,
+      );
+    }
+
+    let data: StoreFile;
+    try {
+      data = validateStoreFile(parsed);
+    } catch (err) {
+      throw new FollowStoreError(
+        `cannot migrate: ${redactText(this.filePath)} has an invalid structure: ${redactError(err)}`,
+      );
+    }
+
+    if (data.version !== 1) {
+      throw new FollowStoreError(
+        `cannot migrate: follow store at ${redactText(this.filePath)} is already at version ${data.version}`,
+      );
+    }
+
+    const migrated: StoreFileV2 = {
+      version: 2,
+      network,
+      follows: data.follows,
+    };
+    this.write(migrated);
   }
 
   follow(chatId: string, ref: string): boolean {
