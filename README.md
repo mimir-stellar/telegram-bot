@@ -466,6 +466,23 @@ Oversized or malformed events never crash the poller and are never re-logged as
 raw remote bytes — only a truncated reason string is kept. No configuration
 change is required; existing cursors remain valid.
 
+### Event archive & JSONL streaming bounds
+
+Rotating event archives (`src/stellar/archive.ts`) and JSONL streams
+(`src/stellar/scan-jsonl.ts`) are read incrementally with a fixed-size chunk
+buffer and a bounded line buffer so memory usage stays independent of total
+archive size:
+
+| Constant / Option | Default | Failure mode |
+|---|---|---|
+| `DEFAULT_MAX_JSONL_LINE_BYTES` / `maxLineBytes` | 64 KiB (`65536`) | Throws `JsonlLineTooLongError` **before** UTF-8 decoding or `JSON.parse` (error message is bounded and never echoes raw record bytes) |
+| `DEFAULT_JSONL_CHUNK_BYTES` / `chunkBytes` | 64 KiB (`65536`) | Throws `RangeError` if not a positive finite integer |
+
+`readArchive(dir, options?)` remains backward-compatible when called without
+options; `readArchiveFile(filePath, options?)`, `parseJsonlStream(chunks, options?)`,
+and `streamBoundedJsonlLines(chunks, options?)` expose the same bounded
+streaming interface for single files and arbitrary async chunk streams.
+
 ## How the polling works
 
 Soroban's `getEvents` is **not** `eth_getLogs`, and the difference is the whole

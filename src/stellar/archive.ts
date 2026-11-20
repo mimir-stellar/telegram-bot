@@ -2,11 +2,37 @@ import { open, mkdir, readdir, unlink, chmod } from "node:fs/promises";
 import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  DEFAULT_JSONL_CHUNK_BYTES,
+  DEFAULT_MAX_JSONL_LINE_BYTES,
+  JsonlLineTooLongError,
+  parseJsonlStream,
+} from "./scan-jsonl.js";
+
+export {
+  DEFAULT_JSONL_CHUNK_BYTES,
+  DEFAULT_MAX_JSONL_LINE_BYTES,
+  JsonlLineTooLongError,
+};
 
 export interface EventArchiveOptions {
   dir: string;
   maxBytes?: number;
   maxFiles?: number;
+}
+
+export interface ReadArchiveOptions {
+  /**
+   * Maximum allowed byte length of a single JSONL record (excluding line ending).
+   * Oversized records are rejected before UTF-8 decoding or `JSON.parse`.
+   * Defaults to {@link DEFAULT_MAX_JSONL_LINE_BYTES} (64 KiB).
+   */
+  maxLineBytes?: number;
+  /**
+   * Fixed read buffer size in bytes for streaming each archive file.
+   * Defaults to {@link DEFAULT_JSONL_CHUNK_BYTES} (64 KiB).
+   */
+  chunkBytes?: number;
 }
 
 export interface EventArchive {
