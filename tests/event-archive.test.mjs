@@ -4,9 +4,11 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  ArchiveMetadataConflictError,
   createEventArchive,
   MalformedArchiveRecordError,
   readArchive,
+  validateArchiveMetadata,
 } from "../dist/stellar/archive.js";
 import { withTempDataDir } from "./helpers/temp-data.mjs";
 
@@ -273,5 +275,92 @@ test("archive reports exact line number for malformed record in CRLF input", asy
     assert.ok(caught instanceof MalformedArchiveRecordError);
     assert.equal(caught.fileName, fileName);
     assert.equal(caught.lineNumber, 3);
+  });
+});
+
+test("archive validates network and contract metadata before event iteration begins", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-archive-meta");
+    const archive = createEventArchive({
+      dir: archiveDir,
+      metadata: { network: "testnet", contractId: "C1234567890" },
+    });
+
+    await archive.append([makeDummyEvent(1), makeDummyEvent(2)]);
+    await archive.close();
+
+    const meta = await validateArchiveMetadata(archiveDir, {
+      expectedNetwork: "testnet",
+      expectedContractId: "C1234567890",
+    });
+    assert.deepEqual(meta, { network: "testnet", contractId: "C1234567890" });
+
+    const validEvents = [];
+    for await (const ev of readArchive(archiveDir, {
+      expectedNetwork: "testnet",
+      expectedContractId: "C1234567890",
+    })) {
+      validEvents.push(ev);
+    }
+    assert.equal(validEvents.length, 2);
+
+    // Contradictory expectedNetwork must reject before yielding any events, even with retainCommitted
+    const yieldedOnConflict = [];
+    let networkError;
+    try {
+      for await (const ev of readArchive(archiveDir, {
+        retainCommitted: true,
+        expectedNetwork: "mainnet",
+      })) {
+        yieldedOnConflict.push(ev);
+      }
+    } catch (err) {
+      networkError = err;
+    }
+    assert.ok(networkError instanceof ArchiveMetadataConflictError);
+    assert.equal(yieldedOnConflict.length, 0);
+
+    // Contradictory expectedContractId must reject before yielding any events
+    await assert.rejects(
+      async () => {
+        for await (const _ of readArchive(archiveDir, { expectedContractId: "COTHER" })) {
+          // should not yield
+        }
+      },
+      ArchiveMetadataConflictError,
+    );
+  });
+});
+
+test("archive conflict in a later file prevents any earlier event from being yielded, including retainCommitted: true", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-archive-conflict");
+    await mkdir(archiveDir, { recursive: true });
+
+    await writeFile(
+      path.join(archiveDir, "events-2026-01-01T00-00-00-000Z-000001.jsonl"),
+      `${JSON.stringify({ type: "metadata", network: "testnet", contractId: "C1234567890" })}\n` +
+        `${JSON.stringify({ ...makeDummyEvent(1), payload: { name: "claim_created" } })}\n`,
+      "utf8",
+    );
+    await writeFile(
+      path.join(archiveDir, "events-2026-01-01T00-00-01-000Z-000002.jsonl"),
+      `${JSON.stringify({ type: "metadata", network: "mainnet", contractId: "C1234567890" })}\n` +
+        `${JSON.stringify({ ...makeDummyEvent(2), payload: { name: "claim_created" } })}\n`,
+      "utf8",
+    );
+
+    const yielded = [];
+    let caught;
+    try {
+      for await (const ev of readArchive(archiveDir, { retainCommitted: true })) {
+        yielded.push(ev);
+      }
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.ok(caught instanceof ArchiveMetadataConflictError);
+    assert.equal(yielded.length, 0);
   });
 });

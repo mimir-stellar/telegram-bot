@@ -4,6 +4,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { ArchiveMetadataConflictError } from "../dist/stellar/archive.js";
 import { readContractEvents } from "../dist/stellar/events.js";
 import { startMockRpc } from "../dist/stellar/mock-rpc.js";
 import { formatScanJsonl } from "../dist/stellar/scan-jsonl.js";
@@ -138,4 +139,41 @@ test("scanner CLI --jsonl writes only valid JSON lines to stdout and sends progr
   } finally {
     await mock.close();
   }
+});
+
+test("formatScanJsonl rejects conflicting network or contractId metadata before emitting aggregates", async () => {
+  const rawEvents = [claimCreatedEvent({ id: makeCursor(101, 0), ledger: 101 })];
+  const server = createFixtureServer(rawEvents);
+  const scan = await readContractEvents(
+    server,
+    { source: "market", contractId: MARKET_CONTRACT },
+    { startLedger: 100 },
+  );
+
+  assert.throws(
+    () =>
+      formatScanJsonl(scan.events, {
+        metadata: { network: "testnet", contractId: MARKET_CONTRACT },
+        expectedNetwork: "mainnet",
+      }),
+    ArchiveMetadataConflictError,
+  );
+
+  assert.throws(
+    () =>
+      formatScanJsonl(scan.events, {
+        expectedContractId: "COTHER_CONTRACT",
+      }),
+    ArchiveMetadataConflictError,
+  );
+
+  // Matching metadata succeeds and emits the summary line
+  const okOutput = formatScanJsonl(scan.events, {
+    metadata: { network: "testnet", contractId: MARKET_CONTRACT },
+    expectedNetwork: "testnet",
+    expectedContractId: MARKET_CONTRACT,
+  });
+  const okLines = okOutput.trimEnd().split("\n").map((l) => JSON.parse(l));
+  assert.equal(okLines[okLines.length - 1].type, "summary");
+  assert.equal(okLines[okLines.length - 1].eventCount, 1);
 });
