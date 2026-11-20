@@ -153,3 +153,13 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_created` events**: Muted by `eventAllowedByCategory` because `config.notificationCategories` is non-empty (`["__none__"]`) and no real on-chain claim category matches `"__none__"`.
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
+
+---
+
+## 4. Filter Expression Unit & Type Rules (`src/notifications/filter-expr.ts`)
+
+[`parseFilterExpression`](../src/notifications/filter-expr.ts) validates field types and unit compatibility at parse time (before live polling starts) and rejects mixed-unit comparisons with a `FilterParseError`:
+
+- **USDC atomic amount fields** (`stake`, `amount`, `totalPaid`, `totalFees`, `owedToChallengers`, `dust`, `gross`, `fee`, `net`, `poolA`, `poolB`): accept USDC literals (`100 USDC`, `$25.50`) or bare numbers (`100`, scaled to 7-decimal atomic USDC units).
+- **Identifiers, ledger numbers, and numeric parameters** (`claimId`, `marketId`, `ledger`, `deadline`, `feeBps`, `confidence`, `winnerSide`, `side`, `result`): accept plain numbers only. Comparing them with USDC literals (`100 USDC`, `$10`) is rejected as a mixed-unit comparison, both when an event name is specified and when `where ...` omits the event name.
+- **Non-USDC integer fields** (`shares` on `deposited`): accept integer numbers only (evaluated without USDC scaling). Comparing `shares` with a USDC literal or a fractional number is rejected at parse time.
