@@ -328,6 +328,20 @@ export interface FormatDigestOptions {
   grouped?: boolean;
 }
 
+/** Options for {@link formatDigestPages}. */
+export interface FormatDigestPagesOptions extends FormatDigestOptions {
+  /**
+   * Maximum length in UTF-16 code units for each rendered Telegram message page.
+   * Defaults to {@link TELEGRAM_MAX_MESSAGE_LENGTH} (4096).
+   */
+  maxLength?: number;
+}
+
+interface DigestEntry {
+  groupHeader: string | null;
+  line: string;
+}
+
 /**
  * One digest line in the flat layout.  Extracted so both the flat path and the
  * grouped renderer share identical line formatting.
@@ -337,12 +351,103 @@ function flatLine(event: DecodedEvent): string {
   return `· mimir\\-${escapeMd(event.source)} \`${escapeMd(clip(name, 80))}\` at ledger ${event.ledger}`;
 }
 
+function digestHeader(totalEvents: number, page?: number, totalPages?: number): string {
+  if (page !== undefined && totalPages !== undefined && totalPages > 1) {
+    return `*Mimir Digest* ${escapeMd(`(${page}/${totalPages})`)} — ${totalEvents} events in this cycle`;
+  }
+  return `*Mimir Digest* — ${totalEvents} events in this cycle`;
+}
+
+function buildDigestEntries(
+  events: readonly DecodedEvent[],
+  grouped: boolean,
+): DigestEntry[] {
+  if (!grouped) {
+    return events.map((event) => ({ groupHeader: null, line: flatLine(event) }));
+  }
+
+  const groups = groupDigestEvents(events);
+  const entries: DigestEntry[] = [];
+  for (const group of groups) {
+    if (group.events.length === 1) {
+      // Singleton group: no header, no indentation — identical to flat layout.
+      const [sole] = group.events;
+      if (sole) entries.push({ groupHeader: null, line: flatLine(sole) });
+    } else {
+      // Multi-event group: MarkdownV2-escaped Group_Key as header, then
+      // each event on an indented line.
+      const groupHeader = escapeMd(group.key);
+      for (const e of group.events) {
+        entries.push({ groupHeader, line: `  ${flatLine(e)}` });
+      }
+    }
+  }
+  return entries;
+}
+
+function packDigestEntries(
+  entries: readonly DigestEntry[],
+  maxBodyLength: number,
+  maxLength: number,
+): string[][] {
+  const pages: string[][] = [];
+  let currentLines: string[] = [];
+  let currentLen = 0;
+  let activeGroupHeader: string | null = null;
+
+  for (const entry of entries) {
+    const needsGroupHeader =
+      entry.groupHeader !== null && entry.groupHeader !== activeGroupHeader;
+    const additionLines = needsGroupHeader
+      ? [entry.groupHeader!, entry.line]
+      : [entry.line];
+    const additionTextLen = additionLines.reduce(
+      (sum, l, idx) => sum + l.length + (idx > 0 ? 1 : 0),
+      0,
+    );
+    const separatorLen = currentLines.length > 0 ? 1 : 0;
+
+    if (currentLines.length > 0 && currentLen + separatorLen + additionTextLen > maxBodyLength) {
+      pages.push(currentLines);
+      currentLines = [];
+      currentLen = 0;
+      activeGroupHeader = null;
+    }
+
+    const freshNeedsHeader =
+      entry.groupHeader !== null && entry.groupHeader !== activeGroupHeader;
+    const freshLines = freshNeedsHeader
+      ? [entry.groupHeader!, entry.line]
+      : [entry.line];
+    const freshTextLen = freshLines.reduce(
+      (sum, l, idx) => sum + l.length + (idx > 0 ? 1 : 0),
+      0,
+    );
+    const freshSepLen = currentLines.length > 0 ? 1 : 0;
+
+    if (currentLen + freshSepLen + freshTextLen > maxBodyLength) {
+      throw new RangeError(
+        `formatDigestPages maxLength ${maxLength} cannot fit digest header and a complete event summary`,
+      );
+    }
+
+    currentLines.push(...freshLines);
+    currentLen += freshSepLen + freshTextLen;
+    activeGroupHeader = entry.groupHeader;
+  }
+
+  if (currentLines.length > 0) {
+    pages.push(currentLines);
+  }
+  return pages;
+}
+
 /**
  * Render a grouped digest.  Called only when `options.grouped` is `true`.
  */
 function renderGroupedDigest(events: readonly DecodedEvent[]): string {
   const groups = groupDigestEvents(events);
-  const header = `*Mimir Digest* — ${events.length} events in this cycle`;
+  const header = digestHeader(events.length);
   const body: string[] = [];
 
   for (const group of groups) {
@@ -377,7 +482,64 @@ export function formatDigest(
   if (events.length === 0) return null;
   if (options.grouped) return renderGroupedDigest(events);
   const lines = events.map(flatLine);
-  return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
+  return [digestHeader(events.length), "", ...lines].join("\n");
+}
+
+/**
+ * Format a digest into one or more Telegram-bounded MarkdownV2 continuation pages.
+ *
+ * - Returns `[]` when `events` is empty.
+ * - When the full digest fits within `maxLength`, returns a single page identical
+ *   to {@link formatDigest}.
+ * - When pagination is required, splits strictly on complete event summaries
+ *   (never mid-line, mid-surrogate-pair, or mid-MarkdownV2 escape), repeats the
+ *   group header when a multi-event group continues onto a new page, and retains
+ *   the same total event count across every page header (`(page/total)`).
+ * - Throws `RangeError` if `maxLength` is invalid or too small to fit a page
+ *   header plus a single complete event summary.
+ */
+export function formatDigestPages(
+  events: readonly DecodedEvent[],
+  options: FormatDigestPagesOptions = {},
+): string[] {
+  const limit = options.maxLength ?? TELEGRAM_MAX_MESSAGE_LENGTH;
+  if (!Number.isFinite(limit) || limit < 1) {
+    throw new RangeError(`formatDigestPages maxLength must be >= 1, got ${limit}`);
+  }
+  const maxLength = Math.floor(limit);
+  if (events.length === 0) return [];
+
+  const grouped = options.grouped === true;
+  const single = formatDigest(events, { grouped });
+  if (single !== null && single.length <= maxLength) {
+    return [single];
+  }
+
+  const totalEvents = events.length;
+  const entries = buildDigestEntries(events, grouped);
+
+  let estimatedTotal = 2;
+  let packedPages: string[][] = [];
+  for (let pass = 0; pass < 8; pass += 1) {
+    const worstHeaderLen = digestHeader(totalEvents, estimatedTotal, estimatedTotal).length;
+    const maxBodyLength = maxLength - worstHeaderLen - 2; // "\n\n"
+    if (maxBodyLength < 1) {
+      throw new RangeError(
+        `formatDigestPages maxLength ${maxLength} cannot fit digest header and a complete event summary`,
+      );
+    }
+    packedPages = packDigestEntries(entries, maxBodyLength, maxLength);
+    const actualTotal = Math.max(2, packedPages.length);
+    if (String(actualTotal).length <= String(estimatedTotal).length) {
+      break;
+    }
+    estimatedTotal = actualTotal;
+  }
+
+  const totalPages = packedPages.length;
+  return packedPages.map(
+    (lines, index) => `${digestHeader(totalEvents, index + 1, totalPages)}\n\n${lines.join("\n")}`,
+  );
 }
 
 /**

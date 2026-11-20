@@ -35,6 +35,7 @@ const MENU = [
   "status",
   "audit",
   "contracts",
+  "filters",
   "health",
   "preview",
   "pause",
