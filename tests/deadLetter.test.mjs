@@ -13,7 +13,11 @@ import os from "node:os";
 import path from "node:path";
 import test, { mock } from "node:test";
 
-import { createDeadLetterQueue, makeEntryId } from "../dist/deadLetter.js";
+import {
+  createDeadLetterQueue,
+  makeEntryId,
+  summarizeDeadLetterAge,
+} from "../dist/deadLetter.js";
 
 const BOT_TOKEN = "1234567890:" + "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
 
@@ -405,4 +409,76 @@ test("makeEntryId is stable for identical payloads and differs on content", () =
   assert.equal(a, b);
   assert.notEqual(a, c);
   assert.notEqual(a, d);
+});
+
+test("legacy entries missing or invalid enqueuedAt load as null and summarizeDeadLetterAge uses oldest failure", async () => {
+  await withQueue(async ({ queue, filePath }) => {
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: "2026-10-18T12:00:00.000Z",
+        entries: [
+          {
+            id: "market:10:claim_created:00000001",
+            source: "market",
+            ledger: 10,
+            eventName: "claim_created",
+            text: "legacy missing timestamp",
+            attempts: 1,
+            lastError: "429",
+          },
+          {
+            id: "market:11:claim_created:00000002",
+            enqueuedAt: "2026-10-18T10:00:00.000Z",
+            source: "market",
+            ledger: 11,
+            eventName: "claim_created",
+            text: "newer failure",
+            attempts: 1,
+            lastError: "429",
+          },
+          {
+            id: "market:12:claim_created:00000003",
+            enqueuedAt: "2026-10-18T08:00:00.000Z",
+            source: "market",
+            ledger: 12,
+            eventName: "claim_created",
+            text: "oldest failure",
+            attempts: 2,
+            lastError: "429",
+          },
+          {
+            id: "market:13:claim_created:00000004",
+            enqueuedAt: "not-a-timestamp",
+            source: "market",
+            ledger: 13,
+            eventName: "claim_created",
+            text: "legacy invalid timestamp",
+            attempts: 1,
+            lastError: "429",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    await queue.load();
+    const loaded = queue.snapshot();
+    assert.equal(loaded.length, 3); // maxEntries is 3; drops index 0 (ledger 10)
+    assert.equal(loaded[0].enqueuedAt, "2026-10-18T10:00:00.000Z");
+    assert.equal(loaded[1].enqueuedAt, "2026-10-18T08:00:00.000Z");
+    assert.equal(loaded[2].enqueuedAt, null);
+
+    const nowMs = Date.parse("2026-10-18T11:30:00.000Z");
+    const summary = summarizeDeadLetterAge(loaded, nowMs);
+    assert.equal(summary.oldestEnqueuedAt, "2026-10-18T08:00:00.000Z");
+    assert.equal(summary.ageMs, 3.5 * 3_600_000);
+    assert.equal(summary.missingTimestamps, 1);
+
+    const onlyMissing = summarizeDeadLetterAge([{ enqueuedAt: null }], nowMs);
+    assert.equal(onlyMissing.oldestEnqueuedAt, null);
+    assert.equal(onlyMissing.ageMs, null);
+    assert.equal(onlyMissing.missingTimestamps, 1);
+  });
 });
