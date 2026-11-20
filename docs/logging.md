@@ -71,7 +71,8 @@ Emitted by the poller loop during event ingestion, cursor management, cycle exec
 
 | Field | Type | Description |
 |---|---|---|
-| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"persistent_volume_unwritable"`. |
+| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_permission_denied"`, `"cursor_read_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"persistent_volume_unwritable"`. |
+| `diagnosticCode` | `string` | Stable cursor diagnostic code (`"CURSOR_NOT_FOUND"`, `"CURSOR_PERMISSION_DENIED"`, `"CURSOR_IO_ERROR"`, `"CURSOR_CORRUPT_JSON"`). |
 | `marketContractId` | `string` | Mimir market contract address watched. |
 | `squadContractId` | `string` | Mimir squad contract address watched. |
 | `pollIntervalMs` | `number` | Polling interval in milliseconds. |

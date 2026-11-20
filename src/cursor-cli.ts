@@ -10,7 +10,48 @@ import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import {
+  classifyCursorFsError,
+  parseAndMigrateCursorFile,
+  type CursorDiagnosticCode,
+} from "./poller.js";
+
+export class CursorDiagnosticError extends Error {
+  readonly code: CursorDiagnosticCode;
+  readonly errno?: string | undefined;
+
+  constructor(code: CursorDiagnosticCode, message: string, errno?: string) {
+    super(`[${code}] ${message}`);
+    this.name = "CursorDiagnosticError";
+    this.code = code;
+    this.errno = errno;
+  }
+}
+
+function toCursorFsDiagnostic(err: unknown, targetPath: string, operation: string): CursorDiagnosticError {
+  if (err instanceof CursorDiagnosticError) return err;
+  const classified = classifyCursorFsError(err);
+  const errnoSuffix = classified.errnoCode ? ` (${classified.errnoCode})` : "";
+  if (classified.kind === "not_found") {
+    return new CursorDiagnosticError(
+      "CURSOR_NOT_FOUND",
+      `cursor file not found while ${operation} "${targetPath}"`,
+      classified.errnoCode,
+    );
+  }
+  if (classified.kind === "permission") {
+    return new CursorDiagnosticError(
+      "CURSOR_PERMISSION_DENIED",
+      `cursor directory or file permission failure while ${operation} "${targetPath}"${errnoSuffix}; existing files were preserved`,
+      classified.errnoCode,
+    );
+  }
+  return new CursorDiagnosticError(
+    "CURSOR_IO_ERROR",
+    `operational I/O failure while ${operation} "${targetPath}"${errnoSuffix}; existing files were preserved`,
+    classified.errnoCode,
+  );
+}
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -27,21 +68,37 @@ async function exists(filePath: string): Promise<boolean> {
     await access(filePath);
     return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw err;
+    const classified = classifyCursorFsError(err);
+    if (classified.kind === "not_found") return false;
+    throw toCursorFsDiagnostic(err, filePath, "checking");
   }
 }
 
-function validateCursor(raw: string): ReturnType<typeof parseAndMigrateCursorFile> {
+function validateCursor(raw: string, filePath: string): ReturnType<typeof parseAndMigrateCursorFile> {
   try {
     return parseAndMigrateCursorFile(raw);
   } catch {
-    throw new Error("cursor file is malformed or uses an unsupported schema");
+    throw new CursorDiagnosticError(
+      "CURSOR_CORRUPT_JSON",
+      `cursor file at "${filePath}" is malformed JSON or uses an unsupported schema`,
+    );
+  }
+}
+
+async function readCursorText(filePath: string): Promise<string> {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (err) {
+    throw toCursorFsDiagnostic(err, filePath, "reading");
   }
 }
 
 async function writeAtomic(filePath: string, contents: string, replace: boolean): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
+  try {
+    await mkdir(path.dirname(filePath), { recursive: true });
+  } catch (err) {
+    throw toCursorFsDiagnostic(err, path.dirname(filePath), "preparing directory for");
+  }
   const temporaryPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
 
   try {
@@ -55,9 +112,13 @@ async function writeAtomic(filePath: string, contents: string, replace: boolean)
         if ((err as NodeJS.ErrnoException).code === "EEXIST") {
           throw new Error(`destination already exists at ${filePath}; pass --force to overwrite`);
         }
-        throw err;
+        throw toCursorFsDiagnostic(err, filePath, "writing");
       }
     }
+  } catch (err) {
+    if (err instanceof CursorDiagnosticError) throw err;
+    if (err instanceof Error && err.message.includes("destination already exists")) throw err;
+    throw toCursorFsDiagnostic(err, filePath, "writing");
   } finally {
     await unlink(temporaryPath).catch(() => undefined);
   }
@@ -65,8 +126,8 @@ async function writeAtomic(filePath: string, contents: string, replace: boolean)
 
 /** Copy a validated supported cursor snapshot without exposing cursor values. */
 export async function backupCursor(options: BackupCursorOptions): Promise<void> {
-  const raw = await readFile(options.cursorFile, "utf8");
-  const parsed = validateCursor(raw);
+  const raw = await readCursorText(options.cursorFile);
+  const parsed = validateCursor(raw, options.cursorFile);
   if (!options.force && (await exists(options.backupFile))) {
     throw new Error(`backup already exists at ${options.backupFile}; pass --force to overwrite`);
   }
@@ -79,10 +140,19 @@ export async function backupCursor(options: BackupCursorOptions): Promise<void> 
 
 /** Restore a compatible cursor while holding the poller's exclusive lock. */
 export async function restoreCursor(options: RestoreCursorOptions): Promise<void> {
-  const lock = await acquireInstanceLock(options.lockFile);
+  let lock: Awaited<ReturnType<typeof acquireInstanceLock>>;
   try {
-    const raw = await readFile(options.backupFile, "utf8");
-    const parsed = validateCursor(raw);
+    lock = await acquireInstanceLock(options.lockFile);
+  } catch (err) {
+    const classified = classifyCursorFsError(err);
+    if (classified.kind === "permission" || classified.kind === "io") {
+      throw toCursorFsDiagnostic(err, options.lockFile, "acquiring lock at");
+    }
+    throw err;
+  }
+  try {
+    const raw = await readCursorText(options.backupFile);
+    const parsed = validateCursor(raw, options.backupFile);
     if (!options.force && (await exists(options.cursorFile))) {
       throw new Error(`cursor already exists at ${options.cursorFile}; pass --force to replace it`);
     }
