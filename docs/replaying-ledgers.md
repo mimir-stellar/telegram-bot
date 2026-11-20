@@ -9,6 +9,7 @@ Operational procedure for recovering missed events and replaying ledger ranges w
 * **The Stellar blockchain is the source of truth.** The notifier is read-only and never holds signing keys, submits transactions, or modifies on-chain state.
 * **Replay is decoupled from the live poller.** Running a replay **never reads from, writes to, or locks** the live cursor file (`CURSOR_FILE`, default `data/cursor.json`). The running daemon's cursor state and scheduling are untouched.
 * **Safe by default (dry-run):** The CLI runs in dry-run mode unless `--send` is explicitly provided. Dry-run mode requires zero Telegram credentials (`BOT_TOKEN` and `TELEGRAM_CHAT_ID` are not needed).
+* **Signed-off delivery:** Every run computes a deterministic plan digest over the normalized range and contract destinations. `--send` requires `--plan-digest` to match that digest, so delivery is tied to a preview an operator actually reviewed.
 * **Bounded execution:** The walk is constrained per contract by `--pages` (default 20) and notification output is capped by `--cap` (default `MAX_NOTIFICATIONS_PER_CYCLE` or 20).
 * **Sanitized output:** Progress messages and error logs are scrubbed via centralized redaction (`src/redact.ts`); bot tokens and credentials never appear in output or JSON reports.
 
@@ -74,12 +75,13 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
+| `--plan-digest` | `<sha256>` | Plan digest printed by a dry-run preview of the same range and `--contract` selection. Required with `--send`; ignored in dry-run. Must be 64 lowercase hex characters. | None (required for `--send`) |
 
 ### Exit Codes
 
 * **`0`:** Scan completed successfully (even if some events were skipped, deduplicated, or capped).
 * **`1`:** Fatal runtime error (RPC unreachable, invalid network passphrase, or missing config in `--send` mode).
-* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, or invalid `--contract`).
+* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, invalid `--contract`, missing/malformed `--plan-digest`, or a digest that does not match the current plan).
 
 ---
 
@@ -104,6 +106,14 @@ To produce machine-readable JSON for scripting or incident audits:
 ```bash
 npm run replay -- --from 4226500 --to 4226800 --json > replay-plan.json
 ```
+
+The preview prints a `plan` digest that binds the normalized range (`--from`, `--to`, or the chain tip when omitted) to the selected contract destinations and network:
+
+```text
+[replay] plan      f983f09b303d14526a9aa929211b14bb1867663dab5f3d08ec3303222bd82fb4
+```
+
+With `--json`, the same value appears at `report.plan.digest`. It is deterministic: flag order does not matter, and the chain tip is not part of the digest, so the value stays valid as the chain advances. Any change to the range, `--contract` selection, contract ids, or network changes it.
 
 ### Step 2: Review the Replay Report & Boundary Warnings
 
@@ -135,23 +145,28 @@ Examine the progress output on `stderr` (or human logs on `stdout`):
 
 ### Step 3: Execute the Live Replay
 
-Once the dry-run confirms the event counts and targets, execute live delivery by adding `--send`:
+Once the dry-run confirms the event counts and targets, execute live delivery by adding `--send` together with the preview's plan digest:
 
 ```bash
-npm run replay -- --from 4226500 --to 4226800 --send
+npm run replay -- --from 4226500 --to 4226800 --send \
+  --plan-digest f983f09b303d14526a9aa929211b14bb1867663dab5f3d08ec3303222bd82fb4
 ```
 
-If only one contract had missed events, restrict the replay with `--contract`:
+If only one contract had missed events, restrict the replay with `--contract` and sign off the digest from a market-only preview (the digest changes with the destination selection):
 
 ```bash
-npm run replay -- --from 4226500 --to 4226800 --contract market --send
+npm run replay -- --from 4226500 --to 4226800 --contract market --send \
+  --plan-digest <digest-from-market-only-preview>
 ```
 
-For wider ranges spanning many pages, expand the page budget:
+For wider ranges spanning many pages, expand the page budget in the preview and delivery runs alike:
 
 ```bash
-npm run replay -- --from 4226500 --to 4230000 --pages 100 --cap 100 --send
+npm run replay -- --from 4226500 --to 4230000 --pages 100 --cap 100 --send \
+  --plan-digest <digest-from-same-preview>
 ```
+
+`--send` without a digest, with a malformed digest, or with a digest from a different range/destination selection exits `2` before any RPC call or Telegram send. Re-run the preview and review the new plan instead of reusing a stale digest.
 
 ### Step 4: Verify Delivery & Confirm Poller Cursor
 
