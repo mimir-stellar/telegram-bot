@@ -323,6 +323,7 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_pending_delivery_queue_age_seconds` | histogram | Age in seconds of pending deliveries in queue, partitioned by stable `destination` class (`channel`, `group`, `dm`, `dead_letter`) with fixed finite buckets (`1`, `5`, `15`, `30`, `60`, `300`, `900`, `3600`, `+Inf`); never uses chat IDs or event IDs as labels |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment
