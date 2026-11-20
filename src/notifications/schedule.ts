@@ -111,6 +111,20 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+/**
+ * Normalize an event's chain close timestamp (`at`, unix seconds) into a
+ * strictly comparable rank for deterministic digest sorting. Positive finite
+ * timestamps sort chronologically; missing/zero/non-finite timestamps sort
+ * deterministically after known timestamps so tie-breaking falls through to
+ * canonical chain identity without violating transitivity.
+ */
+export function normalizeDigestEventTimestamp(at: unknown): number {
+  if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return Math.trunc(at);
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;

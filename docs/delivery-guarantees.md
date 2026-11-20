@@ -44,6 +44,7 @@ Within a single `cycle()` execution ([`src/poller.ts`](../src/poller.ts#L1994-L2
 2. **Sequential target scanning (`market` then `squad`)**: Targets are defined in fixed order (`market` when `MARKET_CONTRACT_ID` is set, followed by `squad` when `SQUAD_CONTRACT_ID` is set) and iterated sequentially ([`src/poller.ts`](../src/poller.ts#L1314-L1321), [`src/poller.ts`](../src/poller.ts#L2045)). All notifications for `market` in a cycle are sent before `squad` is scanned.
    - *Evidence*: [`src/poller.ts`](../src/poller.ts#L1314-L1321), [`src/poller.ts`](../src/poller.ts#L2045); test `"runOnce sends notification for decoded market event and updates status"` in [`tests/poller.test.mjs`](../tests/poller.test.mjs#L71-L103).
 3. **Sequential in-order delivery per target**: `notify()` iterates the sorted `scan.events` array one by one, awaiting `sendWithRetry` and sleeping `INTER_SEND_DELAY_MS` (default `1500ms`) between consecutive sends ([`src/poller.ts`](../src/poller.ts#L1664-L1825)).
+4. **Equal-timestamp digest determinism (`compareDigestEvents` / `sortDigestEvents`)**: Digest builders (`groupDigestEvents` and `formatDigest`) sort events by normalized chain close timestamp (`normalizeDigestEventTimestamp`) and break equal-timestamp ties via canonical chain identity (`compareEvents` → `contractId` → `source` → `eventKey` → payload identity), preserving byte-identical digest output across live multi-contract polling and historical ledger replay. This is ordering only; it adds no exactly-once delivery guarantee.
 
 ---
 
