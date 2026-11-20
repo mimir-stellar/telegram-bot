@@ -987,6 +987,51 @@ export function parseAndMigrateCursorFile(
   throw new Error("cursor file: unrecognised shape (expected versioned targets map)");
 }
 
+/** Compute a stable SHA-256 hex digest of raw cursor file contents for CAS checks. */
+export function cursorDigest(raw: string): string {
+  return createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
+export type CursorCasResult =
+  | { ok: true; digest: string | null }
+  | {
+      ok: false;
+      conflict: true;
+      expected: string | null;
+      actual: string | null;
+      reason: string;
+    };
+
+/**
+ * Compare-and-swap check for a cursor file against an expected SHA-256 digest
+ * (or `null` when the file is expected to be absent). When `expectedDigest` is
+ * `undefined`, no CAS precondition was requested and the check succeeds.
+ */
+export function checkCursorCas(
+  currentRaw: string | null,
+  expectedDigest: string | null | undefined,
+): CursorCasResult {
+  const actual = currentRaw === null ? null : cursorDigest(currentRaw);
+  if (expectedDigest === undefined) {
+    return { ok: true, digest: actual };
+  }
+  if (actual !== expectedDigest) {
+    return {
+      ok: false,
+      conflict: true,
+      expected: expectedDigest,
+      actual,
+      reason:
+        expectedDigest === null
+          ? "file exists on disk (expected absent)"
+          : actual === null
+            ? "file is missing on disk (expected existing content)"
+            : `digest mismatch (expected ${expectedDigest.slice(0, 12)}…, got ${actual.slice(0, 12)}…)`,
+    };
+  }
+  return { ok: true, digest: actual };
+}
+
 /** Build the on-disk payload the poller always writes. */
 export function buildCursorFile(
   targets: Iterable<{

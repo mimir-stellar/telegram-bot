@@ -132,8 +132,9 @@ looks healthy but notifies nobody.
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
-| `npm run cursor -- backup` | Backs up the validated cursor file without contacting Stellar or Telegram |
-| `npm run cursor -- restore --from PATH` | Restores a validated backup while holding the poller lock; replacing an existing cursor requires `--force` |
+| `npm run cursor -- inspect` | Inspects the validated cursor file and prints its schema metadata and SHA-256 CAS digest without exposing cursor values |
+| `npm run cursor -- backup` | Backs up the validated cursor file without contacting Stellar or Telegram (supports `--if-match DIGEST`) |
+| `npm run cursor -- restore --from PATH` | Restores a validated backup while holding the poller lock and enforcing compare-and-swap checks (`--if-match DIGEST`, `--expected-source-digest DIGEST`); replacing an existing cursor requires `--force` |
 
 `/start`, `/help`, and Telegram's command menu are generated from the same
 command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
