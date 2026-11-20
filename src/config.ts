@@ -277,6 +277,8 @@ export interface BotConfig extends StellarConfig {
   telegramSendTimeoutMs: number;
   /** Alias of `telegramSendTimeoutMs` accepted from hand-built configs. */
   sendTimeoutMs?: number;
+  /** Cooldown in milliseconds applied to a destination after a Telegram permission failure (`0` disables). */
+  routeCooldownMs?: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
   /** Show Telegram link previews on market notifications (LINK_PREVIEW_MARKET). */
@@ -313,6 +315,9 @@ export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 
 /** Fallback per-send budget when a config object predates `TELEGRAM_SEND_TIMEOUT_MS`. */
 export const DEFAULT_TELEGRAM_SEND_TIMEOUT_MS = 10_000;
+
+/** Default cooldown applied to a destination route after a Telegram permission failure. */
+export const DEFAULT_ROUTE_COOLDOWN_MS = 300_000;
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -363,6 +368,7 @@ const DEFAULTS = {
   // Bounded so one wedged Telegram send cannot stall the poll loop; long
   // enough for a normal API round-trip on a slow link.
   telegramSendTimeoutMs: DEFAULT_TELEGRAM_SEND_TIMEOUT_MS,
+  routeCooldownMs: DEFAULT_ROUTE_COOLDOWN_MS,
   channelPreviewMode: false,
   linkPreviewMarket: false,
   linkPreviewSquad: false,
@@ -959,6 +965,11 @@ export function loadConfig(): BotConfig {
       DEFAULTS.telegramSendTimeoutMs,
       0,
     ),
+    routeCooldownMs: c.int(
+      "TELEGRAM_ROUTE_COOLDOWN_MS",
+      DEFAULTS.routeCooldownMs,
+      0,
+    ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
     linkPreviewMarket: c.bool("LINK_PREVIEW_MARKET", DEFAULTS.linkPreviewMarket),
     linkPreviewSquad: c.bool("LINK_PREVIEW_SQUAD", DEFAULTS.linkPreviewSquad),
@@ -1149,6 +1160,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "STARTUP_HEALTH_RETRY_MS", secret: false, hasBuiltInDefault: true },
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "TELEGRAM_SEND_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
+  { key: "TELEGRAM_ROUTE_COOLDOWN_MS", secret: false, hasBuiltInDefault: true },
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_MARKET", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_SQUAD", secret: false, hasBuiltInDefault: true },
