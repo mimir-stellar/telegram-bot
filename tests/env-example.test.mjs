@@ -58,6 +58,20 @@ test(".env.example matches exported key metadata in dist/config.js", async () =>
   assert.deepEqual(result.nonEmptySecrets, []);
 });
 
+test("loadKeyMetadata includes logger-owned env keys", async () => {
+  const metadata = await loadKeyMetadata();
+  const keys = new Set(metadata.map((entry) => entry.key));
+  for (const key of [
+    "LOG_LEVEL",
+    "LOG_FORMAT",
+    "LOG_FILE",
+    "LOG_FILE_MAX_BYTES",
+    "LOG_FILE_MAX_FILES",
+  ]) {
+    assert.ok(keys.has(key), `${key} missing from loaded metadata`);
+  }
+});
+
 test("scripts/check-env-example.mjs CLI exits 0 on the repository .env.example", async () => {
   const { code, stdout, stderr } = await runCli();
   assert.equal(code, 0, stderr);

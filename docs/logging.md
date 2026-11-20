@@ -6,12 +6,15 @@ This document describes the structured logging system implemented in `src/logger
 
 ## Overview & Configuration
 
-The bot supports two log formats configured via environment variables:
+The bot supports two console log formats and an optional size-rotated JSONL file sink:
 
 | Variable | Values / Format | Default | Description |
 |---|---|---|---|
 | `LOG_FORMAT` | `text`, `json` | `text` | When set to `json`, emits one self-contained, un-indented JSON object per log record on stdout/stderr. Case-insensitive; falls back to `text` if invalid. |
 | `LOG_LEVEL` | `debug`, `info`, `warn`, `error`, `fatal` | `info` | Minimum log severity to emit. Records with lower severity are suppressed. Case-insensitive; falls back to `info` if invalid. |
+| `LOG_FILE` | file path | *(unset — disabled)* | Optional local JSONL operational log. Every emitted record is appended as one redacted JSON line regardless of `LOG_FORMAT`. |
+| `LOG_FILE_MAX_BYTES` | positive integer | `10485760` (10 MiB) | Rotate the active file after it grows past this many bytes. Invalid or non-positive values fall back to the default. |
+| `LOG_FILE_MAX_FILES` | `1`–`50` | `5` | Total local files retained: the active file plus `.1` through `.N-1`. Invalid values use the default; values above `50` are clamped. |
 
 In addition, standard output streams follow severity conventions:
 - `error` and `fatal` are written to `stderr` (`console.error`).
@@ -144,26 +147,37 @@ Repetitive RPC errors or network disconnects can flood aggregators. The poller p
 
 ---
 
+## Size-Based JSONL Rotation (`LOG_FILE`)
+
+When `LOG_FILE` is set, every log record that passes `LOG_LEVEL` is redacted and appended as a single-line JSON object to that path, even while stdout/stderr stay in `text` mode.
+
+- A write that would push the active file past `LOG_FILE_MAX_BYTES` rotates first: `<LOG_FILE>.<k>` shifts to `<LOG_FILE>.<k+1>`, the active file becomes `.1`, and any archive index at or above `LOG_FILE_MAX_FILES` is removed. `LOG_FILE_MAX_FILES=1` keeps only the active file.
+- Writes and rotations are serialized, so records emitted during a rotation are queued rather than lost. If a rename fails, the failure is reported and the pending record is still appended to the active file when it remains writable.
+- Disk failures are reported separately from normal log records on stderr as `[logger] jsonl disk failure stage=... reason=...` and are counted by `Logger.getJsonlStats()` with a stage (`mkdir`, `stat`, `rotate`, `write`, `cleanup`) and reason (`disk_full`, `permission_denied`, `read_only_fs`, `busy`, `path_error`, `io_error`).
+- Graceful shutdown flushes queued writes before exit. Setting `LOG_FILE` does not change console output or redaction.
+
+---
+
 ## Aggregator Ingestion & `jq` Examples
 
 Because each JSON line is valid JSON, standard tools like `jq`, Vector, FluentBit, Datadog Agent, or Promtail/Loki can ingest and index fields directly.
 
 ### Filter All Errors and Fatal Messages
 ```bash
-tail -f mimir.log | jq -c 'select(.level == "error" or .level == "fatal")'
+tail -f mimir.jsonl | jq -c 'select(.level == "error" or .level == "fatal")'
 ```
 
 ### Filter Poller Errors with Message, Action, and Ledger
 ```bash
-cat mimir.log | jq 'select(.component == "poller" and .level == "error") | {ts, action, ledger, error, msg}'
+cat mimir.jsonl | jq 'select(.component == "poller" and .level == "error") | {ts, action, ledger, error, msg}'
 ```
 
 ### Inspect Startup / Boot Configuration and Warnings
 ```bash
-cat mimir.log | jq 'select(.component == "boot") | {ts, level, action, warning, msg}'
+cat mimir.jsonl | jq 'select(.component == "boot") | {ts, level, action, warning, msg}'
 ```
 
 ### Track Skipped or Dropped Events
 ```bash
-cat mimir.log | jq 'select(.action == "event_skipped" or .action == "notification_cap_reached") | {ts, eventName, ledger, reason}'
+cat mimir.jsonl | jq 'select(.action == "event_skipped" or .action == "notification_cap_reached") | {ts, eventName, ledger, reason}'
 ```

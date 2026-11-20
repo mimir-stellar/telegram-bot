@@ -422,6 +422,7 @@ async function main(): Promise<void> {
 
       // Flush last so entries recorded while stopping are persisted.
       await poller.flushAuditFile().catch(() => undefined);
+      await Logger.flush().catch(() => undefined);
       process.exit(0);
     })();
   };
