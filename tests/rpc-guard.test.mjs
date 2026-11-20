@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   assertEventsResponse,
   DEFAULT_MAX_EVENTS_PER_RESPONSE,
+  DEFAULT_MAX_LEDGER_STALL_MS,
+  LedgerProgressTracker,
   RpcResponseShapeError,
 } from "../dist/stellar/rpc-guard.js";
 import { defaultMockScenario, startMockRpc } from "../dist/stellar/mock-rpc.js";
@@ -350,4 +352,118 @@ test("paginatedGetEvents rejects oversized RPC response at the boundary", async 
       return true;
     },
   );
+});
+
+// ── Unit tests for LedgerProgressTracker ───────────────────────────────────────
+
+test("LedgerProgressTracker does not flag an up-to-date provider as stale when no events exist", () => {
+  let now = 1_000;
+  const tracker = new LedgerProgressTracker({ maxStaleMs: 30_000, now: () => now });
+
+  assert.equal(tracker.snapshot(), null);
+
+  // Initial observation with zero events -> idle, not stale
+  const r1 = tracker.observe({ latestLedger: 500, eventsCount: 0 });
+  assert.equal(r1.status, "idle");
+  assert.equal(r1.stale, false);
+  assert.equal(r1.idle, true);
+  assert.equal(r1.regressed, false);
+  assert.equal(r1.ledgerDelta, 0);
+  assert.equal(r1.stalledMs, 0);
+
+  // 25s later, still zero events, but ledger advanced -> idle, not stale, timer reset
+  now += 25_000;
+  const r2 = tracker.observe({ latestLedger: 505, eventsCount: 0 });
+  assert.equal(r2.status, "idle");
+  assert.equal(r2.stale, false);
+  assert.equal(r2.idle, true);
+  assert.equal(r2.ledgerDelta, 5);
+  assert.equal(r2.stalledMs, 0);
+
+  // Another 25s later (50s total > maxStaleMs), still zero events, ledger advanced again
+  now += 25_000;
+  const r3 = tracker.observe({ latestLedger: 510, eventsCount: 0 });
+  assert.equal(r3.status, "idle");
+  assert.equal(r3.stale, false);
+  assert.equal(r3.idle, true);
+  assert.equal(r3.ledgerDelta, 5);
+  assert.equal(r3.stalledMs, 0);
+  assert.deepEqual(tracker.snapshot(), r3);
+});
+
+test("LedgerProgressTracker flags a stale provider when latestLedger fails to advance over the bounded interval", () => {
+  let now = 10_000;
+  const tracker = new LedgerProgressTracker({ maxStaleMs: 60_000, now: () => now });
+
+  const r1 = tracker.observe({ latestLedger: 1000, eventsCount: 2 });
+  assert.equal(r1.status, "active");
+  assert.equal(r1.stale, false);
+
+  // Within bounded interval (59_999 ms < 60_000 ms): not stale yet
+  now += 59_999;
+  const r2 = tracker.observe({ latestLedger: 1000, eventsCount: 0 });
+  assert.equal(r2.status, "idle");
+  assert.equal(r2.stale, false);
+  assert.equal(r2.stalledMs, 59_999);
+
+  // At boundary (60_000 ms >= 60_000 ms): flagged as stale-provider
+  now += 1;
+  const r3 = tracker.observe({ latestLedger: 1000, eventsCount: 0 });
+  assert.equal(r3.status, "stale-provider");
+  assert.equal(r3.stale, true);
+  assert.equal(r3.idle, true);
+  assert.equal(r3.stalledMs, 60_000);
+  assert.equal(r3.baselineLedger, 1000);
+
+  // Provider recovers when latestLedger advances
+  now += 5_000;
+  const r4 = tracker.observe({ latestLedger: 1001, eventsCount: 1 });
+  assert.equal(r4.status, "active");
+  assert.equal(r4.stale, false);
+  assert.equal(r4.ledgerDelta, 1);
+  assert.equal(r4.stalledMs, 0);
+  assert.equal(r4.baselineLedger, 1001);
+});
+
+test("LedgerProgressTracker detects regressed latestLedger without resetting stall anchor", () => {
+  const tracker = new LedgerProgressTracker({ maxStaleMs: DEFAULT_MAX_LEDGER_STALL_MS });
+
+  tracker.observe({ latestLedger: 2000, eventsCount: 0, observedAtMs: 0 });
+
+  // Provider oscillates backwards to 1998 at t=30s
+  const r1 = tracker.observe({ latestLedger: 1998, eventsCount: 0, observedAtMs: 30_000 });
+  assert.equal(r1.regressed, true);
+  assert.equal(r1.ledgerDelta, -2);
+  assert.equal(r1.baselineLedger, 2000);
+  assert.equal(r1.stale, false);
+  assert.equal(r1.stalledMs, 30_000);
+
+  // Still below 2000 at t=60s -> stale-provider
+  const r2 = tracker.observe({ latestLedger: 1999, eventsCount: 0, observedAtMs: 60_000 });
+  assert.equal(r2.regressed, true);
+  assert.equal(r2.ledgerDelta, -1);
+  assert.equal(r2.baselineLedger, 2000);
+  assert.equal(r2.stale, true);
+  assert.equal(r2.status, "stale-provider");
+});
+
+test("LedgerProgressTracker validates options and inputs and supports reset", () => {
+  assert.throws(() => new LedgerProgressTracker({ maxStaleMs: 0 }), RangeError);
+  assert.throws(() => new LedgerProgressTracker({ maxStaleMs: -100 }), RangeError);
+  assert.throws(() => new LedgerProgressTracker({ maxStaleMs: NaN }), RangeError);
+
+  const tracker = new LedgerProgressTracker({ maxStaleMs: 10_000 });
+  assert.throws(
+    () => tracker.observe({ latestLedger: -1 }),
+    (err) => {
+      assert(err instanceof RpcResponseShapeError);
+      assert.equal(err.problem, "latest-ledger-invalid");
+      return true;
+    },
+  );
+
+  tracker.observe({ latestLedger: 100, observedAtMs: 0 });
+  assert.ok(tracker.snapshot() !== null);
+  tracker.reset();
+  assert.equal(tracker.snapshot(), null);
 });
