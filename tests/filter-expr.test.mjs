@@ -415,3 +415,84 @@ test("parseFilterExpression: respects custom maxDepth option", () => {
   assert.ok(rule.condition);
 });
 
+test("parseFilterExpression: validation errors include exact source ranges and stable codes without echoing full expression", () => {
+  // Leading whitespace preserved in source range
+  const expr1 = "  claim_created where unknown_field == 'crypto'";
+  assert.throws(
+    () => parseFilterExpression(expr1),
+    (err) => {
+      assert.ok(err instanceof FilterParseError);
+      assert.equal(err.code, "FILTER_UNKNOWN_FIELD");
+      assert.deepEqual(err.range, { start: 22, end: 35 });
+      assert.equal(expr1.slice(err.range.start, err.range.end), "unknown_field");
+      assert.equal(err.message.includes(expr1.trim()), false);
+      return true;
+    },
+  );
+
+  // Unknown event name
+  const expr2 = "bad_event where claimId > 1";
+  assert.throws(
+    () => parseFilterExpression(expr2),
+    (err) => {
+      assert.ok(err instanceof FilterParseError);
+      assert.equal(err.code, "FILTER_UNKNOWN_EVENT");
+      assert.deepEqual(err.range, { start: 0, end: 9 });
+      assert.equal(expr2.slice(err.range.start, err.range.end), "bad_event");
+      return true;
+    },
+  );
+
+  // Type mismatch
+  const expr3 = "claim_created where claimId == 'not_a_num'";
+  assert.throws(
+    () => parseFilterExpression(expr3),
+    (err) => {
+      assert.ok(err instanceof FilterParseError);
+      assert.equal(err.code, "FILTER_TYPE_MISMATCH");
+      assert.deepEqual(err.range, { start: 31, end: 42 });
+      assert.equal(expr3.slice(err.range.start, err.range.end), "'not_a_num'");
+      return true;
+    },
+  );
+
+  // Unsupported operator on string field
+  const expr4 = "claim_created where category > 'a'";
+  assert.throws(
+    () => parseFilterExpression(expr4),
+    (err) => {
+      assert.ok(err instanceof FilterParseError);
+      assert.equal(err.code, "FILTER_OPERATOR_NOT_SUPPORTED");
+      assert.deepEqual(err.range, { start: 29, end: 30 });
+      assert.equal(expr4.slice(err.range.start, err.range.end), ">");
+      return true;
+    },
+  );
+
+  // USDC precision overflow
+  const expr5 = "claim_challenged where stake >= $1.12345678";
+  assert.throws(
+    () => parseFilterExpression(expr5),
+    (err) => {
+      assert.ok(err instanceof FilterParseError);
+      assert.equal(err.code, "FILTER_USDC_PRECISION");
+      assert.deepEqual(err.range, { start: 32, end: 43 });
+      assert.equal(expr5.slice(err.range.start, err.range.end), "$1.12345678");
+      return true;
+    },
+  );
+
+  // Token limit and depth limit errors carry codes and ranges
+  const expr6 = "where claimId == 1 and claimId == 2";
+  assert.throws(
+    () => parseFilterExpression(expr6, { maxTokens: 4 }),
+    (err) => {
+      assert.ok(err instanceof FilterTokenLimitError);
+      assert.equal(err.code, "FILTER_TOKEN_LIMIT");
+      assert.deepEqual(err.range, { start: 19, end: 22 });
+      assert.equal(expr6.slice(err.range.start, err.range.end), "and");
+      return true;
+    },
+  );
+});
+

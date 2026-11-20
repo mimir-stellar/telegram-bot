@@ -7,12 +7,31 @@
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
+import type { SourceRange } from "./filter-expr.js";
+
+/** Stable machine-readable error codes for USDC threshold validation. */
+export type InvalidThresholdCode =
+  | "THRESHOLD_NOT_STRING"
+  | "THRESHOLD_EMPTY"
+  | "THRESHOLD_NEGATIVE"
+  | "THRESHOLD_LEADING_PLUS"
+  | "THRESHOLD_MALFORMED"
+  | "THRESHOLD_PRECISION_EXCEEDED";
 
 /** Error thrown when a threshold string is negative, malformed, or invalid. */
 export class InvalidThresholdError extends Error {
-  constructor(message: string) {
+  readonly code: InvalidThresholdCode;
+  readonly range: SourceRange;
+
+  constructor(
+    message: string,
+    code: InvalidThresholdCode = "THRESHOLD_MALFORMED",
+    range: SourceRange = { start: 0, end: 0 },
+  ) {
     super(message);
     this.name = "InvalidThresholdError";
+    this.code = code;
+    this.range = range;
   }
 }
 
@@ -38,43 +57,79 @@ export interface AmountThresholds {
  */
 export function parseUsdcThreshold(text: string): bigint {
   if (typeof text !== "string") {
-    throw new InvalidThresholdError(`Threshold must be a string, got ${typeof text}`);
+    throw new InvalidThresholdError(
+      `Threshold must be a string, got ${typeof text}`,
+      "THRESHOLD_NOT_STRING",
+      { start: 0, end: 0 },
+    );
   }
 
+  const leadingWs = text.length - text.trimStart().length;
   const trimmed = text.trim();
+  const tokenRange: SourceRange = { start: leadingWs, end: leadingWs + trimmed.length };
+  const label = trimmed.length <= 32 ? trimmed : `${trimmed.slice(0, 31)}…`;
+
   if (trimmed === "") {
-    throw new InvalidThresholdError("Threshold cannot be empty");
+    throw new InvalidThresholdError(
+      "Threshold cannot be empty",
+      "THRESHOLD_EMPTY",
+      { start: 0, end: text.length },
+    );
   }
 
   if (trimmed.startsWith("-")) {
-    throw new InvalidThresholdError(`Threshold cannot be negative: "${trimmed}"`);
+    throw new InvalidThresholdError(
+      `Threshold cannot be negative: "${label}"`,
+      "THRESHOLD_NEGATIVE",
+      tokenRange,
+    );
   }
 
   if (trimmed.startsWith("+")) {
-    throw new InvalidThresholdError(`Threshold cannot have leading '+': "${trimmed}"`);
+    throw new InvalidThresholdError(
+      `Threshold cannot have leading '+': "${label}"`,
+      "THRESHOLD_LEADING_PLUS",
+      { start: leadingWs, end: leadingWs + 1 },
+    );
   }
 
   // Must match integer or decimal with digits
   // Disallow leading '.' or trailing '.' without digits, disallow multiple '.'
   const parts = trimmed.split(".");
   if (parts.length > 2) {
-    throw new InvalidThresholdError(`Malformed threshold: "${trimmed}"`);
+    throw new InvalidThresholdError(
+      `Malformed threshold: "${label}"`,
+      "THRESHOLD_MALFORMED",
+      tokenRange,
+    );
   }
 
   const wholeStr = parts[0] ?? "";
   const fracStr = parts.length === 2 ? (parts[1] ?? "") : "";
 
   if (!/^\d+$/.test(wholeStr)) {
-    throw new InvalidThresholdError(`Malformed integer part in threshold: "${trimmed}"`);
+    throw new InvalidThresholdError(
+      `Malformed integer part in threshold: "${label}"`,
+      "THRESHOLD_MALFORMED",
+      { start: leadingWs, end: leadingWs + wholeStr.length },
+    );
   }
 
   if (parts.length === 2 && (fracStr.length === 0 || !/^\d+$/.test(fracStr))) {
-    throw new InvalidThresholdError(`Malformed fractional part in threshold: "${trimmed}"`);
+    const fracStart = leadingWs + wholeStr.length + 1;
+    throw new InvalidThresholdError(
+      `Malformed fractional part in threshold: "${label}"`,
+      "THRESHOLD_MALFORMED",
+      { start: fracStart, end: leadingWs + trimmed.length },
+    );
   }
 
   if (fracStr.length > 7) {
+    const excessStart = leadingWs + wholeStr.length + 1 + 7;
     throw new InvalidThresholdError(
-      `Threshold exceeds maximum USDC precision of 7 decimals: "${trimmed}"`,
+      `Threshold exceeds maximum USDC precision of 7 decimals: "${label}"`,
+      "THRESHOLD_PRECISION_EXCEEDED",
+      { start: excessStart, end: leadingWs + trimmed.length },
     );
   }
 

@@ -114,6 +114,12 @@ NOTIFY_CATEGORIES=crypto
 > [!NOTE]
 > Because `eventAllowedByCategory` only inspects `claim_created`, there is no environment variable that suppresses `claim_challenged` or `claim_resolved` while keeping `claim_created` enabled.
 
+### Validation Error Codes and Source Ranges
+
+Filter expression errors (`FilterParseError`, `FilterTokenLimitError`, `FilterDepthLimitError` in `src/notifications/filter-expr.ts`) and USDC threshold errors (`InvalidThresholdError` in `src/notifications/amount-threshold.ts`) expose:
+- `code`: stable machine-readable error code (such as `FILTER_UNKNOWN_EVENT`, `FILTER_UNKNOWN_FIELD`, `FILTER_TYPE_MISMATCH`, `FILTER_OPERATOR_NOT_SUPPORTED`, `FILTER_USDC_PRECISION`, `FILTER_SYNTAX_ERROR`, `FILTER_TOKEN_LIMIT`, `FILTER_DEPTH_LIMIT`, `THRESHOLD_NEGATIVE`, `THRESHOLD_PRECISION_EXCEEDED`, `THRESHOLD_MALFORMED`).
+- `range`: 0-based `{ start, end }` character span identifying the invalid token or slice in the original input without echoing the entire expression.
+
 ---
 
 ### Example 2: Squad notifications only
