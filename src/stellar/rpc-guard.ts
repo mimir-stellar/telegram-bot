@@ -11,7 +11,11 @@ import type { rpc } from "@stellar/stellar-sdk";
 /** Default ceiling on the number of events permitted in a single RPC response. */
 export const DEFAULT_MAX_EVENTS_PER_RESPONSE = 1_000;
 
+/** Default ceiling on the byte length of a single RPC HTTP response (4 MiB). */
+export const DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+
 export type RpcGuardProblem =
+  | "response-oversized"
   | "not-an-object"
   | "events-not-an-array"
   | "events-oversized"
@@ -138,4 +142,52 @@ export function assertEventsResponse(
   }
 
   return value as unknown as rpc.Api.GetEventsResponse;
+}
+
+/** Matches the error message thrown by `@stellar/stellar-sdk` when `maxContentLength` is exceeded. */
+const MAX_CONTENT_LENGTH_ERROR_RE = /maxContentLength size of \d+ exceeded/i;
+
+/**
+ * Validate that an RPC response byte length does not exceed the configured ceiling.
+ *
+ * @param byteLength The observed or declared byte length of the response.
+ * @param maxBytes Maximum permitted response bytes. Defaults to {@link DEFAULT_MAX_RESPONSE_BYTES}.
+ * @throws {RpcResponseShapeError} With problem `"response-oversized"` if `byteLength > maxBytes`.
+ */
+export function assertRpcResponseSize(
+  byteLength: number,
+  maxBytes: number = DEFAULT_MAX_RESPONSE_BYTES,
+): void {
+  if (byteLength > maxBytes) {
+    throw new RpcResponseShapeError(
+      "response-oversized",
+      `RPC response size ${byteLength} bytes exceeds limit of ${maxBytes} bytes`,
+    );
+  }
+}
+
+/**
+ * Normalize an HTTP client `maxContentLength` abort error into a bounded
+ * {@link RpcResponseShapeError} with problem `"response-oversized"`.
+ *
+ * Any unrelated error is returned unchanged.
+ */
+export function wrapOversizedResponseError(
+  err: unknown,
+  maxBytes: number = DEFAULT_MAX_RESPONSE_BYTES,
+): unknown {
+  if (err instanceof RpcResponseShapeError) return err;
+  const message =
+    err instanceof Error
+      ? err.message
+      : typeof err === "string"
+        ? err
+        : "";
+  if (MAX_CONTENT_LENGTH_ERROR_RE.test(message)) {
+    return new RpcResponseShapeError(
+      "response-oversized",
+      `RPC response exceeded configured limit of ${maxBytes} bytes`,
+    );
+  }
+  return err;
 }

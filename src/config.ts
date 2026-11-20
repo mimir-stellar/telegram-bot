@@ -58,6 +58,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import { DEFAULT_MAX_RESPONSE_BYTES } from "./stellar/rpc-guard.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -183,6 +184,12 @@ export interface StellarConfig {
   networkPassphrase: string;
   /** Optional override for stellar.expert (or compatible) explorer origin. */
   explorerBaseUrl: string;
+  /**
+   * Maximum permitted byte length of a single Soroban RPC HTTP response
+   * (`STELLAR_RPC_MAX_RESPONSE_BYTES`). Optional on this chain-only type so
+   * hand-built configs keep working; defaults to {@link DEFAULT_MAX_RESPONSE_BYTES}.
+   */
+  rpcMaxResponseBytes?: number;
 }
 
 export interface TelegramRoute {
@@ -383,6 +390,7 @@ const DEFAULTS = {
   network: "testnet" as StellarNetwork,
   locale: DEFAULT_LOCALE,
   rpcUrl: NETWORK_RPC_URLS.testnet,
+  rpcMaxResponseBytes: DEFAULT_MAX_RESPONSE_BYTES,
   horizonUrl: NETWORK_HORIZON_URLS.testnet,
   networkPassphrase: NETWORK_PASSPHRASES.testnet,
   pollIntervalMs: 30_000,
@@ -895,6 +903,11 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     marketContractVersion: c.contractVersion("MARKET_CONTRACT_VERSION", "v1"),
     squadContractVersion: c.contractVersion("SQUAD_CONTRACT_VERSION", "v1"),
     rpcUrl: c.url("STELLAR_RPC_URL", namedDefaults.rpcUrl),
+    rpcMaxResponseBytes: c.int(
+      "STELLAR_RPC_MAX_RESPONSE_BYTES",
+      DEFAULTS.rpcMaxResponseBytes,
+      1,
+    ),
     horizonUrl: c.url("STELLAR_HORIZON_URL", namedDefaults.horizonUrl),
     networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? namedDefaults.passphrase,
     explorerBaseUrl: c.url(
@@ -1150,6 +1163,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "SQUAD_CONTRACT_VERSION", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_RPC_URL", secret: false, hasBuiltInDefault: true },
+  { key: "STELLAR_RPC_MAX_RESPONSE_BYTES", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_HORIZON_URL", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK_PASSPHRASE", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_EXPLORER_BASE_URL", secret: false, hasBuiltInDefault: true },

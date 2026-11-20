@@ -15,6 +15,10 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  DEFAULT_MAX_RESPONSE_BYTES,
+  wrapOversizedResponseError,
+} from "./rpc-guard.js";
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -31,11 +35,20 @@ export class RpcPassphraseError extends Error {
  * verified separately at boot by {@link validateNetworkPassphrase}.
  */
 export function createRpcServer(config: StellarConfig): rpc.Server {
-  return new rpc.Server(config.rpcUrl, {
+  const maxResponseBytes = config.rpcMaxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
+  const server = new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
     timeout: 15000,
   });
+  server.httpClient.defaults.maxContentLength = maxResponseBytes;
+  server.httpClient.interceptors.response.use(
+    (response) => response,
+    (err: unknown) => {
+      throw wrapOversizedResponseError(err, maxResponseBytes);
+    },
+  );
+  return server;
 }
 
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */
