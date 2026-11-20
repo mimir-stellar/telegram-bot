@@ -131,6 +131,14 @@ export class FollowStore {
   private readonly renameSync: FollowStoreFs["renameSync"];
   private readonly now: () => number;
 
+  /**
+   * Tail of the in-process serialization chain. Every mutating operation
+   * (`follow`, `unfollow`) appends itself to this chain so that concurrent
+   * calls on the same `FollowStore` instance execute one at a time and cannot
+   * overwrite each other's read-modify-write cycle.
+   */
+  private _mutex: Promise<void> = Promise.resolve();
+
   constructor(options: FollowStoreOptions) {
     this.filePath = options.filePath;
     this.maxPerChat =
@@ -140,6 +148,22 @@ export class FollowStore {
       options.fs?.readFileSync ?? ((p, enc) => fs.readFileSync(p, enc));
     this.renameSync = options.fs?.renameSync ?? fs.renameSync;
     this.now = options.now ?? Date.now;
+  }
+
+  /**
+   * Append `fn` to the serialization chain and return a Promise that resolves
+   * (or rejects) with its result. Only one `fn` runs at a time per store
+   * instance, so concurrent `follow`/`unfollow` calls do not race.
+   */
+  private _serialize<T>(fn: () => T): Promise<T> {
+    const next = this._mutex.then(() => fn());
+    // The chain must never stall on a rejection; swallow errors on the shared
+    // tail so the next operation can always start.
+    this._mutex = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
   }
 
   private read(): StoreFile {
@@ -186,69 +210,94 @@ export class FollowStore {
     return total;
   }
 
-  follow(chatId: string, ref: string): boolean {
+  /**
+   * Add `ref` to `chatId`'s follow list.
+   *
+   * Argument validation is synchronous and throws `FollowStoreError` before
+   * the returned Promise is created. The read-modify-write is serialized
+   * through an in-process mutex so concurrent calls never overwrite each other.
+   *
+   * @returns A Promise that resolves to `true` when the ref was added, or
+   *   `false` when it was already present (idempotent).
+   */
+  follow(chatId: string, ref: string): Promise<boolean> {
     if (typeof chatId !== "string" || chatId.length === 0) {
       throw new FollowStoreError("chatId must be a non-empty string");
     }
     if (parseRef(ref) === null) {
       throw new FollowStoreError(`invalid ref: ${ref}`);
     }
-    const data = this.read();
-    const existing = data.follows[chatId] ?? [];
-    if (existing.includes(ref)) {
-      return false;
-    }
-    if (existing.length >= this.maxPerChat) {
-      throw new FollowStoreError(`per-chat follow limit reached (${this.maxPerChat})`);
-    }
-    if (this.totalCount(data) >= this.maxTotal) {
-      throw new FollowStoreError(`total follow limit reached (${this.maxTotal})`);
-    }
-    data.follows[chatId] = [...existing, ref];
-    this.write(data);
-    return true;
+    return this._serialize(() => {
+      const data = this.read();
+      const existing = data.follows[chatId] ?? [];
+      if (existing.includes(ref)) {
+        return false;
+      }
+      if (existing.length >= this.maxPerChat) {
+        throw new FollowStoreError(`per-chat follow limit reached (${this.maxPerChat})`);
+      }
+      if (this.totalCount(data) >= this.maxTotal) {
+        throw new FollowStoreError(`total follow limit reached (${this.maxTotal})`);
+      }
+      data.follows[chatId] = [...existing, ref];
+      this.write(data);
+      return true;
+    });
   }
 
-  unfollow(chatId: string, ref: string): boolean {
+  /**
+   * Remove `ref` from `chatId`'s follow list.
+   *
+   * Argument validation is synchronous. The read-modify-write is serialized
+   * through the same in-process mutex as `follow`.
+   *
+   * @returns A Promise that resolves to `true` when the ref was removed, or
+   *   `false` when it was not present.
+   */
+  unfollow(chatId: string, ref: string): Promise<boolean> {
     if (typeof chatId !== "string" || chatId.length === 0) {
       throw new FollowStoreError("chatId must be a non-empty string");
     }
     if (parseRef(ref) === null) {
       throw new FollowStoreError(`invalid ref: ${ref}`);
     }
-    const data = this.read();
-    const existing = data.follows[chatId];
-    if (!existing || !existing.includes(ref)) {
-      return false;
-    }
-    const next = existing.filter((entry) => entry !== ref);
-    if (next.length === 0) {
-      delete data.follows[chatId];
-    } else {
-      data.follows[chatId] = next;
-    }
-    this.write(data);
-    return true;
+    return this._serialize(() => {
+      const data = this.read();
+      const existing = data.follows[chatId];
+      if (!existing || !existing.includes(ref)) {
+        return false;
+      }
+      const next = existing.filter((entry) => entry !== ref);
+      if (next.length === 0) {
+        delete data.follows[chatId];
+      } else {
+        data.follows[chatId] = next;
+      }
+      this.write(data);
+      return true;
+    });
   }
 
-  list(chatId: string): string[] {
+  /** Return a snapshot of `chatId`'s follow list. */
+  list(chatId: string): Promise<string[]> {
     if (typeof chatId !== "string" || chatId.length === 0) {
       throw new FollowStoreError("chatId must be a non-empty string");
     }
-    const data = this.read();
-    return [...(data.follows[chatId] ?? [])];
+    return Promise.resolve(this.read()).then((data) => [...(data.follows[chatId] ?? [])]);
   }
 
-  followersOf(ref: string): string[] {
+  /** Return all chat IDs that follow `ref`. */
+  followersOf(ref: string): Promise<string[]> {
     if (parseRef(ref) === null) {
       throw new FollowStoreError(`invalid ref: ${ref}`);
     }
-    const data = this.read();
-    const result: string[] = [];
-    for (const [chatId, list] of Object.entries(data.follows)) {
-      if (list.includes(ref)) result.push(chatId);
-    }
-    return result;
+    return Promise.resolve(this.read()).then((data) => {
+      const result: string[] = [];
+      for (const [chatId, list] of Object.entries(data.follows)) {
+        if (list.includes(ref)) result.push(chatId);
+      }
+      return result;
+    });
   }
 }
 

@@ -92,7 +92,7 @@ test('enforces per-chat cap', async () => {
     });
     await store.follow('chat:1', 'market:a1');
     await store.follow('chat:1', 'market:a2');
-    assert.throws(() => store.follow('chat:1', 'market:a3'), /per-chat follow limit reached \(2\)/);
+    await assert.rejects(() => store.follow('chat:1', 'market:a3'), /per-chat follow limit reached \(2\)/);
     assert.deepStrictEqual(await store.list('chat:1'), ['market:a1', 'market:a2']);
     // Other chats unaffected.
     await store.follow('chat:2', 'market:a1');
@@ -110,7 +110,7 @@ test('enforces total cap', async () => {
     await store.follow('chat:1', 'market:a1');
     await store.follow('chat:1', 'market:a2');
     await store.follow('chat:2', 'market:a3');
-    assert.throws(() => store.follow('chat:2', 'market:a4'), /total follow limit reached \(3\)/);
+    await assert.rejects(() => store.follow('chat:2', 'market:a4'), /total follow limit reached \(3\)/);
     // Idempotent re-follow of existing entry is allowed even at cap.
     await store.follow('chat:1', 'market:a1');
     assert.deepStrictEqual(await store.list('chat:1'), ['market:a1', 'market:a2']);
@@ -172,8 +172,11 @@ test('retains corrupt follow file bytes and throws redacted actionable error whe
     Date.now = () => ts;
     try {
       const s = createFollowStore({ filePath, now: () => ts });
-      for (const op of [() => s.list('c'), () => s.followersOf('market:a'), () => s.follow('c', 'market:a'), () => s.unfollow('c', 'market:a')]) {
+      for (const op of [() => s.list('c'), () => s.followersOf('market:a')]) {
         assert.throws(op, (e) => e.name === 'FollowStoreError' && /quarantine.*retained in place/i.test(e.message));
+      }
+      for (const op of [() => s.follow('c', 'market:a'), () => s.unfollow('c', 'market:a')]) {
+        await assert.rejects(op, (e) => e.name === 'FollowStoreError' && /quarantine.*retained in place/i.test(e.message));
       }
     } finally {
       Date.now = realNow;
@@ -199,8 +202,82 @@ test('preserves unreadable follow file and redacts credentials when read and qua
         unlinkSync: () => { unlinked = true; },
       },
     });
-    assert.throws(() => s.follow('c', 'market:a'), (e) => e.name === 'FollowStoreError' && !e.message.includes('hunter2secret') && e.message.includes('[REDACTED]') && /EROFS/.test(e.message));
+    await assert.rejects(() => s.follow('c', 'market:a'), (e) => e.name === 'FollowStoreError' && !e.message.includes('hunter2secret') && e.message.includes('[REDACTED]') && /EROFS/.test(e.message));
     assert.strictEqual(unlinked, false);
     assert.strictEqual(Buffer.compare(await fs.promises.readFile(filePath), raw), 0);
+  });
+});
+
+// ── #742 – serialized follow-store mutations ──────────────────────────────────
+
+test('concurrent follow calls on the same ref are idempotent and preserve the set', async () => {
+  // Fire 10 concurrent follow() calls for the same ref. Because each is
+  // serialized through the mutex, the final set must contain exactly one
+  // entry, and the results must be: first true, then all false.
+  const { createFollowStore } = await importStore();
+  await withTempDir(async (dir) => {
+    const store = createFollowStore({ filePath: dir + '/follows.json' });
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => store.follow('chat:1', 'market:42')),
+    );
+    assert.strictEqual(results.filter(Boolean).length, 1, 'exactly one follow should succeed');
+    assert.strictEqual(results.filter((r) => !r).length, 9, 'remaining nine should be no-ops');
+    assert.deepStrictEqual(await store.list('chat:1'), ['market:42']);
+  });
+});
+
+test('concurrent follow and unfollow operations preserve the expected final set', async () => {
+  // Add two refs sequentially, then concurrently follow a third ref and
+  // unfollow the first. The final set must be exactly ['market:b', 'market:c'].
+  const { createFollowStore } = await importStore();
+  await withTempDir(async (dir) => {
+    const store = createFollowStore({ filePath: dir + '/follows.json' });
+    await store.follow('chat:1', 'market:a');
+    await store.follow('chat:1', 'market:b');
+
+    // Race: unfollow 'a' while following 'c'.
+    await Promise.all([
+      store.unfollow('chat:1', 'market:a'),
+      store.follow('chat:1', 'market:c'),
+    ]);
+
+    assert.deepStrictEqual(await store.list('chat:1'), ['market:b', 'market:c']);
+  });
+});
+
+test('concurrent follow calls for distinct refs all land in the final set', async () => {
+  // 20 goroutine-style concurrent follows for 20 different refs.
+  // Every ref must appear exactly once in the final list.
+  const { createFollowStore } = await importStore();
+  await withTempDir(async (dir) => {
+    const store = createFollowStore({ filePath: dir + '/follows.json' });
+    const refs = Array.from({ length: 20 }, (_, i) => `market:${i + 1}`);
+    const results = await Promise.all(refs.map((ref) => store.follow('chat:1', ref)));
+    // All 20 must have returned true (new follow).
+    assert.ok(results.every(Boolean), 'all concurrent follows for distinct refs should succeed');
+    const finalList = await store.list('chat:1');
+    assert.strictEqual(finalList.length, 20, 'final list must contain all 20 refs');
+    for (const ref of refs) {
+      assert.ok(finalList.includes(ref), `${ref} must be in the final list`);
+    }
+  });
+});
+
+test('a rejected mutation does not block subsequent operations', async () => {
+  // If one operation rejects (e.g. cap exceeded), the mutex chain must
+  // recover and let the next operation proceed normally.
+  const { createFollowStore } = await importStore();
+  await withTempDir(async (dir) => {
+    const store = createFollowStore({
+      filePath: dir + '/follows.json',
+      maxFollowsPerChat: 1,
+    });
+    await store.follow('chat:1', 'market:a');
+    // This one rejects because the cap is reached.
+    await assert.rejects(() => store.follow('chat:1', 'market:b'), /per-chat follow limit reached/);
+    // The store must still be usable.
+    assert.deepStrictEqual(await store.list('chat:1'), ['market:a']);
+    await store.unfollow('chat:1', 'market:a');
+    assert.deepStrictEqual(await store.list('chat:1'), []);
   });
 });
