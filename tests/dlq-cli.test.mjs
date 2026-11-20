@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -380,4 +380,110 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.equal(parseDurationMs("1h30m"), 5_400_000);
   assert.throws(() => parseDurationMs(""), /requires a duration/);
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
+});
+
+test("list displays dead-letter age from oldest retained failure rather than file mtime", async () => {
+  const oldestAt = Date.parse("2026-10-18T10:00:00.000Z");
+  const newerAt = Date.parse("2026-10-18T12:00:00.000Z");
+  const nowAt = Date.parse("2026-10-18T12:15:00.000Z");
+
+  await withTempDlq(
+    async ({ filePath }) => {
+      // Touch file mtime to `nowAt` so mtime-based age would be 0s, not 2h 15m.
+      const touchTime = new Date(nowAt);
+      await utimes(filePath, touchTime, touchTime);
+
+      const textIo = captureIo();
+      const textRes = await runDlqCli({
+        argv: ["list", "--file", filePath],
+        now: () => nowAt,
+        stdout: textIo.out,
+        stderr: textIo.err,
+      });
+      assert.equal(textRes.exitCode, 0);
+      assert.match(textIo.stdout.join("\n"), /age=2h 15m/);
+
+      const jsonIo = captureIo();
+      const jsonRes = await runDlqCli({
+        argv: ["list", "--file", filePath, "--json"],
+        now: () => nowAt,
+        stdout: jsonIo.out,
+        stderr: jsonIo.err,
+      });
+      assert.equal(jsonRes.exitCode, 0);
+      const parsed = JSON.parse(jsonIo.stdout.join("\n"));
+      assert.equal(parsed.oldestEnqueuedAt, "2026-10-18T10:00:00.000Z");
+      assert.equal(parsed.oldestAgeMs, 2 * 3_600_000 + 15 * 60_000);
+      assert.equal(parsed.oldestAge, "2h 15m");
+      assert.equal(parsed.missingTimestamps, 0);
+    },
+    [
+      { ledger: 201, at: newerAt, text: "newer failure" },
+      { ledger: 202, at: oldestAt, text: "oldest failure" },
+    ],
+  );
+});
+
+test("list and show handle missing legacy timestamps explicitly", async () => {
+  const nowAt = Date.parse("2026-10-18T12:00:00.000Z");
+
+  await withTempDlq(async ({ filePath }) => {
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: "2026-10-18T11:59:00.000Z",
+        entries: [
+          {
+            id: "market:301:claim_created:00000001",
+            source: "market",
+            ledger: 301,
+            eventName: "claim_created",
+            text: "legacy entry without timestamp",
+            attempts: 1,
+            lastError: "429",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const listIo = captureIo();
+    const listRes = await runDlqCli({
+      argv: ["list", "--file", filePath],
+      now: () => nowAt,
+      stdout: listIo.out,
+      stderr: listIo.err,
+    });
+    assert.equal(listRes.exitCode, 0);
+    const listOut = listIo.stdout.join("\n");
+    assert.match(listOut, /age=unknown \(missing legacy timestamp\)/);
+    assert.match(listOut, /enqueued=unknown/);
+
+    const listJsonIo = captureIo();
+    await runDlqCli({
+      argv: ["list", "--file", filePath, "--json"],
+      now: () => nowAt,
+      stdout: listJsonIo.out,
+      stderr: listJsonIo.err,
+    });
+    const listParsed = JSON.parse(listJsonIo.stdout.join("\n"));
+    assert.equal(listParsed.oldestEnqueuedAt, null);
+    assert.equal(listParsed.oldestAgeMs, null);
+    assert.equal(listParsed.oldestAge, null);
+    assert.equal(listParsed.missingTimestamps, 1);
+    assert.equal(listParsed.entries[0].enqueuedAt, null);
+
+    const showIo = captureIo();
+    const showRes = await runDlqCli({
+      argv: ["show", "market:301:claim_created:00000001", "--file", filePath],
+      now: () => nowAt,
+      stdout: showIo.out,
+      stderr: showIo.err,
+    });
+    assert.equal(showRes.exitCode, 0);
+    const showOut = showIo.stdout.join("\n");
+    assert.match(showOut, /enqueuedAt: unknown \(missing legacy timestamp\)/);
+    assert.match(showOut, /age:\s+unknown \(missing legacy timestamp\)/);
+  });
 });

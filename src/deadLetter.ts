@@ -32,7 +32,8 @@ import { safeErrorMessage } from "./notifications/format.js";
 export interface DeadLetterEntry {
   /** Stable id within the queue (source + ledger + event + short text hash). */
   id: string;
-  enqueuedAt: string;
+  /** ISO 8601 timestamp of the original failure, or `null` for legacy entries missing one. */
+  enqueuedAt: string | null;
   source: string;
   ledger: number;
   eventName: string;
@@ -40,6 +41,12 @@ export interface DeadLetterEntry {
   text: string;
   attempts: number;
   lastError: string | null;
+}
+
+export interface DeadLetterAgeSummary {
+  oldestEnqueuedAt: string | null;
+  ageMs: number | null;
+  missingTimestamps: number;
 }
 
 export interface DeadLetterFile {
@@ -108,6 +115,49 @@ export function makeEntryId(
   return `${source}:${ledger}:${eventName}:${shortHash(text)}`;
 }
 
+/**
+ * Parse an entry's original failed-at timestamp (`enqueuedAt`), returning `null`
+ * for missing or invalid legacy timestamps instead of falling back to `now` or file mtime.
+ */
+export function parseEntryTimestampMs(enqueuedAt: unknown): number | null {
+  if (typeof enqueuedAt !== "string" || enqueuedAt.trim() === "") {
+    return null;
+  }
+  const ms = Date.parse(enqueuedAt);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Compute the dead-letter queue age from the oldest retained failure's original
+ * `enqueuedAt` timestamp, counting entries whose legacy timestamp is missing or invalid.
+ */
+export function summarizeDeadLetterAge(
+  entries: readonly Pick<DeadLetterEntry, "enqueuedAt">[],
+  nowMs: number = Date.now(),
+): DeadLetterAgeSummary {
+  let oldestMs: number | null = null;
+  let oldestEnqueuedAt: string | null = null;
+  let missingTimestamps = 0;
+
+  for (const entry of entries) {
+    const ms = parseEntryTimestampMs(entry.enqueuedAt);
+    if (ms === null) {
+      missingTimestamps += 1;
+      continue;
+    }
+    if (oldestMs === null || ms < oldestMs) {
+      oldestMs = ms;
+      oldestEnqueuedAt = entry.enqueuedAt;
+    }
+  }
+
+  return {
+    oldestEnqueuedAt,
+    ageMs: oldestMs === null ? null : Math.max(0, nowMs - oldestMs),
+    missingTimestamps,
+  };
+}
+
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
@@ -164,7 +214,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
           .map((e) => ({
             id: e.id,
             enqueuedAt:
-              typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
+              parseEntryTimestampMs(e.enqueuedAt) !== null ? (e.enqueuedAt as string) : null,
             source: typeof e.source === "string" ? e.source : "unknown",
             ledger: e.ledger,
             eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
