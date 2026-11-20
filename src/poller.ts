@@ -97,6 +97,10 @@ import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./sta
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
 import {
+  RpcLatencyHistogram,
+  type RpcLatencySnapshot,
+} from "./stellar/metrics.js";
+import {
   eventCursorLedger,
   readContractEvents,
   resumeCursorProblem,
@@ -344,6 +348,8 @@ export interface PollerStatus {
   suppressedLogs: number;
   /** Dead-letter queue counters (see src/deadLetter.ts). */
   deadLetter: DeadLetterStats;
+  /** Fixed-provider, fixed-bucket RPC latency snapshot for `/metrics`. */
+  rpcLatency?: RpcLatencySnapshot;
   /** Telegram sends abandoned by the per-send timeout, when tracked. */
   sendTimeouts?: number;
   /** Bounded description of the most recent send timeout, when tracked. */
@@ -1332,6 +1338,9 @@ export function createPoller(deps: PollerDeps) {
   const notifiedGaps = new Set<string>();
   const { config, server, send } = deps;
   const metrics = deps.metrics;
+  // One histogram per poller. When the standalone metrics server is enabled it
+  // owns the same recorder, so both /metrics endpoints report identical data.
+  const rpcLatency = metrics?.rpcLatency ?? new RpcLatencyHistogram();
   const audit: AuditLog = deps.audit ?? createAuditLog();
   const sendSpacing =
     deps.sendOptions?.sendSpacingMs ?? config.interSendDelayMs ?? DEFAULT_SEND_SPACING_MS;
@@ -1510,6 +1519,7 @@ export function createPoller(deps: PollerDeps) {
     lastCyclePages: 0,
     notificationsDropped: 0,
     deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0 },
+    rpcLatency: rpcLatency.snapshot(),
     eventsDeduplicated: 0,
     cursorRewinds: 0,
     restartGaps: 0,
@@ -2568,6 +2578,7 @@ export function createPoller(deps: PollerDeps) {
               seenEventIds: dedupWindow.toJSON(),
               dedupWindow: config.dedupWindow,
               shouldDecode: (name) => isNotificationAllowed(config.featureFlags, target.source, name),
+              rpcLatency,
             }),
             SCAN_TIMEOUT_MS,
             "RPC scan",
@@ -2874,6 +2885,7 @@ export function createPoller(deps: PollerDeps) {
       // they run even when the body above threw.
       try {
         status.targets = [...state.values()].map((t) => ({ ...t }));
+        status.rpcLatency = rpcLatency.snapshot();
         await saveCounters("cycle");
         await saveCursors("cycle");
         await persistStatus();

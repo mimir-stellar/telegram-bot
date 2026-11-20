@@ -8,6 +8,8 @@
  *    them can derive rates with `rate()` / `increase()` reliably.
  *  - Gauges represent momentary state (e.g. consecutive_failures) that can
  *    go up or down.
+ *  - RPC latency is a fixed-bucket histogram keyed by a constant provider
+ *    identity and a bounded operation class; the RPC URL is never a label.
  *  - The output format is Prometheus text exposition v0.0.4, which every
  *    current Prometheus/OpenMetrics scraper understands.
  *  - Secrets: the /metrics response carries only operational counters derived
@@ -25,6 +27,11 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import {
+  RpcLatencyHistogram,
+  type RpcLatencySnapshot,
+} from "./stellar/metrics.js";
+
 // ── Metric types ──────────────────────────────────────────────────────────────
 
 export interface Counter {
@@ -39,6 +46,18 @@ export interface Gauge {
   set(value: number): void;
   /** Current value. */
   value(): number;
+}
+
+export interface CreateMetricsOptions {
+  /** Optional custom finite upper bounds (in ms) for RPC latency buckets. */
+  rpcLatencyBucketsMs?: readonly number[];
+}
+
+export interface RpcLatencyMetrics {
+  /** Record one RPC latency observation; provider identity is always fixed. */
+  observe(operation: unknown, durationMs: number): void;
+  /** Read the fixed-bucket snapshot for the current process. */
+  snapshot(): RpcLatencySnapshot;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -89,6 +108,8 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** Fixed-bucket RPC latency histogram by bounded operation class. */
+  rpcLatency: RpcLatencyMetrics;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -146,7 +167,8 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
-export function createMetrics(): MetricsRegistry {
+export function createMetrics(options: CreateMetricsOptions = {}): MetricsRegistry {
+  const rpcLatencyHistogram = new RpcLatencyHistogram(options.rpcLatencyBucketsMs);
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -223,6 +245,13 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`# TYPE ${g._name} gauge`);
       lines.push(`${g._name} ${g.value()}`);
     }
+
+    lines.push(
+      ...rpcLatencyHistogram.renderPrometheusLines(
+        `${METRICS_PREFIX}rpc_request_latency_ms`,
+        "Soroban RPC latency in milliseconds across fixed buckets by operation.",
+      ),
+    );
 
     // Prometheus text format requires a trailing newline.
     return lines.join("\n") + "\n";
@@ -316,6 +345,10 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    rpcLatency: {
+      observe: (operation, durationMs) => rpcLatencyHistogram.observe(operation, durationMs),
+      snapshot: () => rpcLatencyHistogram.snapshot(),
+    },
     render,
     startServer,
   };

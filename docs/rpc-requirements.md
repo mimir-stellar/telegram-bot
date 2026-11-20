@@ -46,6 +46,19 @@ Used at boot to verify the network passphrase (e.g. `Test SDF Network ; Septembe
 ```
 If the passphrase does not match configuration, the bot refuses to boot with `NetworkPassphraseMismatchError`.
 
+### Latency metrics
+
+Timed RPC awaits are exported as a fixed-bucket Prometheus histogram on both
+`/metrics` endpoints (`mimir_telegram_rpc_request_latency_ms` and
+`mimir_bot_rpc_request_latency_ms`). Series are partitioned only by `network`,
+the constant `provider="soroban-rpc"`, and a bounded `operation`
+(`health`, `events`, `other`). Buckets are fixed in milliseconds (`5`, `10`,
+`25`, `50`, `100`, `250`, `500`, `1_000`, `5_000`, `15_000`, plus `+Inf`).
+
+`STELLAR_RPC_URL` is never used as a metric label: changing providers or adding
+a query string does not grow the series set. Slow providers therefore show up
+as a shift in the same bounded histogram rather than as a new label value.
+
 ---
 
 ## 2. Retention Window Expectations

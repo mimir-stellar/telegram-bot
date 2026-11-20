@@ -249,6 +249,15 @@ The `mimir_telegram_latest_ledger` and `mimir_telegram_target_last_event_ledger`
 lines are omitted when no ledger has been observed yet (cold start or no
 events seen).
 
+`GET /metrics` also emits `mimir_telegram_rpc_request_latency_ms` (`_bucket`,
+`_sum`, `_count`): a Prometheus histogram of timed RPC awaits (`getEvents` pages
+and a `getHealth` probe when the scan performs one), in milliseconds. Bounds are
+fixed (`5`, `10`, `25`, `50`, `100`, `250`, `500`, `1_000`, `5_000`, `15_000`,
+plus `+Inf`) and the only series labels are `network`, the constant
+`provider="soroban-rpc"`, and a bounded `operation` (`health`, `events`,
+`other`). `STELLAR_RPC_URL` — including any query string or host — is never a
+label.
+
 ```bash
 curl -s http://127.0.0.1:8787/metrics
 
@@ -328,6 +337,7 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_rpc_request_latency_ms` | histogram | Fixed-bucket RPC latency in ms by bounded operation class and constant `provider="soroban-rpc"`; no URL or query-string labels |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment

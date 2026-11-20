@@ -92,6 +92,7 @@ The bot reads only public chain data. It does not hold signing keys or any crede
 - **No bot tokens in logs**: Bot tokens are redacted from all logs, error messages, and persisted files
 - **No payment amounts**: Notification messages are formatted with amounts displayed, but amounts are not stored separately in files
 - **No Telegram user IDs**: User IDs may appear transiently in log lines (which are redacted) but are not persisted to disk
+- **No RPC URL in metric labels**: Latency histograms use a fixed provider identity and bounded operation class; query strings and hosts are never exported
 
 ## How to delete all stored data
 

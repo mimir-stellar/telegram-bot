@@ -21,6 +21,10 @@ import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import {
+  RpcLatencyHistogram,
+  renderRpcLatencySnapshotLines,
+} from "./stellar/metrics.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -451,6 +455,16 @@ export function buildMetricsReport(
       );
     }
   }
+
+  lines.push(
+    ``,
+    ...renderRpcLatencySnapshotLines(
+      poller.rpcLatency ?? new RpcLatencyHistogram().snapshot(),
+      `mimir_telegram_rpc_request_latency_ms`,
+      `RPC latency in milliseconds across fixed buckets by operation`,
+      { network },
+    ),
+  );
 
   return lines.join("\\n") + "\\n";
 }
