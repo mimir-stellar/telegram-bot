@@ -69,6 +69,7 @@ Format:
 
 * `shortHash(text)`: A 32-bit non-cryptographic polynomial hash (`h * 31 + charCode`) formatted as an 8-character zero-padded hexadecimal string.
 * **Deduplication**: If an identical event failure is enqueued again while an entry with the same ID is already present in the queue, a duplicate entry is not added. Instead, the existing entry's `attempts` counter increments and `lastError` updates with the latest failure.
+* **Duplicate ID Validation on Load**: Every entry in `dead-letter.json` must have a unique `id`. If a hand-edited or corrupted file contains conflicting entries with the same `id`, validation rejects the file before applying `maxEntries` trimming and preserves the source file untouched on disk for operator inspection rather than silently overwriting it. The offline `dlq` CLI (`list`, `show`, `purge`) exits with status `1` and reports the conflicting IDs.
 
 ---
 

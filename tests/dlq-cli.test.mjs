@@ -381,3 +381,63 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.throws(() => parseDurationMs(""), /requires a duration/);
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
 });
+
+// ── Duplicate ID rejection ────────────────────────────────────────────────────
+
+test("list, show, and purge --yes reject duplicate entry IDs and preserve the source file", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    const duplicateId = `market:42:claim_created:${RAW_CHAT_ID}`;
+    const raw = JSON.stringify(
+      {
+        version: 1,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        entries: [
+          {
+            id: duplicateId,
+            enqueuedAt: "2026-01-01T00:00:00.000Z",
+            source: "market",
+            ledger: 42,
+            eventName: "claim_created",
+            text: "first",
+            attempts: 1,
+            lastError: "Telegram 429",
+          },
+          {
+            id: duplicateId,
+            enqueuedAt: "2026-01-01T00:05:00.000Z",
+            source: "market",
+            ledger: 42,
+            eventName: "claim_created",
+            text: "second",
+            attempts: 2,
+            lastError: "Telegram 500",
+          },
+        ],
+      },
+      null,
+      2,
+    );
+    await writeFile(filePath, raw, "utf8");
+
+    for (const argv of [
+      ["list", "--file", filePath, "--chat-id", RAW_CHAT_ID],
+      ["show", duplicateId, "--file", filePath, "--chat-id", RAW_CHAT_ID],
+      ["purge", "--yes", "--file", filePath, "--chat-id", RAW_CHAT_ID],
+    ]) {
+      const io = captureIo();
+      const { exitCode } = await runDlqCli({
+        argv,
+        stdout: io.out,
+        stderr: io.err,
+      });
+
+      assert.equal(exitCode, 1, `expected exitCode 1 for ${argv[0]}`);
+      assert.equal(io.stdout.length, 0);
+      const errText = io.stderr.join("\n");
+      assert.match(errText, /duplicate dead-letter entry id\(s\)/);
+      assert.equal(errText.includes(RAW_CHAT_ID), false, "raw chat id must not leak in error");
+      assert.equal(errText.includes(REDACTED_CHAT_ID), true, "redacted chat id should appear");
+      assert.equal(await readFile(filePath, "utf8"), raw, "source file must remain untouched");
+    }
+  });
+});
