@@ -11,12 +11,16 @@ import test from "node:test";
 
 import {
   createNotifier as createNotifierFromBot,
+  extractMessageId as extractMessageIdFromBot,
+  InvalidDeliveryResultError as InvalidDeliveryResultErrorFromBot,
   isMarkdownParseError as isMarkdownParseErrorFromBot,
   notifierSkips as notifierSkipsFromBot,
 } from "../dist/bot.js";
 
 import {
   createNotifier as createNotifierDirect,
+  extractMessageId as extractMessageIdDirect,
+  InvalidDeliveryResultError as InvalidDeliveryResultErrorDirect,
   isMarkdownParseError as isMarkdownParseErrorDirect,
   notifierSkips as notifierSkipsDirect,
 } from "../dist/notifications/notifier.js";
@@ -121,4 +125,35 @@ test("notifier module: valid text reaches sendMessage", async () => {
   assert.equal(sent.length, 1);
   assert.equal(sent[0][0], "-1001234567890");
   assert.equal(sent[0][1], "hello world");
+});
+
+test("requireMessageId rejects Telegram responses missing a valid message_id", async () => {
+  assert.strictEqual(InvalidDeliveryResultErrorFromBot, InvalidDeliveryResultErrorDirect);
+  assert.strictEqual(extractMessageIdFromBot, extractMessageIdDirect);
+  assert.equal(extractMessageIdDirect({ message_id: 42 }), 42);
+  assert.equal(extractMessageIdDirect({ message_id: 0 }), null);
+  assert.equal(extractMessageIdDirect({ message_id: "42" }), null);
+  assert.equal(extractMessageIdDirect({}), null);
+  assert.equal(extractMessageIdDirect(null), null);
+
+  for (const badResponse of [{}, undefined, null, { ok: true }, { message_id: 0 }, { message_id: "9" }]) {
+    const fakeBot = { api: { sendMessage: async () => badResponse } };
+    const notifier = createNotifierDirect(
+      fakeBot,
+      { chatId: "-1001234567890" },
+      { requireMessageId: true },
+    );
+    await assert.rejects(
+      () => notifier("hello world", "market", { plainText: "hello world" }),
+      (err) => err instanceof InvalidDeliveryResultErrorDirect,
+    );
+  }
+
+  const goodBot = { api: { sendMessage: async () => ({ message_id: 101 }) } };
+  const goodNotifier = createNotifierDirect(
+    goodBot,
+    { chatId: "-1001234567890" },
+    { requireMessageId: true },
+  );
+  await goodNotifier("hello world");
 });

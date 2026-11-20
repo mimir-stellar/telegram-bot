@@ -20,15 +20,18 @@ import path from "node:path";
 
 export const DEFAULT_SEND_JOURNAL_MAX_ENTRIES = 1_000;
 export const DEFAULT_SEND_JOURNAL_MAX_BYTES = 1_000_000;
+export const SEND_JOURNAL_DIAGNOSTIC_MAX_CHARS = 200;
 
 export interface JournalEntry {
-  kind: "intent" | "done";
+  kind: "intent" | "done" | "invalid_result";
   id: string;
   source: string;
   ledger: number;
   eventName: string;
   /** Bounded hash of the message body; the body itself is never persisted. */
   textHash?: string;
+  /** Bounded diagnostic retained when a delivery result is invalid (e.g. missing message_id). */
+  diagnostic?: string;
   at: number;
 }
 
@@ -54,10 +57,21 @@ export interface SendJournal {
     at: number;
   }): Promise<void>;
   recordDone(id: string): Promise<void>;
+  /**
+   * Record a bounded diagnostic when a send returned an invalid delivery result
+   * (such as missing `message_id`) without marking the intent as `done`.
+   */
+  recordInvalidResult(id: string, diagnostic: string): Promise<void>;
   /** Intents with no matching done: notifications that may have been sent. */
   loadPending(): Promise<JournalEntry[]>;
   compact(): Promise<void>;
   stats(): Promise<SendJournalStats>;
+}
+
+function boundDiagnostic(raw: string): string {
+  const singleLine = raw.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= SEND_JOURNAL_DIAGNOSTIC_MAX_CHARS) return singleLine;
+  return `${singleLine.slice(0, SEND_JOURNAL_DIAGNOSTIC_MAX_CHARS)}…`;
 }
 
 function line(entry: JournalEntry): string {
@@ -159,24 +173,50 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     }
   }
 
+  async function recordInvalidResult(id: string, diagnostic: string): Promise<void> {
+    await append({
+      kind: "invalid_result",
+      id,
+      source: "",
+      ledger: 0,
+      eventName: "",
+      diagnostic: boundDiagnostic(diagnostic),
+      at: now(),
+    });
+    const stats = await journalStats();
+    if (stats.entries > maxEntries || stats.bytes > maxBytes) {
+      await compact();
+    }
+  }
+
+  function resolveUnresolvedIntents(entries: JournalEntry[]): JournalEntry[] {
+    const done = new Set<string>();
+    const diagnostics = new Map<string, string>();
+    for (const entry of entries) {
+      if (entry.kind === "done") {
+        done.add(entry.id);
+      } else if (entry.kind === "invalid_result" && typeof entry.diagnostic === "string") {
+        diagnostics.set(entry.id, boundDiagnostic(entry.diagnostic));
+      }
+    }
+    return entries
+      .filter((e) => e.kind === "intent" && !done.has(e.id))
+      .map((e) => {
+        const diag = diagnostics.get(e.id) ?? e.diagnostic;
+        return diag !== undefined ? { ...e, diagnostic: boundDiagnostic(diag) } : e;
+      });
+  }
+
   async function loadPending(): Promise<JournalEntry[]> {
     const entries = await readLines();
-    const done = new Set<string>();
-    for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
-    }
-    return entries.filter((e) => e.kind === "intent" && !done.has(e.id));
+    return resolveUnresolvedIntents(entries);
   }
 
   async function compact(): Promise<void> {
     const entries = await readLines();
-    const done = new Set<string>();
-    for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
-    }
     // A done line settles its intent: both lines can be dropped. Keep only
-    // unresolved intents.
-    const unresolved = entries.filter((e) => e.kind === "intent" && !done.has(e.id));
+    // unresolved intents (with any attached bounded diagnostic).
+    const unresolved = resolveUnresolvedIntents(entries);
     await persist(unresolved);
   }
 
@@ -199,5 +239,5 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     return journalStats();
   }
 
-  return { recordIntent, recordDone, loadPending, compact, stats };
+  return { recordIntent, recordDone, recordInvalidResult, loadPending, compact, stats };
 }

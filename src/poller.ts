@@ -78,6 +78,7 @@ import {
   createSendJournal,
   type SendJournal,
 } from "./notifications/send-journal.js";
+import { InvalidDeliveryResultError } from "./notifications/notifier.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -2217,6 +2218,18 @@ export function createPoller(deps: PollerDeps) {
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
+        if (sendJournal && err instanceof InvalidDeliveryResultError) {
+          try {
+            await sendJournal.recordInvalidResult(
+              event.eventId,
+              safeErrorMessage(err, [config.botToken]),
+            );
+          } catch (journalErr) {
+            console.error(
+              `[poller] send journal diagnostic failed for ${event.eventId}: ${safeErrorMessage(journalErr)}`,
+            );
+          }
+        }
         recordFailedIncrement();
         metrics?.notificationsFailed.inc();
         failed += 1;

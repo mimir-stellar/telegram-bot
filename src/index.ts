@@ -272,7 +272,7 @@ async function main(): Promise<void> {
     resume: () => poller.resume(),
     logs: logCapture,
   });
-  notify = createNotifier(bot, config);
+  notify = createNotifier(bot, config, { requireMessageId: true });
 
   // Webhook mode only accepts updates carrying this per-process secret, so a
   // reachable health port cannot be used to inject fake Telegram updates.
