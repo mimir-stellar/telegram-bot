@@ -32,6 +32,7 @@ const MENU = [
   "start",
   "help",
   "about",
+  "menu",
   "status",
   "audit",
   "contracts",

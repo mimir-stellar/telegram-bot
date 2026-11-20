@@ -26,7 +26,7 @@ export const DEFAULT_DOCS_PATH = path.join(repoRoot, "docs", "commands.md");
  * Known allowlist-gated commands in src/bot.ts.
  * Fallback in case COMMANDS items do not explicitly declare allowlistGated.
  */
-const KNOWN_ALLOWLIST_GATED = new Set(["status", "contracts", "health", "preview"]);
+const KNOWN_ALLOWLIST_GATED = new Set(["menu", "status", "contracts", "health", "preview"]);
 
 /**
  * Returns whether a command is gated by ALLOWED_CHAT_IDS.
