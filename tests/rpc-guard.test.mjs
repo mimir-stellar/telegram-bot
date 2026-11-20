@@ -3,9 +3,12 @@ import test from "node:test";
 
 import {
   assertEventsResponse,
+  compareProviderEvents,
   DEFAULT_MAX_EVENTS_PER_RESPONSE,
+  ProviderDisagreementTracker,
   RpcResponseShapeError,
 } from "../dist/stellar/rpc-guard.js";
+import { LedgerWindowError } from "../dist/stellar/client.js";
 import { defaultMockScenario, startMockRpc } from "../dist/stellar/mock-rpc.js";
 import { paginatedGetEvents } from "../dist/stellar/events.js";
 
@@ -350,4 +353,152 @@ test("paginatedGetEvents rejects oversized RPC response at the boundary", async 
       return true;
     },
   );
+});
+
+// ── Multi-provider disagreement tracking ───────────────────────────────────────
+
+test("compareProviderEvents agrees when canonical identities match regardless of order", () => {
+  const result = compareProviderEvents(
+    { startLedger: 100, endLedger: 110 },
+    {
+      provider: "primary",
+      events: [
+        { id: "100-0", ledger: 100 },
+        { eventId: "101-0", ledger: 101 },
+      ],
+    },
+    {
+      provider: "secondary",
+      events: [
+        { id: "101-0", ledger: 101 },
+        { id: "100-0", ledger: 100 },
+      ],
+    },
+  );
+
+  assert.equal(result.agrees, true);
+  assert.equal(result.disagrees, false);
+  assert.equal(result.sharedCount, 2);
+  assert.deepEqual(result.onlyInA, []);
+  assert.deepEqual(result.onlyInB, []);
+  assert.equal(result.unidentifiableA, 0);
+  assert.equal(result.unidentifiableB, 0);
+  assert.equal("winner" in result, false);
+});
+
+test("compareProviderEvents exposes disagreement symmetrically without picking a winner", () => {
+  const result = compareProviderEvents(
+    { startLedger: 200, endLedger: 220 },
+    {
+      provider: "rpc-a",
+      events: [
+        { id: "200-0", ledger: 200 },
+        { id: "205-0", ledger: 205 },
+      ],
+    },
+    {
+      provider: "rpc-b",
+      events: [
+        { id: "200-0", ledger: 200 },
+        { id: "210-0", ledger: 210 },
+      ],
+    },
+  );
+
+  assert.equal(result.agrees, false);
+  assert.equal(result.disagrees, true);
+  assert.equal(result.providerA, "rpc-a");
+  assert.equal(result.providerB, "rpc-b");
+  assert.equal(result.sharedCount, 1);
+  assert.deepEqual(result.onlyInA, ["205-0"]);
+  assert.deepEqual(result.onlyInB, ["210-0"]);
+  assert.equal("winner" in result, false);
+});
+
+test("compareProviderEvents treats unidentifiable events as disagreement", () => {
+  const result = compareProviderEvents(
+    { startLedger: 300, endLedger: 310 },
+    { provider: "a", events: [{ id: "300-0", ledger: 300 }, { ledger: 301 }] },
+    { provider: "b", events: [{ id: "300-0", ledger: 300 }] },
+  );
+
+  assert.equal(result.agrees, false);
+  assert.equal(result.disagrees, true);
+  assert.equal(result.sharedCount, 1);
+  assert.equal(result.unidentifiableA, 1);
+  assert.equal(result.unidentifiableB, 0);
+});
+
+test("compareProviderEvents rejects malformed or inverted scan windows and non-array events", () => {
+  assert.throws(
+    () =>
+      compareProviderEvents(
+        { startLedger: 500, endLedger: 400 },
+        { events: [] },
+        { events: [] },
+      ),
+    (err) => err instanceof LedgerWindowError && err.problem === "malformed-window",
+  );
+
+  assert.throws(
+    () =>
+      compareProviderEvents(
+        { startLedger: -1, endLedger: 10 },
+        { events: [] },
+        { events: [] },
+      ),
+    (err) => err instanceof LedgerWindowError && err.problem === "malformed-window",
+  );
+
+  assert.throws(
+    () =>
+      compareProviderEvents(
+        { startLedger: 10, endLedger: 20 },
+        { provider: "bad", events: "not-an-array" },
+        { events: [] },
+      ),
+    (err) => err instanceof RpcResponseShapeError && err.problem === "events-not-an-array",
+  );
+});
+
+test("ProviderDisagreementTracker tracks summary metrics and bounds recent history", () => {
+  const tracker = new ProviderDisagreementTracker(2);
+  assert.equal(tracker.hasDisagreement(), false);
+
+  tracker.compareAndTrack(
+    { startLedger: 100, endLedger: 105 },
+    { events: [{ id: "100-0" }] },
+    { events: [{ id: "100-0" }] },
+  );
+  tracker.compareAndTrack(
+    { startLedger: 106, endLedger: 110 },
+    { events: [{ id: "106-0" }] },
+    { events: [] },
+  );
+  tracker.compareAndTrack(
+    { startLedger: 111, endLedger: 115 },
+    { events: [] },
+    { events: [{ id: "111-0" }] },
+  );
+  tracker.compareAndTrack(
+    { startLedger: 116, endLedger: 120 },
+    { events: [{ id: "116-0" }] },
+    { events: [{ id: "116-1" }] },
+  );
+
+  assert.equal(tracker.hasDisagreement(), true);
+  const summary = tracker.summary();
+  assert.equal(summary.totalWindows, 4);
+  assert.equal(summary.agreedWindows, 1);
+  assert.equal(summary.disagreedWindows, 3);
+  assert.equal(summary.disagreementRate, 0.75);
+  assert.equal(summary.recentDisagreements.length, 2);
+  assert.deepEqual(
+    summary.recentDisagreements.map((d) => d.window.startLedger),
+    [111, 116],
+  );
+
+  tracker.clear();
+  assert.equal(tracker.hasDisagreement(), false);
+  assert.equal(tracker.summary().totalWindows, 0);
 });

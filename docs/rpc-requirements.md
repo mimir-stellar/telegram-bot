@@ -139,3 +139,13 @@ STELLAR_NETWORK=testnet
 STELLAR_RPC_URL=http://localhost:8000/rpc
 STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 ```
+
+---
+
+## 5. Multi-Provider Disagreement Tracking
+
+When comparing two RPC providers over the same closed ledger window (`ScanLedgerWindow` validated by `validateScanWindow` in `src/stellar/client.ts`), `compareProviderEvents` and `ProviderDisagreementTracker` in `src/stellar/rpc-guard.ts` compare canonical event identities (`eventKey` from `src/dedup.ts`):
+
+- **Symmetric comparison**: Reports `sharedCount`, `onlyInA`, `onlyInB`, `unidentifiableA`, and `unidentifiableB` without selecting an unverified winner.
+- **Unidentifiable events**: Events missing a derivable canonical identity increment `unidentifiableA` / `unidentifiableB` and force `disagrees: true` so unverifiable responses are never treated as agreement.
+- **Bounded tracking**: `ProviderDisagreementTracker` records per-window agreement/disagreement counts and retains up to `maxHistory` (default `100`) recent disagreements.
