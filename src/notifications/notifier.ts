@@ -5,10 +5,14 @@
  * command-handling changes no longer touch the same file.
  *
  * Public API (all re-exported from `src/bot.ts` for backwards compatibility):
- *   - {@link SendExtra}         — extra options a caller attaches to a send
- *   - {@link isMarkdownParseError} — classifier for Telegram entity-parse failures
- *   - {@link notifierSkips}    — counters for suppressed sends
- *   - {@link createNotifier}   — factory that returns the poller's send function
+ *   - {@link SendExtra}                   — extra options a caller attaches to a send
+ *   - {@link SendLimiter}                 — bounded global concurrency limiter
+ *   - {@link SendLimiterClosedError}      — error thrown when limiter is shut down
+ *   - {@link DEFAULT_MAX_CONCURRENT_SENDS} — default global send concurrency cap
+ *   - {@link createSendLimiter}           — factory for a shared send limiter
+ *   - {@link isMarkdownParseError}        — classifier for Telegram entity-parse failures
+ *   - {@link notifierSkips}               — counters for suppressed sends
+ *   - {@link createNotifier}              — factory that returns the poller's send function
  */
 
 import type { Bot } from "grammy";
@@ -96,6 +100,161 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
  */
 export const notifierSkips = { emptyText: 0 };
 
+// ── SendLimiter ──────────────────────────────────────────────────────────────
+
+/** Default maximum number of concurrent outbound Telegram `sendMessage` calls. */
+export const DEFAULT_MAX_CONCURRENT_SENDS = 4;
+
+export type SendLimiterShutdownMode = "drain" | "cancel";
+
+/**
+ * Thrown when a send is rejected because the {@link SendLimiter} was shut down
+ * (either newly submitted after shutdown or cancelled while queued).
+ */
+export class SendLimiterClosedError extends Error {
+  readonly mode: SendLimiterShutdownMode;
+
+  constructor(mode: SendLimiterShutdownMode = "drain") {
+    super(
+      mode === "cancel"
+        ? "Telegram send limiter shut down (pending sends cancelled)"
+        : "Telegram send limiter is shutting down",
+    );
+    this.name = "SendLimiterClosedError";
+    this.mode = mode;
+  }
+}
+
+export interface SendLimiterOptions {
+  /** Maximum number of concurrent `sendMessage` calls across all routes. */
+  maxConcurrent?: number | undefined;
+}
+
+export interface SendLimiterStats {
+  active: number;
+  queued: number;
+  maxConcurrent: number;
+  closed: boolean;
+}
+
+export interface SendLimiter {
+  run<T>(fn: () => Promise<T>): Promise<T>;
+  shutdown(mode?: SendLimiterShutdownMode): Promise<void>;
+  stats(): SendLimiterStats;
+}
+
+/**
+ * Bounded global concurrency limiter shared across all Telegram destination routes.
+ *
+ * `shutdown("drain")` stops accepting new work and waits for queued + in-flight
+ * sends to finish. `shutdown("cancel")` stops accepting new work, immediately
+ * rejects all queued sends with {@link SendLimiterClosedError}, and waits for
+ * in-flight sends to settle.
+ */
+export function createSendLimiter(options?: SendLimiterOptions): SendLimiter {
+  const maxConcurrent = options?.maxConcurrent ?? DEFAULT_MAX_CONCURRENT_SENDS;
+  if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) {
+    throw new RangeError(
+      `maxConcurrent must be a positive integer, got ${String(maxConcurrent)}`,
+    );
+  }
+
+  let active = 0;
+  let closed = false;
+  const queue: Array<{
+    fn: () => Promise<unknown>;
+    resolve: (value: unknown) => void;
+    reject: (reason?: unknown) => void;
+  }> = [];
+  const idleResolvers: Array<() => void> = [];
+
+  function notifyIdleIfDone(): void {
+    if (active === 0 && queue.length === 0 && idleResolvers.length > 0) {
+      const resolvers = idleResolvers.splice(0, idleResolvers.length);
+      for (const resolve of resolvers) resolve();
+    }
+  }
+
+  function startTask(
+    fn: () => Promise<unknown>,
+    resolve: (value: unknown) => void,
+    reject: (reason?: unknown) => void,
+  ): void {
+    active += 1;
+    Promise.resolve()
+      .then(fn)
+      .then(resolve, reject)
+      .finally(() => {
+        active -= 1;
+        const next = queue.shift();
+        if (next) {
+          startTask(next.fn, next.resolve, next.reject);
+        } else {
+          notifyIdleIfDone();
+        }
+      });
+  }
+
+  function run<T>(fn: () => Promise<T>): Promise<T> {
+    if (closed) {
+      return Promise.reject(new SendLimiterClosedError("drain"));
+    }
+    return new Promise<T>((resolve, reject) => {
+      if (active < maxConcurrent) {
+        startTask(
+          fn as () => Promise<unknown>,
+          resolve as (value: unknown) => void,
+          reject,
+        );
+      } else {
+        queue.push({
+          fn: fn as () => Promise<unknown>,
+          resolve: resolve as (value: unknown) => void,
+          reject,
+        });
+      }
+    });
+  }
+
+  function shutdown(mode: SendLimiterShutdownMode = "drain"): Promise<void> {
+    closed = true;
+    if (mode === "cancel" && queue.length > 0) {
+      const cancelled = queue.splice(0, queue.length);
+      for (const item of cancelled) {
+        item.reject(new SendLimiterClosedError("cancel"));
+      }
+    }
+    if (active === 0 && queue.length === 0) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      idleResolvers.push(resolve);
+    });
+  }
+
+  function stats(): SendLimiterStats {
+    return { active, queued: queue.length, maxConcurrent, closed };
+  }
+
+  return { run, shutdown, stats };
+}
+
+export interface NotifierOptions {
+  /** Shared limiter across destination routes (defaults to a fresh limiter per notifier). */
+  limiter?: SendLimiter | undefined;
+  /** Maximum concurrent sends when creating a default limiter. */
+  maxConcurrentSends?: number | undefined;
+}
+
+export type Notifier = ((
+  text: string | null,
+  source?: ContractSource,
+  extra?: SendExtra,
+) => Promise<void>) & {
+  limiter: SendLimiter;
+  shutdown: (mode?: SendLimiterShutdownMode) => Promise<void>;
+};
+
 // ── createNotifier ───────────────────────────────────────────────────────────
 
 /**
@@ -120,8 +279,12 @@ export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
     Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
-) {
-  return async (
+  options?: NotifierOptions,
+): Notifier {
+  const limiter =
+    options?.limiter ?? createSendLimiter({ maxConcurrent: options?.maxConcurrentSends });
+
+  const notify = async (
     text: string | null,
     source?: ContractSource,
     extra?: SendExtra,
@@ -168,27 +331,31 @@ export function createNotifier(
     const parts = splitTelegramMessage(text);
     if (parts.length > 1) {
       for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
-          ...notificationOptions,
-          ...(index === parts.length - 1 && extra?.reply_markup
-            ? { reply_markup: extra.reply_markup }
-            : {}),
-          ...(index === 0 && extra?.replyToMessageId !== undefined
-            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-            : {}),
-        });
+        await limiter.run(() =>
+          bot.api.sendMessage(chatId, part, {
+            ...notificationOptions,
+            ...(index === parts.length - 1 && extra?.reply_markup
+              ? { reply_markup: extra.reply_markup }
+              : {}),
+            ...(index === 0 && extra?.replyToMessageId !== undefined
+              ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+              : {}),
+          }),
+        );
       }
       return;
     }
 
     try {
-      await bot.api.sendMessage(chatId, text, {
-        ...notificationOptions,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(extra?.replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-          : {}),
-      });
+      await limiter.run(() =>
+        bot.api.sendMessage(chatId, text, {
+          ...notificationOptions,
+          ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+          ...(extra?.replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+            : {}),
+        }),
+      );
       return;
     } catch (err) {
       // A blank fallback is no fallback: sending whitespace-only text would
@@ -208,14 +375,21 @@ export function createNotifier(
           )}`,
       );
       // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
-        link_preview_options: notificationOptions.link_preview_options,
-        ...silentOption,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(extra?.replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-          : {}),
-      });
+      await limiter.run(() =>
+        bot.api.sendMessage(chatId, fallback, {
+          link_preview_options: notificationOptions.link_preview_options,
+          ...silentOption,
+          ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+          ...(extra?.replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+            : {}),
+        }),
+      );
     }
   };
+
+  return Object.assign(notify, {
+    limiter,
+    shutdown: (mode?: SendLimiterShutdownMode) => limiter.shutdown(mode),
+  });
 }

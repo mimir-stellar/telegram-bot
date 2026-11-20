@@ -368,9 +368,18 @@ export function createBot(deps: BotDeps): Bot {
 // existing imports from "bot.js" keep resolving without modification.
 export {
   createNotifier,
+  createSendLimiter,
+  DEFAULT_MAX_CONCURRENT_SENDS,
   isMarkdownParseError,
   notifierSkips,
+  SendLimiterClosedError,
+  type Notifier,
+  type NotifierOptions,
   type SendExtra,
+  type SendLimiter,
+  type SendLimiterOptions,
+  type SendLimiterShutdownMode,
+  type SendLimiterStats,
 } from "./notifications/notifier.js";
 
 /** Registers the command list so Telegram's UI offers autocompletion. */
