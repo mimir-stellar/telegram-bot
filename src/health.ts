@@ -469,6 +469,26 @@ function sendJson(
   res.end(payload);
 }
 
+const HEALTH_GET_ROUTES = new Set([
+  "/",
+  "/health",
+  "/healthz",
+  "/health/live",
+  "/livez",
+  "/metrics",
+]);
+
+function sendMethodNotAllowed(res: http.ServerResponse, allow: string): void {
+  const payload = `${JSON.stringify({ ok: false, error: "method_not_allowed" })}\n`;
+  res.writeHead(405, {
+    "allow": allow,
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
+
 function sendUnauthorized(res: http.ServerResponse): void {
   res.writeHead(401, {
     "content-type": "application/json; charset=utf-8",
@@ -501,6 +521,11 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     // Check authentication for all routes when token is configured
     if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
       sendUnauthorized(res);
+      return;
+    }
+
+    if (HEALTH_GET_ROUTES.has(url.pathname) && method !== "GET") {
+      sendMethodNotAllowed(res, "GET");
       return;
     }
 

@@ -284,6 +284,22 @@ curl -s -o /dev/null -w "%{http_code}" \
 
 ---
 
+### Unsupported HTTP methods on health routes
+
+Any non-`GET` request (such as `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, or
+`HEAD`) to a health-server `GET` route (`/`, `/health`, `/healthz`,
+`/health/live`, `/livez`, or `/metrics`) is rejected without reading or mutating
+poller state. When `HEALTH_AUTH_TOKEN` is configured, authentication is still
+checked first and unauthenticated requests receive `401`.
+
+**Response — 405**, `Allow: GET`, `Cache-Control: no-store`
+
+```json
+{ "ok": false, "error": "method_not_allowed" }
+```
+
+---
+
 ### `GET <any other path>`
 
 **Response — 404**
@@ -374,6 +390,7 @@ methods (`Allow: GET` header set).
 | Health | GET | `/livez` | 200 | Alias for `/health/live` |
 | Health | GET | `/metrics` | 200 | Prometheus text (poller-level) |
 | Health | POST | `/telegram-webhook` | 200, 401, 404 | Webhook updates (webhook mode only) |
+| Health | non-GET | `/`, `/health`, `/healthz`, `/health/live`, `/livez`, `/metrics` | 405 | Method not allowed (`Allow: GET`) |
 | Health | GET | `<other>` | 404 | — |
 | Metrics | GET | `/metrics` | 200 | Prometheus text (registry-level) |
 | Metrics | GET | `/health` | 200 | Plain-text liveness |
