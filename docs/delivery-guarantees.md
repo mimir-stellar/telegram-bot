@@ -229,3 +229,66 @@ A single poll cycle executes four distinct phases ([`src/poller.ts`](../src/poll
 - [`tests/cursor-backup.test.mjs`](../tests/cursor-backup.test.mjs) — Atomic `.tmp` write-then-rename and `.bak` backup preservation
 - [`tests/shutdown.test.mjs`](../tests/shutdown.test.mjs) — Graceful shutdown mid-RPC read, mid-`notify()` batch abort, and shutdown timeout dirty-cursor flush
 - [`tests/instance-lock.test.mjs`](../tests/instance-lock.test.mjs) — Single-instance lock enforcement and dead-PID stale lock recovery
+
+---
+
+## Telegram Send Timeout: Unknown Outcome vs Confirmed Rejection
+
+When the HTTP call to Telegram's `sendMessage` endpoint times out, the notification may
+already have been received by Telegram — the client simply did not get the response back.
+This is an **unknown outcome**, fundamentally different from a confirmed rejection (a 4xx
+error means Telegram definitively refused the message).
+
+### Classification
+
+`isTimeoutError(err)` in `src/notifications/format.ts` (re-exported from
+`src/notifications/notifier.ts`) returns `true` for `AbortError`, `TimeoutError`,
+`ETIMEDOUT`/`ECONNRESET`/`UND_ERR_*` codes, and messages matching `/timed?\s?out/i`. All
+other errors — rate limits (429), auth failures (401), entity-parse errors (400), and
+unknown-chat errors — are **confirmed rejections**: Telegram returned a response.
+
+### Recovery signal in the send journal
+
+The send journal records three line kinds:
+
+| Kind | When written | Meaning |
+|---|---|---|
+| `intent` | Before `sendMessage` is called | Notification is about to be sent |
+| `done` | After `sendMessage` succeeds | Delivery confirmed |
+| `timeout` | When `sendMessage` times out | Outcome unknown — Telegram may have accepted it |
+
+A `timeout` line for an `id` that has no matching `done` is a **confirmed-unknown outcome**.
+`loadUnknownOutcomes()` returns exactly these pending intents — a subset of `loadPending()`
+that recovery tooling can treat differently from plain crash-recovery intents.
+
+### notifier.ts: onTimeout callback
+
+`SendExtra.onTimeout?: (err: unknown) => void` is called by `createNotifier` when
+`isTimeoutError(err)` is true before the error propagates. Callers that maintain a send
+journal can use this to call `journal.recordTimeout(id)` and flag the pending intent as a
+confirmed-unknown outcome:
+
+```typescript
+await notifier(text, source, {
+  onTimeout: (err) => {
+    void journal.recordTimeout(eventId, err instanceof Error ? err.message : String(err));
+  },
+});
+```
+
+The callback must not re-throw. It never claims exactly-once delivery and never suppresses
+the original error (the send still fails and the poller still parks the notification in the
+DLQ for later replay).
+
+### compaction behaviour
+
+`compact()` preserves `timeout` lines for unresolved intents and drops `timeout` lines for
+settled intents (those with a matching `done`), so the unknown-outcome signal survives
+compaction cycles.
+
+### Tests
+
+[`tests/send-timeout-outcome.test.mjs`](../tests/send-timeout-outcome.test.mjs) covers
+`recordTimeout`, `loadUnknownOutcomes`, compaction of timeout lines, the `onTimeout`
+callback in the notifier, non-timeout errors, callback-throws-but-error-propagates, and
+the `isTimeoutError` re-export.
