@@ -1463,6 +1463,7 @@ export function createPoller(deps: PollerDeps) {
     sendJournal = createSendJournal({
       filePath: config.sendJournalFile,
       now,
+      secrets: config.botToken ? [config.botToken] : [],
     });
   }
 
@@ -2217,6 +2218,22 @@ export function createPoller(deps: PollerDeps) {
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
+        if (sendJournal) {
+          try {
+            await sendJournal.recordError({
+              id: event.eventId,
+              source: event.source,
+              ledger: event.ledger,
+              eventName: event.payload.name,
+              error: err,
+              secrets: config.botToken ? [config.botToken] : [],
+            });
+          } catch (journalErr) {
+            console.error(
+              `[poller] send journal error record failed for ${event.eventId}: ${safeErrorMessage(journalErr)}`,
+            );
+          }
+        }
         recordFailedIncrement();
         metrics?.notificationsFailed.inc();
         failed += 1;
