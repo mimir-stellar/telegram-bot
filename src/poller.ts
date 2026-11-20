@@ -95,6 +95,7 @@ import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
+import { parseRetryAfterHeaderMs } from "./stellar/rpc-guard.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
 import {
   eventCursorLedger,
@@ -623,34 +624,30 @@ const DEFAULT_MAX_BACKOFF_MS = 10_000;
 /** Maximum time to back off based on Retry-After (1 hour). */
 const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 
-export function extractRetryAfterMs(err: unknown): number | null {
+export function extractRetryAfterMs(
+  err: unknown,
+  maxBackoffMs: number = MAX_RETRY_AFTER_MS,
+): number | null {
   if (!err || typeof err !== "object") return null;
   const e = err as any;
 
-  let seconds: number | null = null;
+  let rawRetryAfter: unknown = null;
 
   if (typeof e.parameters?.retry_after === "number") {
-    seconds = e.parameters.retry_after;
+    rawRetryAfter = e.parameters.retry_after;
   } else {
     const headers = e.response?.headers || e.headers;
     if (headers) {
-      let val: any;
       if (typeof headers.get === "function") {
-        val = headers.get("retry-after") || headers.get("Retry-After");
+        rawRetryAfter = headers.get("retry-after") || headers.get("Retry-After");
       } else {
-        val = headers["retry-after"] || headers["Retry-After"];
-      }
-      if (typeof val === "string" || typeof val === "number") {
-        const parsed = parseInt(String(val), 10);
-        if (!Number.isNaN(parsed)) seconds = parsed;
+        rawRetryAfter = headers["retry-after"] || headers["Retry-After"];
       }
     }
   }
 
-  if (seconds !== null && seconds > 0) {
-    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
-  }
-  return null;
+  const clamped = parseRetryAfterHeaderMs(rawRetryAfter, maxBackoffMs);
+  return clamped !== null && clamped > 0 ? clamped : null;
 }
 /**
  * Consecutive automatic floor rewinds allowed for one target before the poller
@@ -2779,7 +2776,7 @@ export function createPoller(deps: PollerDeps) {
             ? eventCursorLedger(current.cursor)
             : null;
 
-          const retryAfterMs = extractRetryAfterMs(err);
+          const retryAfterMs = extractRetryAfterMs(err, targetMaxBackoff);
           if (retryAfterMs !== null) {
             console.warn(`[poller] RPC requested backoff for ${retryAfterMs}ms`);
             explicitBackoff = retryAfterMs;

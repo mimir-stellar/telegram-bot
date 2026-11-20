@@ -139,3 +139,12 @@ STELLAR_NETWORK=testnet
 STELLAR_RPC_URL=http://localhost:8000/rpc
 STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 ```
+
+---
+
+## 5. Untrusted `Retry-After` Delay Clamping
+
+Untrusted `Retry-After` headers from RPC responses are validated and clamped at the ingestion boundary by `parseRetryAfterHeaderMs` and `clampRetryDelayMs` (`src/stellar/rpc-guard.ts`), with `resolveMaxBackoffMs` (`src/stellar/client.ts`) keeping the configured maximum backoff (`DEFAULT_RPC_MAX_BACKOFF_MS = 60_000` ms by default) authoritative:
+
+- **Rejected values**: Negative delays, non-finite numbers (`NaN`, `Infinity`, `-Infinity`), non-numeric strings (including trailing garbage like `"10abc"`), and values that overflow to `Infinity` when converted to milliseconds return `null` so the poller falls back to its own bounded backoff.
+- **Authoritative cap**: Finite oversized delays are clamped to the configured `maxBackoffMs` (e.g. `targetMaxBackoff` in `src/poller.ts`).
