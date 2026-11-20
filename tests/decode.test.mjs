@@ -22,6 +22,7 @@ import test from "node:test";
 import { nativeToScVal, Address, Keypair } from "@stellar/stellar-sdk";
 import {
   decodeEvent,
+  explainDecodeEvent,
   formatUsdc,
   shortAddress,
   winnerSideLabel,
@@ -693,4 +694,54 @@ test("decodeEvent: claim_cancelled has no value fields and still decodes", () =>
   const result = decodeEvent("market", raw);
   assert.equal(result.payload.name, "claim_cancelled");
   assert.equal(result.payload.claimId, 9);
+});
+
+// ── explainDecodeEvent ───────────────────────────────────────────────────────
+
+test("explainDecodeEvent: reports selectedSchema, fieldChecks, and null rejectionReason for valid event", () => {
+  const raw = {
+    id: "60-0",
+    contractId: "C1",
+    ledger: 60,
+    txHash: "aa".repeat(32),
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_cancelled"), scU64(42)],
+    value: nativeToScVal({}),
+  };
+  const explanation = explainDecodeEvent("market", raw);
+  assert.equal(explanation.accepted, true);
+  assert.equal(explanation.selectedSchema, "market:v1:claim_cancelled");
+  assert.equal(explanation.eventName, "claim_cancelled");
+  assert.equal(explanation.rejectionReason, null);
+  assert.ok(explanation.fieldChecks.some((c) => c.field === "topic[0]" && c.passed));
+  assert.ok(explanation.fieldChecks.some((c) => c.field === "payload.claimId" && c.passed));
+});
+
+test("explainDecodeEvent: reports rejectionReason and redacts/bounds raw values on failure", () => {
+  const fakeSeed = "S" + "A".repeat(55);
+  const longText = "Z".repeat(400);
+  const raw = {
+    id: "61-0",
+    contractId: "C1",
+    ledger: 61,
+    txHash: "bb".repeat(32),
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("unknown_event")],
+    value: nativeToScVal({ secretNote: `${fakeSeed} ${longText}` }),
+  };
+  const explanation = explainDecodeEvent("market", raw);
+  assert.equal(explanation.accepted, false);
+  assert.equal(explanation.selectedSchema, "market:v1:unknown_event");
+  assert.equal(explanation.rejectionReason, "no decoder");
+
+  const secretCheck = explanation.fieldChecks.find((c) => c.field === "value.secretNote");
+  assert.ok(secretCheck);
+  assert.equal(secretCheck.observedPreview.includes(fakeSeed), false);
+  assert.equal(secretCheck.observedPreview.includes(longText), false);
+  assert.ok(secretCheck.observedPreview.length <= 80);
+
+  // Empty/malformed topic array never throws and reports rejection reason
+  const emptyTopic = explainDecodeEvent("market", { id: "62-0", ledger: 62, topic: [] });
+  assert.equal(emptyTopic.accepted, false);
+  assert.equal(emptyTopic.rejectionReason, "empty topic array");
 });

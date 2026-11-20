@@ -16,6 +16,7 @@
  */
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
+import { redactText } from "../redact.js";
 
 // ── Bounded Limits ───────────────────────────────────────────────────────────
 
@@ -653,5 +654,80 @@ export function decodeGenericEvent(
       value,
       summary,
     },
+  };
+}
+
+export interface GenericDecodeExplainCheck {
+  field: string;
+  passed: boolean;
+  observedPreview: string;
+  reason?: string;
+}
+
+export interface GenericDecodeExplainResult {
+  selectedSchema: "generic:v1";
+  eventName: string;
+  accepted: boolean;
+  fieldChecks: GenericDecodeExplainCheck[];
+  rejectionReason: string | null;
+  decoded: GenericDecodedEvent;
+}
+
+function redactAndBoundGeneric(text: string, maxLen: number = 120): string {
+  return redactText(sanitizeText(text), { maxLen: Math.max(1, maxLen) });
+}
+
+/**
+ * Explain how {@link decodeGenericEvent} evaluates a single captured event.
+ * Redacts and bounds all raw values in diagnostics. Never throws.
+ */
+export function explainGenericEvent(
+  rawEvent: unknown,
+  source: string = "generic",
+  options?: GenericRenderOptions,
+): GenericDecodeExplainResult {
+  const decoded = decodeGenericEvent(rawEvent, source, options);
+  const fieldChecks: GenericDecodeExplainCheck[] = [];
+
+  const isObj = rawEvent !== null && typeof rawEvent === "object" && !Array.isArray(rawEvent);
+  fieldChecks.push({
+    field: "event",
+    passed: isObj,
+    observedPreview: isObj ? "object" : redactAndBoundGeneric(String(rawEvent)),
+    ...(!isObj ? { reason: "raw event must be a non-null object" } : {}),
+  });
+
+  const hasTopics = decoded.topics.length > 0;
+  fieldChecks.push({
+    field: "topics",
+    passed: hasTopics,
+    observedPreview: redactAndBoundGeneric(decoded.topicSummary),
+    ...(!hasTopics ? { reason: "missing or empty topic array" } : {}),
+  });
+
+  const hasEventName = decoded.eventName !== "unknown" && decoded.eventName !== "";
+  fieldChecks.push({
+    field: "topic[0]",
+    passed: hasEventName,
+    observedPreview: redactAndBoundGeneric(decoded.eventName),
+    ...(!hasEventName ? { reason: "topic[0] did not yield an event name" } : {}),
+  });
+
+  const valueMalformed = decoded.valueSummary.startsWith("malformed:");
+  fieldChecks.push({
+    field: "value",
+    passed: !valueMalformed,
+    observedPreview: redactAndBoundGeneric(decoded.valueSummary),
+    ...(valueMalformed ? { reason: redactAndBoundGeneric(decoded.valueSummary) } : {}),
+  });
+
+  const failedCheck = fieldChecks.find((c) => !c.passed);
+  return {
+    selectedSchema: "generic:v1",
+    eventName: decoded.eventName,
+    accepted: !failedCheck,
+    fieldChecks,
+    rejectionReason: failedCheck ? (failedCheck.reason ?? "invalid generic event") : null,
+    decoded,
   };
 }
