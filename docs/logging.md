@@ -122,9 +122,9 @@ To protect log aggregators and prevent denial-of-service via massive RPC payload
 
 ### Redaction Rules
 Every log record is redacted before it leaves the process:
-1. **Registered Secrets**: Explicit secrets such as `config.botToken` and `config.chatId` are replaced with `[REDACTED]`.
-2. **Telegram Token Pattern**: Any substring matching Telegram bot token shape (`\b\d{5,}:[A-Za-z0-9_-]{20,}/g`) is automatically replaced with `[REDACTED]`, even if not explicitly registered in secrets configuration.
-3. **URL Redaction**: Internal helpers (`redactUrl`) mask HTTP basic auth or query credentials in URLs before logging.
+1. **Registered Secrets**: Explicit secrets such as `config.botToken` and `config.chatId` (including URL percent-encoded variants) are replaced with `[REDACTED]`.
+2. **Telegram Token & Stellar Seed Patterns**: Any substring matching Telegram bot token shape (`(?:bot)?\d{5,}:[A-Za-z0-9_-]{20,}`) or Stellar secret seed strkey (`S` + 55 base32 chars) is automatically replaced with `[REDACTED]`, even if not explicitly registered.
+3. **Consistent URL Component Redaction**: URL redaction (`redactUrl`, `redactInlineUrls`, `redactText`, `redactLine`, and `Logger`) inspects every URL component consistently—masking userinfo (`user:pass@`, `token@`, `:pass@`), secret-shaped path segments, repeated or array-style credential query parameters (`?token=…&token=…`, `?token[]=…`), secret-shaped values under arbitrary query keys, and all non-empty URL `#fragment`s—while preserving safe host, port, route path, public chain strkey (`G…`/`C…`), 64-hex transaction hash, and diagnostic query parameters (`limit=10`, cursors).
 4. **All Fields Protected**: Redaction applies recursively to both the log `msg` and all string values in custom `fields`.
 
 ---
