@@ -34,6 +34,7 @@ import { createMetrics } from "./metrics.js";
 import type { MetricsServer } from "./metrics.js";
 import { boundText } from "./status.js";
 import { redactUrl, registerSecrets } from "./redact.js";
+import { createFollowStore } from "./subscriptions/store.js";
 
 /**
  * Installed before anything else can throw, so a rejection during startup is
@@ -271,6 +272,9 @@ async function main(): Promise<void> {
     pause: () => poller.pause(),
     resume: () => poller.resume(),
     logs: logCapture,
+    followStore: config.followFile
+      ? createFollowStore({ filePath: config.followFile })
+      : undefined,
   });
   notify = createNotifier(bot, config);
 

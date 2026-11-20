@@ -14,6 +14,9 @@
 | `/preview` | Preview channel notification formatting | No | Yes |
 | `/pause` | Operator only: pause new scans | Yes | No |
 | `/resume` | Operator only: resume polling now | Yes | No |
+| `/follow` | Subscribe this chat to a market or squad ref | No | No |
+| `/unfollow` | Remove a follow subscription | No | No |
+| `/follows` | List active follow subscriptions for this chat | No | No |
 
 ## Access Controls
 

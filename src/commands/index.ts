@@ -25,6 +25,9 @@ import "./health.js";
 import "./preview.js";
 import "./pause.js";
 import "./resume.js";
+import "./follow.js";
+import "./unfollow.js";
+import "./follows.js";
 import "./log-export.js"; // hidden: operator log export
 
 export {
@@ -65,3 +68,6 @@ export { previewCommand } from "./preview.js";
 export { resumeCommand, resumeMessage } from "./resume.js";
 export { lastEventMessage, statusCommand, statusMessage } from "./status.js";
 export { logExportCommand } from "./log-export.js";
+export { followCommand, followQuotaMessage } from "./follow.js";
+export { unfollowCommand } from "./unfollow.js";
+export { followsCommand } from "./follows.js";

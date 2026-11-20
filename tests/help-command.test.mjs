@@ -15,13 +15,17 @@ const PUBLIC_LINES = [
   "/contracts — Contract ids and explorer links",
   "/health — Health assessment and operational readiness",
   "/preview — Preview channel notification formatting",
+  "/follow — Subscribe this chat to a market or squad ref",
+  "/unfollow — Remove a follow subscription",
+  "/follows — List active follow subscriptions for this chat",
 ];
 const ALL_LINES = [
   ...PUBLIC_LINES.slice(0, 4),
   "/audit — Operator only: audit report \\(redacted, bounded\\)",
-  ...PUBLIC_LINES.slice(4),
+  ...PUBLIC_LINES.slice(4, 7),
   "/pause — Operator only: pause new scans",
   "/resume — Operator only: resume polling now",
+  ...PUBLIC_LINES.slice(7),
 ];
 
 function fixture(operatorTelegramUserId) {
@@ -53,7 +57,7 @@ for (const operatorId of [null, "42"]) {
       assert.ok(handlers.has(command), `${command} has a handler`);
       assert.ok(description.length >= 1 && description.length <= 256);
     }
-    assert.equal(handlers.size, 11, "disabled operator handlers still enforce authorization");
+    assert.equal(handlers.size, 14, "disabled operator handlers still enforce authorization");
   });
 }
 

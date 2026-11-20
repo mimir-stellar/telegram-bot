@@ -22,6 +22,7 @@ import type { BotConfig } from "../config.js";
 import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
+import type { FollowStore } from "../subscriptions/store.js";
 import type { BroadcastStore } from "./broadcast.js";
 
 /** Everything a command handler may need, supplied once by `createBot`. */
@@ -45,6 +46,11 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /**
+   * Persistent follow store for /follow, /unfollow, and /follows. When absent
+   * those commands reply with a "not available" message rather than crashing.
+   */
+  followStore?: FollowStore | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */

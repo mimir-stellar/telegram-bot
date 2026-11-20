@@ -357,6 +357,11 @@ export interface BotConfig extends StellarConfig {
   mimirAppUrl: string | null;
   /** Optional bearer token for health endpoint authentication. Null disables auth. The server rejects Authorization headers over 4096 UTF-8 bytes before comparison. */
   healthAuthToken: string | null;
+  /**
+   * Path to the JSON file backing the follow store. When absent the /follow,
+   * /unfollow, and /follows commands reply with a "not configured" message.
+   */
+  followFile?: string | undefined;
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
@@ -1025,6 +1030,10 @@ export function loadConfig(): BotConfig {
     telegramApiRoot: c.loopbackApiRoot("TELEGRAM_API_ROOT"),
     mimirAppUrl: c.optionalHttpsUrl("MIMIR_APP_URL"),
     healthAuthToken: c.optionalSecret("HEALTH_AUTH_TOKEN"),
+    followFile: (() => {
+      const raw = c.get("FOLLOW_FILE");
+      return raw !== undefined ? path.resolve(process.cwd(), raw) : undefined;
+    })(),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
@@ -1166,6 +1175,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "CURSOR_FILE", secret: false, hasBuiltInDefault: true },
   { key: "INSTANCE_LOCK_FILE", secret: false, hasBuiltInDefault: true },
   { key: "STATUS_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "FOLLOW_FILE", secret: false },
   { key: "MAX_NOTIFICATIONS_PER_CYCLE", secret: false, hasBuiltInDefault: true },
   { key: "INTER_SEND_DELAY_MS", secret: false, hasBuiltInDefault: true },
   { key: "METRICS_PORT", secret: false },

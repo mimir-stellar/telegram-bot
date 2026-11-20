@@ -92,6 +92,30 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     description: "Operator only: resume polling for contract events immediately if paused.",
     examples: ["/resume"],
   },
+  follow: {
+    usage: "/follow <ref>",
+    arguments: "<ref> (required) — a market or squad reference, e.g. market:abc or squad:xyz",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Subscribe this chat to on-chain notifications for a specific market or squad ref. Each chat has a per-chat follow limit; the installation also has a global cap. Use /unfollow to free up a slot.",
+    examples: ["/follow market:abc", "/follow squad:xyz"],
+  },
+  unfollow: {
+    usage: "/unfollow <ref>",
+    arguments: "<ref> (required) — the market or squad reference to remove",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Remove a follow subscription from this chat. The chat will no longer receive notifications for the given ref. Use /follows to see active subscriptions.",
+    examples: ["/unfollow market:abc", "/unfollow squad:xyz"],
+  },
+  follows: {
+    usage: "/follows",
+    arguments: "None",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "List all active follow subscriptions for this chat. Use /follow to add one and /unfollow to remove one.",
+    examples: ["/follows"],
+  },
 };
 
 /**
