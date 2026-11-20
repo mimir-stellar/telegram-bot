@@ -870,7 +870,7 @@ export async function runReplayCli(opts: {
         const { Bot } = await import("grammy");
         const { createNotifier } = await import("../bot.js");
         const bot = new Bot(botConfig.botToken);
-        send = createNotifier(bot, botConfig);
+        send = createNotifier(bot, botConfig, { requireMessageId: true });
       }
     } else {
       config = overrideDeps.config ?? loadStellarConfig();

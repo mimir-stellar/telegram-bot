@@ -368,8 +368,11 @@ export function createBot(deps: BotDeps): Bot {
 // existing imports from "bot.js" keep resolving without modification.
 export {
   createNotifier,
+  extractMessageId,
+  InvalidDeliveryResultError,
   isMarkdownParseError,
   notifierSkips,
+  type NotifierOptions,
   type SendExtra,
 } from "./notifications/notifier.js";
 

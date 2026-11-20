@@ -116,11 +116,60 @@ export const notifierSkips = { emptyText: 0 };
  * 400, and a formatters' `null` must never turn into a doomed send. The skip
  * is counted in {@link notifierSkips} and logged with bounded metadata.
  */
+/**
+ * Error thrown when Telegram's `sendMessage` response is missing a valid positive
+ * integer `message_id`, so the caller does not treat it as confirmed delivery.
+ */
+export class InvalidDeliveryResultError extends Error {
+  constructor(detail?: string) {
+    super(
+      detail
+        ? `Telegram sendMessage returned an invalid delivery result: ${detail}`
+        : "Telegram sendMessage returned an invalid delivery result (missing message_id)",
+    );
+    this.name = "InvalidDeliveryResultError";
+  }
+}
+
+/**
+ * Extract a valid Telegram `message_id` (positive finite integer) from a
+ * `sendMessage` response, or return `null` when missing or malformed.
+ */
+export function extractMessageId(response: unknown): number | null {
+  if (!response || typeof response !== "object") return null;
+  const id = (response as { message_id?: unknown }).message_id;
+  if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) return null;
+  return id;
+}
+
+function assertDeliveryMessageId(response: unknown): void {
+  if (extractMessageId(response) !== null) return;
+  const shape =
+    response === null
+      ? "null"
+      : response === undefined
+        ? "undefined"
+        : typeof response === "object"
+          ? `missing/invalid message_id`
+          : typeof response;
+  throw new InvalidDeliveryResultError(shape);
+}
+
+export interface NotifierOptions {
+  /**
+   * When true, require a valid positive integer `message_id` in every
+   * `sendMessage` response and throw {@link InvalidDeliveryResultError} if missing.
+   */
+  requireMessageId?: boolean;
+}
+
 export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
     Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  options?: NotifierOptions,
 ) {
+  const requireMessageId = options?.requireMessageId === true;
   return async (
     text: string | null,
     source?: ContractSource,
@@ -168,7 +217,7 @@ export function createNotifier(
     const parts = splitTelegramMessage(text);
     if (parts.length > 1) {
       for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
+        const res = await bot.api.sendMessage(chatId, part, {
           ...notificationOptions,
           ...(index === parts.length - 1 && extra?.reply_markup
             ? { reply_markup: extra.reply_markup }
@@ -177,18 +226,20 @@ export function createNotifier(
             ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
             : {}),
         });
+        if (requireMessageId) assertDeliveryMessageId(res);
       }
       return;
     }
 
     try {
-      await bot.api.sendMessage(chatId, text, {
+      const res = await bot.api.sendMessage(chatId, text, {
         ...notificationOptions,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(extra?.replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
           : {}),
       });
+      if (requireMessageId) assertDeliveryMessageId(res);
       return;
     } catch (err) {
       // A blank fallback is no fallback: sending whitespace-only text would
@@ -208,7 +259,7 @@ export function createNotifier(
           )}`,
       );
       // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
+      const res = await bot.api.sendMessage(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
         ...silentOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
@@ -216,6 +267,7 @@ export function createNotifier(
           ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
           : {}),
       });
+      if (requireMessageId) assertDeliveryMessageId(res);
     }
   };
 }
