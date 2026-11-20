@@ -82,6 +82,7 @@ Decoder Registry Dispatch (src/stellar/decode.ts)
 1. **Normalization:** [`normalizeContractVersion`](../src/stellar/decode.ts) trims whitespace, converts input to lowercase, and falls back to `DEFAULT_CONTRACT_VERSION` (`"v1"`) when given an empty or undefined string.
 2. **Unsupported Versions:** When an unmapped or future version string (e.g., `"v99"`) is passed, `decoderMap[normVersion]` returns `undefined`. The lookup immediately falls back to `decoderMap[DEFAULT_CONTRACT_VERSION]`, which points to `decodeMarketV1` or `decodeSquadV1`.
 3. **No Rejection:** Unsupported version strings are **not** rejected with a thrown error. The event is safely processed through the baseline v1 decoder, and `event.version` records the normalized version string for observability.
+4. **Startup Validation & Unsupported Version Flagging:** Before live polling begins, [`validateDecoderCombinations`](../src/stellar/decode.ts) inspects all configured targets. Any unsupported version combinations are warned in structured logs (`action: 'unsupported_contract_version'`) and recorded on `target.supportedVersion` and `status.unsupportedVersions`. Live polling continues safely using the baseline fallback.
 
 ---
 

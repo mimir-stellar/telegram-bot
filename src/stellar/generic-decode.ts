@@ -16,6 +16,7 @@
  */
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
+import type { DecoderCapabilityReport } from "./decode.js";
 
 // ── Bounded Limits ───────────────────────────────────────────────────────────
 
@@ -653,5 +654,31 @@ export function decodeGenericEvent(
       value,
       summary,
     },
+  };
+}
+
+/**
+ * Return a capability report for the generic wildcard event decoder.
+ */
+export function getGenericDecoderCapabilityReport(contractId?: string): DecoderCapabilityReport {
+  return {
+    source: "generic",
+    ...(contractId ? { contractId } : {}),
+    version: "*",
+    normalizedVersion: "*",
+    supported: true,
+    decoderKind: "generic",
+    supportedVersions: ["*"],
+    eventSchemas: [
+      {
+        name: "*",
+        expectedTopicCount: -1,
+        topicArgs: [],
+        isAdmin: false,
+      },
+    ],
+    events: ["*"],
+    adminEvents: [],
+    wildcardSupport: true,
   };
 }

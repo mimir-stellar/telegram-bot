@@ -32,8 +32,9 @@ import { eventKey } from "../dedup.js";
 import { txExplorerUrl } from "./client.js";
 import { redactText } from "../redact.js";
 import { peekEventName } from "./peek.js";
+import { getGenericDecoderCapabilityReport } from "./generic-decode.js";
 
-export { peekEventName };
+export { peekEventName, getGenericDecoderCapabilityReport };
 
 /** Which of the two Mimir contracts an event came from. */
 export type ContractSource = "market" | "squad";
@@ -1046,6 +1047,293 @@ export const SQUAD_DECODERS: Record<string, SquadDecoderFn> = {
   v2: decodeSquadV2,
 };
 
+// ── Decoder Capabilities & Schemas ──────────────────────────────────────────
+
+/** Canonical admin event names supported across contracts. */
+export const ADMIN_EVENT_NAMES: readonly string[] = [
+  "oracle_changed",
+  "ownership_transferred",
+  "agent_attributed",
+  "fee_accrued",
+  "fee_policy_set",
+  "fee_policy_changed",
+  "fee_policy_updated",
+  "fee_policy_removed",
+  "admin",
+] as const;
+
+/** Schema description of an event decoded by the subsystem. */
+export interface DecoderEventSchema {
+  name: string;
+  expectedTopicCount: number;
+  topicArgs: readonly TopicArgKind[];
+  extensions?: readonly string[];
+  isAdmin?: boolean;
+}
+
+/** Comprehensive capability report for a contract decoder and version. */
+export interface DecoderCapabilityReport {
+  source: string;
+  contractId?: string;
+  version: string;
+  normalizedVersion: string;
+  supported: boolean;
+  decoderKind: "typed" | "generic";
+  fallbackVersion?: string;
+  supportedVersions: readonly string[];
+  eventSchemas: readonly DecoderEventSchema[];
+  events: readonly string[];
+  adminEvents: readonly string[];
+  wildcardSupport: boolean;
+}
+
+/** Description of an unsupported combination flagged before polling starts. */
+export interface UnsupportedCombinationFlag {
+  source: string;
+  version?: string;
+  normalizedVersion: string;
+  contractId?: string;
+  fallbackVersion: string;
+  reason: string;
+}
+
+/** Configuration targets used to resolve decoder capabilities. */
+export interface DecoderTargetConfig {
+  marketContractId?: string;
+  squadContractId?: string;
+  marketContractVersion?: string;
+  squadContractVersion?: string;
+}
+
+/**
+ * Check whether a given contract version is explicitly supported for a source.
+ */
+export function isContractVersionSupported(
+  source: ContractSource | "generic" | string,
+  version?: string,
+): boolean {
+  const norm = normalizeContractVersion(version);
+  if (source === "generic") {
+    return true;
+  }
+  if (source === "market") {
+    return Object.prototype.hasOwnProperty.call(MARKET_DECODERS, norm);
+  }
+  if (source === "squad") {
+    return Object.prototype.hasOwnProperty.call(SQUAD_DECODERS, norm);
+  }
+  return false;
+}
+
+/**
+ * List supported event schemas for a contract source and version.
+ */
+export function listSupportedEventSchemas(
+  source: ContractSource | "generic" | string,
+  version: string = DEFAULT_CONTRACT_VERSION,
+): readonly DecoderEventSchema[] {
+  const norm = normalizeContractVersion(version);
+  if (source === "generic") {
+    return [
+      {
+        name: "*",
+        expectedTopicCount: -1,
+        topicArgs: [],
+        isAdmin: false,
+      },
+    ];
+  }
+
+  const schemas: DecoderEventSchema[] = [];
+  if (source === "market") {
+    for (const [eventName, schema] of Object.entries(MARKET_TOPIC_SCHEMAS)) {
+      const extensions: string[] = [];
+      if (norm === "v2") {
+        if (eventName === "claim_created") extensions.push("title");
+        if (eventName === "claim_resolved") extensions.push("resolver");
+      }
+      schemas.push({
+        name: eventName,
+        expectedTopicCount: schema.expectedCount,
+        topicArgs: schema.args,
+        ...(extensions.length > 0 ? { extensions } : {}),
+        isAdmin: false,
+      });
+    }
+  } else if (source === "squad") {
+    for (const [eventName, schema] of Object.entries(SQUAD_TOPIC_SCHEMAS)) {
+      const extensions: string[] = [];
+      if (norm === "v2") {
+        if (eventName === "market_created") extensions.push("category");
+      }
+      schemas.push({
+        name: eventName,
+        expectedTopicCount: schema.expectedCount,
+        topicArgs: schema.args,
+        ...(extensions.length > 0 ? { extensions } : {}),
+        isAdmin: false,
+      });
+    }
+  }
+
+  if (source === "market" || source === "squad") {
+    for (const adminName of ADMIN_EVENT_NAMES) {
+      schemas.push({
+        name: adminName,
+        expectedTopicCount: 1,
+        topicArgs: [],
+        isAdmin: true,
+      });
+    }
+  }
+
+  return schemas;
+}
+
+/**
+ * Generate a decoder capability report for a single contract source and version.
+ */
+export function getDecoderCapabilityReport(
+  source: ContractSource | "generic" | string,
+  version?: string,
+  contractId?: string,
+): DecoderCapabilityReport {
+  const rawVersion = version ?? DEFAULT_CONTRACT_VERSION;
+  const normVersion = normalizeContractVersion(rawVersion);
+
+  if (source === "generic") {
+    const genericReport = getGenericDecoderCapabilityReport(contractId);
+    if (version !== undefined) {
+      return {
+        ...genericReport,
+        version,
+        normalizedVersion: normVersion,
+      };
+    }
+    return genericReport;
+  }
+
+  const isMarket = source === "market";
+  const isSquad = source === "squad";
+  const knownSource = isMarket || isSquad;
+
+  const supportedVersions = isMarket
+    ? Object.keys(MARKET_DECODERS)
+    : isSquad
+      ? Object.keys(SQUAD_DECODERS)
+      : [];
+
+  const supported = knownSource && supportedVersions.includes(normVersion);
+  const fallbackVersion = supported ? undefined : DEFAULT_CONTRACT_VERSION;
+  const effectiveVersion = supported ? normVersion : DEFAULT_CONTRACT_VERSION;
+
+  const eventSchemas = knownSource
+    ? listSupportedEventSchemas(source as ContractSource, effectiveVersion)
+    : [];
+
+  const nonAdminEvents = eventSchemas
+    .filter((s) => !s.isAdmin && s.name !== "*")
+    .map((s) => s.name);
+  const adminEvents = eventSchemas.filter((s) => s.isAdmin).map((s) => s.name);
+
+  return {
+    source,
+    ...(contractId ? { contractId } : {}),
+    version: rawVersion,
+    normalizedVersion: normVersion,
+    supported,
+    decoderKind: "typed",
+    ...(fallbackVersion ? { fallbackVersion } : {}),
+    supportedVersions,
+    eventSchemas,
+    events: nonAdminEvents,
+    adminEvents,
+    wildcardSupport: false,
+  };
+}
+
+/**
+ * Generate capability reports for all configured contract versions.
+ */
+export function getConfiguredDecoderCapabilities(
+  config: DecoderTargetConfig,
+): DecoderCapabilityReport[] {
+  const reports: DecoderCapabilityReport[] = [];
+  if (config.marketContractId || config.marketContractVersion) {
+    reports.push(
+      getDecoderCapabilityReport(
+        "market",
+        config.marketContractVersion,
+        config.marketContractId,
+      ),
+    );
+  }
+  if (config.squadContractId || config.squadContractVersion) {
+    reports.push(
+      getDecoderCapabilityReport(
+        "squad",
+        config.squadContractVersion,
+        config.squadContractId,
+      ),
+    );
+  }
+  return reports;
+}
+
+/**
+ * Validate contract version combinations and flag unsupported ones.
+ */
+export function validateDecoderCombinations(
+  targets: readonly { source: string; version?: string; contractId?: string }[],
+): UnsupportedCombinationFlag[] {
+  const flags: UnsupportedCombinationFlag[] = [];
+  for (const t of targets) {
+    const report = getDecoderCapabilityReport(t.source, t.version, t.contractId);
+    if (!report.supported) {
+      let reason = `Version '${t.version ?? ""}' is not supported for contract source '${t.source}'`;
+      if (report.supportedVersions.length > 0) {
+        reason += ` (supported: ${report.supportedVersions.join(', ')})`;
+      } else {
+        reason += ` (unknown source '${t.source}')`;
+      }
+      flags.push({
+        source: t.source,
+        version: t.version,
+        normalizedVersion: report.normalizedVersion,
+        ...(t.contractId ? { contractId: t.contractId } : {}),
+        fallbackVersion: report.fallbackVersion ?? DEFAULT_CONTRACT_VERSION,
+        reason,
+      });
+    }
+  }
+  return flags;
+}
+
+/**
+ * Format a human-readable text summary of a DecoderCapabilityReport.
+ */
+export function formatDecoderCapabilityReport(report: DecoderCapabilityReport): string {
+  const lines: string[] = [];
+  lines.push(
+    `Decoder Capability Report: ${report.source}${report.contractId ? ` (${report.contractId})` : ''}`,
+  );
+  lines.push(`  Decoder Kind: ${report.decoderKind}`);
+  lines.push(`  Version: ${report.version} (normalized: ${report.normalizedVersion})`);
+  lines.push(
+    `  Supported: ${report.supported ? 'yes' : `no (fallback: ${report.fallbackVersion ?? 'none'})`}`,
+  );
+  lines.push(`  Supported Versions: ${report.supportedVersions.join(', ') || 'none'}`);
+  lines.push(`  Wildcard Support: ${report.wildcardSupport ? 'yes' : 'no'}`);
+  if (report.events.length > 0) {
+    lines.push(`  Events (${report.events.length}): ${report.events.join(', ')}`);
+  }
+  if (report.adminEvents.length > 0) {
+    lines.push(`  Admin Events (${report.adminEvents.length}): ${report.adminEvents.join(', ')}`);
+  }
+  return lines.join("\n");
+}
+
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 function contractIdOf(event: rpc.Api.EventResponse): string {
@@ -1472,19 +1760,7 @@ export function squadSideLabel(side: number): string {
 /** Check if a payload represents a decoded admin event. */
 export function isAdminPayload(payload: EventPayload): payload is AdminPayload {
   if (!payload || typeof payload !== "object") return false;
-  if (payload.name === "admin") return true;
-  if (
-    payload.name === "oracle_changed" ||
-    payload.name === "ownership_transferred" ||
-    payload.name === "agent_attributed" ||
-    payload.name === "fee_accrued" ||
-    payload.name === "fee_policy_set" ||
-    payload.name === "fee_policy_changed" ||
-    payload.name === "fee_policy_updated" ||
-    payload.name === "fee_policy_removed"
-  ) {
-    return true;
-  }
+  if ((ADMIN_EVENT_NAMES as readonly string[]).includes(payload.name)) return true;
   if (
     typeof payload.name === "string" &&
     (payload.name.startsWith("fee_policy_") || payload.name.startsWith("admin_"))
