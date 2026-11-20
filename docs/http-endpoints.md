@@ -324,6 +324,22 @@ The metrics registry tracks:
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
 
+#### Registration contract
+
+The registry exposes a `register(name, type, help)` method (see
+`MetricsRegistry` in `src/metrics.ts`). It guards against duplicate registration
+corrupting the exposition output:
+
+- **First call** for a name creates and stores the metric.
+- **Identical re-registration** (same `name`, `type`, and `help`) returns the
+  existing live metric unchanged — safe for module-level init code that runs
+  more than once.
+- **Conflicting re-registration** (same `name`, different `type` or `help`)
+  throws `MetricRegistrationError` so a mismatch is caught at construction
+  time rather than producing a `# TYPE`/`# HELP` line that disagrees with the
+  value line. The error exposes `metricName`, `field` (`"type"` | `"help"`),
+  `existing`, and `attempted` for programmatic inspection.
+
 ```bash
 METRICS_PORT=9090  # in .env or environment
 

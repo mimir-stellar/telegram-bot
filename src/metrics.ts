@@ -13,6 +13,11 @@
  *  - Secrets: the /metrics response carries only operational counters derived
  *    from in-process state. It never echoes env vars, bot tokens, or cursor
  *    file contents.
+ *  - Duplicate registration: a second call to register() with the same name
+ *    is accepted silently when the type and help string are identical
+ *    (idempotent). A conflicting type or help string throws
+ *    MetricRegistrationError so callers find mismatches at construction time
+ *    rather than producing corrupt Prometheus exposition output.
  *
  * Usage:
  *   const metrics = createMetrics();
@@ -26,6 +31,32 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 // ── Metric types ──────────────────────────────────────────────────────────────
+
+/** The two Prometheus metric kinds this registry supports. */
+export type MetricType = "counter" | "gauge";
+
+/**
+ * Thrown when a name is registered a second time with a different type or a
+ * different help string. Identical re-registration is accepted silently.
+ *
+ * The message is deterministic and value-free: it names the metric name, the
+ * field that conflicted (`type` or `help`), and the existing vs. attempted
+ * values, so the caller can fix the mismatch without reading private state.
+ */
+export class MetricRegistrationError extends Error {
+  constructor(
+    public readonly metricName: string,
+    public readonly field: "type" | "help",
+    public readonly existing: string,
+    public readonly attempted: string,
+  ) {
+    super(
+      `Metric "${metricName}" is already registered with ${field} "${existing}"; ` +
+        `cannot re-register with ${field} "${attempted}"`,
+    );
+    this.name = "MetricRegistrationError";
+  }
+}
 
 export interface Counter {
   /** Increment by 1 (default) or by `delta` (must be ≥ 0). */
@@ -97,6 +128,27 @@ export interface MetricsRegistry {
   render(): string;
 
   /**
+   * Register a metric by name.
+   *
+   * - **First call** for a name: creates and stores the metric, returns it.
+   * - **Identical re-registration** (same `name`, `type`, and `help`): returns
+   *   the existing metric unchanged — safe to call from module-level init code
+   *   that runs more than once (e.g. in tests that share a registry, or in a
+   *   module that is imported by multiple callers).
+   * - **Conflicting re-registration** (same `name`, different `type` or
+   *   `help`): throws {@link MetricRegistrationError}. A conflict at
+   *   construction time is far easier to debug than a silent corruption of the
+   *   Prometheus exposition output that only surfaces when a scraper complains.
+   *
+   * The returned metric is typed as `Counter` when `type === "counter"` and
+   * as `Gauge` when `type === "gauge"`. Use the overloads to get the precise
+   * type back without an explicit cast.
+   */
+  register(name: string, type: "counter", help: string): Counter;
+  register(name: string, type: "gauge", help: string): Gauge;
+  register(name: string, type: MetricType, help: string): Counter | Gauge;
+
+  /**
    * Start an HTTP server on `port` that serves GET /metrics.
    *
    * Also serves GET /health (returns `200 OK\n`) as a minimal liveness probe.
@@ -115,11 +167,9 @@ export interface MetricsRegistry {
 
 // ── Implementation ────────────────────────────────────────────────────────────
 
-function makeCounter(name: string, help: string): Counter & { _name: string; _help: string } {
+function makeCounter(): Counter {
   let _value = 0;
   return {
-    _name: name,
-    _help: help,
     inc(delta = 1): void {
       if (delta < 0) throw new RangeError(`Counter.inc delta must be >= 0; got ${delta}`);
       _value += delta;
@@ -130,11 +180,9 @@ function makeCounter(name: string, help: string): Counter & { _name: string; _he
   };
 }
 
-function makeGauge(name: string, help: string): Gauge & { _name: string; _help: string } {
+function makeGauge(): Gauge {
   let _value = 0;
   return {
-    _name: name,
-    _help: help,
     set(value: number): void {
       _value = value;
     },
@@ -144,84 +192,116 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
   };
 }
 
+/**
+ * Internal record for one registered metric. `metric` is the live handle the
+ * caller mutates; `type` is what the `# TYPE` line must emit so a re-registered
+ * gauge can never be silently retyped as a counter (or vice versa).
+ */
+interface RegisteredMetric {
+  name: string;
+  type: MetricType;
+  help: string;
+  metric: Counter | Gauge;
+}
+
 const METRICS_PREFIX = "mimir_bot_";
 
 export function createMetrics(): MetricsRegistry {
-  const pollCycles = makeCounter(
-    `${METRICS_PREFIX}poll_cycles_total`,
-    "Total number of poll cycles started.",
-  );
-  const rpcRequests = makeCounter(
-    `${METRICS_PREFIX}rpc_requests_total`,
-    "Total successful Soroban RPC getEvents calls.",
-  );
-  const rpcErrors = makeCounter(
-    `${METRICS_PREFIX}rpc_errors_total`,
-    "Total failed Soroban RPC getEvents calls.",
-  );
-  const eventsDecoded = makeCounter(
-    `${METRICS_PREFIX}events_decoded_total`,
-    "Total on-chain events returned by the RPC and passed through the decoder.",
-  );
-  const eventsSkipped = makeCounter(
-    `${METRICS_PREFIX}events_skipped_total`,
-    "Total events not notified: unknown type, no formatter, or MAX_NOTIFICATIONS_PER_CYCLE cap.",
-  );
-  const notificationsSent = makeCounter(
-    `${METRICS_PREFIX}notifications_sent_total`,
-    "Total Telegram messages successfully sent.",
-  );
-  const notificationsFailed = makeCounter(
-    `${METRICS_PREFIX}notifications_failed_total`,
-    "Total Telegram sends that threw an error (cursor still advanced).",
-  );
-  const staleCursorEvents = makeCounter(
-    `${METRICS_PREFIX}stale_cursor_events_total`,
-    "Number of times a stale-cursor warning was emitted (events in the gap are lost).",
-  );
-  const consecutiveFailures = makeGauge(
-    `${METRICS_PREFIX}consecutive_failures`,
-    "Current number of consecutive full-cycle RPC failures (resets to 0 on any success).",
-  );
-  const lastCycleEvents = makeGauge(
-    `${METRICS_PREFIX}last_cycle_events`,
-    "Events observed in the most recent complete poll cycle.",
-  );
-  const activityBaselineEvents = makeGauge(
-    `${METRICS_PREFIX}activity_baseline_events`,
-    "Rolling mean events per cycle at the most recent baseline comparison (rounded).",
-  );
-  const activityAnomalies = makeCounter(
-    `${METRICS_PREFIX}activity_anomalies_total`,
-    "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
-  );
+  /** Insertion-ordered registry of every metric this instance has created. */
+  const registry = new Map<string, RegisteredMetric>();
 
-  const counters = [
-    pollCycles,
-    rpcRequests,
-    rpcErrors,
-    eventsDecoded,
-    eventsSkipped,
-    notificationsSent,
-    notificationsFailed,
-    staleCursorEvents,
-    activityAnomalies,
-  ];
-  const gauges = [consecutiveFailures, lastCycleEvents, activityBaselineEvents];
+  /**
+   * Create a metric on first sight, or return the existing one on an identical
+   * re-registration. Reject conflicts on `type` or `help` loudly.
+   */
+  function register(name: string, type: MetricType, help: string): Counter | Gauge {
+    const existing = registry.get(name);
+    if (existing !== undefined) {
+      if (existing.type !== type) {
+        throw new MetricRegistrationError(name, "type", existing.type, type);
+      }
+      if (existing.help !== help) {
+        throw new MetricRegistrationError(name, "help", existing.help, help);
+      }
+      return existing.metric;
+    }
+
+    const metric =
+      type === "counter"
+        ? makeCounter()
+        : makeGauge();
+    registry.set(name, { name, type, help, metric });
+    return metric;
+  }
+
+  const pollCycles = register(
+    `${METRICS_PREFIX}poll_cycles_total`,
+    "counter",
+    "Total number of poll cycles started.",
+  ) as Counter;
+  const rpcRequests = register(
+    `${METRICS_PREFIX}rpc_requests_total`,
+    "counter",
+    "Total successful Soroban RPC getEvents calls.",
+  ) as Counter;
+  const rpcErrors = register(
+    `${METRICS_PREFIX}rpc_errors_total`,
+    "counter",
+    "Total failed Soroban RPC getEvents calls.",
+  ) as Counter;
+  const eventsDecoded = register(
+    `${METRICS_PREFIX}events_decoded_total`,
+    "counter",
+    "Total on-chain events returned by the RPC and passed through the decoder.",
+  ) as Counter;
+  const eventsSkipped = register(
+    `${METRICS_PREFIX}events_skipped_total`,
+    "counter",
+    "Total events not notified: unknown type, no formatter, or MAX_NOTIFICATIONS_PER_CYCLE cap.",
+  ) as Counter;
+  const notificationsSent = register(
+    `${METRICS_PREFIX}notifications_sent_total`,
+    "counter",
+    "Total Telegram messages successfully sent.",
+  ) as Counter;
+  const notificationsFailed = register(
+    `${METRICS_PREFIX}notifications_failed_total`,
+    "counter",
+    "Total Telegram sends that threw an error (cursor still advanced).",
+  ) as Counter;
+  const staleCursorEvents = register(
+    `${METRICS_PREFIX}stale_cursor_events_total`,
+    "counter",
+    "Number of times a stale-cursor warning was emitted (events in the gap are lost).",
+  ) as Counter;
+  const consecutiveFailures = register(
+    `${METRICS_PREFIX}consecutive_failures`,
+    "gauge",
+    "Current number of consecutive full-cycle RPC failures (resets to 0 on any success).",
+  ) as Gauge;
+  const lastCycleEvents = register(
+    `${METRICS_PREFIX}last_cycle_events`,
+    "gauge",
+    "Events observed in the most recent complete poll cycle.",
+  ) as Gauge;
+  const activityBaselineEvents = register(
+    `${METRICS_PREFIX}activity_baseline_events`,
+    "gauge",
+    "Rolling mean events per cycle at the most recent baseline comparison (rounded).",
+  ) as Gauge;
+  const activityAnomalies = register(
+    `${METRICS_PREFIX}activity_anomalies_total`,
+    "counter",
+    "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
+  ) as Counter;
 
   function render(): string {
     const lines: string[] = [];
 
-    for (const c of counters) {
-      lines.push(`# HELP ${c._name} ${c._help}`);
-      lines.push(`# TYPE ${c._name} counter`);
-      lines.push(`${c._name} ${c.value()}`);
-    }
-
-    for (const g of gauges) {
-      lines.push(`# HELP ${g._name} ${g._help}`);
-      lines.push(`# TYPE ${g._name} gauge`);
-      lines.push(`${g._name} ${g.value()}`);
+    for (const { name, type, help, metric } of registry.values()) {
+      lines.push(`# HELP ${name} ${help}`);
+      lines.push(`# TYPE ${name} ${type}`);
+      lines.push(`${name} ${metric.value()}`);
     }
 
     // Prometheus text format requires a trailing newline.
@@ -308,7 +388,8 @@ export function createMetrics(): MetricsRegistry {
     activityAnomalies,
     render,
     startServer,
-  };
+    register,
+  } as unknown as MetricsRegistry;
 }
 
 export type Metrics = ReturnType<typeof createMetrics>;
