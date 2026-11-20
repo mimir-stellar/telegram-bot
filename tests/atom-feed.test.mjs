@@ -344,6 +344,14 @@ test("buildAtomFeed: <link rel='self'> is present for a valid https selfUrl", ()
   assert.ok(feed.includes("https://example.com/feed.atom"), "selfUrl not in self link");
 });
 
+test("buildAtomFeed: rejects credential-bearing selfUrl without serializing it", () => {
+  const selfUrl = "https://private:secret@example.com/feed.atom";
+  assert.throws(
+    () => buildAtomFeed([], { ...FEED_OPTS, selfUrl }),
+    /valid HTTPS URL without credentials/,
+  );
+});
+
 test("buildAtomFeed: empty events array produces no <entry> elements", () => {
   const feed = buildAtomFeed([], FEED_OPTS);
   assert.ok(!feed.includes("<entry>"), "empty feed should have no entries");

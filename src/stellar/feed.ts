@@ -243,7 +243,10 @@ export function buildAtomFeed(
     feedUpdated = maxAt > 0 ? new Date(maxAt * 1000).toISOString() : UNKNOWN_EVENT_TIMESTAMP;
   }
 
-  const validSelfUrl = safeHttpsUrl(selfUrl) ?? "";
+  const validSelfUrl = safeHttpsUrl(selfUrl);
+  if (validSelfUrl === null) {
+    throw new TypeError("Atom feed selfUrl must be a valid HTTPS URL without credentials");
+  }
 
   const lines: string[] = [
     '<?xml version="1.0" encoding="UTF-8"?>',
@@ -256,7 +259,7 @@ export function buildAtomFeed(
   }
 
   lines.push(
-    `  <id>${escapeXml(validSelfUrl || selfUrl)}</id>`,
+    `  <id>${escapeXml(validSelfUrl)}</id>`,
     `  <updated>${escapeXml(feedUpdated)}</updated>`,
   );
 
