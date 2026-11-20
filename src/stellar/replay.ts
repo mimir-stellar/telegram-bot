@@ -36,7 +36,7 @@
  * that was within the range.
  */
 
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, truncate, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -140,6 +140,20 @@ export interface ReplayReport {
 
 // ── Progress / Checkpoint schema ─────────────────────────────────────────────
 
+export interface ReplayOutputRecord {
+  type: "event";
+  source: ContractSource;
+  contractId: string;
+  ledger: number;
+  txHash: string;
+  eventId: string;
+  name: string;
+  sent: boolean;
+  skipped: boolean;
+  skipReason?: string | undefined;
+  payload: DecodedEvent["payload"];
+}
+
 export interface ReplayProgressTarget {
   contractId: string;
   cursor: string | null;
@@ -155,6 +169,8 @@ export interface ReplayProgressTarget {
   duplicates: number;
   completed: boolean;
   failedSends?: number | undefined;
+  lastCommittedOutputEventId?: string | null | undefined;
+  committedOutputRecords?: number | undefined;
 }
 
 export interface ReplayProgressFile {
@@ -169,6 +185,7 @@ export interface ReplayProgressFile {
     to: number | null;
   };
   contracts: ContractSource[];
+  outputFile?: string | undefined;
   targets: Partial<Record<ContractSource, ReplayProgressTarget>>;
 }
 
@@ -236,10 +253,20 @@ export interface ReplayOptions {
   show?: number | undefined;
   /** Path to an optional progress/checkpoint file. */
   progressFile?: string | undefined;
+  /** Path to an optional JSONL output file for committed event records. */
+  outputFile?: string | undefined;
+  /** Event IDs already committed in an existing output file (to avoid duplicates on resume). */
+  committedOutputIds?: ReadonlySet<string> | undefined;
+  /** Initial count of committed output records for this target. */
+  initialCommittedOutputCount?: number | undefined;
+  /** Initial last committed output event ID for this target. */
+  initialLastCommittedOutputEventId?: string | null | undefined;
   /** Maximum RPC requests per minute. */
   rpm?: number | undefined;
   /** Checkpoint state for this specific target, if resuming. */
   targetProgress?: ReplayProgressTarget | undefined;
+  /** Called after each event is processed when writing output records. */
+  onOutputRecord?: ((record: ReplayOutputRecord, update: { lastCommittedOutputEventId: string; committedOutputRecords: number }) => Promise<void>) | undefined;
   /** Called atomically after each page is processed. */
   onPageComplete?: ((targetUpdate: ReplayProgressTarget) => Promise<void>) | undefined;
   /** Global RPC budget tracker. */
@@ -266,6 +293,8 @@ export interface ReplayDeps {
   sleep?: ((ms: number) => Promise<void>) | undefined;
   /** Timestamp provider for deterministic rate-limit / delay tests. */
   now?: (() => number) | undefined;
+  /** Optional output line writer for testing interrupted or partial output writes. */
+  writeOutputLine?: ((filePath: string, line: string) => Promise<void>) | undefined;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -281,6 +310,138 @@ export async function writeProgressFileAtomic(filePath: string, data: ReplayProg
   } catch (err) {
     try { await unlink(tmp); } catch {}
     throw err;
+  }
+}
+
+export interface PreparedReplayOutput {
+  committedEventIds: Set<string>;
+  committedEventIdsBySource: Partial<Record<ContractSource, Set<string>>>;
+  lastCommittedEventId: string | null;
+  lastCommittedEventIdBySource: Partial<Record<ContractSource, string>>;
+  committedCount: number;
+  committedCountBySource: Partial<Record<ContractSource, number>>;
+  trimmedTrailingBytes: number;
+}
+
+/**
+ * Inspect an existing replay output JSONL file before resuming:
+ * - Preserves all fully committed newline-terminated JSON records without truncating them.
+ * - Trims any incomplete or corrupt trailing fragment left by an interrupted write.
+ * - Rejects corrupt records in the middle of the file.
+ */
+export async function prepareReplayOutputFile(filePath: string): Promise<PreparedReplayOutput> {
+  const committedEventIds = new Set<string>();
+  const committedEventIdsBySource: Partial<Record<ContractSource, Set<string>>> = {};
+  const lastCommittedEventIdBySource: Partial<Record<ContractSource, string>> = {};
+  const committedCountBySource: Partial<Record<ContractSource, number>> = {};
+  let lastCommittedEventId: string | null = null;
+  let committedCount = 0;
+
+  let buf: Buffer;
+  try {
+    buf = await readFile(filePath);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      await mkdir(path.dirname(filePath), { recursive: true });
+      return {
+        committedEventIds,
+        committedEventIdsBySource,
+        lastCommittedEventId,
+        lastCommittedEventIdBySource,
+        committedCount,
+        committedCountBySource,
+        trimmedTrailingBytes: 0,
+      };
+    }
+    throw new Error(`cannot read output file "${filePath}": ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  let validEndOffset = 0;
+  let lineStart = 0;
+  let lineNumber = 0;
+
+  while (lineStart < buf.length) {
+    const newlineIdx = buf.indexOf(0x0a, lineStart);
+    if (newlineIdx === -1) {
+      // Unterminated trailing fragment from an interrupted write.
+      break;
+    }
+
+    lineNumber += 1;
+    const rawLine = buf.subarray(lineStart, newlineIdx).toString("utf8").replace(/\r$/, "");
+    const nextStart = newlineIdx + 1;
+
+    if (rawLine.trim().length === 0) {
+      validEndOffset = nextStart;
+      lineStart = nextStart;
+      continue;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawLine);
+    } catch (err: unknown) {
+      // If this is the final line in the file, treat it as an interrupted write and trim it.
+      if (nextStart >= buf.length) {
+        break;
+      }
+      throw new Error(
+        `corrupt output record at line ${lineNumber} in "${filePath}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    if (!parsed || typeof parsed !== "object" || typeof (parsed as { eventId?: unknown }).eventId !== "string") {
+      if (nextStart >= buf.length) {
+        break;
+      }
+      throw new Error(`invalid output record schema at line ${lineNumber} in "${filePath}"`);
+    }
+
+    const rec = parsed as Partial<ReplayOutputRecord>;
+    const eventId = rec.eventId as string;
+    committedEventIds.add(eventId);
+    lastCommittedEventId = eventId;
+    committedCount += 1;
+
+    if (rec.source === "market" || rec.source === "squad") {
+      let set = committedEventIdsBySource[rec.source];
+      if (!set) {
+        set = new Set<string>();
+        committedEventIdsBySource[rec.source] = set;
+      }
+      set.add(eventId);
+      lastCommittedEventIdBySource[rec.source] = eventId;
+      committedCountBySource[rec.source] = (committedCountBySource[rec.source] ?? 0) + 1;
+    }
+
+    validEndOffset = nextStart;
+    lineStart = nextStart;
+  }
+
+  const trimmedTrailingBytes = buf.length - validEndOffset;
+  if (trimmedTrailingBytes > 0) {
+    await truncate(filePath, validEndOffset);
+  }
+
+  return {
+    committedEventIds,
+    committedEventIdsBySource,
+    lastCommittedEventId,
+    lastCommittedEventIdBySource,
+    committedCount,
+    committedCountBySource,
+    trimmedTrailingBytes,
+  };
+}
+
+async function defaultWriteOutputLine(filePath: string, line: string): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const fh = await open(filePath, "a");
+  try {
+    await fh.write(line, null, "utf8");
+    await fh.sync();
+  } finally {
+    await fh.close();
   }
 }
 
@@ -300,6 +461,7 @@ export async function loadAndValidateProgressFile(
     contracts: ContractSource[];
     network: string;
     config: StellarConfig | BotConfig;
+    outputFile?: string | undefined;
   },
 ): Promise<ReplayProgressFile | null> {
   let content: string;
@@ -359,6 +521,13 @@ export async function loadAndValidateProgressFile(
   }
   if (p.targets?.squad && p.targets.squad.contractId !== opts.config.squadContractId) {
     throw new Error(`progress file squad contractId does not match current config`);
+  }
+
+  // Validate output file if both checkpoint and CLI specify one
+  if (p.outputFile && opts.outputFile && path.resolve(p.outputFile) !== path.resolve(opts.outputFile)) {
+    throw new Error(
+      `progress file outputFile (${p.outputFile}) does not match requested --output-file (${opts.outputFile})`,
+    );
   }
 
   return p as ReplayProgressFile;
@@ -476,6 +645,10 @@ async function replayContract(
   let duplicates = opts.targetProgress?.duplicates ?? 0;
   let failedSends = opts.targetProgress?.failedSends ?? 0;
   let totalProcessedEvents = opts.targetProgress?.eventsProcessed ?? 0;
+  let lastCommittedOutputEventId: string | null =
+    opts.initialLastCommittedOutputEventId ?? opts.targetProgress?.lastCommittedOutputEventId ?? null;
+  let committedOutputRecords =
+    opts.initialCommittedOutputCount ?? opts.targetProgress?.committedOutputRecords ?? 0;
 
   let lastCursor: string | null = opts.targetProgress?.cursor ?? null;
   let truncated = false;
@@ -675,6 +848,31 @@ async function replayContract(
       if (event.ledger > 0 && (lastEventLedger === null || event.ledger > lastEventLedger)) {
         lastEventLedger = event.ledger;
       }
+
+      if (opts.onOutputRecord) {
+        const recordId = evKey || `${event.txHash}:${event.ledger}`;
+        if (!opts.committedOutputIds?.has(recordId)) {
+          committedOutputRecords += 1;
+          lastCommittedOutputEventId = recordId;
+          const record: ReplayOutputRecord = {
+            type: "event",
+            source: event.source,
+            contractId: target.contractId,
+            ledger: event.ledger,
+            txHash: event.txHash,
+            eventId: recordId,
+            name: entry.name,
+            sent: entry.sent,
+            skipped: entry.skipped,
+            ...(entry.skipReason !== undefined ? { skipReason: entry.skipReason } : {}),
+            payload: event.payload,
+          };
+          await opts.onOutputRecord(record, {
+            lastCommittedOutputEventId: recordId,
+            committedOutputRecords,
+          });
+        }
+      }
     }
 
     const nextCursor = typeof response?.cursor === "string" ? response.cursor : "";
@@ -713,6 +911,8 @@ async function replayContract(
         duplicates,
         completed: isFinalPage && !truncated,
         failedSends,
+        lastCommittedOutputEventId,
+        committedOutputRecords,
       });
     }
 
@@ -790,13 +990,14 @@ export async function runReplayCli(opts: {
   const dryRun = !boolFlag("send"); // Default is dry-run; --send enables actual sending.
   const asJson = boolFlag("json");
   const progressFile = flag("progress-file");
+  const outputFile = flag("output-file") ?? flag("out");
   const rpmRaw = flag("rpm");
   const progress = overrideDeps.progress ?? (asJson ? console.error.bind(console) : console.log.bind(console));
   const safeErr = (err: unknown): string => safeErrorMessage(err, []);
 
   if (!fromRaw) {
     console.error("[replay] error: --from <ledger|cursor> is required");
-    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N]");
+    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--output-file <path>] [--rpm N]");
     return { report: null, exitCode: 2 };
   }
 
@@ -888,11 +1089,13 @@ export async function runReplayCli(opts: {
     progress(`[replay] from      ${fromRaw}${toLedger !== undefined ? `  to ${toLedger}` : "  (to chain tip)"}`);
     progress(`[replay] mode      ${dryRun ? "dry-run (use --send to deliver to Telegram)" : "SEND"}`);
     if (progressFile) progress(`[replay] progress  ${progressFile}`);
+    if (outputFile) progress(`[replay] output    ${outputFile}`);
     if (rpm !== undefined) progress(`[replay] rpm       ${rpm}`);
   } else {
     progress(
       `replay ${network} from=${fromRaw} to=${toLedger ?? "tip"} mode=${dryRun ? "dry-run" : "send"}` +
         (progressFile ? ` progress=${progressFile}` : "") +
+        (outputFile ? ` output=${outputFile}` : "") +
         (rpm !== undefined ? ` rpm=${rpm}` : ""),
     );
   }
@@ -917,7 +1120,27 @@ export async function runReplayCli(opts: {
   const now = overrideDeps.now ?? Date.now;
   const budget = rpm !== undefined ? new RpcBudgetTracker(rpm, sleep, now) : undefined;
 
-  // ── Load or initialize progress file ──────────────────────────────────────
+  // ── Prepare output file (if any) & load/initialize progress file ──────────
+
+  let preparedOutput: PreparedReplayOutput | null = null;
+  if (outputFile) {
+    try {
+      preparedOutput = await prepareReplayOutputFile(outputFile);
+      if (preparedOutput.trimmedTrailingBytes > 0) {
+        progress(
+          `[replay] trimmed ${preparedOutput.trimmedTrailingBytes} uncommitted trailing bytes from "${outputFile}"`,
+        );
+      }
+      if (preparedOutput.committedCount > 0) {
+        progress(
+          `[replay] resuming output file "${outputFile}" (${preparedOutput.committedCount} committed records, last=${preparedOutput.lastCommittedEventId ?? "none"})`,
+        );
+      }
+    } catch (err: unknown) {
+      console.error(`[replay] error: ${err instanceof Error ? err.message : String(err)}`);
+      return { report: null, exitCode: 2 };
+    }
+  }
 
   let progressData: ReplayProgressFile | null = null;
   if (progressFile) {
@@ -928,8 +1151,12 @@ export async function runReplayCli(opts: {
         contracts: requestedContracts,
         network,
         config,
+        outputFile,
       });
       if (progressData) {
+        if (outputFile && !progressData.outputFile) {
+          progressData.outputFile = outputFile;
+        }
         progress(`[replay] loaded progress file "${progressFile}"`);
       } else {
         progressData = {
@@ -944,6 +1171,7 @@ export async function runReplayCli(opts: {
             to: normalizeRangeTo(toLedger),
           },
           contracts: requestedContracts,
+          ...(outputFile ? { outputFile } : {}),
           targets: {},
         };
       }
@@ -957,9 +1185,56 @@ export async function runReplayCli(opts: {
 
   const targetResults: ReplayTargetResult[] = [];
   let fatalError: string | undefined;
+  const writeLine = overrideDeps.writeOutputLine ?? defaultWriteOutputLine;
 
   for (const target of targets) {
     const targetProgress = progressData?.targets?.[target.source];
+    const targetCommittedIds = preparedOutput?.committedEventIdsBySource[target.source];
+    const targetCommittedCount =
+      preparedOutput?.committedCountBySource[target.source] ?? targetProgress?.committedOutputRecords ?? 0;
+    const targetLastCommittedId =
+      preparedOutput?.lastCommittedEventIdBySource[target.source] ??
+      targetProgress?.lastCommittedOutputEventId ??
+      null;
+
+    const onOutputRecord = outputFile
+      ? async (
+          record: ReplayOutputRecord,
+          update: { lastCommittedOutputEventId: string; committedOutputRecords: number },
+        ) => {
+          const line = `${JSON.stringify(record, scanJsonReplacer)}\n`;
+          await writeLine(outputFile, line);
+          if (progressData && progressFile) {
+            const existing = progressData.targets[target.source];
+            progressData.targets[target.source] = existing
+              ? {
+                  ...existing,
+                  lastCommittedOutputEventId: update.lastCommittedOutputEventId,
+                  committedOutputRecords: update.committedOutputRecords,
+                }
+              : {
+                  contractId: target.contractId,
+                  cursor: null,
+                  lastEventLedger: null,
+                  lastProcessedEventId: null,
+                  recentEventIds: [],
+                  pagesProcessed: 0,
+                  eventsProcessed: 0,
+                  eventsSent: 0,
+                  eventsSkipped: 0,
+                  eventsCapped: 0,
+                  adminLogged: 0,
+                  duplicates: 0,
+                  completed: false,
+                  lastCommittedOutputEventId: update.lastCommittedOutputEventId,
+                  committedOutputRecords: update.committedOutputRecords,
+                };
+            progressData.updatedAt = new Date().toISOString();
+            await writeProgressFileAtomic(progressFile, progressData);
+          }
+        }
+      : undefined;
+
     const onPageComplete = progressFile
       ? async (update: ReplayProgressTarget) => {
           if (!progressData) return;
@@ -982,8 +1257,13 @@ export async function runReplayCli(opts: {
           dryRun,
           contracts: requestedContracts,
           progressFile,
+          outputFile,
+          committedOutputIds: targetCommittedIds,
+          initialCommittedOutputCount: targetCommittedCount,
+          initialLastCommittedOutputEventId: targetLastCommittedId,
           rpm,
           targetProgress,
+          onOutputRecord,
           onPageComplete,
           budget,
         },

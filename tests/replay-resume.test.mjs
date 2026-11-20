@@ -554,3 +554,180 @@ test("backward compatibility: replay without --progress-file or --rpm runs clean
   assert.ok(report !== null);
   assert.equal(report.totals.events, 0);
 });
+
+test("resumes historical replay after an interrupted output write without truncating or duplicating", async () => {
+  await withTempDataDir(async (tmp) => {
+    const progressFile = tmp.file("progress.json");
+    const outputFile = tmp.file("replay-output.jsonl");
+
+    const cursor1 = makeCursor(4100, 1);
+    const cursor2 = makeCursor(4200, 1);
+    const cursor3 = makeCursor(4300, 1);
+
+    const evA = claimCreatedEvent({ ledger: 4100, claimId: 601, id: cursor1, pagingToken: cursor1 });
+    const evB = claimCreatedEvent({ ledger: 4200, claimId: 602, id: cursor2, pagingToken: cursor2 });
+    const evC = claimCreatedEvent({ ledger: 4300, claimId: 603, id: cursor3, pagingToken: cursor3 });
+
+    const server1 = makeServer({ oldestLedger: 3000, latestLedger: 5000 }, {
+      [MARKET_CONTRACT]: [
+        { events: [evA, evB, evC], cursor: cursor3, latestLedger: 5000 },
+      ],
+    });
+
+    // Simulate a write interruption on the 2nd output record:
+    // Record 1 is fully committed with trailing '\n', then Record 2 writes a partial
+    // unterminated JSON fragment and throws an I/O error.
+    let writeCalls = 0;
+    const interruptingWriter = async (filePath, line) => {
+      writeCalls += 1;
+      if (writeCalls === 1) {
+        await writeFile(filePath, line, { flag: "a", encoding: "utf8" });
+        return;
+      }
+      await writeFile(filePath, line.slice(0, 18), { flag: "a", encoding: "utf8" });
+      throw new Error("simulated disk write interruption");
+    };
+
+    const run1 = await runReplayCli({
+      argv: [
+        "node",
+        "replay-cli.ts",
+        "--from",
+        "4000",
+        "--to",
+        "5000",
+        "--contract",
+        "market",
+        "--progress-file",
+        progressFile,
+        "--output-file",
+        outputFile,
+      ],
+      deps: { config: fakeBotConfig(), server: server1, writeOutputLine: interruptingWriter },
+    });
+
+    assert.equal(run1.exitCode, 1, "interrupted output write must exit 1");
+
+    // Checkpoint must record the last fully committed output record (evA)
+    const midProgress = JSON.parse(await readFile(progressFile, "utf8"));
+    assert.equal(midProgress.targets.market.lastCommittedOutputEventId, cursor1);
+    assert.equal(midProgress.targets.market.committedOutputRecords, 1);
+    assert.equal(midProgress.targets.market.completed, false);
+
+    // Run 2: Resume with normal durable writer; RPC re-serves the interrupted page
+    const server2 = makeServer({ oldestLedger: 3000, latestLedger: 5000 }, {
+      [MARKET_CONTRACT]: [
+        { events: [evA, evB, evC], cursor: cursor3, latestLedger: 5000 },
+        { events: [], cursor: cursor3, latestLedger: 5000 },
+      ],
+    });
+
+    const run2 = await runReplayCli({
+      argv: [
+        "node",
+        "replay-cli.ts",
+        "--from",
+        "4000",
+        "--to",
+        "5000",
+        "--contract",
+        "market",
+        "--progress-file",
+        progressFile,
+        "--output-file",
+        outputFile,
+      ],
+      deps: { config: fakeBotConfig(), server: server2 },
+    });
+
+    assert.equal(run2.exitCode, 0);
+
+    // Output file must contain exactly 3 valid JSONL records (evA, evB, evC) with no truncation or duplication
+    const rawOut = await readFile(outputFile, "utf8");
+    const lines = rawOut.trimEnd().split("\n");
+    assert.equal(lines.length, 3, "output file must have exactly 3 committed records");
+    const parsed = lines.map((l) => JSON.parse(l));
+    assert.deepEqual(
+      parsed.map((r) => r.eventId),
+      [cursor1, cursor2, cursor3],
+    );
+
+    const finalProgress = JSON.parse(await readFile(progressFile, "utf8"));
+    assert.equal(finalProgress.targets.market.lastCommittedOutputEventId, cursor3);
+    assert.equal(finalProgress.targets.market.committedOutputRecords, 3);
+    assert.equal(finalProgress.targets.market.completed, true);
+  });
+});
+
+test("rejects mismatched --output-file on resume and corrupt middle output records", async () => {
+  await withTempDataDir(async (tmp) => {
+    const progressFile = tmp.file("progress.json");
+    const outputA = tmp.file("out-a.jsonl");
+    const outputB = tmp.file("out-b.jsonl");
+
+    const cursor1 = makeCursor(4100, 1);
+    const evA = claimCreatedEvent({ ledger: 4100, claimId: 701, id: cursor1, pagingToken: cursor1 });
+    const server = makeServer({ oldestLedger: 3000, latestLedger: 5000 }, {
+      [MARKET_CONTRACT]: [{ events: [evA], cursor: cursor1, latestLedger: 5000 }],
+    });
+
+    const r1 = await runReplayCli({
+      argv: [
+        "node",
+        "replay-cli.ts",
+        "--from",
+        "4000",
+        "--to",
+        "5000",
+        "--contract",
+        "market",
+        "--progress-file",
+        progressFile,
+        "--output-file",
+        outputA,
+      ],
+      deps: { config: fakeBotConfig(), server },
+    });
+    assert.equal(r1.exitCode, 0);
+
+    // Mismatched --output-file must reject with exit code 2
+    const rMismatch = await runReplayCli({
+      argv: [
+        "node",
+        "replay-cli.ts",
+        "--from",
+        "4000",
+        "--to",
+        "5000",
+        "--contract",
+        "market",
+        "--progress-file",
+        progressFile,
+        "--output-file",
+        outputB,
+      ],
+      deps: { config: fakeBotConfig(), server },
+    });
+    assert.equal(rMismatch.exitCode, 2);
+
+    // Corrupt middle line in output file must reject with exit code 2 without truncating
+    const corruptFile = tmp.file("corrupt-mid.jsonl");
+    await writeFile(corruptFile, "{bad-json\n{\"eventId\":\"ok\"}\n", "utf8");
+    const rCorrupt = await runReplayCli({
+      argv: [
+        "node",
+        "replay-cli.ts",
+        "--from",
+        "4000",
+        "--to",
+        "5000",
+        "--contract",
+        "market",
+        "--output-file",
+        corruptFile,
+      ],
+      deps: { config: fakeBotConfig(), server },
+    });
+    assert.equal(rCorrupt.exitCode, 2);
+  });
+});

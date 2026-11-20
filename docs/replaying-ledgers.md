@@ -74,6 +74,9 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
+| `--progress-file` | `<path>` | Checkpoint replay progress atomically after each page (and after each committed output record when `--output-file` is used) so interrupted runs can resume. | None |
+| `--output-file` | `<path>` | Append committed replay event records as LF-delimited JSONL (`--out` alias). On resume, trims any incomplete trailing line without truncating or duplicating committed records. | None |
+| `--rpm` | `<number>` | Maximum RPC requests per minute across `getHealth` and `getEvents` calls. | Unlimited |
 
 ### Exit Codes
 
