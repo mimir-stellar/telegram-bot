@@ -93,6 +93,7 @@ import {
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
+import { parseBoundedRetryAfterMs } from "./notifications/notifier.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
@@ -624,33 +625,8 @@ const DEFAULT_MAX_BACKOFF_MS = 10_000;
 const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 
 export function extractRetryAfterMs(err: unknown): number | null {
-  if (!err || typeof err !== "object") return null;
-  const e = err as any;
-
-  let seconds: number | null = null;
-
-  if (typeof e.parameters?.retry_after === "number") {
-    seconds = e.parameters.retry_after;
-  } else {
-    const headers = e.response?.headers || e.headers;
-    if (headers) {
-      let val: any;
-      if (typeof headers.get === "function") {
-        val = headers.get("retry-after") || headers.get("Retry-After");
-      } else {
-        val = headers["retry-after"] || headers["Retry-After"];
-      }
-      if (typeof val === "string" || typeof val === "number") {
-        const parsed = parseInt(String(val), 10);
-        if (!Number.isNaN(parsed)) seconds = parsed;
-      }
-    }
-  }
-
-  if (seconds !== null && seconds > 0) {
-    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
-  }
-  return null;
+  const parsed = parseBoundedRetryAfterMs(err, MAX_RETRY_AFTER_MS);
+  return parsed.status === "ok" ? parsed.delayMs : null;
 }
 /**
  * Consecutive automatic floor rewinds allowed for one target before the poller

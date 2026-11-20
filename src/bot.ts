@@ -368,8 +368,15 @@ export function createBot(deps: BotDeps): Bot {
 // existing imports from "bot.js" keep resolving without modification.
 export {
   createNotifier,
+  createRoutePacer,
+  DEFAULT_MAX_RETRY_AFTER_MS,
   isMarkdownParseError,
   notifierSkips,
+  parseBoundedRetryAfterMs,
+  type NotifierOptions,
+  type RetryAfterParseResult,
+  type RoutePacer,
+  type RoutePacerOptions,
   type SendExtra,
 } from "./notifications/notifier.js";
 

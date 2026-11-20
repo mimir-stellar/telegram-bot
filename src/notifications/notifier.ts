@@ -5,10 +5,13 @@
  * command-handling changes no longer touch the same file.
  *
  * Public API (all re-exported from `src/bot.ts` for backwards compatibility):
- *   - {@link SendExtra}         — extra options a caller attaches to a send
- *   - {@link isMarkdownParseError} — classifier for Telegram entity-parse failures
- *   - {@link notifierSkips}    — counters for suppressed sends
- *   - {@link createNotifier}   — factory that returns the poller's send function
+ *   - {@link SendExtra}                   — extra options a caller attaches to a send
+ *   - {@link DEFAULT_MAX_RETRY_AFTER_MS}  — default upper bound for Telegram retry_after delays
+ *   - {@link parseBoundedRetryAfterMs}    — parser/validator for Telegram retry_after delays
+ *   - {@link createRoutePacer}            — per-route flood pacing without blocking other routes
+ *   - {@link isMarkdownParseError}        — classifier for Telegram entity-parse failures
+ *   - {@link notifierSkips}               — counters for suppressed sends
+ *   - {@link createNotifier}              — factory that returns the poller's send function
  */
 
 import type { Bot } from "grammy";
@@ -96,6 +99,150 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
  */
 export const notifierSkips = { emptyText: 0 };
 
+// ── Bounded retry_after & per-route pacing ───────────────────────────────────
+
+/** Default upper bound (60s) for honoring Telegram `retry_after` flood delays. */
+export const DEFAULT_MAX_RETRY_AFTER_MS = 60_000;
+
+export type RetryAfterParseResult =
+  | { status: "none" }
+  | { status: "ok"; delayMs: number }
+  | { status: "rejected"; reason: "malformed" | "extreme"; raw: unknown };
+
+function readRawRetryAfter(err: unknown): { present: boolean; raw: unknown } {
+  if (!err || typeof err !== "object") return { present: false, raw: undefined };
+  const e = err as Record<string, unknown> & {
+    parameters?: Record<string, unknown>;
+    response?: { headers?: unknown };
+    headers?: unknown;
+  };
+
+  if (e.parameters && typeof e.parameters === "object" && "retry_after" in e.parameters) {
+    return { present: true, raw: e.parameters.retry_after };
+  }
+  if ("retry_after" in e) {
+    return { present: true, raw: e.retry_after };
+  }
+
+  const headers = (e.response?.headers ?? e.headers) as
+    | { get?: (name: string) => unknown; [key: string]: unknown }
+    | undefined;
+  if (headers && typeof headers === "object") {
+    const val =
+      typeof headers.get === "function"
+        ? headers.get("retry-after") ?? headers.get("Retry-After")
+        : headers["retry-after"] ?? headers["Retry-After"];
+    if (val !== undefined && val !== null) {
+      return { present: true, raw: val };
+    }
+  }
+
+  return { present: false, raw: undefined };
+}
+
+/**
+ * Parse and validate a Telegram flood `retry_after` delay (in seconds),
+ * rejecting malformed (non-finite, non-positive, non-numeric) or extreme
+ * (`> maxRetryAfterMs`) server delays.
+ */
+export function parseBoundedRetryAfterMs(
+  err: unknown,
+  maxRetryAfterMs: number = DEFAULT_MAX_RETRY_AFTER_MS,
+): RetryAfterParseResult {
+  const { present, raw } = readRawRetryAfter(err);
+  if (!present) return { status: "none" };
+
+  let seconds: number;
+  if (typeof raw === "number") {
+    seconds = raw;
+  } else if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed === "" || !/^\d+(?:\.\d+)?$/.test(trimmed)) {
+      return { status: "rejected", reason: "malformed", raw };
+    }
+    seconds = Number(trimmed);
+  } else {
+    return { status: "rejected", reason: "malformed", raw };
+  }
+
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return { status: "rejected", reason: "malformed", raw };
+  }
+
+  const delayMs = Math.ceil(seconds * 1000);
+  if (!Number.isFinite(delayMs) || delayMs > maxRetryAfterMs) {
+    return { status: "rejected", reason: "extreme", raw };
+  }
+
+  return { status: "ok", delayMs };
+}
+
+export interface RoutePacerOptions {
+  maxRetryAfterMs?: number | undefined;
+  now?: (() => number) | undefined;
+  sleep?: ((ms: number) => Promise<void>) | undefined;
+}
+
+export interface RoutePacer {
+  waitForRoute(route: string): Promise<void>;
+  recordFloodResponse(route: string, err: unknown): RetryAfterParseResult;
+  getRouteCooldownUntil(route: string): number | null;
+}
+
+const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Per-route flood pacer: when Telegram returns a valid bounded `retry_after`
+ * for one destination route (`chatId`), only that route waits out the cooldown
+ * while unrelated routes continue unblocked.
+ */
+export function createRoutePacer(options?: RoutePacerOptions): RoutePacer {
+  const maxRetryAfterMs = options?.maxRetryAfterMs ?? DEFAULT_MAX_RETRY_AFTER_MS;
+  const now = options?.now ?? Date.now;
+  const sleep = options?.sleep ?? defaultSleep;
+  const cooldownUntilByRoute = new Map<string, number>();
+
+  async function waitForRoute(route: string): Promise<void> {
+    const deadline = cooldownUntilByRoute.get(route);
+    if (deadline === undefined) return;
+    const remaining = deadline - now();
+    if (remaining > 0) {
+      await sleep(remaining);
+    } else {
+      cooldownUntilByRoute.delete(route);
+    }
+  }
+
+  function recordFloodResponse(route: string, err: unknown): RetryAfterParseResult {
+    const parsed = parseBoundedRetryAfterMs(err, maxRetryAfterMs);
+    if (parsed.status === "ok") {
+      const target = now() + parsed.delayMs;
+      const existing = cooldownUntilByRoute.get(route) ?? 0;
+      if (target > existing) {
+        cooldownUntilByRoute.set(route, target);
+      }
+    } else if (parsed.status === "rejected") {
+      console.warn(
+        `[notifier] rejected ${parsed.reason} retry_after for route ${route}: ${String(parsed.raw).slice(0, 32)}`,
+      );
+    }
+    return parsed;
+  }
+
+  function getRouteCooldownUntil(route: string): number | null {
+    return cooldownUntilByRoute.get(route) ?? null;
+  }
+
+  return { waitForRoute, recordFloodResponse, getRouteCooldownUntil };
+}
+
+export interface NotifierOptions {
+  maxRetryAfterMs?: number | undefined;
+  now?: (() => number) | undefined;
+  sleep?: ((ms: number) => Promise<void>) | undefined;
+  pacer?: RoutePacer | undefined;
+}
+
 // ── createNotifier ───────────────────────────────────────────────────────────
 
 /**
@@ -120,7 +267,30 @@ export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
     Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  options?: NotifierOptions,
 ) {
+  const pacer =
+    options?.pacer ??
+    createRoutePacer({
+      maxRetryAfterMs: options?.maxRetryAfterMs,
+      now: options?.now,
+      sleep: options?.sleep,
+    });
+
+  const sendToRoute = async (
+    chatId: string,
+    body: string,
+    payloadOptions: Record<string, unknown>,
+  ): Promise<void> => {
+    await pacer.waitForRoute(chatId);
+    try {
+      await bot.api.sendMessage(chatId, body, payloadOptions);
+    } catch (err) {
+      pacer.recordFloodResponse(chatId, err);
+      throw err;
+    }
+  };
+
   return async (
     text: string | null,
     source?: ContractSource,
@@ -168,7 +338,7 @@ export function createNotifier(
     const parts = splitTelegramMessage(text);
     if (parts.length > 1) {
       for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
+        await sendToRoute(chatId, part, {
           ...notificationOptions,
           ...(index === parts.length - 1 && extra?.reply_markup
             ? { reply_markup: extra.reply_markup }
@@ -182,7 +352,7 @@ export function createNotifier(
     }
 
     try {
-      await bot.api.sendMessage(chatId, text, {
+      await sendToRoute(chatId, text, {
         ...notificationOptions,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(extra?.replyToMessageId !== undefined
@@ -208,7 +378,7 @@ export function createNotifier(
           )}`,
       );
       // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
+      await sendToRoute(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
         ...silentOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
