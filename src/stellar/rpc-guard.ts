@@ -11,6 +11,83 @@ import type { rpc } from "@stellar/stellar-sdk";
 /** Default ceiling on the number of events permitted in a single RPC response. */
 export const DEFAULT_MAX_EVENTS_PER_RESPONSE = 1_000;
 
+export type RpcUrlProblem =
+  | "invalid-url"
+  | "unsupported-protocol"
+  | "embedded-credentials";
+
+/**
+ * Error thrown when a configured RPC or endpoint URL fails boundary validation.
+ *
+ * Messages are strictly bounded and report only the affected configuration key,
+ * never echoing the raw URL or any embedded credentials.
+ */
+export class RpcEndpointUrlError extends Error {
+  readonly problem: RpcUrlProblem;
+  readonly configKey: string;
+
+  constructor(problem: RpcUrlProblem, configKey: string, message: string) {
+    super(message);
+    this.name = "RpcEndpointUrlError";
+    this.problem = problem;
+    this.configKey = configKey;
+  }
+}
+
+/** Matches an authority section containing userinfo (`@` before path/query/hash). */
+const EMBEDDED_USERINFO_RE = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i;
+
+/**
+ * Validate a configured HTTP(S) endpoint URL before startup or client creation.
+ *
+ * Rejects malformed URLs, non-HTTP(S) protocols, and URLs with embedded
+ * credentials (`user:pass@host`, `user@host`, `:pass@host`, or `@host`).
+ * Errors report only the affected configuration key and never echo the URL or
+ * credentials.
+ *
+ * @param url The configured URL string to validate.
+ * @param configKey Configuration key name reported in errors (defaults to `"STELLAR_RPC_URL"`).
+ * @returns The validated URL string.
+ * @throws {RpcEndpointUrlError} When the URL is invalid, non-HTTP(S), or contains embedded credentials.
+ */
+export function assertRpcEndpointUrl(
+  url: string,
+  configKey = "STELLAR_RPC_URL",
+): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new RpcEndpointUrlError(
+      "invalid-url",
+      configKey,
+      `${configKey} is not a valid URL`,
+    );
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new RpcEndpointUrlError(
+      "unsupported-protocol",
+      configKey,
+      `${configKey} must be an http(s) URL`,
+    );
+  }
+
+  if (
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    EMBEDDED_USERINFO_RE.test(url.trim())
+  ) {
+    throw new RpcEndpointUrlError(
+      "embedded-credentials",
+      configKey,
+      `${configKey} must not contain embedded credentials`,
+    );
+  }
+
+  return url;
+}
+
 export type RpcGuardProblem =
   | "not-an-object"
   | "events-not-an-array"

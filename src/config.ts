@@ -58,6 +58,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import { assertRpcEndpointUrl, RpcEndpointUrlError } from "./stellar/rpc-guard.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -605,12 +606,13 @@ function collector(profile: Record<string, string>) {
     url(name: string, fallback: string): string {
       const value = get(name) ?? fallback;
       try {
-        const parsed = new URL(value);
-        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          problems.push(`${name} must be an http(s) URL; got "${value}"`);
+        assertRpcEndpointUrl(value, name);
+      } catch (err) {
+        if (err instanceof RpcEndpointUrlError) {
+          problems.push(err.message);
+        } else {
+          problems.push(`${name} is not a valid URL`);
         }
-      } catch {
-        problems.push(`${name} is not a valid URL; got "${value}"`);
       }
       return value;
     },
@@ -619,12 +621,13 @@ function collector(profile: Record<string, string>) {
       const value = read(name);
       if (value === undefined) return null;
       try {
-        const parsed = new URL(value);
-        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          problems.push(`${name} must be an http(s) URL; got "${value}"`);
+        assertRpcEndpointUrl(value, name);
+      } catch (err) {
+        if (err instanceof RpcEndpointUrlError) {
+          problems.push(err.message);
+        } else {
+          problems.push(`${name} is not a valid URL`);
         }
-      } catch {
-        problems.push(`${name} is not a valid URL; got "${value}"`);
       }
       return value;
     },

@@ -15,6 +15,7 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import { assertRpcEndpointUrl } from "./rpc-guard.js";
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -31,6 +32,7 @@ export class RpcPassphraseError extends Error {
  * verified separately at boot by {@link validateNetworkPassphrase}.
  */
 export function createRpcServer(config: StellarConfig): rpc.Server {
+  assertRpcEndpointUrl(config.rpcUrl, "STELLAR_RPC_URL");
   return new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
