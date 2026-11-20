@@ -28,6 +28,11 @@ export class FollowStoreError extends Error {
   }
 }
 
+export interface ImportResult {
+  added: number;
+  skipped: number;
+}
+
 export interface FollowStoreFs {
   readFileSync: (filePath: fs.PathOrFileDescriptor, encoding: BufferEncoding) => string;
   renameSync: (oldPath: fs.PathLike, newPath: fs.PathLike) => void;
@@ -76,6 +81,24 @@ function emptyStore(): StoreFile {
   return { version: STORE_VERSION, follows: {} };
 }
 
+function normalizeRefList(chatId: string, list: unknown, context: string): string[] {
+  if (!Array.isArray(list)) {
+    throw new FollowStoreError(`${context}[${chatId}] is not an array`);
+  }
+  const seen = new Set<string>();
+  const cleaned: string[] = [];
+  for (const entry of list) {
+    if (typeof entry !== "string" || parseRef(entry) === null) {
+      throw new FollowStoreError(`invalid ref in ${context}[${chatId}]`);
+    }
+    if (!seen.has(entry)) {
+      seen.add(entry);
+      cleaned.push(entry);
+    }
+  }
+  return cleaned;
+}
+
 function validateStoreFile(data: unknown): StoreFile {
   if (!isPlainObject(data)) {
     throw new FollowStoreError("store file is not an object");
@@ -88,17 +111,7 @@ function validateStoreFile(data: unknown): StoreFile {
   }
   const follows: Record<string, string[]> = {};
   for (const [chatId, list] of Object.entries(data.follows as Record<string, unknown>)) {
-    if (!Array.isArray(list)) {
-      throw new FollowStoreError(`follows[${chatId}] is not an array`);
-    }
-    const cleaned: string[] = [];
-    for (const entry of list) {
-      if (typeof entry !== "string" || parseRef(entry) === null) {
-        throw new FollowStoreError(`invalid ref in follows[${chatId}]`);
-      }
-      cleaned.push(entry);
-    }
-    follows[chatId] = cleaned;
+    follows[chatId] = normalizeRefList(chatId, list, "follows");
   }
   return { version: STORE_VERSION, follows };
 }
@@ -237,6 +250,71 @@ export class FollowStore {
     }
     const data = this.read();
     return [...(data.follows[chatId] ?? [])];
+  }
+
+  /**
+   * Import follows from a `StoreFile` or `chatId -> refs[]` map.
+   * Duplicate references (within the import or already present in the store)
+   * are normalized away before enforcing `maxPerChat` and `maxTotal` limits.
+   */
+  import(source: StoreFile | Record<string, readonly string[]>): ImportResult {
+    if (!isPlainObject(source)) {
+      throw new FollowStoreError("import payload must be an object");
+    }
+    let rawFollows: Record<string, unknown>;
+    if ("version" in source && "follows" in source && typeof source.version === "number") {
+      if (source.version !== STORE_VERSION) {
+        throw new FollowStoreError(`unsupported store version: ${String(source.version)}`);
+      }
+      if (!isPlainObject(source.follows)) {
+        throw new FollowStoreError("follows is not an object");
+      }
+      rawFollows = source.follows as Record<string, unknown>;
+    } else {
+      rawFollows = source as Record<string, unknown>;
+    }
+
+    const normalized = new Map<string, { rawCount: number; refs: string[] }>();
+    for (const [chatId, list] of Object.entries(rawFollows)) {
+      if (typeof chatId !== "string" || chatId.length === 0) {
+        throw new FollowStoreError("chatId must be a non-empty string");
+      }
+      const refs = normalizeRefList(chatId, list, "import");
+      normalized.set(chatId, { rawCount: (list as unknown[]).length, refs });
+    }
+
+    const data = this.read();
+    let totalNew = 0;
+    let skipped = 0;
+    const pending: Array<{ chatId: string; toAdd: string[] }> = [];
+
+    for (const [chatId, { rawCount, refs }] of normalized) {
+      const existing = data.follows[chatId] ?? [];
+      const existingSet = new Set(existing);
+      const toAdd = refs.filter((ref) => !existingSet.has(ref));
+      skipped += rawCount - toAdd.length;
+
+      if (existing.length + toAdd.length > this.maxPerChat) {
+        throw new FollowStoreError(`per-chat follow limit reached (${this.maxPerChat})`);
+      }
+      totalNew += toAdd.length;
+      if (toAdd.length > 0) {
+        pending.push({ chatId, toAdd });
+      }
+    }
+
+    if (this.totalCount(data) + totalNew > this.maxTotal) {
+      throw new FollowStoreError(`total follow limit reached (${this.maxTotal})`);
+    }
+
+    if (totalNew > 0) {
+      for (const { chatId, toAdd } of pending) {
+        data.follows[chatId] = [...(data.follows[chatId] ?? []), ...toAdd];
+      }
+      this.write(data);
+    }
+
+    return { added: totalNew, skipped };
   }
 
   followersOf(ref: string): string[] {
