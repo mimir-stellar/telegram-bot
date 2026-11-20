@@ -13,6 +13,7 @@ Operational reference describing all on-disk state files maintained by the Mimir
 | **Audit Trail File** | `AUDIT_FILE` | `./data/audit.jsonl` | `src/audit.ts` | Append (`appendFile` with JSON line per entry) | If absent, automatically created on next append. Historical audit records prior to deletion are lost. | `/audit` skips unreadable/malformed lines (`unreadableLines` count incremented) and processes valid lines. poller append operations continue appending new entries. |
 | **Status Snapshot File** | `STATUS_FILE` | `./data/status.json` | `src/status.ts` | Atomic (write temporary file `${STATUS_FILE}.tmp` then rename) | Harmless to poller loop. Recreated atomically on the next poll cycle. CLI `--status` command will fail to find status until rewritten. | Overwritten atomically on the next poll cycle. External tools or CLI reading corrupt file before next cycle encounter parse errors. |
 | **Instance Lock File** | `INSTANCE_LOCK_FILE` | `./data/poller.lock` | `src/instanceLock.ts` | Exclusive file creation (`O_EXCL` / `wx` flag via `open`) | Poller will re-acquire lock on next startup if no other instance holds it. During runtime, removal removes concurrency protection against double instances. | Stale or unparseable lock payload (non-JSON, bad schema, or dead PID) is warned and automatically unlinked by next acquiring instance. |
+| **Digest Delivery Journal** | `DIGEST_DELIVERY_FILE` | `./data/digest-delivery.jsonl` | `src/notifications/schedule.ts` | Append with fsync (`open` with `"a"` and `handle.sync()`), atomic compaction | Treated as empty delivery journal on startup. Incomplete multi-page digests start fresh without prior recovery checkpoints. | Malformed or torn lines are safely skipped on read; valid recovery records are retained. |
 
 ---
 
@@ -64,3 +65,11 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Digest Delivery Journal (`DIGEST_DELIVERY_FILE`)
+- **Writer Module**: [`src/notifications/schedule.ts`](../src/notifications/schedule.ts) (`FileDigestDeliveryStore`)
+- **Default Path**: `./data/digest-delivery.jsonl`
+- **Write Pattern**: Append-only (`open` with `"a"` and `handle.sync()`) with JSONL lines for `intent`, `confirmed`, `failed`, and `completed`. Compacted atomically (`.tmp` then rename) once settled digests exceed entry or byte thresholds.
+- **Deleted**: If missing, treated as empty journal on boot.
+- **Corrupt**: Reading skips malformed/torn lines without failing. Uncorrupted checkpoints and outcomes remain readable.
+- **Recovery Role**: Persists page-level outcomes per destination for multi-page digests. On restart, confirmed pages are skipped to prevent duplicate delivery, and uncertain in-flight sends are surfaced and reported.
