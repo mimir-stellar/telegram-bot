@@ -70,6 +70,7 @@ import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
 import { EventDedupWindow } from "./dedup.js";
 import {
   createDeadLetterQueue,
+  DEAD_LETTER_MAX_AGE_MS,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
   type DeadLetterStats,
@@ -1449,6 +1450,7 @@ export function createPoller(deps: PollerDeps) {
     filePath: deadLetterEnabled ? (config.deadLetterFile as string) : null,
     maxEntries: config.deadLetterMax ?? DEAD_LETTER_MAX_ENTRIES,
     maxAttempts: config.deadLetterMaxAttempts ?? DEAD_LETTER_MAX_ATTEMPTS,
+    maxAgeMs: config.deadLetterMaxAgeMs ?? DEAD_LETTER_MAX_AGE_MS,
     // A Telegram error embeds the token in its request URL, and the queue is
     // the last place it belongs.
     secrets: [config.botToken],
@@ -1509,7 +1511,7 @@ export function createPoller(deps: PollerDeps) {
     lastCycleEmptyPages: 0,
     lastCyclePages: 0,
     notificationsDropped: 0,
-    deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0 },
+    deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0, expired: 0 },
     eventsDeduplicated: 0,
     cursorRewinds: 0,
     restartGaps: 0,

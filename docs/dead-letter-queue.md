@@ -87,7 +87,10 @@ The queue is strictly bounded across every dimension:
 1. **Depth Limit (`DEAD_LETTER_MAX` / `maxEntries`)**:
    * Configured via `DEAD_LETTER_MAX` (default `100`).
    * When enqueuing a new entry into a queue that has reached `maxEntries`, the **oldest** entry is dropped and counted (`dropped` counter). This prevents permanently failing sends from expanding the file indefinitely.
-2. **Attempt Limit (`DEAD_LETTER_MAX_ATTEMPTS` / `maxAttempts`)**:
+2. **Age Limit (`DEAD_LETTER_MAX_AGE_MS` / `maxAgeMs`)**:
+   * Configured via `DEAD_LETTER_MAX_AGE_MS` (default `604800000` ms / 7 days).
+   * Entries older than `maxAgeMs` are evicted on `load()`, `enqueue()`, and `flush()`, and counted in the `expired` stat (`status.deadLetter.expired` and `dlq list --json`). Expired entries are evicted before capacity checks so newly failed entries are preserved.
+3. **Attempt Limit (`DEAD_LETTER_MAX_ATTEMPTS` / `maxAttempts`)**:
    * Configured via `DEAD_LETTER_MAX_ATTEMPTS` (default `10`).
    * If a message fails replay `maxAttempts` times, it is deemed a "poison entry" (e.g. invalid formatting rejected by Telegram) and is dropped from the queue.
 3. **Payload Truncation**:

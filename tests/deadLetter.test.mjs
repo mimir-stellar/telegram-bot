@@ -406,3 +406,98 @@ test("makeEntryId is stable for identical payloads and differs on content", () =
   assert.notEqual(a, c);
   assert.notEqual(a, d);
 });
+
+// ── Age-based retention & expiry counters ─────────────────────────────────────
+
+test("expired entries are evicted on load and flush while newly failed entries are preserved", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-dlq-age-"));
+  const filePath = path.join(directory, "dead-letter.json");
+  let clock = 1_700_000_000_000;
+  const maxAgeMs = 60_000;
+
+  try {
+    const first = createDeadLetterQueue({
+      filePath,
+      maxEntries: 2,
+      maxAttempts: 3,
+      maxAgeMs,
+      now: () => clock,
+    });
+    await first.load();
+    await first.enqueue(parked(1, "msg-1"));
+    clock += 30_000;
+    await first.enqueue(parked(2, "msg-2"));
+    assert.equal(first.stats().depth, 2);
+    assert.equal(first.stats().expired, 0);
+
+    // Advance so ledger 1 (70s old) is expired, while ledger 2 (40s old) is still valid.
+    clock += 40_000;
+    // Enqueueing ledger 3 should evict expired ledger 1 first instead of dropping valid ledger 2.
+    await first.enqueue(parked(3, "msg-3"));
+    assert.equal(first.stats().expired, 1);
+    assert.equal(first.stats().dropped, 0);
+    assert.equal(first.stats().depth, 2);
+    assert.deepEqual(
+      first.snapshot().map((e) => e.ledger),
+      [2, 3],
+    );
+
+    // Advance so ledger 2 (70s old) expires, while ledger 3 (30s old) remains.
+    clock += 30_000;
+    const flushed = [];
+    const res = await first.flush(async (_text, entry) => {
+      flushed.push(entry.ledger);
+    }, 10);
+    assert.deepEqual(flushed, [3]);
+    assert.equal(res.sent, 1);
+    assert.equal(res.remaining, 0);
+    assert.equal(first.stats().expired, 2);
+
+    // Reloading a file with an expired entry evicts it on load and counts it.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: new Date(clock).toISOString(),
+        entries: [
+          {
+            id: makeEntryId("market", 10, "claim_cancelled", "old"),
+            enqueuedAt: new Date(clock - maxAgeMs - 1).toISOString(),
+            source: "market",
+            ledger: 10,
+            eventName: "claim_cancelled",
+            text: "old",
+            attempts: 1,
+            lastError: "err",
+          },
+          {
+            id: makeEntryId("market", 11, "claim_cancelled", "exact-boundary"),
+            enqueuedAt: new Date(clock - maxAgeMs).toISOString(),
+            source: "market",
+            ledger: 11,
+            eventName: "claim_cancelled",
+            text: "exact-boundary",
+            attempts: 1,
+            lastError: "err",
+          },
+        ],
+      }),
+    );
+
+    const reloaded = createDeadLetterQueue({
+      filePath,
+      maxEntries: 5,
+      maxAttempts: 3,
+      maxAgeMs,
+      now: () => clock,
+    });
+    await reloaded.load();
+    assert.equal(reloaded.stats().expired, 1);
+    assert.deepEqual(
+      reloaded.snapshot().map((e) => e.ledger),
+      [11],
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});

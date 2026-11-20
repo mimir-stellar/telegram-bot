@@ -53,6 +53,7 @@ export interface DeadLetterStats {
   enqueued: number;
   replayed: number;
   dropped: number;
+  expired: number;
 }
 
 export interface DeadLetterQueueOptions {
@@ -65,6 +66,11 @@ export interface DeadLetterQueueOptions {
   filePath: string | null;
   maxEntries: number;
   maxAttempts: number;
+  /**
+   * Maximum retention age in milliseconds (`null` disables age expiry).
+   * Defaults to {@link DEAD_LETTER_MAX_AGE_MS}.
+   */
+  maxAgeMs?: number | null;
   /**
    * Config secrets to scrub from a recorded error, passed straight to
    * `safeErrorMessage`. The poller hands over its bot token: a Telegram failure
@@ -79,6 +85,7 @@ export interface DeadLetterQueueOptions {
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
+export const DEAD_LETTER_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
@@ -111,12 +118,21 @@ export function makeEntryId(
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
+  const maxAgeMs =
+    options.maxAgeMs === null
+      ? null
+      : options.maxAgeMs !== undefined
+        ? Number.isFinite(options.maxAgeMs) && options.maxAgeMs > 0
+          ? options.maxAgeMs
+          : null
+        : DEAD_LETTER_MAX_AGE_MS;
   let entries: DeadLetterEntry[] = [];
   const stats: DeadLetterStats = {
     depth: 0,
     enqueued: 0,
     replayed: 0,
     dropped: 0,
+    expired: 0,
   };
 
   /** Redacted, truncated error text — the only form that may be persisted. */
@@ -126,6 +142,35 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
 
   function syncDepth(): void {
     stats.depth = entries.length;
+  }
+
+  /**
+   * Evict entries older than `maxAgeMs` and increment `stats.expired`.
+   * Returns the number of entries evicted.
+   */
+  function pruneExpired(): number {
+    if (maxAgeMs === null || entries.length === 0) return 0;
+    const cutoff = now() - maxAgeMs;
+    const kept: DeadLetterEntry[] = [];
+    let evicted = 0;
+    for (const entry of entries) {
+      const enqueuedMs = Date.parse(entry.enqueuedAt);
+      if (Number.isFinite(enqueuedMs) && enqueuedMs < cutoff) {
+        evicted += 1;
+        stats.expired += 1;
+        console.warn(
+          `[dead-letter] expired ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
+            `(enqueuedAt=${entry.enqueuedAt})`,
+        );
+      } else {
+        kept.push(entry);
+      }
+    }
+    if (evicted > 0) {
+      entries = kept;
+      syncDepth();
+    }
+    return evicted;
   }
 
   async function load(): Promise<void> {
@@ -172,7 +217,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
             attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
             lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
           }));
-        // Bound on load too: the file may have been edited by hand.
+        // Bound by age first so expired entries do not count against capacity,
+        // then bound by entry count.
+        pruneExpired();
         while (entries.length > options.maxEntries) {
           entries.shift();
           stats.dropped += 1;
@@ -222,6 +269,10 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     text: string;
     error: unknown;
   }): Promise<DeadLetterEntry> {
+    // Evict expired entries before checking deduplication or capacity so
+    // newly failed entries are always preserved.
+    pruneExpired();
+
     const id = makeEntryId(input.source, input.ledger, input.eventName, input.text);
     const existing = entries.find((e) => e.id === id);
     if (existing) {
@@ -273,7 +324,11 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     send: (text: string, entry: DeadLetterEntry) => Promise<void>,
     budget: number,
   ): Promise<{ sent: number; remaining: number }> {
+    const expiredCount = pruneExpired();
     if (budget <= 0 || entries.length === 0) {
+      if (expiredCount > 0) {
+        await persist();
+      }
       return { sent: 0, remaining: entries.length };
     }
 

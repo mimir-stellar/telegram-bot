@@ -381,3 +381,48 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.throws(() => parseDurationMs(""), /requires a duration/);
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
 });
+
+test("list --json exposes expired counter when maxAgeMs is configured", async () => {
+  const t0 = 1_700_000_000_000;
+  await withTempDlq(
+    async ({ filePath }) => {
+      const io = captureIo();
+      const { exitCode } = await runDlqCli({
+        argv: ["list", "--file", filePath, "--json"],
+        now: () => t0 + 120_000,
+        stdout: io.out,
+        stderr: io.err,
+      });
+      // Without DEAD_LETTER_MAX_AGE_MS set, offline list keeps all entries.
+      assert.equal(exitCode, 0);
+      const withoutLimit = JSON.parse(io.stdout.join("\n"));
+      assert.equal(withoutLimit.depth, 2);
+      assert.equal(withoutLimit.expired, 0);
+
+      // With DEAD_LETTER_MAX_AGE_MS=60000, the 2-minute-old entry expires while the 30s-old entry stays.
+      const prev = process.env.DEAD_LETTER_MAX_AGE_MS;
+      process.env.DEAD_LETTER_MAX_AGE_MS = "60000";
+      try {
+        const io2 = captureIo();
+        const res2 = await runDlqCli({
+          argv: ["list", "--file", filePath, "--json"],
+          now: () => t0 + 120_000,
+          stdout: io2.out,
+          stderr: io2.err,
+        });
+        assert.equal(res2.exitCode, 0);
+        const withLimit = JSON.parse(io2.stdout.join("\n"));
+        assert.equal(withLimit.depth, 1);
+        assert.equal(withLimit.expired, 1);
+        assert.equal(withLimit.entries[0].ledger, 20);
+      } finally {
+        if (prev === undefined) delete process.env.DEAD_LETTER_MAX_AGE_MS;
+        else process.env.DEAD_LETTER_MAX_AGE_MS = prev;
+      }
+    },
+    [
+      { ledger: 10, at: t0 },
+      { ledger: 20, at: t0 + 90_000 },
+    ],
+  );
+});
