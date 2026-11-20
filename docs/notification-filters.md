@@ -153,3 +153,15 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_created` events**: Muted by `eventAllowedByCategory` because `config.notificationCategories` is non-empty (`["__none__"]`) and no real on-chain claim category matches `"__none__"`.
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
+
+---
+
+## 4. Atomic Filter Configuration Reloads
+
+For programmatic filter sets combining typed filter expressions ([`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts)) and integer USDC amount thresholds ([`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts)), [`src/notifications/filter-reload.ts`](../src/notifications/filter-reload.ts) provides atomic configuration reloads:
+
+- **`compileFilterConfig(candidate, version?)`**: Validates the entire candidate configuration (every expression in `expressions` and every threshold in `thresholds`) upfront and returns a frozen `CompiledFilterSet`. If any field is invalid, it throws `FilterConfigValidationError` with all collected `issues`—partial configurations are never produced.
+- **`AtomicFilterReloader`**:
+  - `reload(candidate)` compiles and validates the full candidate before performing a single atomic reference swap to the new `CompiledFilterSet`. On failure, it returns `{ ok: false, applied: false, error, filterSet }` and retains the previous working filter set unchanged (version does not increment).
+  - `reloadOrThrow(candidate)` performs the same atomic swap and throws `FilterConfigValidationError` on failure while retaining the previous working filter set.
+  - `matches(event)` evaluates an event against the active immutable snapshot via `evaluateFilterSet` (requires `meetsThreshold` and, when `rules` is non-empty, at least one matching `FilterRule`).
