@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
+import type { DigestPeriodCompleteness } from "./digest-grouping.js";
 
 export type ScheduleKind = "daily" | "weekly";
 
@@ -150,9 +151,22 @@ export const systemClock: SchedulerClock = {
   clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
+export interface ScheduledRunContext {
+  /**
+   * True when this run was triggered on `start()` to catch up after a restart
+   * missed one or more scheduled boundaries; false for normal on-time ticks.
+   */
+  afterRestart: boolean;
+  /**
+   * Digest period completeness metadata derived from scheduler state.
+   * Marked incomplete with reason `"restart"` when `afterRestart` is true.
+   */
+  completeness: DigestPeriodCompleteness;
+}
+
 export interface SchedulerOptions {
   schedule: Schedule | string;
-  run: (atMs: number) => Promise<void> | void;
+  run: (atMs: number, context: ScheduledRunContext) => Promise<void> | void;
   clock?: SchedulerClock;
   lastRunStore: LastRunStore;
 }
@@ -196,7 +210,14 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       // the next boundary instead of firing early (and then again at it).
       const shouldFire = last === null ? atBoundary : nextRun(schedule, last) <= now;
       if (shouldFire) {
-        await run(nextRun(schedule, last ?? now - 1));
+        const afterRestart = !atBoundary;
+        const context: ScheduledRunContext = {
+          afterRestart,
+          completeness: afterRestart
+            ? { complete: false, reasons: ["restart"] }
+            : { complete: true, reasons: [] },
+        };
+        await run(nextRun(schedule, last ?? now - 1), context);
         await lastRunStore.write(now);
       }
     } catch (err) {

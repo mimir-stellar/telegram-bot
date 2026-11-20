@@ -27,7 +27,12 @@ import {
 import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
 import { iconForCategory } from "./category-icons.js";
-import { groupDigestEvents } from "./digest-grouping.js";
+import {
+  formatCompletenessLabel,
+  groupDigestEvents,
+  normalizeDigestCompleteness,
+  type DigestPeriodCompleteness,
+} from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
@@ -326,6 +331,23 @@ export interface FormatDigestOptions {
    * option is omitted or set to `false`.
    */
   grouped?: boolean;
+  /**
+   * Completeness metadata for the digest period.
+   *
+   * When incomplete (e.g. affected by an RPC gap or restart), the header
+   * explicitly labels the period as incomplete and marks the event count as a
+   * partial observation rather than a complete ledger summary.
+   */
+  completeness?: Partial<DigestPeriodCompleteness>;
+}
+
+function digestHeader(count: number, completeness: DigestPeriodCompleteness): string {
+  if (completeness.complete) {
+    return `*Mimir Digest* — ${count} events in this cycle`;
+  }
+  const label = formatCompletenessLabel(completeness) ?? "Incomplete period";
+  const noun = count === 1 ? "event" : "events";
+  return `*Mimir Digest* — ${escapeMd(label)} \\(${count} observed ${noun}, partial\\)`;
 }
 
 /**
@@ -340,9 +362,12 @@ function flatLine(event: DecodedEvent): string {
 /**
  * Render a grouped digest.  Called only when `options.grouped` is `true`.
  */
-function renderGroupedDigest(events: readonly DecodedEvent[]): string {
+function renderGroupedDigest(
+  events: readonly DecodedEvent[],
+  completeness: DigestPeriodCompleteness,
+): string {
   const groups = groupDigestEvents(events);
-  const header = `*Mimir Digest* — ${events.length} events in this cycle`;
+  const header = digestHeader(events.length, completeness);
   const body: string[] = [];
 
   for (const group of groups) {
@@ -365,19 +390,31 @@ function renderGroupedDigest(events: readonly DecodedEvent[]): string {
 
 /**
  * One MarkdownV2 message summarising a burst of events: a header with the count
- * and one bounded line per event. Returns null when there is nothing to send.
+ * and one bounded line per event. Returns null when there is nothing to send
+ * and the digest period is complete.
  *
  * Pass `{ grouped: true }` to group consecutive events by claim / squad market.
+ * Pass `{ completeness: { complete: false, reasons: ["rpc_gap"] } }` (or
+ * `"restart"`) to label an incomplete period explicitly so partial counts are
+ * never presented as complete ledger summaries.
  * The default (`{}` or no second argument) produces the unchanged flat layout.
  */
 export function formatDigest(
   events: readonly DecodedEvent[],
   options: FormatDigestOptions = {},
 ): string | null {
-  if (events.length === 0) return null;
-  if (options.grouped) return renderGroupedDigest(events);
+  const completeness = normalizeDigestCompleteness(options.completeness);
+  if (events.length === 0) {
+    if (completeness.complete) return null;
+    return [
+      digestHeader(0, completeness),
+      "",
+      "_No events observed; ledger coverage for this period is incomplete\\._",
+    ].join("\n");
+  }
+  if (options.grouped) return renderGroupedDigest(events, completeness);
   const lines = events.map(flatLine);
-  return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
+  return [digestHeader(events.length, completeness), "", ...lines].join("\n");
 }
 
 /**
