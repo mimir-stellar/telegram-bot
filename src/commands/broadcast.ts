@@ -9,6 +9,7 @@
  */
 
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
+import { createHash } from "node:crypto";
 import type { BotConfig } from "../config.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
@@ -28,11 +29,11 @@ export const BROADCAST_NO_CHATS_MESSAGE = "No notification chats configured.";
 /**
  * Extracts and deduplicates all unique configured notification chats from config.
  * Chats come from TELEGRAM_CHAT_ID (chatId / chatIds), TELEGRAM_MARKET_CHAT_ID,
- * and TELEGRAM_SQUAD_CHAT_ID.
+ * TELEGRAM_SQUAD_CHAT_ID, and per-chat routes.
  */
 export function getConfiguredBroadcastChats(
   config: Pick<BotConfig, "chatId"> &
-    Partial<Pick<BotConfig, "chatIds" | "marketChatId" | "squadChatId">>,
+    Partial<Pick<BotConfig, "chatIds" | "marketChatId" | "squadChatId" | "routes">>,
 ): string[] {
   const candidates: string[] = [];
   if (Array.isArray(config.chatIds) && config.chatIds.length > 0) {
@@ -45,6 +46,13 @@ export function getConfiguredBroadcastChats(
   }
   if (config.squadChatId) {
     candidates.push(config.squadChatId);
+  }
+  if (Array.isArray(config.routes)) {
+    for (const r of config.routes) {
+      if (r && typeof r.chatId === "string") {
+        candidates.push(r.chatId);
+      }
+    }
   }
 
   const seen = new Set<string>();
@@ -80,6 +88,25 @@ export function getConfiguredBroadcastChats(
   return unique;
 }
 
+/**
+ * Computes a deterministic, order-independent SHA-256 fingerprint for a destination set.
+ * - Trims each chat identifier.
+ * - Filters empty or blank values.
+ * - Deduplicates unique destinations.
+ * - Lexicographically sorts destination identifiers for canonical representation.
+ * - Hashes the canonical newline-delimited sequence with SHA-256.
+ */
+export function fingerprintDestinationSet(chats: readonly string[]): string {
+  const unique = Array.from(
+    new Set(
+      chats
+        .map((c) => (typeof c === "string" ? c.trim() : String(c ?? "").trim()))
+        .filter((c) => c.length > 0),
+    ),
+  ).sort();
+  return createHash("sha256").update(unique.join("\n")).digest("hex");
+}
+
 export interface PendingBroadcast {
   id: string;
   operatorId: string;
@@ -88,10 +115,12 @@ export interface PendingBroadcast {
   expiresAt: number;
   chats: readonly string[];
   confirmed: boolean;
+  destinationFingerprint?: string;
 }
 
 export class BroadcastStore {
   private readonly items = new Map<string, PendingBroadcast>();
+  private readonly cancelledReasons = new Map<string, "route-change" | "user-cancelled">();
   private readonly defaultTtlMs: number;
   private counter = 0;
 
@@ -104,6 +133,7 @@ export class BroadcastStore {
     message: string,
     chats: readonly string[],
     ttlMs?: number,
+    destinationFingerprint?: string,
   ): PendingBroadcast {
     this.cleanup();
     this.counter = (this.counter + 1) % 1_000_000;
@@ -117,6 +147,7 @@ export class BroadcastStore {
       expiresAt: now + (ttlMs ?? this.defaultTtlMs),
       chats,
       confirmed: false,
+      ...(destinationFingerprint !== undefined ? { destinationFingerprint } : {}),
     };
     this.items.set(id, item);
     return item;
@@ -131,16 +162,45 @@ export class BroadcastStore {
     return this.items.delete(id);
   }
 
+  /**
+   * Cancels and removes all pending broadcast confirmations whose reviewed destination
+   * fingerprint does not match the provided current destination set (or fingerprint).
+   * Returns the list of cancelled broadcast IDs.
+   */
+  cancelOnRouteChange(currentChatsOrFingerprint: readonly string[] | string): string[] {
+    const targetFingerprint =
+      typeof currentChatsOrFingerprint === "string"
+        ? currentChatsOrFingerprint
+        : fingerprintDestinationSet(currentChatsOrFingerprint);
+    const cancelled: string[] = [];
+    for (const [id, item] of this.items.entries()) {
+      if (item.destinationFingerprint && item.destinationFingerprint !== targetFingerprint) {
+        this.items.delete(id);
+        this.cancelledReasons.set(id, "route-change");
+        cancelled.push(id);
+      }
+    }
+    return cancelled;
+  }
+
+  getCancelReason(id: string): "route-change" | "user-cancelled" | undefined {
+    return this.cancelledReasons.get(id);
+  }
+
   cleanup(now: number = Date.now()): void {
     for (const [id, item] of this.items.entries()) {
       if (item.expiresAt <= now) {
         this.items.delete(id);
       }
     }
+    if (this.cancelledReasons.size > 1000) {
+      this.cancelledReasons.clear();
+    }
   }
 
   clear(): void {
     this.items.clear();
+    this.cancelledReasons.clear();
   }
 
   size(): number {
@@ -156,11 +216,17 @@ export function broadcastKeyboard(id: string): InlineKeyboard {
     .text("❌ Cancel", `broadcast:cancel:${id}`);
 }
 
-export function formatBroadcastPreview(message: string, chats: readonly string[]): string {
+export function formatBroadcastPreview(
+  message: string,
+  chats: readonly string[],
+  destinationFingerprint?: string,
+): string {
   const chatList = chats.map((c) => `• ${c}`).join("\n");
+  const fp = destinationFingerprint ?? fingerprintDestinationSet(chats);
   return (
     `📢 Broadcast Preview\n\n` +
     `Target chats (${chats.length}):\n${chatList}\n\n` +
+    `Route fingerprint: \`${fp.slice(0, 12)}\`\n\n` +
     `Message:\n${message}\n\n` +
     `Click Confirm to send or Cancel to abort.`
   );
@@ -266,15 +332,17 @@ export async function handleBroadcastCommand(
     return;
   }
 
+  const fingerprint = fingerprintDestinationSet(chats);
   const store = deps.broadcastStore ?? defaultBroadcastStore;
   const pending = store.create(
     String(ctx.from?.id),
     text,
     chats,
     deps.broadcastExpiryMs,
+    fingerprint,
   );
 
-  const previewText = formatBroadcastPreview(text, chats);
+  const previewText = formatBroadcastPreview(text, chats, fingerprint);
   const keyboard = broadcastKeyboard(pending.id);
 
   await ctx.reply(previewText, {
@@ -322,6 +390,24 @@ export async function handleBroadcastCallback(
   const pending = store.get(broadcastId);
 
   if (!pending) {
+    const cancelReason = store.getCancelReason?.(broadcastId);
+    if (cancelReason === "route-change") {
+      await safeAnswerCallback(ctx, config, {
+        text: "Route configuration changed. New preview required.",
+        show_alert: true,
+      });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText(
+            "⚠️ Route configuration changed since preview. Broadcast confirmation cancelled. Run /broadcast again for an updated preview.",
+          );
+        } catch {
+          // ignore edit failure
+        }
+      }
+      return;
+    }
+
     await safeAnswerCallback(ctx, config, {
       text: "Broadcast expired or already processed",
       show_alert: true,
@@ -350,6 +436,30 @@ export async function handleBroadcastCallback(
       }
     }
     return;
+  }
+
+  // Cancel pending broadcast confirmation if route configuration has changed since preview
+  if (pending.destinationFingerprint !== undefined) {
+    const currentChats = getConfiguredBroadcastChats(config);
+    const currentFingerprint = fingerprintDestinationSet(currentChats);
+
+    if (pending.destinationFingerprint !== currentFingerprint) {
+      store.delete(broadcastId);
+      await safeAnswerCallback(ctx, config, {
+        text: "Route configuration changed. New preview required.",
+        show_alert: true,
+      });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText(
+            "⚠️ Route configuration changed since preview. Broadcast confirmation cancelled. Run /broadcast again for an updated preview.",
+          );
+        } catch {
+          // ignore edit failure
+        }
+      }
+      return;
+    }
   }
 
   if (subAction === "cancel") {

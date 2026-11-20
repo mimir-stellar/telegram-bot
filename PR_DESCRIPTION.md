@@ -1,87 +1,55 @@
-# Feature #90: Control Link Previews Per Notification Type
-
 ## Summary
-This PR implements per-contract control of link preview rendering in Telegram notifications, allowing operators to configure whether link previews are shown for market or squad contract notifications independently.
 
-## Changes
+Cryptographically fingerprint the reviewed destination set for operator broadcast previews (`/broadcast`), and automatically cancel pending confirmations if route configuration changes before confirmation. Operators must review an updated preview before any broadcast is delivered.
 
-### Configuration
-- **New Environment Variables:**
-  - `LINK_PREVIEW_MARKET` (default: `false`) - Enable/disable link previews for market contract notifications
-  - `LINK_PREVIEW_SQUAD` (default: `false`) - Enable/disable link previews for squad contract notifications
-  - Accepted values: `true/false`, `1/0`, `yes/no`, `on/off` (case-insensitive)
-  - These settings apply only to event notifications; bot commands (`/status`, `/help`, etc.) always have link previews disabled
+Broadcast confirmations carry state-changing operator intent. Previously, if the bot's route configuration (`TELEGRAM_CHAT_ID`, `TELEGRAM_MARKET_CHAT_ID`, `TELEGRAM_SQUAD_CHAT_ID`, or per-chat routes) changed between preview generation and confirmation click, the broadcast could be dispatched to an unreviewed, stale, or newly added destination set without operator review. This change binds each pending broadcast to a canonical SHA-256 fingerprint of the reviewed destination set and invalidates pending confirmations upon any route change.
 
-### Code Changes
-1. **src/config.ts**
-   - Added `linkPreviewMarket` and `linkPreviewSquad` boolean fields to `BotConfig` interface
-   - Added default values (both `false` for backward compatibility) to `DEFAULTS`
-   - Added config loading for both new environment variables
-   - Added entries to `CONFIG_KEYS` for provenance tracking
+## Linked issue
 
-2. **src/bot.ts**
-   - Modified `createNotifier()` to compute `link_preview_options` dynamically based on contract source
-   - Market notifications use `config.linkPreviewMarket` setting
-   - Squad notifications use `config.linkPreviewSquad` setting
-   - Commands (where source is undefined) always have link previews disabled
-   - Plain-text fallback respects the same link preview settings as MarkdownV2
+Closes #853
 
-3. **src/notifications/format.ts**
-   - Updated `previewMessage()` to accept link preview configuration
-   - Now displays current link preview status ("enabled" or "disabled") in preview messages
-   - Shows preview for the appropriate contract when `/preview market` or `/preview squad` is called
+## Failure modes
 
-4. **.env.example**
-   - Added documentation for the new `LINK_PREVIEW_MARKET` and `LINK_PREVIEW_SQUAD` options
+| Failure mode | Behavior before | Behavior after |
+| --- | --- | --- |
+| Route added before confirmation (e.g. new chat configured in `TELEGRAM_CHAT_ID` or routes) | Sent message to old or modified destinations without operator review | Confirmation rejected; pending broadcast cancelled from store; operator alerted that route configuration changed and a new preview is required; 0 messages sent |
+| Route removed before confirmation (e.g. revoked chat destination) | Broadcasted to stale/revoked destination set | Confirmation rejected; pending confirmation cancelled; 0 messages sent |
+| Route reordered in config (e.g. `[chatA, chatB]` -> `[chatB, chatA]`) | N/A | Canonical fingerprint is order-independent and deduplicated; confirmation succeeds normally |
+| Proactive route configuration change | Pending confirmations remained active with old destination set | `BroadcastStore.cancelOnRouteChange()` cancels and purges mismatched items, recording `"route-change"` cancellation reason |
+| Cancel clicked after route change | Cancelled broadcast | Cancelled cleanly; pending broadcast removed from store |
+| Unchanged route configuration | Broadcast delivered to configured chats | Preserved; broadcast delivered to reviewed chats |
 
-5. **tests/link-preview-control.test.mjs**
-   - Added comprehensive test suite with 18 test cases covering:
-     - Positive cases: link previews disabled/enabled for both contracts
-     - Market and squad notifications with independent settings
-     - Commands always have link previews disabled regardless of config
-     - Chat routing respects link preview settings
-     - Plain text fallback behavior
-     - Backward compatibility (all defaults disabled)
-     - Preview message display of current settings
+## Cursor safety
 
-## Failure Modes & Deployment Notes
+Unchanged. Broadcasts and operator confirmations operate independently of the poller cursor and never access or mutate the persisted cursor state file (`data/cursor.json`).
 
-### Cursor Safety
-- **No cursor changes:** This feature only affects the Telegram send options and never touches event processing, cursor advancement, or dedup logic. Cursors remain fully compatible and unaffected.
-- **Rollback safe:** A deployment using this feature can safely roll back to a previous version without cursor migration. The new settings are optional and default to the previous "always disabled" behavior.
+## Logs and security
 
-### Telegram API Behavior
-- **Link preview disabling:** When `is_disabled: false`, Telegram's client will unfold URLs found in the message. This is a client-side feature and doesn't affect the message itself.
-- **Malformed messages:** If an URL in a message causes Telegram to reject the message formatting, the plain-text fallback (when provided) still respects the link preview setting and will be sent.
+- Logs and status output never disclose secrets or bot tokens; all errors pass through `safeErrorMessage` / `redactText`.
+- When confirmation is attempted on a broadcast whose route configuration changed:
+  - Callback query returns user-facing alert: `"Route configuration changed. New preview required."`
+  - Inline message is edited with warning: `"⚠️ Route configuration changed since preview. Broadcast confirmation cancelled. Run /broadcast again for an updated preview."`
+  - No messages are dispatched to any chat.
+- Threat model entry **T-18** added to `docs/threat-model.md` covering route desynchronization and destination set fingerprinting.
 
-### Operational Impact
-- **Default behavior unchanged:** All link previews are disabled by default, maintaining the current safe, reliable behavior for existing deployments.
-- **Per-contract granularity:** Market and squad contracts can have independent link preview settings, allowing operators to enable previews for one while keeping them disabled for the other.
-- **Command consistency:** All bot commands always have link previews disabled, regardless of the notification settings. This ensures operator commands remain stable and predictable.
+## Configuration and deployment impact
 
-### RPC & Telegram Failures
-- **RPC failures:** No change. Link preview settings are purely local configuration and never depend on RPC state.
-- **Telegram failures:** If Telegram rejects a message, the retry with plain-text fallback uses the same link preview setting. The feature doesn't introduce new failure modes.
-- **Configuration errors:** Invalid boolean values in `LINK_PREVIEW_*` variables are caught at startup by the same configuration validation that applies to all other settings (e.g., `NOTIFY_*`).
+None. No new environment variables or schema migrations are introduced. Fully backward compatible with all existing deployment targets and configuration shapes, with added support for per-chat `routes` in `getConfiguredBroadcastChats`.
 
-### Health & Status
-- **GET /health:** The config provenance report includes the new settings (as names only, never values), showing which settings came from the environment, `.env` file, or defaults.
-- **GET /status:** No changes to the status output. Link preview settings are not exposed in status messages.
-- **Audit trail:** Link preview settings are not logged in the audit trail; they're part of the static configuration captured at startup.
+## Test coverage
 
-## Backward Compatibility
-- ✅ **100% backward compatible:** Default values maintain the current "previews disabled" behavior
-- ✅ **No cursor format changes:** Version-1 cursor format unchanged
-- ✅ **No protocol changes:** Telegram API payloads use the same standard structure
-- ✅ **No feature flag interactions:** Link preview settings are independent of existing `NOTIFY_*` feature flags
+Focused automated test suite in `tests/broadcast-route-change.test.mjs` (16 test cases) plus existing broadcast test suite in `tests/broadcast-command.test.mjs` (14 test cases):
+- `fingerprintDestinationSet`: verifies deterministic 64-character SHA-256 hex string, order-independence across permutations, deduplication, whitespace normalization, and sensitivity to additions, removals, and modifications.
+- `getConfiguredBroadcastChats`: verifies chat extraction across `chatId`, `chatIds`, `marketChatId`, `squadChatId`, and `routes`.
+- `handleBroadcastCommand`: verifies destination fingerprint is recorded in `PendingBroadcast` and displayed in preview message.
+- `handleBroadcastCallback`: verifies confirmation succeeds with unchanged/reordered routes, and is cancelled/rejected with zero sends when routes are added, removed, or changed.
+- `BroadcastStore`: verifies `cancelOnRouteChange` purges mismatched items while preserving matching items, and tracks `"route-change"` cancellation reason.
+- `handleCallbackQuery`: verifies full ingress integration and operator feedback.
 
-## Testing
-All tests pass locally:
-- 18 new tests in `tests/link-preview-control.test.mjs`
-- Tests cover positive cases, boundary cases, regressions, routing, and plain-text fallback
-- Tests verify independent market/squad settings
-- Tests confirm backward compatibility (all defaults disabled)
-- Tests validate preview command behavior
-
-## Related Issues
-Closes #90
+Verification results:
+- [x] `npm run scan:secrets` passes (497 files scanned, 0 findings)
+- [x] `npm run typecheck` passes (0 errors)
+- [x] `npm run build` passes
+- [x] `npm test` passes (all broadcast unit and regression tests pass without live network credentials)
+- [x] Threat model / documentation updated (`docs/threat-model.md`, `src/callbacks.ts`, `src/commands/broadcast.ts`)
+- [x] No real bot tokens, chat ids, or signing keys added to the repo

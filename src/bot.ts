@@ -96,6 +96,7 @@ export {
   registerBroadcastHandlers,
   handleBroadcastCommand,
   getConfiguredBroadcastChats,
+  fingerprintDestinationSet,
   BroadcastStore,
   sendBroadcast,
 } from "./commands/broadcast.js";
