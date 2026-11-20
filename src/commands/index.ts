@@ -5,7 +5,7 @@
  * here is the order Telegram's menu and `/help` list them in. Adding a command:
  *
  *   1. create `src/commands/<name>.ts` and export a module from
- *      `defineCommand({ command, operatorOnly?, chatAllowlist?, hidden?, handler })`
+ *      `defineCommand({ command, operatorOnly?, chatAllowlist?, hidden?, availability?, handler })`
  *   2. add one import line here — in menu order — and re-export anything
  *      `src/bot.ts` or the tests need
  *   3. if the command is advertised, add its description to
@@ -21,6 +21,7 @@ import "./about.js";
 import "./status.js";
 import "./audit.js";
 import "./contracts.js";
+import "./filters.js";
 import "./health.js";
 import "./preview.js";
 import "./pause.js";
@@ -28,11 +29,17 @@ import "./resume.js";
 import "./log-export.js"; // hidden: operator log export
 
 export {
+  commandAvailabilityReport,
   commandMetadata,
   commandModule,
   defineCommand,
+  formatCommandAvailabilityReport,
   registeredCommands,
   visibleCommandMetadata,
+  type CommandAvailabilityCheck,
+  type CommandAvailabilityCheckResult,
+  type CommandAvailabilityEntry,
+  type CommandAvailabilityReport,
   type CommandDeps,
   type CommandHandler,
   type CommandMetadata,
@@ -59,6 +66,7 @@ export { aboutMessage, aboutCommand } from "./about.js";
 export { helpCommand, helpMessage, startCommand } from "./help.js";
 export { auditCommand, renderAuditForTelegram } from "./audit.js";
 export { contractsCommand, contractsMessage } from "./contracts.js";
+export { filtersCommand, filtersMessage } from "./filters.js";
 export { healthCommand, healthMessage } from "./health.js";
 export { pauseCommand, pauseMessage, PAUSE_PROMPT } from "./pause.js";
 export { previewCommand } from "./preview.js";

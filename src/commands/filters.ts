@@ -14,6 +14,8 @@ import { redactChatId } from "../status.js";
 import type { BotConfig } from "../config.js";
 import type { NotificationFeatureFlags } from "../notifications/featureFlags.js";
 import { DEFAULT_FEATURE_FLAGS } from "../notifications/featureFlags.js";
+import { defineCommand } from "./registry.js";
+import { TELEGRAM_OPTIONS } from "./runtime.js";
 
 /** Event types supported by mimir-market. */
 export const MARKET_EVENT_TYPES = [
@@ -48,6 +50,8 @@ export type FiltersConfig = Partial<
     | "chatIds"
     | "marketChatId"
     | "squadChatId"
+    | "channelPreviewMode"
+    | "routes"
   >
 >;
 
@@ -142,15 +146,36 @@ export function filtersMessage(config: FiltersConfig = {}): string {
   }
   lines.push("");
 
-  // Chat Routing
+  // Chat Routing (global default vs route-specific overrides)
   lines.push("*Chat Routing*");
+  lines.push("· Scope: feature flags and categories apply globally; chat destinations and preview mode can be route\\-specific\\.");
   lines.push(`· Default chat: \`${escapeMd(redactChatId(defaultChat))}\``);
   if (config.marketChatId && config.marketChatId !== defaultChat) {
-    lines.push(`· mimir\\-market chat: \`${escapeMd(redactChatId(marketChat))}\``);
+    lines.push(`· mimir\\-market chat \\(route\\-specific\\): \`${escapeMd(redactChatId(marketChat))}\``);
   }
   if (config.squadChatId && config.squadChatId !== defaultChat) {
-    lines.push(`· mimir\\-squad chat: \`${escapeMd(redactChatId(squadChat))}\``);
+    lines.push(`· mimir\\-squad chat \\(route\\-specific\\): \`${escapeMd(redactChatId(squadChat))}\``);
+  }
+
+  const routes = config.routes ?? [];
+  if (routes.length > 0) {
+    lines.push(`· Per\\-chat routes \\(${routes.length}\\):`);
+    for (const route of routes) {
+      const previewLabel = route.channelPreviewMode ? "preview on" : "preview off";
+      lines.push(`  \\- \`${escapeMd(redactChatId(route.chatId))}\`: ${previewLabel}`);
+    }
+  } else {
+    const globalPreview = config.channelPreviewMode ? "preview on" : "preview off";
+    lines.push(`· Per\\-chat routes: none \\(using global default, ${globalPreview}\\)`);
   }
 
   return lines.join("\n");
 }
+
+export const filtersCommand = defineCommand({
+  command: "filters",
+  chatAllowlist: true,
+  handler: async (ctx, deps) => {
+    await ctx.reply(filtersMessage(deps.config), TELEGRAM_OPTIONS);
+  },
+});

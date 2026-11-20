@@ -60,6 +60,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     description: "Display watched Soroban contract addresses (market and squad) with links to Stellar block explorers.",
     examples: ["/contracts"],
   },
+  filters: {
+    usage: "/filters",
+    arguments: "None",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Display active notification filters, global feature flags, category allowlists, and redacted chat routing settings.",
+    examples: ["/filters"],
+  },
   health: {
     usage: "/health",
     arguments: "None",

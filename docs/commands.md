@@ -10,6 +10,7 @@
 | `/status` | Last-seen ledger and watched contracts | No | Yes |
 | `/audit` | Operator only: audit report (redacted, bounded) | Yes | No |
 | `/contracts` | Contract ids and explorer links | No | Yes |
+| `/filters` | Active notification filters and routing | No | No |
 | `/health` | Health assessment and operational readiness | No | Yes |
 | `/preview` | Preview channel notification formatting | No | Yes |
 | `/pause` | Operator only: pause new scans | Yes | No |
