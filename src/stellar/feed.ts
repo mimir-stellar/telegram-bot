@@ -12,6 +12,7 @@
  */
 
 import { formatPlainTextEvent, eventExplorerUrl } from "../notifications/format.js";
+import { appUrlFor } from "../notifications/app-links.js";
 import type { DecodedEvent } from "./decode.js";
 import type { StellarConfig } from "../config.js";
 
@@ -53,15 +54,22 @@ export function stripXmlIllegal(text: string): string {
 }
 
 /**
+ * Strip XML-illegal control characters and clip a string to `max` Unicode code
+ * points, appending an ellipsis when truncated.
+ */
+export function cleanFeedText(text: string, max: number): string {
+  const cleaned = stripXmlIllegal(text);
+  const chars = Array.from(cleaned);
+  return chars.length <= max ? cleaned : `${chars.slice(0, max - 1).join("")}…`;
+}
+
+/**
  * Clip and clean a string for use inside an XML element.
  * Strips XML-illegal control characters, clips to `max` Unicode code points,
  * then XML-escapes the result.
  */
 export function xmlText(text: string, max: number): string {
-  const cleaned = stripXmlIllegal(text);
-  const chars = Array.from(cleaned);
-  const clipped = chars.length <= max ? cleaned : `${chars.slice(0, max - 1).join("")}…`;
-  return escapeXml(clipped);
+  return escapeXml(cleanFeedText(text, max));
 }
 
 /**
@@ -261,4 +269,187 @@ export function buildAtomFeed(
 
   lines.push("</feed>");
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// JSON Feed 1.1 export (bounded)
+// ---------------------------------------------------------------------------
+
+/** JSON Feed specification version URI (https://jsonfeed.org/version/1.1). */
+export const JSON_FEED_VERSION = "https://jsonfeed.org/version/1.1";
+
+/** Version of the Mimir-specific `_mimir` extension block in JSON Feed output. */
+export const JSON_FEED_SCHEMA_VERSION = 1;
+
+/** Default maximum number of items emitted in a single JSON Feed export. */
+export const JSON_FEED_DEFAULT_MAX_ITEMS = 100;
+
+/** Hard upper bound on `maxItems` to keep JSON Feed exports bounded. */
+export const JSON_FEED_MAX_ITEMS_LIMIT = 500;
+
+export interface JsonFeedItem {
+  /** Permanent tag URI matching {@link AtomEntry.id}. */
+  id: string;
+  /** Human-readable event title, bounded to {@link FEED_TITLE_MAX_CHARS}. */
+  title: string;
+  /** Event ledger close timestamp in RFC 3339 / ISO 8601. */
+  date_published: string;
+  /** Plain-text event rendering, bounded to {@link FEED_CONTENT_MAX_CHARS}. */
+  content_text?: string;
+  /** Sanitized `https:` explorer URL matching {@link AtomEntry.link}. */
+  url?: string;
+  /** Sanitized `https:` Mimir web-app deep link when available. */
+  external_url?: string;
+  /** Event source and event name tags. */
+  tags: string[];
+}
+
+export interface JsonFeedMimirExtension {
+  schema_version: number;
+  updated: string;
+  total_items: number;
+  max_items: number;
+  truncated: boolean;
+}
+
+export interface JsonFeedDocument {
+  version: string;
+  title: string;
+  home_page_url?: string;
+  feed_url?: string;
+  description?: string;
+  _mimir: JsonFeedMimirExtension;
+  items: JsonFeedItem[];
+}
+
+export type JsonFeedConfig = StellarConfig & {
+  /** Optional Mimir web-app base URL (`MIMIR_APP_URL`). */
+  mimirAppUrl?: string | null;
+};
+
+export interface JsonFeedOptions extends Omit<AtomFeedOptions, "config"> {
+  /** StellarConfig (with optional `mimirAppUrl`), forwarded to event/link builders. */
+  config: JsonFeedConfig;
+  /** Optional `https:` home page URL; defaults to `config.mimirAppUrl` when valid. */
+  homePageUrl?: string;
+  /**
+   * Maximum number of items to include in the exported feed.
+   * Defaults to {@link JSON_FEED_DEFAULT_MAX_ITEMS} and is capped at
+   * {@link JSON_FEED_MAX_ITEMS_LIMIT}. Must be a non-negative integer.
+   */
+  maxItems?: number;
+}
+
+function resolveFeedUpdated(
+  events: readonly DecodedEvent[],
+  updatedAt?: string,
+): string {
+  if (updatedAt) return updatedAt;
+  if (events.length > 0) {
+    const maxAt = events.reduce((best, e) => Math.max(best, e.at ?? 0), 0);
+    return new Date(maxAt > 0 ? maxAt * 1000 : Date.now()).toISOString();
+  }
+  return new Date().toISOString();
+}
+
+function resolveMaxItems(maxItems?: number): number {
+  if (maxItems === undefined) return JSON_FEED_DEFAULT_MAX_ITEMS;
+  if (!Number.isInteger(maxItems) || maxItems < 0) {
+    throw new RangeError(
+      `maxItems must be a non-negative integer, received: ${String(maxItems)}`,
+    );
+  }
+  return Math.min(maxItems, JSON_FEED_MAX_ITEMS_LIMIT);
+}
+
+/**
+ * Build one JSON Feed 1.1 item from a decoded event using the same canonical
+ * entry derivation as {@link buildAtomEntry}, preserving ID, timestamp,
+ * bounded plain-text content, and sanitized `https:` explorer and app links.
+ */
+export function buildJsonFeedItem(
+  event: DecodedEvent,
+  config: JsonFeedConfig,
+): JsonFeedItem {
+  const entry = buildAtomEntry(event, config);
+  const eventName =
+    event.payload.name === "unknown"
+      ? (event.payload.eventName ?? "unknown")
+      : event.payload.name;
+
+  const item: JsonFeedItem = {
+    id: entry.id,
+    title: cleanFeedText(entry.title, FEED_TITLE_MAX_CHARS),
+    date_published: entry.updated,
+    tags: [
+      cleanFeedText(event.source, FEED_TITLE_MAX_CHARS),
+      cleanFeedText(eventName, FEED_TITLE_MAX_CHARS),
+    ],
+  };
+
+  if (entry.content !== null) {
+    item.content_text = cleanFeedText(entry.content, FEED_CONTENT_MAX_CHARS);
+  }
+
+  if (entry.link !== null) {
+    item.url = entry.link;
+  }
+
+  const rawAppUrl = appUrlFor(event, config.mimirAppUrl);
+  const appUrl = rawAppUrl ? safeHttpsUrl(rawAppUrl) : null;
+  if (appUrl !== null) {
+    item.external_url = appUrl;
+  }
+
+  return item;
+}
+
+/**
+ * Build a bounded, versioned JSON Feed 1.1 document object from decoded events.
+ *
+ * Preserves input ordering across the bounded slice (`events.slice(0, maxItems)`)
+ * and sanitizes all URLs to `https:` only.
+ */
+export function buildJsonFeedDocument(
+  events: readonly DecodedEvent[],
+  options: JsonFeedOptions,
+): JsonFeedDocument {
+  const { title, selfUrl, config, subtitle, updatedAt, homePageUrl } = options;
+  const maxItems = resolveMaxItems(options.maxItems);
+  const feedUpdated = resolveFeedUpdated(events, updatedAt);
+
+  const validSelfUrl = safeHttpsUrl(selfUrl);
+  const candidateHomeUrl = homePageUrl ?? config.mimirAppUrl ?? null;
+  const validHomeUrl = candidateHomeUrl ? safeHttpsUrl(candidateHomeUrl) : null;
+
+  const boundedEvents = events.slice(0, maxItems);
+  const items = boundedEvents.map((event) => buildJsonFeedItem(event, config));
+
+  const doc: JsonFeedDocument = {
+    version: JSON_FEED_VERSION,
+    title: cleanFeedText(title, FEED_TITLE_MAX_CHARS),
+    ...(validHomeUrl ? { home_page_url: validHomeUrl } : {}),
+    ...(validSelfUrl ? { feed_url: validSelfUrl } : {}),
+    ...(subtitle ? { description: cleanFeedText(subtitle, FEED_TITLE_MAX_CHARS) } : {}),
+    _mimir: {
+      schema_version: JSON_FEED_SCHEMA_VERSION,
+      updated: feedUpdated,
+      total_items: events.length,
+      max_items: maxItems,
+      truncated: events.length > boundedEvents.length,
+    },
+    items,
+  };
+
+  return doc;
+}
+
+/**
+ * Serialize a bounded, versioned JSON Feed 1.1 document as a JSON string.
+ */
+export function buildJsonFeed(
+  events: readonly DecodedEvent[],
+  options: JsonFeedOptions,
+): string {
+  return JSON.stringify(buildJsonFeedDocument(events, options), null, 2);
 }
