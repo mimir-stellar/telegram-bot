@@ -36,6 +36,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     description: "Show the bot version, the Stellar network it watches, and where its source lives.",
     examples: ["/about"],
   },
+  menu: {
+    usage: "/menu",
+    arguments: "None",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Show an interactive navigation menu with buttons for status, contracts, and help.",
+    examples: ["/menu"],
+  },
   status: {
     usage: "/status",
     arguments: "None",
