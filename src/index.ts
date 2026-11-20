@@ -348,6 +348,10 @@ async function main(): Promise<void> {
     shuttingDown = true;
     Logger.info("shutdown", `[shutdown] ${signal} received, draining`, { signal });
 
+    // Transition readiness to false immediately before stopping polling so
+    // supervisors stop routing probes/work while liveness stays 200 during drain.
+    healthServer.beginShutdown();
+
     // A clean-stop marker closes the audit window: anything after it belongs to
     // the next run, which is how an operator tells a crash from a restart.
     poller.audit.record(auditShutdownEntry(signal));

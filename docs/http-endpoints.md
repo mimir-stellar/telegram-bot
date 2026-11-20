@@ -72,13 +72,15 @@ response fields is backward-compatible with v1; removing or renaming a v1 field,
 changing its type, or changing a fixed enum requires a new contract version.
 The v1 fixture remains the compatibility baseline for future response shapes.
 
-| Condition | `status` | `ok` | HTTP |
-|---|---|---|---|
-| Poller running, recent successful poll | `"ok"` | `true` | 200 |
-| Poller running but paused by operator | `"ok"` | `true` | 200 |
-| Poller draining (graceful shutdown) | `"ok"` | `true` | 200 |
-| Too many consecutive failures, stale, stale/stalled cursor | `"degraded"` | `false` | 503 |
-| Poller not running | `"stopped"` | `false` | 503 |
+| Condition | `status` | `ok` | `ready` | HTTP |
+|---|---|---|---|---|
+| Poller running, recent successful poll | `"ok"` | `true` | `true` | 200 |
+| Poller running but paused by operator | `"ok"` | `true` | `true` | 200 |
+| Poller draining (graceful shutdown) | `"ok"` | `true` | `false` | 503 |
+| Too many consecutive failures, stale, stale/stalled cursor | `"degraded"` | `false` | `false` | 503 |
+| Poller not running | `"stopped"` | `false` | `false` | 503 |
+
+During graceful shutdown, the health server transitions readiness to `false` (HTTP `503`) and stops accepting operational HTTP work (such as webhook deliveries) before polling stops and before the HTTP server closes, while `GET /health/live` (and `GET /livez`) continues returning HTTP `200` until the server closes.
 
 **Response body fields**
 

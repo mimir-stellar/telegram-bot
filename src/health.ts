@@ -43,12 +43,32 @@ export interface HealthServer {
   url: string | null;
   /** Port actually bound (0 when disabled). */
   port: number;
+  /**
+   * Transition the server into shutdown drain mode before stopping polling.
+   * Readiness probes immediately report not ready (HTTP 503) and operational
+   * HTTP work stops being accepted, while liveness stays 200 until `close()`.
+   * Idempotent.
+   */
+  beginShutdown(): void;
+  /** Whether `beginShutdown()` has been called. */
+  isShuttingDown(): boolean;
   close(): Promise<void>;
+}
+
+/** Optional overrides for {@link buildHealthReport}. */
+export interface HealthReportOptions {
+  /** True once shutdown readiness transition has started, before poller.stopping flips. */
+  draining?: boolean;
 }
 
 /** Safe, redacted snapshot for HTTP clients. Never includes secrets. */
 export interface HealthReport {
   ok: boolean;
+  /**
+   * Operational readiness: true only when `status === "ok"` and the process is
+   * not draining for shutdown. Readiness probes return HTTP 200 iff `ready`.
+   */
+  ready: boolean;
   status: "ok" | "degraded" | "stopped";
   service: "mimir-telegram-bot";
   /** Semver string from `package.json`, or `"unknown"` if unavailable. */
@@ -258,6 +278,7 @@ export function buildHealthReport(
   poller: PollerStatus,
   nowMs: number = Date.now(),
   provenance: ConfigProvenance = configProvenance(),
+  options: HealthReportOptions = {},
 ): HealthReport {
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
   // Tolerate a status snapshot that never learned about the chain clock (and
@@ -293,8 +314,12 @@ export function buildHealthReport(
     status = tooManyFailures || stale || hasStaleCursor || hasStalledCursor ? "degraded" : "ok";
   }
 
+  const draining = options.draining === true || poller.stopping === true;
+  const ready = status === "ok" && !draining;
+
   return {
     ok: status === "ok",
+    ready,
     status,
     service: "mimir-telegram-bot",
     version: config.version,
@@ -485,18 +510,41 @@ function sendUnauthorized(res: http.ServerResponse): void {
  * useful for unit tests and one-shot CLI runs that must not bind a port.
  */
 export function startHealthServer(deps: HealthDeps): HealthServer {
-  const { config, status, logs } = deps;
+  const { config, status, logs, webhookHandler } = deps;
   const now = deps.now ?? Date.now;
   const provenance = deps.provenance ?? configProvenance;
+  let draining = false;
+
+  const beginShutdown = (): void => {
+    draining = true;
+  };
+  const isShuttingDown = (): boolean => draining;
 
   if (config.healthPort === 0) {
     console.log("[health] disabled (HEALTH_PORT=0)");
-    return { url: null, port: 0, close: async () => undefined };
+    return {
+      url: null,
+      port: 0,
+      beginShutdown,
+      isShuttingDown,
+      close: async () => undefined,
+    };
   }
 
   const server = http.createServer((req, res) => {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
+
+    // Webhook deliveries carry Telegram's own secret-token header rather than
+    // the health bearer token, and stop being accepted as soon as drain starts.
+    if (webhookHandler && method === "POST" && url.pathname === "/telegram-webhook") {
+      if (draining || status().stopping === true) {
+        sendJson(res, 503, { ok: false, ready: false, error: "shutting_down" });
+        return;
+      }
+      webhookHandler(req, res);
+      return;
+    }
 
     // Check authentication for all routes when token is configured
     if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
@@ -505,8 +553,8 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     }
 
     if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
-      const report = buildHealthReport(config, status(), now(), provenance());
-      sendJson(res, report.ok ? 200 : 503, report);
+      const report = buildHealthReport(config, status(), now(), provenance(), { draining });
+      sendJson(res, report.ready ? 200 : 503, report);
       return;
     }
 
@@ -565,6 +613,8 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   return {
     url,
     port,
+    beginShutdown,
+    isShuttingDown,
     close: () =>
       new Promise((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
