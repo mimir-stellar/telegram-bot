@@ -11,7 +11,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { groupDigestEvents } from "../dist/notifications/digest-grouping.js";
+import {
+  groupDigestEvents,
+  pruneExpiredDigestEntries,
+} from "../dist/notifications/digest-grouping.js";
 import { formatDigest } from "../dist/notifications/format.js";
 
 // ---------------------------------------------------------------------------
@@ -266,4 +269,85 @@ test("formatDigest grouped: mixed burst — header only for multi-event groups",
 
   const nonIndentedBullets = lines.filter((l) => l.match(/^· /));
   assert.equal(nonIndentedBullets.length, 1, "squad singleton should produce 1 non-indented bullet");
+});
+
+// ---------------------------------------------------------------------------
+// pruneExpiredDigestEntries
+// ---------------------------------------------------------------------------
+
+test("pruneExpiredDigestEntries: drops expired low-priority events and counts them", () => {
+  const nowMs = 1_700_000_100_000;
+  const maxAgeMs = 60_000;
+
+  const expiredLow = makeEvent({ at: nowMs - 60_001, ledger: 1 }); // claim_created (low-priority)
+  const freshLow = makeEvent({ at: nowMs - 10_000, ledger: 2 });
+  const expiredCritical = makeEvent({
+    at: nowMs - 120_000,
+    ledger: 3,
+    payload: { name: "claim_resolved", claimId: 1, outcome: true },
+  });
+
+  const result = pruneExpiredDigestEntries(
+    [expiredLow, freshLow, expiredCritical],
+    { nowMs, maxAgeMs },
+  );
+
+  assert.equal(result.omittedCount, 1);
+  assert.deepEqual(result.events, [freshLow, expiredCritical]);
+});
+
+test("pruneExpiredDigestEntries: exact age boundary (age === maxAgeMs) is retained", () => {
+  const nowMs = 1_700_000_100_000;
+  const maxAgeMs = 60_000;
+
+  const atBoundary = makeEvent({ at: nowMs - maxAgeMs, ledger: 1 });
+  const justExpired = makeEvent({ at: nowMs - maxAgeMs - 1, ledger: 2 });
+
+  const result = pruneExpiredDigestEntries([atBoundary, justExpired], {
+    nowMs,
+    maxAgeMs,
+  });
+
+  assert.equal(result.omittedCount, 1);
+  assert.deepEqual(result.events, [atBoundary]);
+});
+
+test("pruneExpiredDigestEntries: respects custom criticalEvents set", () => {
+  const nowMs = 1_700_000_100_000;
+  const maxAgeMs = 1_000;
+
+  const customCritical = makeEvent({
+    at: nowMs - 50_000,
+    ledger: 1,
+    payload: { name: "claim_created", claimId: 1, category: "test", creator: "GBMGZ3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI" },
+  });
+  const defaultCritical = makeEvent({
+    at: nowMs - 50_000,
+    ledger: 2,
+    payload: { name: "claim_resolved", claimId: 1, outcome: true },
+  });
+
+  const result = pruneExpiredDigestEntries([customCritical, defaultCritical], {
+    nowMs,
+    maxAgeMs,
+    criticalEvents: ["claim_created"],
+  });
+
+  assert.equal(result.omittedCount, 1);
+  assert.deepEqual(result.events, [customCritical]);
+});
+
+test("pruneExpiredDigestEntries: throws RangeError on invalid bounds", () => {
+  assert.throws(
+    () => pruneExpiredDigestEntries([], { nowMs: Number.NaN, maxAgeMs: 1000 }),
+    RangeError,
+  );
+  assert.throws(
+    () => pruneExpiredDigestEntries([], { nowMs: 1000, maxAgeMs: -1 }),
+    RangeError,
+  );
+  assert.throws(
+    () => pruneExpiredDigestEntries([], { nowMs: 1000, maxAgeMs: Number.POSITIVE_INFINITY }),
+    RangeError,
+  );
 });
