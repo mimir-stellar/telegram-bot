@@ -73,6 +73,7 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--cap` | `<number>` | Maximum notifications to send/count per contract. | `config.maxNotificationsPerCycle` in `--send` mode; `20` in dry-run mode |
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
+| `--certificate-file` | `<path>` | Write a deterministic replay completeness certificate (`mimir-replay-certificate-v1`) JSON file atomically. | None |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
 
 ### Exit Codes
@@ -186,7 +187,17 @@ Soroban RPC nodes maintain a rolling window of history (typically ~120,960 ledge
   If an outage lasted longer than the retention window:
   1. The replay CLI can only recover events from `oldestLedger` to the recovery point.
   2. Events prior to `oldestLedger` **cannot be recovered via Soroban RPC**.
-  3. For archival recovery prior to `oldestLedger`, operators must consult an external archival indexer or Stellar Expert block explorer; the Soroban RPC itself cannot serve pruned event history.
+  3. The generated completeness certificate (`report.certificate` or `--certificate-file`) records the `pruned-history` gap and sets `complete: false` so partial or pruned ranges are never marked complete.
+  4. For archival recovery prior to `oldestLedger`, operators must consult an external archival indexer or Stellar Expert block explorer; the Soroban RPC itself cannot serve pruned event history.
+
+### 6.1 Deterministic Completeness Certificate
+
+Every replay run produces a deterministic `mimir-replay-certificate-v1` completeness certificate on `report.certificate` (and optionally written to `--certificate-file <path>`):
+
+* **`requestedRange` & `observedRange`:** Records the requested `[from, to]` bounds alongside the actually observed `[fromLedger, toLedger]` range per contract and overall.
+* **`gaps`:** Lists any unresolved gaps (`pruned-history`, `truncated-pages`, `beyond-tip`, or `scan-error`) with their ledger bounds and reason.
+* **`complete`:** `true` only when every requested target observed its full requested range without pruning, truncation, or scan errors. Partial or pruned ranges are never marked complete.
+* **`digest`:** Deterministic SHA-256 hex digest over the canonical certificate payload (omitting wall-clock timestamps so identical inputs produce identical certificates).
 
 ---
 
