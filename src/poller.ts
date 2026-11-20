@@ -94,7 +94,13 @@ import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
-import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
+import { normalizeRpcEndpoint, validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
+import {
+  DEFAULT_CIRCUIT_COOLDOWN_MS,
+  DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+  RpcCircuitBreaker,
+  type CircuitBreakerState,
+} from "./stellar/rpc-guard.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
 import {
   eventCursorLedger,
@@ -360,6 +366,12 @@ export interface PollerStatus {
     openedAt: number | null;
     failureCount: number;
     lastFailureAt: number | null;
+    /** Endpoint-specific circuit state (`"closed" | "open" | "half-open"`). */
+    state?: CircuitBreakerState;
+    /** Normalized RPC endpoint key tracked by this circuit breaker. */
+    endpoint?: string;
+    /** Number of bounded half-open recovery probes currently in flight. */
+    probesInFlight?: number;
   };
 }
 
@@ -577,8 +589,10 @@ export interface TargetBackoffOptions {
 export interface CircuitBreakerOptions {
   /** Number of consecutive failures before opening the circuit */
   failureThreshold?: number;
-  /** Milliseconds to wait before attempting to close the circuit */
+  /** Milliseconds to wait before attempting a bounded half-open recovery probe */
   cooldownMs?: number;
+  /** Maximum concurrent recovery probes allowed while half-open (defaults to 1) */
+  maxHalfOpenProbes?: number;
 }
 
 /** Default maximum backoff in milliseconds for per-target RPC backoff. */
@@ -586,12 +600,6 @@ const DEFAULT_TARGET_MAX_BACKOFF_MS = 60_000;
 
 /** Default backoff factor for per-target RPC backoff. */
 const DEFAULT_TARGET_BACKOFF_FACTOR = 2;
-
-/** Default number of consecutive RPC failures before opening the circuit. */
-const DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5;
-
-/** Default cooldown period in milliseconds before attempting to close the circuit. */
-const DEFAULT_CIRCUIT_COOLDOWN_MS = 60_000;
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
 const DEFAULT_SEND_SPACING_MS = 1_500;
@@ -1353,6 +1361,13 @@ export function createPoller(deps: PollerDeps) {
   const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
   const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
   const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
+  const rpcEndpoint = normalizeRpcEndpoint(config.rpcUrl);
+  const circuitBreaker = new RpcCircuitBreaker({
+    failureThreshold: circuitThreshold,
+    cooldownMs: circuitCooldown,
+    maxHalfOpenProbes: deps.circuitBreakerOptions?.maxHalfOpenProbes,
+    now,
+  });
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
 
   // One key per failure source: a broken market contract must not silence the
@@ -1529,8 +1544,22 @@ export function createPoller(deps: PollerDeps) {
       openedAt: null,
       failureCount: 0,
       lastFailureAt: null,
+      state: "closed",
+      endpoint: rpcEndpoint,
+      probesInFlight: 0,
     },
   };
+
+  function syncCircuitBreakerStatus(): void {
+    const snap = circuitBreaker.snapshot(rpcEndpoint);
+    status.circuitBreaker.open = snap.open;
+    status.circuitBreaker.openedAt = snap.openedAt;
+    status.circuitBreaker.failureCount = snap.failureCount;
+    status.circuitBreaker.lastFailureAt = snap.lastFailureAt;
+    status.circuitBreaker.state = snap.state;
+    status.circuitBreaker.endpoint = snap.endpoint;
+    status.circuitBreaker.probesInFlight = snap.probesInFlight;
+  }
 
   function syncCounterSnapshots(): void {
     status.sinceStart = { ...sinceStartCounters };
@@ -2459,29 +2488,31 @@ export function createPoller(deps: PollerDeps) {
     ledgerCache.reset();
 
     // ── Circuit breaker check ─────────────────────────────────────────────────────
-    if (status.circuitBreaker.open) {
-      const nowMs = now();
-      const timeSinceOpen = status.circuitBreaker.openedAt ? nowMs - status.circuitBreaker.openedAt : Infinity;
-      
-      if (timeSinceOpen >= circuitCooldown) {
-        // Cooldown elapsed, attempt to close the circuit
+    const probeDecision = circuitBreaker.allowRequest(rpcEndpoint);
+    syncCircuitBreakerStatus();
+    if (!probeDecision.allowed) {
+      if (probeDecision.state === "open") {
+        const elapsedMs = Math.max(0, circuitCooldown - probeDecision.remainingCooldownMs);
         console.log(
-          `[poller] circuit breaker cooldown elapsed (${timeSinceOpen}ms >= ${circuitCooldown}ms), attempting recovery`,
+          `[poller] circuit breaker open for ${probeDecision.endpoint}, skipping RPC calls (${Math.round(elapsedMs / 1000)}s/${Math.round(circuitCooldown / 1000)}s elapsed)`,
         );
-        status.circuitBreaker.open = false;
-        status.circuitBreaker.openedAt = null;
-        status.circuitBreaker.failureCount = 0;
       } else {
-        // Still in cooldown, skip RPC calls
         console.log(
-          `[poller] circuit breaker open, skipping RPC calls (${Math.round(timeSinceOpen / 1000)}s/${Math.round(circuitCooldown / 1000)}s elapsed)`,
+          `[poller] circuit breaker half-open for ${probeDecision.endpoint}, skipping RPC calls (recovery probe already in flight)`,
         );
-        status.targets = [...state.values()].map((t) => ({ ...t }));
-        inFlight = false;
-        endCycleTracking();
-        return;
       }
+      status.targets = [...state.values()].map((t) => ({ ...t }));
+      inFlight = false;
+      endCycleTracking();
+      return;
     }
+    const isHalfOpenProbe = probeDecision.isProbe;
+    if (isHalfOpenProbe) {
+      console.log(
+        `[poller] circuit breaker cooldown elapsed for ${probeDecision.endpoint}, entering half-open state with 1 bounded recovery probe`,
+      );
+    }
+    let probeAttempted = false;
 
     let anyOk = false;
     let cyclePages = 0;
@@ -2538,6 +2569,10 @@ export function createPoller(deps: PollerDeps) {
           continue;
         }
 
+        if (isHalfOpenProbe) {
+          probeAttempted = true;
+        }
+
         const targetStartedAt = now();
         try {
           // Before asking for events, place the resume position against the last
@@ -2567,6 +2602,7 @@ export function createPoller(deps: PollerDeps) {
                 !rewinding && current.cursor === null ? config.startLookbackLedgers : undefined,
               seenEventIds: dedupWindow.toJSON(),
               dedupWindow: config.dedupWindow,
+              maxPages: isHalfOpenProbe ? 1 : undefined,
               shouldDecode: (name) => isNotificationAllowed(config.featureFlags, target.source, name),
             }),
             SCAN_TIMEOUT_MS,
@@ -2650,14 +2686,18 @@ export function createPoller(deps: PollerDeps) {
             );
           }
 
-          // Reset circuit breaker on success
-          if (status.circuitBreaker.failureCount > 0) {
+          // Reset circuit breaker on success (closes half-open probe or clears closed failures)
+          const prevFailures = status.circuitBreaker.failureCount;
+          const wasHalfOpen = status.circuitBreaker.state === "half-open";
+          if (prevFailures > 0 || wasHalfOpen) {
             console.log(
-              `[poller] RPC succeeded, resetting circuit breaker (was at ${status.circuitBreaker.failureCount} failures)`,
+              wasHalfOpen
+                ? `[poller] half-open recovery probe succeeded for ${rpcEndpoint}, closing circuit breaker`
+                : `[poller] RPC succeeded, resetting circuit breaker (was at ${prevFailures} failures)`,
             );
-            status.circuitBreaker.failureCount = 0;
-            status.circuitBreaker.lastFailureAt = null;
           }
+          circuitBreaker.recordSuccess(rpcEndpoint);
+          syncCircuitBreakerStatus();
 
           if (scan.duplicates > 0) {
             status.eventsDeduplicated += scan.duplicates;
@@ -2735,6 +2775,12 @@ export function createPoller(deps: PollerDeps) {
           };
 
           trackCursorAdvance(current, previousCursor, scan.latestLedger);
+
+          if (isHalfOpenProbe) {
+            // Bounded recovery probe succeeded: leave remaining targets for the
+            // next cycle so the recovering endpoint does not receive full load.
+            break;
+          }
         } catch (err) {
           cycleFailures++;
           metrics?.rpcErrors.inc();
@@ -2783,6 +2829,18 @@ export function createPoller(deps: PollerDeps) {
           if (retryAfterMs !== null) {
             console.warn(`[poller] RPC requested backoff for ${retryAfterMs}ms`);
             explicitBackoff = retryAfterMs;
+          }
+
+          if (isHalfOpenProbe) {
+            circuitBreaker.recordFailure(rpcEndpoint, 1);
+            syncCircuitBreakerStatus();
+            console.error(
+              `[poller] half-open recovery probe failed for ${rpcEndpoint}, re-opening circuit breaker`,
+            );
+            break;
+          }
+
+          if (retryAfterMs !== null) {
             break; // Stop scanning other targets, they will likely hit the same limit
           }
         } finally {
@@ -2798,15 +2856,17 @@ export function createPoller(deps: PollerDeps) {
       status.lastCycleEmptyPages = cycleEmptyPages;
 
       // ── Circuit breaker state update ─────────────────────────────────────────────
-      if (cycleFailures > 0) {
-        status.circuitBreaker.failureCount += cycleFailures;
-        status.circuitBreaker.lastFailureAt = now();
+      if (isHalfOpenProbe && !probeAttempted) {
+        circuitBreaker.releaseProbe(rpcEndpoint);
+        syncCircuitBreakerStatus();
+      } else if (!isHalfOpenProbe && cycleFailures > 0) {
+        const wasOpen = status.circuitBreaker.open;
+        circuitBreaker.recordFailure(rpcEndpoint, cycleFailures);
+        syncCircuitBreakerStatus();
 
-        if (status.circuitBreaker.failureCount >= circuitThreshold && !status.circuitBreaker.open) {
-          status.circuitBreaker.open = true;
-          status.circuitBreaker.openedAt = now();
+        if (status.circuitBreaker.open && !wasOpen) {
           console.error(
-            `[poller] circuit breaker opened after ${status.circuitBreaker.failureCount} failures (threshold: ${circuitThreshold})`,
+            `[poller] circuit breaker opened for ${rpcEndpoint} after ${status.circuitBreaker.failureCount} failures (threshold: ${circuitThreshold})`,
           );
         }
       }

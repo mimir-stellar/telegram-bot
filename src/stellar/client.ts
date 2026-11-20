@@ -15,6 +15,7 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import { assertRpcEndpointUrl } from "./rpc-guard.js";
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -27,10 +28,28 @@ export class RpcPassphraseError extends Error {
 }
 
 /**
+ * Normalize a Soroban RPC URL into a bounded, secret-free endpoint key suitable
+ * for per-endpoint circuit-breaker state and logs. Strips credentials, query
+ * parameters, and fragments; falls back to `"default"` when empty or invalid.
+ */
+export function normalizeRpcEndpoint(rpcUrl: string): string {
+  const trimmed = typeof rpcUrl === "string" ? rpcUrl.trim() : "";
+  if (!trimmed) return "default";
+  try {
+    const parsed = new URL(trimmed);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.protocol}//${parsed.host.toLowerCase()}${pathname}`;
+  } catch {
+    return trimmed.replace(/\/+$/, "").slice(0, 128) || "default";
+  }
+}
+
+/**
  * Create an RPC server. Construction is offline; the network passphrase is
  * verified separately at boot by {@link validateNetworkPassphrase}.
  */
 export function createRpcServer(config: StellarConfig): rpc.Server {
+  assertRpcEndpointUrl(config.rpcUrl, "STELLAR_RPC_URL");
   return new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
