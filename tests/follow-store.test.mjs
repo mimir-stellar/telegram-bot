@@ -204,3 +204,79 @@ test('preserves unreadable follow file and redacts credentials when read and qua
     assert.strictEqual(Buffer.compare(await fs.promises.readFile(filePath), raw), 0);
   });
 });
+
+// ── #739 – noncanonical numeric identifier rejection ─────────────────────────
+
+test('parseRef accepts canonical unsigned integer ids', async () => {
+  const { parseRef } = await importStore();
+  const valid = [
+    'market:0',
+    'market:1',
+    'market:42',
+    'squad:0',
+    'squad:12345',
+    // 20-digit id (u64::MAX)
+    'market:18446744073709551615',
+    // non-numeric id (strkey / slug) is unrestricted
+    'market:CABC123',
+    'squad:abc-def',
+  ];
+  for (const ref of valid) {
+    assert.notStrictEqual(parseRef(ref), null, `ref ${JSON.stringify(ref)} should be accepted`);
+  }
+});
+
+test('parseRef rejects noncanonical numeric ids', async () => {
+  const { parseRef } = await importStore();
+  const invalid = [
+    // exponent notation
+    'market:1e5',
+    'squad:2E3',
+    'market:1.5e2',
+    // signed identifiers
+    'market:+42',
+    'squad:-1',
+    'market:-0',
+    // leading zeros
+    'market:01',
+    'squad:007',
+    'market:00',
+    // oversized decimal string (21 digits)
+    'market:999999999999999999999',
+    // decimal point
+    'market:3.14',
+    // hex prefix
+    'market:0x1A',
+  ];
+  for (const ref of invalid) {
+    assert.strictEqual(parseRef(ref), null, `ref ${JSON.stringify(ref)} should be rejected`);
+  }
+});
+
+test('follow rejects noncanonical numeric ref ids', async () => {
+  const { createFollowStore } = await importStore();
+  await withTempDir(async (dir) => {
+    const store = createFollowStore({ filePath: dir + '/follows.json' });
+    const bad = ['market:1e5', 'squad:+42', 'market:-1', 'market:01', 'market:999999999999999999999'];
+    for (const ref of bad) {
+      assert.throws(
+        () => store.follow('chat:1', ref),
+        { name: 'FollowStoreError' },
+        `follow with ${JSON.stringify(ref)} should throw FollowStoreError`,
+      );
+    }
+    // No side-effects from the rejected calls.
+    assert.deepStrictEqual(store.list('chat:1'), []);
+  });
+});
+
+test('canonical numeric id "0" is not treated as leading-zero', async () => {
+  const { parseRef, createFollowStore } = await importStore();
+  assert.notStrictEqual(parseRef('market:0'), null);
+  assert.notStrictEqual(parseRef('squad:0'), null);
+  await withTempDir(async (dir) => {
+    const store = createFollowStore({ filePath: dir + '/follows.json' });
+    store.follow('chat:1', 'market:0');
+    assert.deepStrictEqual(store.list('chat:1'), ['market:0']);
+  });
+});
