@@ -58,6 +58,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import { normalizeCategory } from "./stellar/category.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -202,6 +203,13 @@ export interface BotConfig extends StellarConfig {
   /** Optional per-contract destinations; absent values use `chatId`. */
   marketChatId?: string;
   squadChatId?: string;
+  /** Optional default Telegram forum topic (`message_thread_id`) for notifications. */
+  defaultForumTopicId?: number;
+  /**
+   * Optional per-category forum topic overrides (normalized category -> topic id,
+   * or `null` to explicitly disable topic routing for that category).
+   */
+  categoryForumTopics?: Record<string, number | null>;
   /** Chats allowed to use /status. Empty array means no restriction. */
   allowedChatIds: string[];
   /** Telegram user id allowed to run operator-only commands. Null disables them. */
@@ -691,6 +699,106 @@ function collector(profile: Record<string, string>) {
       return parsed;
     },
 
+    /**
+     * Parse an optional positive integer Telegram forum topic (`message_thread_id`).
+     * Returns `undefined` when absent/empty.
+     */
+    optionalTopicId(name: string): number | undefined {
+      const raw = read(name);
+      if (raw === undefined) return undefined;
+      if (!/^\d+$/.test(raw)) {
+        problems.push(`${name} must be a positive integer forum topic id; got "${raw}"`);
+        return undefined;
+      }
+      const parsed = Number(raw);
+      if (!Number.isSafeInteger(parsed) || parsed < 1) {
+        problems.push(`${name} must be a positive integer forum topic id; got "${raw}"`);
+        return undefined;
+      }
+      return parsed;
+    },
+
+    /**
+     * Parse per-category forum topic overrides from either `cat:id,cat2:off`
+     * pairs or a JSON object `{ "cat": 123, "cat2": null }`.
+     */
+    categoryForumTopics(name: string): Record<string, number | null> {
+      const raw = read(name);
+      if (raw === undefined) return {};
+      const out: Record<string, number | null> = {};
+
+      const assignTopic = (rawKey: string, rawVal: unknown): void => {
+        const key = normalizeCategory(rawKey);
+        if (!key) {
+          problems.push(`${name} contains an empty category name`);
+          return;
+        }
+        if (rawVal === null) {
+          out[key] = null;
+          return;
+        }
+        if (typeof rawVal === "string") {
+          const trimmed = rawVal.trim().toLowerCase();
+          if (trimmed === "off" || trimmed === "none" || trimmed === "disabled" || trimmed === "0") {
+            out[key] = null;
+            return;
+          }
+          if (/^\d+$/.test(trimmed)) {
+            const parsed = Number(trimmed);
+            if (Number.isSafeInteger(parsed) && parsed >= 1) {
+              out[key] = parsed;
+              return;
+            }
+          }
+          problems.push(
+            `${name} topic for "${rawKey}" must be a positive integer or off/none/disabled/0; got "${rawVal}"`,
+          );
+          return;
+        }
+        if (typeof rawVal === "number") {
+          if (rawVal === 0) {
+            out[key] = null;
+            return;
+          }
+          if (Number.isSafeInteger(rawVal) && rawVal >= 1) {
+            out[key] = rawVal;
+            return;
+          }
+          problems.push(`${name} topic for "${rawKey}" must be a positive integer or 0/null; got ${rawVal}`);
+          return;
+        }
+        problems.push(`${name} topic for "${rawKey}" must be a positive integer or null`);
+      };
+
+      if (raw.startsWith("{")) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          problems.push(`${name} is not valid JSON`);
+          return {};
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          problems.push(`${name} JSON value must be an object mapping category to topic id`);
+          return {};
+        }
+        for (const [k, v] of Object.entries(parsed)) {
+          assignTopic(k, v);
+        }
+        return out;
+      }
+
+      for (const pair of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const sep = pair.indexOf(":");
+        if (sep === -1) {
+          problems.push(`${name} entry "${pair}" must be in "category:topicId" format`);
+          continue;
+        }
+        assignTopic(pair.slice(0, sep), pair.slice(sep + 1));
+      }
+      return out;
+    },
+
     optionalChatId(name: string, fallback: string): string {
       const value = read(name) ?? fallback;
       if (value === "") return value;
@@ -900,6 +1008,8 @@ export function loadConfig(): BotConfig {
     chatIds,
     marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
     squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
+    defaultForumTopicId: c.optionalTopicId("TELEGRAM_DEFAULT_TOPIC_ID"),
+    categoryForumTopics: c.categoryForumTopics("TELEGRAM_CATEGORY_TOPICS"),
     allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
@@ -1108,6 +1218,8 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "TELEGRAM_CHAT_ID", secret: true },
   { key: "TELEGRAM_MARKET_CHAT_ID", secret: true, derivedFrom: { key: "TELEGRAM_CHAT_ID" } },
   { key: "TELEGRAM_SQUAD_CHAT_ID", secret: true, derivedFrom: { key: "TELEGRAM_CHAT_ID" } },
+  { key: "TELEGRAM_DEFAULT_TOPIC_ID", secret: false },
+  { key: "TELEGRAM_CATEGORY_TOPICS", secret: false },
   { key: "ALLOWED_CHAT_IDS", secret: true },
   { key: "OPERATOR_TELEGRAM_USER_ID", secret: true },
   { key: "POLL_INTERVAL_MS", secret: false, hasBuiltInDefault: true },

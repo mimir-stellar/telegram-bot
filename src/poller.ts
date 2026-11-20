@@ -2078,8 +2078,15 @@ export function createPoller(deps: PollerDeps) {
           // below is unchanged: either path counts as sent, neither as skipped.
           const plainText = formatPlainTextEvent(config, event);
           const eventRef = { eventId: event.eventId, ledger: event.ledger, source: event.source };
+          const eventCategory =
+            "category" in event.payload &&
+            typeof event.payload.category === "string" &&
+            event.payload.category.trim() !== ""
+              ? event.payload.category
+              : undefined;
           extra = {
             eventName: event.payload.name,
+            ...(eventCategory ? { category: eventCategory } : {}),
             ...(reply_markup ? { reply_markup } : {}),
             ...(plainText !== null ? { plainText, eventRef } : {}),
           };
