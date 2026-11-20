@@ -14,6 +14,8 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Telegram Settings
 - `BOT_TOKEN`: The API token for the Telegram bot. Required.
 - `TELEGRAM_CHAT_ID`: The numeric ID or `@channelusername` where notifications are posted. Required.
+- `TELEGRAM_DEFAULT_TOPIC_ID`: Optional positive integer forum topic (`message_thread_id`) used when a notification has no matching category override.
+- `TELEGRAM_CATEGORY_TOPICS`: Optional per-category forum topic overrides (`category:topicId` comma-separated pairs or JSON `{ "category": topicId }`). Category overrides are resolved before `TELEGRAM_DEFAULT_TOPIC_ID`. Setting a category to `off`, `none`, `disabled`, `0`, or `null` explicitly disables topic routing for that category (omitting `message_thread_id` instead of falling back to `TELEGRAM_DEFAULT_TOPIC_ID`). Categories disabled by `NOTIFY_CATEGORIES` are still suppressed before delivery.
 - `MIMIR_LOCALE`: Language for bot replies and notifications. Supported: `en` (default) and `es`; region tags such as `es-MX` resolve to the base language. Any other value fails fast at startup. See [Translator Guide](translating.md).
 
 ### Mimir Contract Settings

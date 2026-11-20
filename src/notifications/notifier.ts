@@ -14,6 +14,7 @@
 import type { Bot } from "grammy";
 
 import type { BotConfig } from "../config.js";
+import { normalizeCategory } from "../stellar/category.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
   safeErrorMessage,
@@ -46,6 +47,8 @@ export interface SendExtra {
   replyToMessageId?: number | undefined;
   /** Decoded contract event name used to apply silent-notification policy. */
   eventName?: string | undefined;
+  /** Optional claim/event category used to resolve forum topic overrides. */
+  category?: string | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -88,6 +91,41 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
   return parts.length > 0 ? ` (${parts.join(" ")})` : "";
 }
 
+/**
+ * Resolve the Telegram forum topic (`message_thread_id`) for a notification.
+ *
+ * Precedence:
+ * 1. Explicit category override in `config.categoryForumTopics` (matched case-insensitively
+ *    via `normalizeCategory`). A `null` override disables topic routing for that
+ *    category and returns `undefined` instead of falling back to the default topic.
+ * 2. `config.defaultForumTopicId` when the category is unmatched or absent.
+ * 3. `undefined` (unthreaded) when neither applies.
+ */
+export function resolveForumTopicId(
+  config: Partial<Pick<BotConfig, "defaultForumTopicId" | "categoryForumTopics">>,
+  category?: string,
+): number | undefined {
+  if (typeof category === "string" && category.trim() !== "" && config.categoryForumTopics) {
+    const targetKey = normalizeCategory(category);
+    if (targetKey) {
+      if (Object.prototype.hasOwnProperty.call(config.categoryForumTopics, targetKey)) {
+        const direct = config.categoryForumTopics[targetKey];
+        if (direct === null) return undefined;
+        if (typeof direct === "number" && Number.isInteger(direct) && direct >= 1) return direct;
+      }
+      for (const [rawKey, value] of Object.entries(config.categoryForumTopics)) {
+        if (normalizeCategory(rawKey) === targetKey) {
+          if (value === null) return undefined;
+          if (typeof value === "number" && Number.isInteger(value) && value >= 1) return value;
+        }
+      }
+    }
+  }
+
+  const def = config.defaultForumTopicId;
+  return typeof def === "number" && Number.isInteger(def) && def >= 1 ? def : undefined;
+}
+
 // ── notifierSkips ────────────────────────────────────────────────────────────
 
 /**
@@ -119,7 +157,17 @@ export const notifierSkips = { emptyText: 0 };
 export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
-    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+    Partial<
+      Pick<
+        BotConfig,
+        | "chatIds"
+        | "linkPreviewMarket"
+        | "linkPreviewSquad"
+        | "silentEvents"
+        | "defaultForumTopicId"
+        | "categoryForumTopics"
+      >
+    >,
 ) {
   return async (
     text: string | null,
@@ -156,10 +204,13 @@ export function createNotifier(
     const silentOption = extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS)
       ? { disable_notification: true }
       : {};
+    const messageThreadId = resolveForumTopicId(config, extra?.category);
+    const topicOption = messageThreadId !== undefined ? { message_thread_id: messageThreadId } : {};
     const notificationOptions = {
       parse_mode: "MarkdownV2" as const,
       link_preview_options: { is_disabled: linkPreviewDisabled },
       ...silentOption,
+      ...topicOption,
     };
 
     // Oversized payloads go out as ordered chunks under Telegram's limit. The
@@ -211,6 +262,7 @@ export function createNotifier(
       await bot.api.sendMessage(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
         ...silentOption,
+        ...topicOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(extra?.replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
