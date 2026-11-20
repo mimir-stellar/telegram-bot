@@ -18,17 +18,23 @@
 import { mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
+import { sanitizeTelegramError } from "./notifier.js";
+
 export const DEFAULT_SEND_JOURNAL_MAX_ENTRIES = 1_000;
 export const DEFAULT_SEND_JOURNAL_MAX_BYTES = 1_000_000;
 
 export interface JournalEntry {
-  kind: "intent" | "done";
+  kind: "intent" | "done" | "error";
   id: string;
   source: string;
   ledger: number;
   eventName: string;
   /** Bounded hash of the message body; the body itself is never persisted. */
   textHash?: string;
+  /** Stable error code for operator triage (e.g. Telegram error_code 400, 429). */
+  errorCode?: number | string;
+  /** Sanitized, redacted, and length-bounded error description. */
+  errorDescription?: string;
   at: number;
 }
 
@@ -37,6 +43,8 @@ export interface SendJournalOptions {
   maxEntries?: number;
   maxBytes?: number;
   now?: () => number;
+  /** Known secrets (e.g. botToken) to redact from persisted error descriptions. */
+  secrets?: readonly string[];
 }
 
 export interface SendJournalStats {
@@ -54,7 +62,16 @@ export interface SendJournal {
     at: number;
   }): Promise<void>;
   recordDone(id: string): Promise<void>;
-  /** Intents with no matching done: notifications that may have been sent. */
+  recordError(entry: {
+    id: string;
+    source?: string;
+    ledger?: number;
+    eventName?: string;
+    error: unknown;
+    secrets?: readonly string[];
+    at?: number;
+  }): Promise<void>;
+  /** Intents with no matching done or error: notifications that may have been sent. */
   loadPending(): Promise<JournalEntry[]>;
   compact(): Promise<void>;
   stats(): Promise<SendJournalStats>;
@@ -159,25 +176,55 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     }
   }
 
+  async function recordError(entry: {
+    id: string;
+    source?: string;
+    ledger?: number;
+    eventName?: string;
+    error: unknown;
+    secrets?: readonly string[];
+    at?: number;
+  }): Promise<void> {
+    const secrets = [...(options.secrets ?? []), ...(entry.secrets ?? [])];
+    const sanitized = sanitizeTelegramError(entry.error, secrets);
+    await append({
+      kind: "error",
+      id: entry.id,
+      source: entry.source ?? "",
+      ledger: entry.ledger ?? 0,
+      eventName: entry.eventName ?? "",
+      ...(sanitized.errorCode !== undefined ? { errorCode: sanitized.errorCode } : {}),
+      errorDescription: sanitized.description,
+      at: entry.at ?? now(),
+    });
+    const stats = await journalStats();
+    if (stats.entries > maxEntries || stats.bytes > maxBytes) {
+      await compact();
+    }
+  }
+
   async function loadPending(): Promise<JournalEntry[]> {
     const entries = await readLines();
-    const done = new Set<string>();
+    const settled = new Set<string>();
     for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
+      if (entry.kind === "done" || entry.kind === "error") settled.add(entry.id);
     }
-    return entries.filter((e) => e.kind === "intent" && !done.has(e.id));
+    return entries.filter((e) => e.kind === "intent" && !settled.has(e.id));
   }
 
   async function compact(): Promise<void> {
     const entries = await readLines();
-    const done = new Set<string>();
+    const settled = new Set<string>();
     for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
+      if (entry.kind === "done" || entry.kind === "error") settled.add(entry.id);
     }
-    // A done line settles its intent: both lines can be dropped. Keep only
-    // unresolved intents.
-    const unresolved = entries.filter((e) => e.kind === "intent" && !done.has(e.id));
-    await persist(unresolved);
+    // A done or error line settles its intent: both intent+done can be dropped.
+    // Keep unresolved intents and recent error entries (bounded to maxEntries).
+    const unresolved = entries.filter((e) => e.kind === "intent" && !settled.has(e.id));
+    const errors = entries.filter((e) => e.kind === "error");
+    const errorBudget = Math.max(0, maxEntries - unresolved.length);
+    const keptErrors = errorBudget > 0 ? errors.slice(-errorBudget) : [];
+    await persist([...unresolved, ...keptErrors]);
   }
 
   async function journalStats(): Promise<SendJournalStats> {
@@ -199,5 +246,5 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     return journalStats();
   }
 
-  return { recordIntent, recordDone, loadPending, compact, stats };
+  return { recordIntent, recordDone, recordError, loadPending, compact, stats };
 }

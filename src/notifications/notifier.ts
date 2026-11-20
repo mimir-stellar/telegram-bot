@@ -14,6 +14,7 @@
 import type { Bot } from "grammy";
 
 import type { BotConfig } from "../config.js";
+import { DEFAULT_MAX_LEN, redactText } from "../redact.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
   safeErrorMessage,
@@ -72,6 +73,65 @@ export function isMarkdownParseError(err: unknown): boolean {
   if (!/can't parse entities|can't find end of the entity/i.test(text)) return false;
   if (typeof record.error_code === "number") return record.error_code === 400;
   return true;
+}
+
+// ── sanitizeTelegramError ────────────────────────────────────────────────────
+
+export interface SanitizedTelegramError {
+  /** Stable error code from Telegram (`error_code`) or Node/network (`code`), if present. */
+  errorCode?: number | string;
+  /** Redacted, whitespace-collapsed, length-bounded error description. */
+  description: string;
+}
+
+/**
+ * Sanitize a Telegram or transport error before persisting it to the send
+ * journal: applies existing redaction rules and length limits to remote
+ * descriptions while retaining stable error codes for operator triage.
+ */
+export function sanitizeTelegramError(
+  err: unknown,
+  secrets: readonly string[] = [],
+): SanitizedTelegramError {
+  let errorCode: number | string | undefined;
+  let rawDescription: string | undefined;
+
+  if (err && typeof err === "object") {
+    const record = err as { error_code?: unknown; code?: unknown; description?: unknown };
+    if (typeof record.error_code === "number" && Number.isFinite(record.error_code)) {
+      errorCode = record.error_code;
+    } else if (typeof record.code === "number" && Number.isFinite(record.code)) {
+      errorCode = record.code;
+    } else if (typeof record.code === "string" && record.code.trim() !== "") {
+      errorCode = record.code.trim().slice(0, 64);
+    }
+
+    if (typeof record.description === "string" && record.description.trim() !== "") {
+      rawDescription = record.description;
+    }
+  }
+
+  let description: string;
+  if (rawDescription !== undefined) {
+    const collapsed = rawDescription.replace(/\s+/g, " ").trim();
+    const redacted = redactText(collapsed, { secrets, maxLen: DEFAULT_MAX_LEN }).trim();
+    description = redacted || "unknown error";
+  } else if (
+    err &&
+    typeof err === "object" &&
+    !(err instanceof Error) &&
+    typeof (err as { message?: unknown }).message !== "string" &&
+    errorCode !== undefined
+  ) {
+    description = `error code ${errorCode}`;
+  } else {
+    description = safeErrorMessage(err, secrets);
+  }
+
+  return {
+    ...(errorCode !== undefined ? { errorCode } : {}),
+    description,
+  };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
