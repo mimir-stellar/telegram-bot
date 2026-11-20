@@ -1452,6 +1452,7 @@ export function createPoller(deps: PollerDeps) {
     // A Telegram error embeds the token in its request URL, and the queue is
     // the last place it belongs.
     secrets: [config.botToken],
+    networkPassphrase: config.networkPassphrase,
     now,
   });
 

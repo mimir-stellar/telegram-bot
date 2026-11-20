@@ -53,6 +53,7 @@ Each entry in `entries` mirrors the `DeadLetterEntry` TypeScript interface defin
 * `text` (`string`): The formatted Telegram `MarkdownV2` message body. Bounded and truncated to at most 4,000 characters (`TEXT_TRUNCATE`).
 * `attempts` (`number`): The number of delivery attempts made so far (starts at `1` upon initial enqueue and increments on each failed replay).
 * `lastError` (`string | null`): Scrubbed, redacted error message from the most recent send failure, truncated to at most 200 characters (`ERROR_TRUNCATE`). Sensitive secrets like `BOT_TOKEN` are scrubbed via `safeErrorMessage`.
+* `networkPassphrase` (`string`, optional): Stellar network passphrase where the failure originated. When configured on the queue, `flush` compares each entry's `networkPassphrase` against the active network and rejects replay of entries from another network, leaving them unchanged on disk.
 
 ---
 

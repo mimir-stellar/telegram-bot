@@ -40,6 +40,8 @@ export interface DeadLetterEntry {
   text: string;
   attempts: number;
   lastError: string | null;
+  /** Stellar network passphrase where the failure originated, if recorded. */
+  networkPassphrase?: string;
 }
 
 export interface DeadLetterFile {
@@ -73,6 +75,8 @@ export interface DeadLetterQueueOptions {
    * a URL, so the value itself is what makes that case safe.
    */
   secrets?: readonly string[];
+  /** Active Stellar network passphrase; replay rejects entries from another network. */
+  networkPassphrase?: string;
   /** Optional clock for deterministic tests. */
   now?: () => number;
 }
@@ -171,6 +175,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
             text: truncate(e.text, TEXT_TRUNCATE),
             attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
             lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
+            ...(typeof e.networkPassphrase === "string" && e.networkPassphrase.trim() !== ""
+              ? { networkPassphrase: e.networkPassphrase }
+              : {}),
           }));
         // Bound on load too: the file may have been edited by hand.
         while (entries.length > options.maxEntries) {
@@ -251,6 +258,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       text: truncate(input.text, TEXT_TRUNCATE),
       attempts: 1,
       lastError: safeError(input.error),
+      ...(typeof options.networkPassphrase === "string" && options.networkPassphrase.trim() !== ""
+        ? { networkPassphrase: options.networkPassphrase }
+        : {}),
     };
     entries.push(entry);
     stats.enqueued += 1;
@@ -272,17 +282,38 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   async function flush(
     send: (text: string, entry: DeadLetterEntry) => Promise<void>,
     budget: number,
-  ): Promise<{ sent: number; remaining: number }> {
+  ): Promise<{ sent: number; remaining: number; rejectedNetworkMismatch: number }> {
     if (budget <= 0 || entries.length === 0) {
-      return { sent: 0, remaining: entries.length };
+      return { sent: 0, remaining: entries.length, rejectedNetworkMismatch: 0 };
     }
 
+    const configuredNetwork =
+      typeof options.networkPassphrase === "string" && options.networkPassphrase.trim() !== ""
+        ? options.networkPassphrase
+        : null;
+
     let sent = 0;
+    let rejectedNetworkMismatch = 0;
     const kept: DeadLetterEntry[] = [];
 
     for (const entry of entries) {
       if (sent >= budget) {
         kept.push(entry);
+        continue;
+      }
+
+      if (
+        configuredNetwork !== null &&
+        typeof entry.networkPassphrase === "string" &&
+        entry.networkPassphrase.trim() !== "" &&
+        entry.networkPassphrase !== configuredNetwork
+      ) {
+        rejectedNetworkMismatch += 1;
+        kept.push(entry);
+        console.warn(
+          `[dead-letter] rejected replay for ${entry.source} ${entry.eventName} ` +
+            `@ ledger ${entry.ledger}: entry network does not match current configuration`,
+        );
         continue;
       }
 
@@ -316,7 +347,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     entries = kept;
     syncDepth();
     await persist();
-    return { sent, remaining: entries.length };
+    return { sent, remaining: entries.length, rejectedNetworkMismatch };
   }
 
   return {

@@ -381,3 +381,45 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.throws(() => parseDurationMs(""), /requires a duration/);
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
 });
+
+test("list and show surface stored networkPassphrase and purge --yes can still remove entries", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    const queue = createDeadLetterQueue({
+      filePath,
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      now: () => 1_700_000_000_000,
+    });
+    await queue.load();
+    const entry = await queue.enqueue({
+      source: "market",
+      ledger: 90,
+      eventName: "claim_created",
+      text: "cross-network entry",
+      error: "Telegram 429",
+    });
+
+    const listIo = captureIo();
+    const listRes = await runDlqCli({
+      argv: ["list", "--file", filePath],
+      stdout: listIo.out,
+      stderr: listIo.err,
+    });
+    assert.equal(listRes.exitCode, 0);
+    assert.match(listIo.stdout.join("\n"), /network=Test SDF Network ; September 2015/);
+
+    const showIo = captureIo();
+    const showRes = await runDlqCli({
+      argv: ["show", entry.id, "--file", filePath],
+      stdout: showIo.out,
+      stderr: showIo.err,
+    });
+    assert.equal(showRes.exitCode, 0);
+    assert.match(showIo.stdout.join("\n"), /network:\s+Test SDF Network ; September 2015/);
+
+    const purgeRes = await purgeDeadLetters({ filePath, yes: true });
+    assert.equal(purgeRes.purged, 1);
+    assert.equal(purgeRes.remaining, 0);
+  });
+});
