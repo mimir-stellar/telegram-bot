@@ -33,6 +33,7 @@ const MENU = [
   "help",
   "about",
   "status",
+  "events",
   "audit",
   "contracts",
   "health",

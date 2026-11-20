@@ -44,6 +44,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     description: "Display the last-seen ledger number, watched contracts, poller health, and sync status.",
     examples: ["/status"],
   },
+  events: {
+    usage: "/events [page]",
+    arguments: "[page] (optional, default: 1) — positive integer page of retained recent event summaries",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Display a paginated, bounded list of recent canonical contract event summaries retained in memory.",
+    examples: ["/events", "/events 1", "/events 2"],
+  },
   audit: {
     usage: "/audit",
     arguments: "None",

@@ -66,13 +66,18 @@ export {
 export { TELEGRAM_OPTIONS, isChatAllowed, isOperator } from "./commands/runtime.js";
 export {
   aboutMessage,
+  eventsMessage,
+  eventsPage,
   helpMessage,
   contractsMessage,
   healthMessage,
   lastEventMessage,
   pauseMessage,
+  RecentEventStore,
   resumeMessage,
   statusMessage,
+  toCanonicalEventSummary,
+  type CanonicalEventSummary,
 } from "./commands/index.js";
 export {
   CALLBACK_FALLBACK_FEEDBACK,

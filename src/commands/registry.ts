@@ -23,6 +23,7 @@ import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
 import type { BroadcastStore } from "./broadcast.js";
+import type { CanonicalEventSummary } from "./events.js";
 
 /** Everything a command handler may need, supplied once by `createBot`. */
 export interface CommandDeps {
@@ -45,6 +46,11 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /** Retained canonical event summaries for `/events`. */
+  recentEvents?:
+    | (() => readonly CanonicalEventSummary[])
+    | readonly CanonicalEventSummary[]
+    | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */

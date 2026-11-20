@@ -30,16 +30,26 @@ import { contractsMessage } from "./commands/contracts.js";
 import { pauseMessage } from "./commands/pause.js";
 import { resumeMessage } from "./commands/resume.js";
 import { statusMessage } from "./commands/status.js";
+import { eventsMessage, eventsPage, resolveRecentEvents } from "./commands/events.js";
+import { pageKeyboard, parsePaginationCallback } from "./notifications/pagination.js";
 import type { CommandDeps } from "./commands/registry.js";
-import { TELEGRAM_OPTIONS, isOperator, safeAnswerCallback } from "./commands/runtime.js";
+import { TELEGRAM_OPTIONS, isChatAllowed, isOperator, safeAnswerCallback } from "./commands/runtime.js";
 
 // ── Callback payload validation ──────────────────────────────────────────────
 
-export type CallbackActionType = "status" | "contracts" | "help" | "pause" | "resume" | "broadcast";
+export type CallbackActionType =
+  | "status"
+  | "contracts"
+  | "help"
+  | "pause"
+  | "resume"
+  | "broadcast"
+  | "events_page";
 
 export interface ValidCallbackAction {
   type: CallbackActionType;
   raw: string;
+  page?: number;
 }
 
 export type CallbackValidationResult =
@@ -126,7 +136,23 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
     }
   }
 
-  // 2. Colon-delimited: e.g. "status:refresh", "mimir:contracts", etc.
+  // 2. Pagination callback: "pg:v1:events:<page>"
+  const pagination = parsePaginationCallback(trimmed);
+  if (pagination !== null) {
+    if (pagination.kind === "events") {
+      return {
+        ok: true,
+        action: { type: "events_page", page: pagination.page, raw },
+      };
+    }
+    return {
+      ok: false,
+      reason: "unknown-action",
+      fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+    };
+  }
+
+  // 3. Colon-delimited: e.g. "status:refresh", "mimir:contracts", etc.
   if (trimmed.includes(":")) {
     const parts = trimmed.split(":");
     if (parts[0] === "mimir" && parts[1] && isKnownAction(parts[1])) {
@@ -254,6 +280,34 @@ export async function handleCallbackQuery(
     switch (action.type) {
       case "broadcast": {
         await handleBroadcastCallback(ctx, deps, action.raw);
+        break;
+      }
+
+      case "events_page": {
+        const chatId = ctx.chat?.id;
+        if (chatId === undefined || !isChatAllowed(config.allowedChatIds, chatId)) {
+          await safeAnswerCallback(ctx, config, {
+            text: CALLBACK_FALLBACK_FEEDBACK,
+            show_alert: false,
+          });
+          break;
+        }
+        const summaries = resolveRecentEvents(deps);
+        const { pageIndex, totalPages } = eventsPage(summaries, action.page ?? 0);
+        const text = eventsMessage(config, summaries, pageIndex);
+        const keyboard =
+          totalPages > 1 ? pageKeyboard("events", pageIndex, totalPages) : undefined;
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text, keyboard);
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, {
+            ...TELEGRAM_OPTIONS,
+            ...(keyboard ? { reply_markup: keyboard } : {}),
+          });
+        }
+        await safeAnswerCallback(ctx, config, {
+          text: totalPages > 0 ? `Page ${pageIndex + 1}/${totalPages}` : "No recent events",
+        });
         break;
       }
 

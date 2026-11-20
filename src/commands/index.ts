@@ -19,6 +19,7 @@
 import "./help.js"; // registers /start and /help, in that order
 import "./about.js";
 import "./status.js";
+import "./events.js";
 import "./audit.js";
 import "./contracts.js";
 import "./health.js";
@@ -64,4 +65,17 @@ export { pauseCommand, pauseMessage, PAUSE_PROMPT } from "./pause.js";
 export { previewCommand } from "./preview.js";
 export { resumeCommand, resumeMessage } from "./resume.js";
 export { lastEventMessage, statusCommand, statusMessage } from "./status.js";
+export {
+  EVENTS_PAGE_SIZE,
+  EVENTS_USAGE_MESSAGE,
+  MAX_EVENT_SUMMARY_CHARS,
+  RecentEventStore,
+  eventsCommand,
+  eventsMessage,
+  eventsPage,
+  parseEventsPageArg,
+  resolveRecentEvents,
+  toCanonicalEventSummary,
+  type CanonicalEventSummary,
+} from "./events.js";
 export { logExportCommand } from "./log-export.js";

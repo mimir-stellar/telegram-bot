@@ -227,5 +227,5 @@ test("registerCommands includes /contracts alongside the existing commands", asy
 
   assert.equal(calls.length, 1);
   const commands = calls[0].commands.map((c) => c.command);
-  assert.deepEqual(commands, ["start", "help", "about", "status", "audit", "contracts", "health", "preview", "pause", "resume"]);
+  assert.deepEqual(commands, ["start", "help", "about", "status", "events", "audit", "contracts", "health", "preview", "pause", "resume"]);
 });
