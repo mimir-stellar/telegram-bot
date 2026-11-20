@@ -86,10 +86,21 @@ import {
 import {
   clip,
   explorerKeyboard,
+  formatDigestPages,
   formatEvent,
   formatPlainTextEvent,
   safeErrorMessage,
 } from "./notifications/format.js";
+import {
+  createDigestCheckpoint,
+  DEFAULT_DIGEST_MAX_PENDING,
+  type DigestCheckpoint,
+} from "./notifications/digest-checkpoint.js";
+import {
+  createScheduler,
+  type Scheduler,
+  type SchedulerClock,
+} from "./notifications/schedule.js";
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
@@ -543,6 +554,8 @@ export interface PollerDeps {
    * avoid waiting for real wall-clock time.
    */
   sleep?: (ms: number) => Promise<void>;
+  /** Optional clock for the scheduled digest timer (tests inject a fake clock). */
+  schedulerClock?: SchedulerClock;
 }
 
 export interface ShutdownOptions {
@@ -1455,6 +1468,67 @@ export function createPoller(deps: PollerDeps) {
     now,
   });
 
+  // Scheduled digests are opt-in via DIGEST_SCHEDULE. When unset, the poller
+  // delivers each event immediately with zero digest file I/O.
+  const digestScheduleSpec =
+    typeof config.digestSchedule === "string" && config.digestSchedule.trim().length > 0
+      ? config.digestSchedule.trim()
+      : null;
+  const digestCheckpoint: DigestCheckpoint | null = digestScheduleSpec
+    ? createDigestCheckpoint({
+        filePath:
+          typeof config.digestCheckpointFile === "string" &&
+          config.digestCheckpointFile.length > 0
+            ? config.digestCheckpointFile
+            : null,
+        maxPending: config.digestMaxPending ?? DEFAULT_DIGEST_MAX_PENDING,
+        now,
+      })
+    : null;
+  const digestScheduler: Scheduler | null =
+    digestScheduleSpec && digestCheckpoint
+      ? createScheduler({
+          schedule: digestScheduleSpec,
+          clock: deps.schedulerClock,
+          lastRunStore: digestCheckpoint,
+          run: async () => {
+            const pending = digestCheckpoint.snapshotPending();
+            if (pending.length === 0) return;
+            const chunks = formatDigestPages(pending, { grouped: true });
+            if (chunks.length === 0) return;
+            try {
+              for (const chunk of chunks) {
+                await sendWithRetry(
+                  (message) => send(message, undefined),
+                  chunk,
+                  config.botToken,
+                  sendOptions,
+                  () => !status.stopping,
+                  sleep,
+                );
+                recordSentIncrement();
+                metrics?.notificationsSent.inc();
+              }
+            } catch (err) {
+              recordFailedIncrement();
+              metrics?.notificationsFailed.inc();
+              Logger.error(
+                "poller",
+                `[poller] scheduled digest send failed (${pending.length} pending event(s) kept): ` +
+                  errorMessage(err),
+                {
+                  action: "digest_send_failed",
+                  pendingCount: pending.length,
+                  error: errorMessage(err),
+                },
+              );
+              throw err;
+            }
+            await digestCheckpoint.acknowledgeSent(new Set(pending.map((e) => e.eventId)));
+          },
+        })
+      : null;
+
   /** Crash-safe send journal: intent before a send, done after. */
   const sendJournalEnabled =
     typeof config.sendJournalFile === "string" && config.sendJournalFile.length > 0;
@@ -2115,6 +2189,13 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
+      // Scheduled digest mode: buffer the event into the bounded checkpoint
+      // instead of sending immediately; the scheduler flushes grouped digests.
+      if (digestCheckpoint !== null) {
+        digestCheckpoint.enqueue(event);
+        continue;
+      }
+
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
         recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
@@ -2257,6 +2338,10 @@ export function createPoller(deps: PollerDeps) {
         `[poller] shutdown drain dropped ${droppedForShutdown} unsent notification(s); ` +
           `the cursor still advances so they are not replayed`,
       );
+    }
+
+    if (digestCheckpoint !== null) {
+      await digestCheckpoint.flush();
     }
 
     return { sent: sentThisCycle, failed, skipped };
@@ -2992,6 +3077,11 @@ export function createPoller(deps: PollerDeps) {
       await deadLetter.load();
       refreshDeadLetterStatus();
 
+      if (digestCheckpoint && digestScheduler) {
+        await digestCheckpoint.load();
+        await digestScheduler.start();
+      }
+
       // Recover which notifications may already have been sent: an intent
       // without a matching done means a crash happened between sendMessage and
       // the cursor commit. Treat them as committed so a restart never duplicates
@@ -3084,6 +3174,12 @@ export function createPoller(deps: PollerDeps) {
       resumePending = false;
       if (timer) clearTimeout(timer);
       timer = null;
+      if (digestScheduler) {
+        await digestScheduler.stop();
+      }
+      if (digestCheckpoint) {
+        await digestCheckpoint.flush();
+      }
       // Best-effort: the process may be exiting, but a final snapshot that says
       // `running: false` is what tells a supervisor the stop was deliberate.
       void persistStatus();
@@ -3147,6 +3243,13 @@ export function createPoller(deps: PollerDeps) {
 
       if (countersDirty) {
         await saveCounters("shutdown");
+      }
+
+      if (digestScheduler) {
+        await digestScheduler.stop();
+      }
+      if (digestCheckpoint) {
+        await digestCheckpoint.flush();
       }
 
       status.running = false;

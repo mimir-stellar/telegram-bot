@@ -892,6 +892,38 @@ Two things it deliberately does not do:
 `DEAD_LETTER_FILE` disables the queue entirely, and the poller then behaves
 exactly as it did before the queue existed.
 
+## Scheduled digests
+
+Set `DIGEST_SCHEDULE` to buffer notifiable events and deliver them as a grouped
+digest on a UTC cadence instead of sending each event immediately:
+
+- `DIGEST_SCHEDULE` — `daily@HH:mm` or `weekly@day HH:mm` (UTC, `day` in
+  `sun`..`sat`). Unset (default) preserves immediate per-event delivery with no
+  digest checkpoint I/O.
+- `DIGEST_CHECKPOINT_FILE` — path to the versioned JSON checkpoint storing
+  pending events and the last completed run timestamp (default
+  `./data/digest-checkpoint.json`).
+- `DIGEST_MAX_PENDING` — maximum pending events retained between scheduled runs
+  (default `200`). When full, the oldest pending events are evicted first so
+  memory and disk usage remain bounded.
+- **Bounded continuation pages** — when a digest exceeds Telegram's 4096-character
+  message limit, `formatDigestPages` splits it deterministically on complete event
+  summaries (repeating the group header when a multi-event group spans pages) and
+  includes `(page/total)` with the stable total event count in every page header.
+
+Restart behavior:
+
+- On startup, the poller restores `lastRunMs` and pending events from
+  `DIGEST_CHECKPOINT_FILE` (truncating to `DIGEST_MAX_PENDING` if the cap
+  shrank). A corrupt or incompatible checkpoint is quarantined beside the live
+  file (`*.corrupt.<timestamp>`) and treated as a clean cold start.
+- If a scheduled boundary was missed while the bot was down, the scheduler
+  flushes the restored pending events once on startup; on a cold start with no
+  prior run, it waits for the next scheduled boundary.
+- Delivery is best-effort (never claiming exactly-once): pending events are
+  cleared only after the Telegram send succeeds, and a failed send keeps them
+  buffered for the next scheduled boundary.
+
 ## Graceful shutdown
 
 `SIGINT`/`SIGTERM` starts a bounded drain rather than a hard stop:

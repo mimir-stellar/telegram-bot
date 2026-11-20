@@ -35,6 +35,7 @@ import { formatSquadResolution, renderSquadResolution } from "./squad-resolution
 import type { StellarConfig } from "../config.js";
 import { messagesFor, type Messages } from "../i18n.js";
 import { formatDeadline } from "./time.js";
+import { buildSampleEvents } from "./samples.js";
 import {
   highlightLevel,
   highlightMarker,
@@ -328,6 +329,20 @@ export interface FormatDigestOptions {
   grouped?: boolean;
 }
 
+/** Options for {@link formatDigestPages}. */
+export interface FormatDigestPagesOptions extends FormatDigestOptions {
+  /**
+   * Maximum length in UTF-16 code units for each rendered Telegram message page.
+   * Defaults to {@link TELEGRAM_MAX_MESSAGE_LENGTH} (4096).
+   */
+  maxLength?: number;
+}
+
+interface DigestEntry {
+  groupHeader: string | null;
+  line: string;
+}
+
 /**
  * One digest line in the flat layout.  Extracted so both the flat path and the
  * grouped renderer share identical line formatting.
@@ -337,12 +352,103 @@ function flatLine(event: DecodedEvent): string {
   return `· mimir\\-${escapeMd(event.source)} \`${escapeMd(clip(name, 80))}\` at ledger ${event.ledger}`;
 }
 
+function digestHeader(totalEvents: number, page?: number, totalPages?: number): string {
+  if (page !== undefined && totalPages !== undefined && totalPages > 1) {
+    return `*Mimir Digest* ${escapeMd(`(${page}/${totalPages})`)} — ${totalEvents} events in this cycle`;
+  }
+  return `*Mimir Digest* — ${totalEvents} events in this cycle`;
+}
+
+function buildDigestEntries(
+  events: readonly DecodedEvent[],
+  grouped: boolean,
+): DigestEntry[] {
+  if (!grouped) {
+    return events.map((event) => ({ groupHeader: null, line: flatLine(event) }));
+  }
+
+  const groups = groupDigestEvents(events);
+  const entries: DigestEntry[] = [];
+  for (const group of groups) {
+    if (group.events.length === 1) {
+      // Singleton group: no header, no indentation — identical to flat layout.
+      const [sole] = group.events;
+      if (sole) entries.push({ groupHeader: null, line: flatLine(sole) });
+    } else {
+      // Multi-event group: MarkdownV2-escaped Group_Key as header, then
+      // each event on an indented line.
+      const groupHeader = escapeMd(group.key);
+      for (const e of group.events) {
+        entries.push({ groupHeader, line: `  ${flatLine(e)}` });
+      }
+    }
+  }
+  return entries;
+}
+
+function packDigestEntries(
+  entries: readonly DigestEntry[],
+  maxBodyLength: number,
+  maxLength: number,
+): string[][] {
+  const pages: string[][] = [];
+  let currentLines: string[] = [];
+  let currentLen = 0;
+  let activeGroupHeader: string | null = null;
+
+  for (const entry of entries) {
+    const needsGroupHeader =
+      entry.groupHeader !== null && entry.groupHeader !== activeGroupHeader;
+    const additionLines = needsGroupHeader
+      ? [entry.groupHeader!, entry.line]
+      : [entry.line];
+    const additionTextLen = additionLines.reduce(
+      (sum, l, idx) => sum + l.length + (idx > 0 ? 1 : 0),
+      0,
+    );
+    const separatorLen = currentLines.length > 0 ? 1 : 0;
+
+    if (currentLines.length > 0 && currentLen + separatorLen + additionTextLen > maxBodyLength) {
+      pages.push(currentLines);
+      currentLines = [];
+      currentLen = 0;
+      activeGroupHeader = null;
+    }
+
+    const freshNeedsHeader =
+      entry.groupHeader !== null && entry.groupHeader !== activeGroupHeader;
+    const freshLines = freshNeedsHeader
+      ? [entry.groupHeader!, entry.line]
+      : [entry.line];
+    const freshTextLen = freshLines.reduce(
+      (sum, l, idx) => sum + l.length + (idx > 0 ? 1 : 0),
+      0,
+    );
+    const freshSepLen = currentLines.length > 0 ? 1 : 0;
+
+    if (currentLen + freshSepLen + freshTextLen > maxBodyLength) {
+      throw new RangeError(
+        `formatDigestPages maxLength ${maxLength} cannot fit digest header and a complete event summary`,
+      );
+    }
+
+    currentLines.push(...freshLines);
+    currentLen += freshSepLen + freshTextLen;
+    activeGroupHeader = entry.groupHeader;
+  }
+
+  if (currentLines.length > 0) {
+    pages.push(currentLines);
+  }
+  return pages;
+}
+
 /**
  * Render a grouped digest.  Called only when `options.grouped` is `true`.
  */
 function renderGroupedDigest(events: readonly DecodedEvent[]): string {
   const groups = groupDigestEvents(events);
-  const header = `*Mimir Digest* — ${events.length} events in this cycle`;
+  const header = digestHeader(events.length);
   const body: string[] = [];
 
   for (const group of groups) {
@@ -377,7 +483,64 @@ export function formatDigest(
   if (events.length === 0) return null;
   if (options.grouped) return renderGroupedDigest(events);
   const lines = events.map(flatLine);
-  return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
+  return [digestHeader(events.length), "", ...lines].join("\n");
+}
+
+/**
+ * Format a digest into one or more Telegram-bounded MarkdownV2 continuation pages.
+ *
+ * - Returns `[]` when `events` is empty.
+ * - When the full digest fits within `maxLength`, returns a single page identical
+ *   to {@link formatDigest}.
+ * - When pagination is required, splits strictly on complete event summaries
+ *   (never mid-line, mid-surrogate-pair, or mid-MarkdownV2 escape), repeats the
+ *   group header when a multi-event group continues onto a new page, and retains
+ *   the same total event count across every page header (`(page/total)`).
+ * - Throws `RangeError` if `maxLength` is invalid or too small to fit a page
+ *   header plus a single complete event summary.
+ */
+export function formatDigestPages(
+  events: readonly DecodedEvent[],
+  options: FormatDigestPagesOptions = {},
+): string[] {
+  const limit = options.maxLength ?? TELEGRAM_MAX_MESSAGE_LENGTH;
+  if (!Number.isFinite(limit) || limit < 1) {
+    throw new RangeError(`formatDigestPages maxLength must be >= 1, got ${limit}`);
+  }
+  const maxLength = Math.floor(limit);
+  if (events.length === 0) return [];
+
+  const grouped = options.grouped === true;
+  const single = formatDigest(events, { grouped });
+  if (single !== null && single.length <= maxLength) {
+    return [single];
+  }
+
+  const totalEvents = events.length;
+  const entries = buildDigestEntries(events, grouped);
+
+  let estimatedTotal = 2;
+  let packedPages: string[][] = [];
+  for (let pass = 0; pass < 8; pass += 1) {
+    const worstHeaderLen = digestHeader(totalEvents, estimatedTotal, estimatedTotal).length;
+    const maxBodyLength = maxLength - worstHeaderLen - 2; // "\n\n"
+    if (maxBodyLength < 1) {
+      throw new RangeError(
+        `formatDigestPages maxLength ${maxLength} cannot fit digest header and a complete event summary`,
+      );
+    }
+    packedPages = packDigestEntries(entries, maxBodyLength, maxLength);
+    const actualTotal = Math.max(2, packedPages.length);
+    if (String(actualTotal).length <= String(estimatedTotal).length) {
+      break;
+    }
+    estimatedTotal = actualTotal;
+  }
+
+  const totalPages = packedPages.length;
+  return packedPages.map(
+    (lines, index) => `${digestHeader(totalEvents, index + 1, totalPages)}\n\n${lines.join("\n")}`,
+  );
 }
 
 /**
@@ -812,62 +975,45 @@ export function formatFallbackEvent(
 
 /**
  * Generate a channel preview message for on-demand preview commands.
- * Shows a sample notification and current link preview settings for the specified contract.
+ * Shows a sample notification and current link preview settings for the specified contract or event.
+ * If an unknown event or target is requested, returns a usage message listing valid names.
  */
-export function previewMessage(config: StellarConfig & { linkPreviewMarket?: boolean; linkPreviewSquad?: boolean }, target = "market"): string {
+export function previewMessage(
+  config: StellarConfig & { linkPreviewMarket?: boolean; linkPreviewSquad?: boolean },
+  target = "market",
+): string {
   const messages = messagesFor(config.locale);
-  const isSquad = target.trim().toLowerCase() === "squad";
-  const linkPreviewEnabled = isSquad
-    ? config.linkPreviewSquad ?? false
-    : config.linkPreviewMarket ?? false;
+  const normalized = target.trim().toLowerCase();
+  const samples = buildSampleEvents(config);
 
-  const settingsLine = `Link previews: ${linkPreviewEnabled ? "enabled" : "disabled"}`;
-
-  if (isSquad) {
-    const sampleEvent: DecodedEvent = {
-      source: "squad",
-      contractId: config.squadContractId,
-      version: "v1",
-      ledger: 1000000,
-      txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-      at: Math.floor(Date.now() / 1000),
-      eventId: "1000000-1",
-      eventType: "contract",
-      transactionIndex: 0,
-      operationIndex: 0,
-      inSuccessfulContractCall: true,
-      payload: {
-        name: "market_created",
-        marketId: 1,
-        question: "Will Stellar process 1M Soroban operations in 24 hours?",
-        captain: "GDZCB3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
-        feeBps: 100,
-        deadline: 1770000000,
-      },
-    };
+  const render = (sampleEvent: DecodedEvent): string => {
+    const isSquad = sampleEvent.source === "squad";
+    const linkPreviewEnabled = isSquad
+      ? config.linkPreviewSquad ?? false
+      : config.linkPreviewMarket ?? false;
+    const settingsLine = `Link previews: ${linkPreviewEnabled ? "enabled" : "disabled"}`;
+    const header = isSquad
+      ? messages.notificationMd.channelPreviewSquad
+      : messages.notificationMd.channelPreviewMarket;
     const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
-    return `${messages.notificationMd.channelPreviewSquad}\n${settingsLine}\n\n${formatted}`;
+    return `${header}\n${settingsLine}\n\n${formatted}`;
+  };
+
+  if (normalized === "squad") return render(samples["market_created"]);
+  if (normalized === "market") return render(samples["claim_created"]);
+
+  if (Object.prototype.hasOwnProperty.call(samples, normalized)) {
+    return render(samples[normalized as keyof typeof samples]);
   }
 
-  const sampleEvent: DecodedEvent = {
-    source: "market",
-    contractId: config.marketContractId,
-    version: "v1",
-    ledger: 1000000,
-    txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-    at: Math.floor(Date.now() / 1000),
-    eventId: "1000000-0",
-    eventType: "contract",
-    transactionIndex: 0,
-    operationIndex: 0,
-    inSuccessfulContractCall: true,
-    payload: {
-      name: "claim_created",
-      claimId: 1,
-      category: "crypto",
-      creator: "GBMGZ3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
-    },
-  };
-  const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
-  return `${messages.notificationMd.channelPreviewMarket}\n${settingsLine}\n\n${formatted}`;
+  const validNames = Object.keys(samples)
+    .sort()
+    .map((name) => escapeMd(name))
+    .join(", ");
+  return (
+    `Unknown preview event: \`${escapeMd(clip(target, 40))}\`\n\n` +
+    `Usage: \`/preview <event_name>\`\n` +
+    `Valid names:\n${validNames}\n\n` +
+    `Shortcuts: \`market\`, \`squad\``
+  );
 }

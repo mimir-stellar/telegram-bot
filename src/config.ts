@@ -58,6 +58,8 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import { parseSchedule } from "./notifications/schedule.js";
+import { DEFAULT_DIGEST_MAX_PENDING } from "./notifications/digest-checkpoint.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -295,6 +297,16 @@ export interface BotConfig extends StellarConfig {
   /** Replay attempts before a parked send is dropped as poison. */
   deadLetterMaxAttempts: number;
   /**
+   * Optional scheduled digest cadence (`daily@HH:mm` or `weekly@day HH:mm` in
+   * UTC). When set, notifiable events are buffered in a bounded checkpoint and
+   * delivered as a grouped digest on schedule instead of per-event.
+   */
+  digestSchedule?: string | null;
+  /** Path to the bounded scheduled-digest checkpoint file. */
+  digestCheckpointFile?: string;
+  /** Maximum pending events retained in the digest checkpoint between runs. */
+  digestMaxPending?: number;
+  /**
    * Crash-safe send journal: intent is logged before a Telegram send and done
    * after, so a restart can tell which notifications may have been sent
    * (see src/notifications/send-journal.ts). Empty disables the journal.
@@ -400,6 +412,8 @@ const DEFAULTS = {
   deadLetterFile: "./data/dead-letter.json",
   deadLetterMax: 100,
   deadLetterMaxAttempts: 10,
+  digestCheckpointFile: "./data/digest-checkpoint.json",
+  digestMaxPending: DEFAULT_DIGEST_MAX_PENDING,
   sendJournalFile: "./data/send-journal.jsonl",
   healthHost: "127.0.0.1",
   healthPort: 8787,
@@ -942,6 +956,19 @@ export function loadConfig(): BotConfig {
     );
   }
 
+  const digestScheduleInput = read("DIGEST_SCHEDULE");
+  let digestSchedule: string | null = null;
+  if (digestScheduleInput !== undefined) {
+    try {
+      parseSchedule(digestScheduleInput);
+      digestSchedule = digestScheduleInput;
+    } catch (err) {
+      c.problems.push(
+        `DIGEST_SCHEDULE is invalid: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   const config: BotConfig = {
     ...stellar,
     locale: locale ?? DEFAULT_LOCALE,
@@ -985,6 +1012,12 @@ export function loadConfig(): BotConfig {
       DEFAULTS.deadLetterMaxAttempts,
       1,
     ),
+    digestSchedule,
+    digestCheckpointFile: path.resolve(
+      process.cwd(),
+      c.get("DIGEST_CHECKPOINT_FILE") ?? DEFAULTS.digestCheckpointFile,
+    ),
+    digestMaxPending: c.int("DIGEST_MAX_PENDING", DEFAULTS.digestMaxPending, 1),
     sendJournalFile: path.resolve(
       process.cwd(),
       read("SEND_JOURNAL_FILE") ?? DEFAULTS.sendJournalFile,
@@ -1179,6 +1212,9 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "DEAD_LETTER_FILE", secret: false, hasBuiltInDefault: true },
   { key: "DEAD_LETTER_MAX", secret: false, hasBuiltInDefault: true },
   { key: "DEAD_LETTER_MAX_ATTEMPTS", secret: false, hasBuiltInDefault: true },
+  { key: "DIGEST_SCHEDULE", secret: false },
+  { key: "DIGEST_CHECKPOINT_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "DIGEST_MAX_PENDING", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_HOST", secret: false, hasBuiltInDefault: true },
   {
     key: "HEALTH_PORT",
