@@ -223,3 +223,35 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Archive Schema Versions
+
+The archive helpers expose `getSupportedArchiveSchemaVersions()` and
+`negotiateArchiveSchemaVersion()` from `src/stellar/archive.ts`. The current
+reader and writer support schema version **1** for event archives and scan
+JSONL. Writers reject unsupported requested versions; readers reject unknown
+version metadata instead of interpreting newer records as the current shape.
+
+`createEventArchive({ dir })` writes `archive-schema.json` with the archive
+format and schema version before appending records. Its optional
+`schemaVersion` setting defaults to `1` and rejects unsupported versions.
+Existing archive directories without this sidecar are read as the prior
+version-1 layout for backward compatibility. Set `requireExplicitVersion: true`
+on `readArchive` when a caller must reject such unversioned directories.
+
+The existing `formatScanJsonl(events)` output remains unchanged. To mark a
+capture explicitly, pass the supported writer version:
+
+```ts
+const capture = formatScanJsonl(events, { schemaVersion: 1 });
+const parsed = parseScanJsonl(capture, { requireExplicitVersion: true });
+```
+
+The versioned scan output starts with a `type: "schema"` line declaring
+`format: "mimir-scan-jsonl"` and `schemaVersion: 1`. `parseScanJsonl` also
+accepts existing unversioned output as version 1 unless
+`requireExplicitVersion` is enabled. Both readers accept an
+`acceptedVersions` list to constrain negotiation to a caller's supported
+versions.
