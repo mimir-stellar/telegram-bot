@@ -78,7 +78,7 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 ### Exit Codes
 
 * **`0`:** Scan completed successfully (even if some events were skipped, deduplicated, or capped).
-* **`1`:** Fatal runtime error (RPC unreachable, invalid network passphrase, or missing config in `--send` mode).
+* **`1`:** Fatal runtime error (RPC unreachable, nonmonotonic RPC page ledger boundaries, invalid network passphrase, or missing config in `--send` mode).
 * **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, or invalid `--contract`).
 
 ---
@@ -173,6 +173,7 @@ The replay engine applies identical decoding and deduplication rules as the live
 3. **Deduplication:** An in-memory `EventDedupWindow` (capacity 256) tracks the canonical `eventKey` across overlapping pages. Duplicate event IDs returned across page boundaries are counted in `duplicates` and suppressed.
 4. **Cap Protection:** If the count of sent notifications reaches `--cap`, subsequent events are skipped with `skipReason = "cap"` to prevent Telegram rate-limiting (HTTP 429).
 5. **Send Errors:** An individual Telegram dispatch failure is logged and recorded as skipped (`skipReason = "send-error"`). It does not abort the remaining replay walk.
+6. **Nonmonotonic Ledger Boundaries:** Each RPC page is validated before decoding, sending, or committing progress. If a page reports a regressing `latestLedger`, a `cursor` ledger behind the prior cursor or committed event ledger, an event ledger behind the committed boundary or decreasing within the page, or a `cursor` ledger behind an event on the same page, replay aborts with a bounded `ReplayConsistencyError` (exit code `1`) and leaves the previously committed progress checkpoint unchanged.
 
 ---
 
