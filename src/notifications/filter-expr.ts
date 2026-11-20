@@ -15,6 +15,7 @@
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
+import { InvalidThresholdError, parseUsdcThreshold } from "./amount-threshold.js";
 
 /** USDC atomic unit divisor (7 decimal places). */
 export const USDC_SCALE = 10_000_000n;
@@ -211,7 +212,7 @@ export type ComparisonOp = "==" | "!=" | "<" | "<=" | ">" | ">=";
 /** Value literals supported by the AST. */
 export type LiteralValue =
   | { kind: "string"; value: string }
-  | { kind: "number"; value: number }
+  | { kind: "number"; value: number; raw?: string }
   | { kind: "boolean"; value: boolean }
   | { kind: "usdc"; atomic: bigint; rawDecimal: string };
 
@@ -466,20 +467,23 @@ class Lexer {
 
 /** Convert a decimal string to 7-decimal atomic bigint. */
 export function parseUsdcStringToUnits(numStr: string, pos = 0): bigint {
-  const parts = numStr.split(".");
-  const wholeStr = parts[0] ?? "";
-  const fracStr = parts[1] ?? "";
-
-  if (fracStr.length > 7) {
+  const trimmed = numStr.trim();
+  const parts = trimmed.split(".");
+  if (parts.length === 2 && (parts[1]?.length ?? 0) > 7) {
     throw new FilterParseError(
-      `USDC amount "${numStr}" exceeds maximum precision of 7 decimals`,
+      `USDC amount "${trimmed}" exceeds maximum precision of 7 decimals`,
       pos,
     );
   }
 
-  const whole = BigInt(wholeStr);
-  const frac = BigInt(fracStr.padEnd(7, "0"));
-  return whole * USDC_SCALE + frac;
+  try {
+    return parseUsdcThreshold(trimmed);
+  } catch (err) {
+    if (err instanceof InvalidThresholdError) {
+      throw new FilterParseError(err.message, pos);
+    }
+    throw err;
+  }
 }
 
 /**
@@ -708,7 +712,7 @@ export class FilterParser {
 
     if (tok.type === "NUMBER") {
       this.advance();
-      return { kind: "number", value: tok.value as number };
+      return { kind: "number", value: tok.value as number, raw: tok.text };
     }
 
     if (tok.type === "IDENTIFIER") {
@@ -786,6 +790,10 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
             `Field "${node.field}" is a numeric/USDC amount, but got ${node.value.kind} literal`,
             node.valuePos,
           );
+        }
+        if (node.value.kind === "number") {
+          const raw = node.value.raw ?? String(node.value.value);
+          parseUsdcStringToUnits(raw, node.valuePos);
         }
         break;
 
@@ -883,7 +891,8 @@ function compareValues(
     if (literal.kind === "usdc") {
       targetBigInt = literal.atomic;
     } else if (literal.kind === "number") {
-      targetBigInt = BigInt(Math.floor(literal.value)) * USDC_SCALE;
+      const raw = literal.raw ?? String(literal.value);
+      targetBigInt = parseUsdcStringToUnits(raw);
     } else {
       return false;
     }

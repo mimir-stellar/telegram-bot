@@ -86,6 +86,23 @@ export function parseUsdcThreshold(text: string): bigint {
 }
 
 /**
+ * Normalizes a valid decimal USDC threshold string to its canonical 7-decimal representation.
+ *
+ * Canonical equivalent decimal strings produce identical output:
+ * - "1", "01", "1.0", "1.00", "1.0000000" -> "1.0000000"
+ * - "0.5", "00.50", "0.5000000" -> "0.5000000"
+ *
+ * Rejects negative numbers, malformed input, or values exceeding 7 fractional digits
+ * with an {@link InvalidThresholdError}.
+ */
+export function normalizeUsdcThreshold(text: string): string {
+  const atomic = parseUsdcThreshold(text);
+  const whole = atomic / 10_000_000n;
+  const frac = (atomic % 10_000_000n).toString().padStart(7, "0");
+  return `${whole}.${frac}`;
+}
+
+/**
  * Evaluates whether an event meets the configured amount thresholds.
  *
  * Filtering rules:
