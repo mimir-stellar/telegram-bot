@@ -41,6 +41,58 @@ export interface Gauge {
   value(): number;
 }
 
+/**
+ * Stable, low-cardinality destination classes for pending delivery queue age.
+ * Never use chat IDs or event IDs as labels.
+ */
+export type DeliveryDestinationClass = "channel" | "group" | "dm" | "dead_letter";
+
+export const DELIVERY_DESTINATION_CLASSES: readonly DeliveryDestinationClass[] = [
+  "channel",
+  "group",
+  "dm",
+  "dead_letter",
+] as const;
+
+/** Fixed finite upper bounds (in seconds) for pending delivery queue age histograms. */
+export const QUEUE_AGE_BUCKETS_SECONDS: readonly number[] = [
+  1, 5, 15, 30, 60, 300, 900, 3600,
+] as const;
+
+export interface QueueAgeBucketSnapshot {
+  /** Upper bound in seconds, or `"+Inf"` for the cumulative catch-all bucket. */
+  le: number | "+Inf";
+  /** Cumulative count of observations less than or equal to `le`. */
+  count: number;
+}
+
+export interface QueueAgeDestinationSnapshot {
+  buckets: QueueAgeBucketSnapshot[];
+  sum: number;
+  count: number;
+}
+
+export interface QueueAgeHistogram {
+  /** Fixed finite bucket upper bounds in seconds (excluding `+Inf`). */
+  readonly buckets: readonly number[];
+  /** Stable destination classes accepted by this histogram. */
+  readonly destinations: readonly DeliveryDestinationClass[];
+  /**
+   * Observe a pending delivery queue age in seconds for a stable destination class.
+   * Throws `RangeError` for unknown destination classes (e.g. chat IDs or event IDs)
+   * or negative/non-finite ages.
+   */
+  observe(destination: DeliveryDestinationClass, ageSeconds: number): void;
+  /**
+   * Observe a pending delivery queue age computed from `nowMs - enqueuedAtMs`.
+   * Clock skew (`nowMs < enqueuedAtMs`) is clamped to 0 seconds.
+   * Throws `RangeError` for unknown destination classes or non-finite timestamps.
+   */
+  observeSince(destination: DeliveryDestinationClass, enqueuedAtMs: number, nowMs?: number): void;
+  /** Return a snapshot of cumulative bucket counts, sum, and count for `destination`. */
+  snapshot(destination: DeliveryDestinationClass): QueueAgeDestinationSnapshot;
+}
+
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
 export interface MetricsServer {
   /** The port the server is actually listening on. */
@@ -89,6 +141,9 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** Fixed-bucket queue age histogram (in seconds) for pending deliveries,
+   *  partitioned by stable destination class (never chat IDs or event IDs). */
+  pendingDeliveryQueueAge: QueueAgeHistogram;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -144,6 +199,93 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
   };
 }
 
+function roundSum(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function makeQueueAgeHistogram(
+  name: string,
+  help: string,
+  buckets: readonly number[] = QUEUE_AGE_BUCKETS_SECONDS,
+  destinations: readonly DeliveryDestinationClass[] = DELIVERY_DESTINATION_CLASSES,
+): QueueAgeHistogram & { _name: string; _help: string } {
+  const fixedBuckets = Object.freeze([...buckets]);
+  const fixedDestinations = Object.freeze([...destinations]);
+  const state = new Map<
+    DeliveryDestinationClass,
+    { bucketCounts: number[]; sum: number; count: number }
+  >();
+
+  for (const dest of fixedDestinations) {
+    state.set(dest, {
+      bucketCounts: new Array<number>(fixedBuckets.length).fill(0),
+      sum: 0,
+      count: 0,
+    });
+  }
+
+  function requireDestination(destination: DeliveryDestinationClass) {
+    const entry = state.get(destination);
+    if (!entry) {
+      throw new RangeError(
+        `Invalid destination class "${String(destination)}"; expected one of: ${fixedDestinations.join(", ")}`,
+      );
+    }
+    return entry;
+  }
+
+  function observe(destination: DeliveryDestinationClass, ageSeconds: number): void {
+    const entry = requireDestination(destination);
+    if (!Number.isFinite(ageSeconds) || ageSeconds < 0) {
+      throw new RangeError(`Queue age must be a finite number >= 0; got ${ageSeconds}`);
+    }
+    for (let i = 0; i < fixedBuckets.length; i++) {
+      if (ageSeconds <= fixedBuckets[i]!) {
+        entry.bucketCounts[i]! += 1;
+      }
+    }
+    entry.sum += ageSeconds;
+    entry.count += 1;
+  }
+
+  function observeSince(
+    destination: DeliveryDestinationClass,
+    enqueuedAtMs: number,
+    nowMs: number = Date.now(),
+  ): void {
+    requireDestination(destination);
+    if (!Number.isFinite(enqueuedAtMs) || !Number.isFinite(nowMs)) {
+      throw new RangeError("Queue timestamps must be finite numbers");
+    }
+    const ageSeconds = Math.max(0, (nowMs - enqueuedAtMs) / 1000);
+    observe(destination, ageSeconds);
+  }
+
+  function snapshot(destination: DeliveryDestinationClass): QueueAgeDestinationSnapshot {
+    const entry = requireDestination(destination);
+    const bucketSnapshots: QueueAgeBucketSnapshot[] = fixedBuckets.map((le, i) => ({
+      le,
+      count: entry.bucketCounts[i]!,
+    }));
+    bucketSnapshots.push({ le: "+Inf", count: entry.count });
+    return {
+      buckets: bucketSnapshots,
+      sum: roundSum(entry.sum),
+      count: entry.count,
+    };
+  }
+
+  return {
+    _name: name,
+    _help: help,
+    buckets: fixedBuckets,
+    destinations: fixedDestinations,
+    observe,
+    observeSince,
+    snapshot,
+  };
+}
+
 const METRICS_PREFIX = "mimir_bot_";
 
 export function createMetrics(): MetricsRegistry {
@@ -195,6 +337,10 @@ export function createMetrics(): MetricsRegistry {
     `${METRICS_PREFIX}activity_anomalies_total`,
     "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
   );
+  const pendingDeliveryQueueAge = makeQueueAgeHistogram(
+    `${METRICS_PREFIX}pending_delivery_queue_age_seconds`,
+    "Age in seconds of pending deliveries in queue, partitioned by stable destination class.",
+  );
 
   const counters = [
     pollCycles,
@@ -208,6 +354,7 @@ export function createMetrics(): MetricsRegistry {
     activityAnomalies,
   ];
   const gauges = [consecutiveFailures, lastCycleEvents, activityBaselineEvents];
+  const histograms = [pendingDeliveryQueueAge];
 
   function render(): string {
     const lines: string[] = [];
@@ -222,6 +369,21 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`# HELP ${g._name} ${g._help}`);
       lines.push(`# TYPE ${g._name} gauge`);
       lines.push(`${g._name} ${g.value()}`);
+    }
+
+    for (const h of histograms) {
+      lines.push(`# HELP ${h._name} ${h._help}`);
+      lines.push(`# TYPE ${h._name} histogram`);
+      for (const destination of h.destinations) {
+        const snap = h.snapshot(destination);
+        for (const bucket of snap.buckets) {
+          lines.push(
+            `${h._name}_bucket{destination="${destination}",le="${bucket.le}"} ${bucket.count}`,
+          );
+        }
+        lines.push(`${h._name}_sum{destination="${destination}"} ${snap.sum}`);
+        lines.push(`${h._name}_count{destination="${destination}"} ${snap.count}`);
+      }
     }
 
     // Prometheus text format requires a trailing newline.
@@ -306,6 +468,7 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    pendingDeliveryQueueAge,
     render,
     startServer,
   };
