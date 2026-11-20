@@ -12,6 +12,8 @@
  *   npm run replay -- --from 4226500 --json              # machine-readable
  *   npm run replay -- --from 4226500 --send              # send to Telegram
  *   npm run replay -- --from 4226500 --mock              # local mock profile
+ *   npm run replay -- --archive scan.json                # offline from scanner archive
+ *   npm run replay -- --archive scan.json --from 4226500 --to 4226800
  *
  * ── Safety ──────────────────────────────────────────────────────────────────
  *
@@ -70,10 +72,14 @@ import {
 import {
   eventCursorLedger,
   scanJsonReplacer,
+  type ScanJsonEvent,
+  type ScanJsonReport,
+  type ScanJsonTarget,
   type WatchTarget,
   EVENT_MAX_PAGES,
   EVENT_PAGE_LIMIT,
 } from "./events.js";
+import { reviveScanReport } from "./scan-reviver.js";
 
 // ── Replay report types ───────────────────────────────────────────────────────
 
@@ -121,6 +127,7 @@ export interface ReplayReport {
   format: "mimir-replay-v1";
   network: string;
   rpcUrl: string;
+  archivePath?: string | undefined;
   fromLedger: number;
   toLedger: number | null;
   dryRun: boolean;
@@ -366,6 +373,345 @@ export async function loadAndValidateProgressFile(
 
 function isBotConfig(config: StellarConfig | BotConfig): config is BotConfig {
   return "botToken" in config;
+}
+
+// ── Offline scanner archive validation & replay ──────────────────────────────
+
+/**
+ * Load and validate a `mimir-scan-v1` scanner archive before offline replay.
+ * Enforces schema identity (`format === "mimir-scan-v1"`), structural integrity,
+ * and network identity (`archive.network === expected.network`) before any
+ * events are processed.
+ */
+export async function loadAndValidateScannerArchive(
+  filePath: string,
+  expected: {
+    network: string;
+  },
+): Promise<ScanJsonReport> {
+  let content: string;
+  try {
+    content = await readFile(filePath, "utf8");
+  } catch (err: unknown) {
+    throw new Error(
+      `cannot read archive file "${filePath}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  let archive: ScanJsonReport;
+  try {
+    archive = reviveScanReport(content);
+  } catch (err: unknown) {
+    throw new Error(
+      `invalid scanner archive "${filePath}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // Enforce network identity before processing any events.
+  if (archive.network !== expected.network) {
+    throw new Error(
+      `archive network (${archive.network}) does not match configured network (${expected.network})`,
+    );
+  }
+
+  // Validate ledgers metadata.
+  if (
+    typeof archive.ledgers.oldest !== "number" ||
+    !Number.isFinite(archive.ledgers.oldest) ||
+    typeof archive.ledgers.latest !== "number" ||
+    !Number.isFinite(archive.ledgers.latest)
+  ) {
+    throw new Error(
+      `invalid scanner archive "${filePath}": ledgers.oldest and ledgers.latest must be finite numbers`,
+    );
+  }
+
+  // Validate each target and its events.
+  for (let i = 0; i < archive.targets.length; i += 1) {
+    const t = archive.targets[i] as Partial<ScanJsonTarget> | null | undefined;
+    if (!t || typeof t !== "object") {
+      throw new Error(`invalid scanner archive "${filePath}": target[${i}] is not an object`);
+    }
+    if (t.source !== "market" && t.source !== "squad") {
+      throw new Error(
+        `invalid scanner archive "${filePath}": target[${i}].source must be "market" or "squad", got "${String(t.source)}"`,
+      );
+    }
+    if (typeof t.contractId !== "string" || !t.contractId.trim()) {
+      throw new Error(
+        `invalid scanner archive "${filePath}": target[${i}].contractId must be a non-empty string`,
+      );
+    }
+    if (!Array.isArray(t.events)) {
+      throw new Error(
+        `invalid scanner archive "${filePath}": target[${i}].events must be an array`,
+      );
+    }
+    for (let j = 0; j < t.events.length; j += 1) {
+      const ev = t.events[j] as Partial<ScanJsonEvent> | null | undefined;
+      if (!ev || typeof ev !== "object") {
+        throw new Error(
+          `invalid scanner archive "${filePath}": target[${i}].events[${j}] is not an object`,
+        );
+      }
+      if (typeof ev.ledger !== "number" || !Number.isFinite(ev.ledger) || ev.ledger < 0) {
+        throw new Error(
+          `invalid scanner archive "${filePath}": target[${i}].events[${j}].ledger must be a non-negative finite number`,
+        );
+      }
+      if (typeof ev.txHash !== "string") {
+        throw new Error(
+          `invalid scanner archive "${filePath}": target[${i}].events[${j}].txHash must be a string`,
+        );
+      }
+      if (typeof ev.eventId !== "string") {
+        throw new Error(
+          `invalid scanner archive "${filePath}": target[${i}].events[${j}].eventId must be a string`,
+        );
+      }
+      if (
+        !ev.payload ||
+        typeof ev.payload !== "object" ||
+        typeof (ev.payload as { name?: unknown }).name !== "string"
+      ) {
+        throw new Error(
+          `invalid scanner archive "${filePath}": target[${i}].events[${j}].payload must be an object with a string name`,
+        );
+      }
+    }
+  }
+
+  return archive;
+}
+
+/**
+ * Replay one contract offline from a validated `ScanJsonReport` without
+ * contacting any RPC server.
+ */
+async function replayContractFromArchive(
+  archive: ScanJsonReport,
+  target: WatchTarget,
+  opts: {
+    fromLedger?: number | undefined;
+    toLedger?: number | undefined;
+    cap?: number | undefined;
+    dryRun?: boolean | undefined;
+    show?: number | undefined;
+  },
+  send: ((text: string, source?: ContractSource) => Promise<void>) | undefined,
+  config: StellarConfig | BotConfig,
+  progress: (...args: unknown[]) => void,
+): Promise<ReplayTargetResult> {
+  const cap = opts.cap ?? (isBotConfig(config) ? config.maxNotificationsPerCycle : 20);
+  const showLog = (opts.show ?? 0) > 0 || opts.dryRun === true;
+  const fromLedger = opts.fromLedger;
+  const toLedger = opts.toLedger ?? null;
+
+  const matchingTargets = archive.targets.filter((t) => t.source === target.source);
+  const contractId = matchingTargets[0]?.contractId ?? target.contractId;
+  const dedupCapacity = isBotConfig(config) ? config.dedupWindow : 256;
+  const dedup = new EventDedupWindow(dedupCapacity);
+
+  const decodedEvents: DecodedEvent[] = [];
+  let duplicates = 0;
+
+  for (const archiveTarget of matchingTargets) {
+    for (const ev of archiveTarget.events) {
+      const decoded: DecodedEvent = {
+        source: target.source,
+        contractId: archiveTarget.contractId || target.contractId,
+        version: "v1",
+        ledger: ev.ledger,
+        txHash: ev.txHash,
+        at: 0,
+        eventId: ev.eventId,
+        eventType: "contract",
+        transactionIndex: 0,
+        operationIndex: 0,
+        inSuccessfulContractCall: true,
+        payload: ev.payload,
+      };
+      const key = ev.eventId || eventKey(decoded);
+      if (dedup.add(key)) {
+        decodedEvents.push(decoded);
+      } else {
+        duplicates += 1;
+      }
+    }
+  }
+
+  const filteredEvents = sortEvents(
+    dedupeEvents(
+      decodedEvents.filter((e) => {
+        if (fromLedger !== undefined && e.ledger < fromLedger) return false;
+        if (toLedger !== null && e.ledger > toLedger) return false;
+        return true;
+      }),
+    ),
+  );
+
+  let sent = 0;
+  let skipped = 0;
+  let capped = 0;
+  let adminLogged = 0;
+  let failedSends = 0;
+  let lastEventLedger: number | null = null;
+  let lastProcessedEventId: string | null = null;
+  const eventLog: ReplayEventSummary[] = [];
+
+  const botToken = isBotConfig(config) ? config.botToken : undefined;
+  const errorMsg = (err: unknown): string =>
+    safeErrorMessage(err, botToken ? [botToken] : []);
+
+  for (const event of filteredEvents) {
+    const entry: ReplayEventSummary = {
+      ledger: event.ledger,
+      txHash: event.txHash,
+      eventId: event.eventId,
+      name:
+        event.payload.name === "unknown"
+          ? `unknown:${(event.payload as { eventName?: string }).eventName ?? "?"}`
+          : event.payload.name,
+      source: event.source,
+      sent: false,
+      skipped: false,
+    };
+
+    if (isAdminPayload(event.payload)) {
+      adminLogged += 1;
+      entry.skipped = true;
+      entry.skipReason = "admin";
+      progress(
+        `[replay] ${target.source}: logged admin event "${event.payload.name}" at ledger ${event.ledger}`,
+      );
+      if (showLog) eventLog.push(entry);
+      continue;
+    }
+
+    if (event.payload.name === "unknown") {
+      skipped += 1;
+      entry.skipped = true;
+      entry.skipReason = "unknown";
+      const reason = (event.payload as { reason?: string }).reason;
+      progress(
+        `[replay] ${target.source}: skipped unknown event "${(event.payload as { eventName?: string }).eventName ?? "?"}" at ledger ${event.ledger}` +
+          (reason ? ` (${reason})` : ""),
+      );
+      if (showLog) eventLog.push(entry);
+      continue;
+    }
+
+    if (sent >= cap) {
+      capped += 1;
+      entry.skipped = true;
+      entry.skipReason = "cap";
+      progress(
+        `[replay] ${target.source}: cap (${cap}) reached — skipping "${event.payload.name}" at ledger ${event.ledger}`,
+      );
+      if (showLog) eventLog.push(entry);
+      continue;
+    }
+
+    if (opts.dryRun !== false && !send) {
+      let text: string | null = null;
+      try {
+        text = isBotConfig(config)
+          ? formatEvent(config, event)
+          : `[${event.source}] ${event.payload.name} at ledger ${event.ledger}`;
+      } catch {
+        text = `[${event.source}] ${event.payload.name} at ledger ${event.ledger}`;
+      }
+      progress(
+        `[replay] ${target.source}: would send "${event.payload.name}" at ledger ${event.ledger}${text ? ` — ${text.replace(/\s+/g, " ").slice(0, 80)}` : ""}`,
+      );
+      sent += 1;
+      entry.sent = true;
+      if (showLog) eventLog.push(entry);
+    } else if (send) {
+      let text: string | null = null;
+      try {
+        if (isBotConfig(config)) {
+          text = formatEvent(config, event);
+        } else {
+          text = `[${event.source}] ${event.payload.name} at ledger ${event.ledger}`;
+        }
+      } catch (err) {
+        skipped += 1;
+        entry.skipped = true;
+        entry.skipReason = "format-error";
+        progress(
+          `[replay] ${target.source}: format failed for "${event.payload.name}" at ledger ${event.ledger}: ` +
+            errorMsg(err),
+        );
+        if (showLog) eventLog.push(entry);
+        continue;
+      }
+
+      if (text === null) {
+        skipped += 1;
+        entry.skipped = true;
+        entry.skipReason = "null-format";
+        if (showLog) eventLog.push(entry);
+        continue;
+      }
+
+      try {
+        await send(text, event.source);
+        sent += 1;
+        entry.sent = true;
+      } catch (err) {
+        skipped += 1;
+        failedSends += 1;
+        entry.skipped = true;
+        entry.skipReason = "send-error";
+        progress(
+          `[replay] ${target.source}: send failed for "${event.payload.name}" at ledger ${event.ledger}: ` +
+            errorMsg(err),
+        );
+      }
+      if (showLog) eventLog.push(entry);
+    } else {
+      sent += 1;
+      entry.sent = true;
+      if (showLog) eventLog.push(entry);
+    }
+
+    const evKey = event.eventId || eventKey(event);
+    if (evKey) {
+      lastProcessedEventId = evKey;
+    }
+    if (event.ledger > 0 && (lastEventLedger === null || event.ledger > lastEventLedger)) {
+      lastEventLedger = event.ledger;
+    }
+  }
+
+  progress(
+    `[replay] ${target.source}: archive events=${filteredEvents.length} sent=${sent} ` +
+      `skipped=${skipped} capped=${capped} admin=${adminLogged} duplicates=${duplicates}`,
+  );
+
+  return {
+    source: target.source,
+    contractId,
+    fromLedger: fromLedger ?? archive.ledgers.oldest ?? 0,
+    toLedger: toLedger ?? archive.ledgers.latest ?? null,
+    startLedger: fromLedger ?? matchingTargets[0]?.startLedger ?? null,
+    startClamped: false,
+    pages: 0,
+    events: filteredEvents.length,
+    sent,
+    skipped,
+    capped,
+    adminLogged,
+    duplicates,
+    truncated: false,
+    lastEventLedger,
+    cursor: matchingTargets[matchingTargets.length - 1]?.cursor ?? null,
+    eventLog: showLog ? eventLog : [],
+    resumedSkippedEvents: 0,
+    lastProcessedEventId,
+    failedSends,
+  };
 }
 
 /**
@@ -783,6 +1129,7 @@ export async function runReplayCli(opts: {
 
   const fromRaw = flag("from");
   const toRaw = flag("to");
+  const archivePath = flag("archive");
   const contractFilter = flag("contract") as ContractSource | undefined;
   const maxPages = flag("pages") ? Math.max(1, Number(flag("pages"))) : EVENT_MAX_PAGES;
   const cap = flag("cap") ? Math.max(1, Number(flag("cap"))) : undefined;
@@ -794,9 +1141,9 @@ export async function runReplayCli(opts: {
   const progress = overrideDeps.progress ?? (asJson ? console.error.bind(console) : console.log.bind(console));
   const safeErr = (err: unknown): string => safeErrorMessage(err, []);
 
-  if (!fromRaw) {
-    console.error("[replay] error: --from <ledger|cursor> is required");
-    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N]");
+  if (!fromRaw && !archivePath) {
+    console.error("[replay] error: --from <ledger|cursor> or --archive <path> is required");
+    console.error("Usage: npm run replay -- (--from <ledger> | --archive <path>) [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N]");
     return { report: null, exitCode: 2 };
   }
 
@@ -830,16 +1177,28 @@ export async function runReplayCli(opts: {
 
   // Validate --from vs --to for ledger numbers (cursors are opaque).
   let fromLedger: number | undefined;
-  if (!/^\d+-\d+$/.test(fromRaw)) {
-    // Might be a plain ledger number.
-    const n = parseInt(fromRaw, 10);
-    if (Number.isFinite(n) && n >= 1) {
-      fromLedger = n;
-    } else if (Number.isFinite(n) && n < 1) {
-      console.error(`[replay] error: --from ledger must be >= 1, got ${n}`);
-      return { report: null, exitCode: 2 };
+  if (fromRaw !== undefined) {
+    if (!/^\d+-\d+$/.test(fromRaw)) {
+      // Might be a plain ledger number.
+      const n = parseInt(fromRaw, 10);
+      if (Number.isFinite(n) && n >= 1) {
+        fromLedger = n;
+      } else if (Number.isFinite(n) && n < 1) {
+        console.error(`[replay] error: --from ledger must be >= 1, got ${n}`);
+        return { report: null, exitCode: 2 };
+      } else if (archivePath) {
+        console.error(`[replay] error: --from must be a positive ledger number or cursor when using --archive, got "${fromRaw}"`);
+        return { report: null, exitCode: 2 };
+      }
+      // Non-numeric is fine in RPC mode, some cursors might not match our digit pattern.
+    } else if (archivePath) {
+      const cursorLedger = eventCursorLedger(fromRaw);
+      if (cursorLedger === null || cursorLedger < 1) {
+        console.error(`[replay] error: --from cursor "${fromRaw}" could not be resolved to a ledger for archive replay`);
+        return { report: null, exitCode: 2 };
+      }
+      fromLedger = cursorLedger;
     }
-    // Non-numeric is fine, some cursors might not match our digit pattern.
   }
 
   if (fromLedger !== undefined && toLedger !== undefined && toLedger < fromLedger) {
@@ -880,22 +1239,7 @@ export async function runReplayCli(opts: {
     return { report: null, exitCode: 1 };
   }
 
-  const server = overrideDeps.server ?? createRpcServer(config);
   const network = networkLabel(config);
-
-  if (!asJson) {
-    progress(`[replay] network   ${network} · rpc ${config.rpcUrl}`);
-    progress(`[replay] from      ${fromRaw}${toLedger !== undefined ? `  to ${toLedger}` : "  (to chain tip)"}`);
-    progress(`[replay] mode      ${dryRun ? "dry-run (use --send to deliver to Telegram)" : "SEND"}`);
-    if (progressFile) progress(`[replay] progress  ${progressFile}`);
-    if (rpm !== undefined) progress(`[replay] rpm       ${rpm}`);
-  } else {
-    progress(
-      `replay ${network} from=${fromRaw} to=${toLedger ?? "tip"} mode=${dryRun ? "dry-run" : "send"}` +
-        (progressFile ? ` progress=${progressFile}` : "") +
-        (rpm !== undefined ? ` rpm=${rpm}` : ""),
-    );
-  }
 
   // ── Build target list ─────────────────────────────────────────────────────
 
@@ -911,6 +1255,114 @@ export async function runReplayCli(opts: {
     ? [contractFilter]
     : ["market", "squad"];
 
+  // ── Offline archive mode (no RPC) ─────────────────────────────────────────
+
+  if (archivePath) {
+    let archive: ScanJsonReport;
+    try {
+      archive = await loadAndValidateScannerArchive(archivePath, { network });
+    } catch (err: unknown) {
+      console.error(`[replay] error: ${err instanceof Error ? err.message : String(err)}`);
+      return { report: null, exitCode: 2 };
+    }
+
+    if (!asJson) {
+      progress(`[replay] network   ${network} · archive ${archivePath} (offline, no RPC)`);
+      progress(
+        `[replay] range     ${fromLedger !== undefined ? `from ${fromLedger}` : `from ${archive.ledgers.oldest}`}` +
+          `${toLedger !== undefined ? `  to ${toLedger}` : `  to ${archive.ledgers.latest}`}`,
+      );
+      progress(`[replay] mode      ${dryRun ? "dry-run (use --send to deliver to Telegram)" : "SEND"}`);
+    } else {
+      progress(
+        `replay ${network} archive=${archivePath} from=${fromLedger ?? archive.ledgers.oldest} to=${toLedger ?? archive.ledgers.latest} mode=${dryRun ? "dry-run" : "send"}`,
+      );
+    }
+
+    const targetResults: ReplayTargetResult[] = [];
+    for (const target of targets) {
+      const result = await replayContractFromArchive(
+        archive,
+        target,
+        {
+          fromLedger,
+          toLedger,
+          cap,
+          show,
+          dryRun,
+        },
+        dryRun ? undefined : send,
+        config,
+        progress,
+      );
+      targetResults.push(result);
+    }
+
+    const totals = targetResults.reduce(
+      (acc, r) => ({
+        events: acc.events + r.events,
+        sent: acc.sent + r.sent,
+        skipped: acc.skipped + r.skipped,
+        capped: acc.capped + r.capped,
+        adminLogged: acc.adminLogged + r.adminLogged,
+        duplicates: acc.duplicates + r.duplicates,
+        resumedSkippedEvents: (acc.resumedSkippedEvents ?? 0) + (r.resumedSkippedEvents ?? 0),
+        failedSends: (acc.failedSends ?? 0) + (r.failedSends ?? 0),
+      }),
+      {
+        events: 0,
+        sent: 0,
+        skipped: 0,
+        capped: 0,
+        adminLogged: 0,
+        duplicates: 0,
+        resumedSkippedEvents: 0,
+        failedSends: 0,
+      },
+    );
+
+    const report: ReplayReport = {
+      format: "mimir-replay-v1",
+      network,
+      rpcUrl: archive.rpcUrl,
+      archivePath,
+      fromLedger: fromLedger ?? archive.ledgers.oldest,
+      toLedger: toLedger ?? archive.ledgers.latest,
+      dryRun,
+      targets: targetResults,
+      totals,
+    };
+
+    if (asJson) {
+      process.stdout.write(JSON.stringify(report, scanJsonReplacer, 2) + "\n");
+    } else {
+      progress(
+        `[replay] done  events=${totals.events} sent=${totals.sent} skipped=${totals.skipped} ` +
+          `capped=${totals.capped} admin=${totals.adminLogged} duplicates=${totals.duplicates}`,
+      );
+    }
+
+    return { report, exitCode: 0 };
+  }
+
+  // ── Live RPC mode ─────────────────────────────────────────────────────────
+
+  const server = overrideDeps.server ?? createRpcServer(config);
+
+  if (!asJson) {
+    progress(`[replay] network   ${network} · rpc ${config.rpcUrl}`);
+    progress(`[replay] from      ${fromRaw!}${toLedger !== undefined ? `  to ${toLedger}` : "  (to chain tip)"}`);
+    progress(`[replay] mode      ${dryRun ? "dry-run (use --send to deliver to Telegram)" : "SEND"}`);
+    if (progressFile) progress(`[replay] progress  ${progressFile}`);
+    if (rpm !== undefined) progress(`[replay] rpm       ${rpm}`);
+  } else {
+    progress(
+      `replay ${network} from=${fromRaw!} to=${toLedger ?? "tip"} mode=${dryRun ? "dry-run" : "send"}` +
+        (progressFile ? ` progress=${progressFile}` : "") +
+        (rpm !== undefined ? ` rpm=${rpm}` : ""),
+    );
+  }
+
   // ── Rate limiter budget ───────────────────────────────────────────────────
 
   const sleep = overrideDeps.sleep ?? defaultSleep;
@@ -923,7 +1375,7 @@ export async function runReplayCli(opts: {
   if (progressFile) {
     try {
       progressData = await loadAndValidateProgressFile(progressFile, {
-        from: fromRaw,
+        from: fromRaw!,
         to: toLedger,
         contracts: requestedContracts,
         network,
@@ -940,7 +1392,7 @@ export async function runReplayCli(opts: {
           network,
           rpcUrl: config.rpcUrl,
           range: {
-            from: normalizeRangeFrom(fromRaw),
+            from: normalizeRangeFrom(fromRaw!),
             to: normalizeRangeTo(toLedger),
           },
           contracts: requestedContracts,
@@ -974,7 +1426,7 @@ export async function runReplayCli(opts: {
         server,
         target,
         {
-          from: fromRaw,
+          from: fromRaw!,
           to: toLedger,
           maxPages,
           cap,

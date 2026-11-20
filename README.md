@@ -293,14 +293,16 @@ npm run replay -- --from 4226500 --json          # machine-readable mimir-replay
 npm run replay -- --from 4226500 --pages 5       # walk at most 5 pages per contract
 npm run replay -- --from 4226500 --cap 10        # cap at 10 notifications per contract
 npm run replay:mock -- --from 4226500            # local mock profile, no credentials
+npm run replay -- --archive scan.json            # offline replay from mimir-scan-v1 archive
 ```
 
 **Flags:**
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--from <ledger\|cursor>` | (required) | Start of the range — a ledger number or an opaque RPC cursor |
+| `--from <ledger\|cursor>` | (required unless `--archive` is set) | Start of the range — a ledger number or an opaque RPC cursor |
 | `--to <ledger>` | chain tip | End of the range (inclusive). Clamped to the tip when above it |
+| `--archive <path>` | off | Replay offline from a validated `mimir-scan-v1` scanner archive without contacting RPC; enforces schema (`mimir-scan-v1`) and network identity before processing |
 | `--send` | off | Actually post to Telegram; requires `BOT_TOKEN` and `TELEGRAM_CHAT_ID` |
 | `--contract market\|squad` | both | Scan only the named contract |
 | `--pages <n>` | 20 | Page budget per contract |
