@@ -55,6 +55,13 @@ export interface DeadLetterStats {
   dropped: number;
 }
 
+export interface DeadLetterAckResult {
+  acknowledged: DeadLetterEntry[];
+  acknowledgedIds: string[];
+  unmatchedIds: string[];
+  remaining: number;
+}
+
 export interface DeadLetterQueueOptions {
   /**
    * Where the queue lives. `null` disables persistence and loading: the queue
@@ -79,6 +86,7 @@ export interface DeadLetterQueueOptions {
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
+export const DEAD_LETTER_MAX_ACK_IDS = 100;
 
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
@@ -319,10 +327,72 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     return { sent, remaining: entries.length };
   }
 
+  /**
+   * Atomically acknowledge (remove) an explicit, bounded list of inspected
+   * dead-letter entry IDs. Unmatched IDs are reported and all non-matching
+   * queued entries are preserved untouched in their original order.
+   */
+  async function acknowledge(ids: readonly string[]): Promise<DeadLetterAckResult> {
+    if (!Array.isArray(ids) || ids.length === 0) {
+      throw new RangeError("acknowledge requires at least one entry id");
+    }
+    if (ids.length > DEAD_LETTER_MAX_ACK_IDS) {
+      throw new RangeError(
+        `acknowledge accepts at most ${DEAD_LETTER_MAX_ACK_IDS} entry ids (received ${ids.length})`,
+      );
+    }
+
+    const normalizedIds: string[] = [];
+    const requestedSet = new Set<string>();
+    for (const rawId of ids) {
+      if (typeof rawId !== "string" || rawId.trim() === "") {
+        throw new RangeError("acknowledge entry ids must be non-empty strings");
+      }
+      const id = rawId.trim();
+      if (!requestedSet.has(id)) {
+        requestedSet.add(id);
+        normalizedIds.push(id);
+      }
+    }
+
+    const acknowledged: DeadLetterEntry[] = [];
+    const kept: DeadLetterEntry[] = [];
+    const matchedSet = new Set<string>();
+
+    for (const entry of entries) {
+      if (requestedSet.has(entry.id)) {
+        acknowledged.push(entry);
+        matchedSet.add(entry.id);
+      } else {
+        kept.push(entry);
+      }
+    }
+
+    const unmatchedIds = normalizedIds.filter((id) => !matchedSet.has(id));
+
+    if (acknowledged.length > 0) {
+      entries = kept;
+      syncDepth();
+      await persist();
+      console.log(
+        `[dead-letter] acknowledged ${acknowledged.length} entry(s) ` +
+          `(${unmatchedIds.length} unmatched, ${entries.length} remaining)`,
+      );
+    }
+
+    return {
+      acknowledged: acknowledged.map((e) => ({ ...e })),
+      acknowledgedIds: acknowledged.map((e) => e.id),
+      unmatchedIds,
+      remaining: entries.length,
+    };
+  }
+
   return {
     load,
     enqueue,
     flush,
+    acknowledge,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
     },

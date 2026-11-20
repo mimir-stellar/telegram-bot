@@ -892,6 +892,20 @@ Two things it deliberately does not do:
 `DEAD_LETTER_FILE` disables the queue entirely, and the poller then behaves
 exactly as it did before the queue existed.
 
+Operators can inspect and manage parked entries offline (without contacting
+Stellar or Telegram) via the DLQ CLI:
+
+```bash
+npm run dlq -- list [--file PATH] [--json]
+npm run dlq -- show <id> [--file PATH] [--json]
+npm run dlq -- ack <id...> [--yes] [--file PATH] [--json]
+npm run dlq -- purge [--older-than <dur>] [--yes] [--file PATH] [--json]
+```
+
+`ack` accepts an explicit bounded list of up to 100 entry IDs (`DEAD_LETTER_MAX_ACK_IDS`),
+performs a dry run unless `--yes` is passed, atomically removes all matched entries in a
+single write-then-rename, and preserves unmatched entries untouched.
+
 ## Graceful shutdown
 
 `SIGINT`/`SIGTERM` starts a bounded drain rather than a hard stop:

@@ -13,7 +13,11 @@ import os from "node:os";
 import path from "node:path";
 import test, { mock } from "node:test";
 
-import { createDeadLetterQueue, makeEntryId } from "../dist/deadLetter.js";
+import {
+  createDeadLetterQueue,
+  DEAD_LETTER_MAX_ACK_IDS,
+  makeEntryId,
+} from "../dist/deadLetter.js";
 
 const BOT_TOKEN = "1234567890:" + "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
 
@@ -405,4 +409,69 @@ test("makeEntryId is stable for identical payloads and differs on content", () =
   assert.equal(a, b);
   assert.notEqual(a, c);
   assert.notEqual(a, d);
+});
+
+// ── Bulk acknowledge ──────────────────────────────────────────────────────────
+
+test("acknowledge removes matched entries atomically and preserves unmatched entries", async () => {
+  await withQueue(
+    async ({ queue, filePath }) => {
+      const e1 = await queue.enqueue(parked(1, "one", "err-1"));
+      const e2 = await queue.enqueue(parked(2, "two", "err-2"));
+      const e3 = await queue.enqueue(parked(3, "three", "err-3"));
+
+      const result = await queue.acknowledge([e1.id, "market:999:missing:00000000", e3.id, e1.id]);
+
+      assert.deepEqual(result.acknowledgedIds, [e1.id, e3.id]);
+      assert.deepEqual(result.unmatchedIds, ["market:999:missing:00000000"]);
+      assert.equal(result.remaining, 1);
+      assert.equal(queue.stats().depth, 1);
+
+      // Unmatched queued entry is preserved untouched (same attempts, lastError, text).
+      const remaining = queue.snapshot();
+      assert.equal(remaining.length, 1);
+      assert.deepEqual(remaining[0], e2);
+
+      // Atomic write-then-rename leaves no .tmp file and persists only the remaining entry.
+      await assert.rejects(() => stat(`${filePath}.tmp`));
+      const persisted = JSON.parse(await readFile(filePath, "utf8"));
+      assert.equal(persisted.version, 1);
+      assert.deepEqual(persisted.entries.map((e) => e.id), [e2.id]);
+    },
+    { maxEntries: 5 },
+  );
+});
+
+test("acknowledge with only unmatched ids leaves the queue and file untouched", async () => {
+  await withQueue(async ({ queue, filePath }) => {
+    const e1 = await queue.enqueue(parked(1, "one"));
+    const beforeRaw = await readFile(filePath, "utf8");
+
+    const result = await queue.acknowledge(["market:999:missing:00000000"]);
+    assert.deepEqual(result.acknowledgedIds, []);
+    assert.deepEqual(result.unmatchedIds, ["market:999:missing:00000000"]);
+    assert.equal(result.remaining, 1);
+    assert.equal(queue.snapshot()[0].id, e1.id);
+    assert.equal(await readFile(filePath, "utf8"), beforeRaw);
+  });
+});
+
+test("acknowledge rejects empty, blank, or oversized id lists without mutating state", async () => {
+  await withQueue(async ({ queue, filePath }) => {
+    const e1 = await queue.enqueue(parked(1, "one"));
+    const beforeRaw = await readFile(filePath, "utf8");
+
+    await assert.rejects(() => queue.acknowledge([]), RangeError);
+    await assert.rejects(() => queue.acknowledge(["   "]), RangeError);
+
+    const tooMany = Array.from(
+      { length: DEAD_LETTER_MAX_ACK_IDS + 1 },
+      (_, i) => `market:${i}:claim_cancelled:00000000`,
+    );
+    await assert.rejects(() => queue.acknowledge(tooMany), RangeError);
+
+    assert.equal(queue.stats().depth, 1);
+    assert.equal(queue.snapshot()[0].id, e1.id);
+    assert.equal(await readFile(filePath, "utf8"), beforeRaw);
+  });
 });

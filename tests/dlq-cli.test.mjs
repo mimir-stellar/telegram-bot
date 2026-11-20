@@ -16,8 +16,9 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { createDeadLetterQueue } from "../dist/deadLetter.js";
+import { createDeadLetterQueue, DEAD_LETTER_MAX_ACK_IDS } from "../dist/deadLetter.js";
 import {
+  acknowledgeDeadLetters,
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
@@ -223,6 +224,128 @@ test("show without an <id> prints usage and exits 2", async () => {
   });
 });
 
+// ── ack subcommand ────────────────────────────────────────────────────────────
+
+test("ack without --yes performs a dry run and leaves the file untouched", async () => {
+  await withTempDlq(
+    async ({ filePath }) => {
+      const entries = await listDeadLetters({ filePath, chatId: RAW_CHAT_ID });
+      const beforeRaw = await readFile(filePath, "utf8");
+      const io = captureIo();
+      const { exitCode } = await runDlqCli({
+        argv: [
+          "ack",
+          entries[0].id,
+          "market:999:missing:00000000",
+          "--file",
+          filePath,
+          "--chat-id",
+          RAW_CHAT_ID,
+        ],
+        stdout: io.out,
+        stderr: io.err,
+      });
+
+      assert.equal(exitCode, 0);
+      const output = io.stdout.join("\n");
+      assert.match(output, /dry-run/i);
+      assert.match(output, /would acknowledge 1 entry\(s\), 1 unmatched, 1 remaining/);
+      assert.equal(output.includes(RAW_CHAT_ID), false);
+      assert.equal(output.includes(REDACTED_CHAT_ID), true);
+      assert.equal(await readFile(filePath, "utf8"), beforeRaw);
+    },
+    [{ ledger: 1 }, { ledger: 2 }],
+  );
+});
+
+test("ack --yes atomically acknowledges valid entries and preserves unmatched entries", async () => {
+  await withTempDlq(
+    async ({ filePath }) => {
+      const before = await listDeadLetters({ filePath, chatId: RAW_CHAT_ID });
+      assert.equal(before.length, 3);
+      const [e1, e2, e3] = before;
+
+      const io = captureIo();
+      const { exitCode } = await runDlqCli({
+        argv: [
+          "ack",
+          e1.id,
+          "market:999:missing:00000000",
+          e3.id,
+          "--yes",
+          "--file",
+          filePath,
+          "--chat-id",
+          RAW_CHAT_ID,
+          "--json",
+        ],
+        stdout: io.out,
+        stderr: io.err,
+      });
+
+      assert.equal(exitCode, 0);
+      assert.equal(io.stderr.length, 0);
+      const rawJson = io.stdout.join("\n");
+      assert.equal(rawJson.includes(RAW_CHAT_ID), false);
+
+      const parsed = JSON.parse(rawJson);
+      assert.equal(parsed.dryRun, false);
+      assert.equal(parsed.acknowledged, 2);
+      assert.equal(parsed.remaining, 1);
+      assert.deepEqual(parsed.acknowledgedIds, [e1.id, e3.id]);
+      assert.deepEqual(parsed.unmatchedIds, ["market:999:missing:00000000"]);
+      assert.equal(parsed.chatId, REDACTED_CHAT_ID);
+
+      // Atomic write-then-rename leaves no .tmp file and preserves unmatched entry untouched.
+      await assert.rejects(() => stat(`${filePath}.tmp`));
+      const persisted = JSON.parse(await readFile(filePath, "utf8"));
+      assert.equal(persisted.version, 1);
+      assert.equal(persisted.entries.length, 1);
+      assert.equal(persisted.entries[0].id, e2.id);
+      assert.equal(persisted.entries[0].attempts, e2.attempts);
+
+      // Direct API verification.
+      const apiRes = await acknowledgeDeadLetters({
+        filePath,
+        ids: [e2.id],
+        yes: false,
+        chatId: RAW_CHAT_ID,
+      });
+      assert.equal(apiRes.dryRun, true);
+      assert.equal(apiRes.acknowledged, 1);
+      assert.equal(apiRes.remaining, 0);
+      assert.deepEqual(apiRes.unmatchedIds, []);
+    },
+    [{ ledger: 10 }, { ledger: 20 }, { ledger: 30 }],
+  );
+});
+
+test("ack rejects missing or over-limit id lists with exit code 2", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    const emptyIo = captureIo();
+    const emptyRes = await runDlqCli({
+      argv: ["ack", "--file", filePath],
+      stdout: emptyIo.out,
+      stderr: emptyIo.err,
+    });
+    assert.equal(emptyRes.exitCode, 2);
+    assert.ok(emptyIo.stderr.join("\n").includes(USAGE));
+
+    const overLimit = Array.from(
+      { length: DEAD_LETTER_MAX_ACK_IDS + 1 },
+      (_, i) => `market:${i}:claim_created:00000000`,
+    );
+    const overIo = captureIo();
+    const overRes = await runDlqCli({
+      argv: ["ack", ...overLimit, "--yes", "--file", filePath],
+      stdout: overIo.out,
+      stderr: overIo.err,
+    });
+    assert.equal(overRes.exitCode, 2);
+    assert.ok(overIo.stderr.join("\n").includes(USAGE));
+  });
+});
+
 // ── purge subcommand ──────────────────────────────────────────────────────────
 
 test("purge without --yes performs a dry run and leaves the file untouched", async () => {
@@ -338,6 +461,7 @@ test("unknown subcommands and invalid flags print usage and exit 2", async () =>
       ["list", "--unknown-flag"],
       ["list", "--yes"],
       ["list", "--older-than", "10m"],
+      ["ack", "--older-than", "10m", "id-1"],
       ["purge", "--older-than", "not-a-duration"],
       ["purge", "--older-than"],
       ["show", "id-1", "extra-arg"],
