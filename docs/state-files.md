@@ -64,3 +64,10 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Send Journal File (`SEND_JOURNAL_FILE`)
+- **Writer Module**: [`src/notifications/send-journal.ts`](../src/notifications/send-journal.ts) (`createSendJournal`), also used by [`src/notifications/notifier.ts`](../src/notifications/notifier.ts)
+- **Default Path**: `./data/send-journal.jsonl` (configured via `DEFAULTS.sendJournalFile` in [`src/config.ts`](../src/config.ts); empty disables)
+- **Write Pattern**: Append-only JSONL with `fsync` per entry (`intent` before send, `done` with optional `chatId`, `topicId`, and `outcome` after send), compacted atomically via `${sendJournalFile}.tmp` -> `${sendJournalFile}`.
+- **Per-Destination Recovery**: Intents and outcomes are keyed by `(id, chatId, topicId)` (with legacy destination-less entries keyed by `id`). On crash recovery, `loadPending()` / `loadPendingForEvent(id)` returns only unfinished destinations so already-completed chats/topics are not re-sent.
+- **Corrupt**: Torn or unparseable JSONL lines are skipped on read without failing the journal.

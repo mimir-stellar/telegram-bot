@@ -11,6 +11,7 @@
  *   - {@link createNotifier}   — factory that returns the poller's send function
  */
 
+import { createHash } from "node:crypto";
 import type { Bot } from "grammy";
 
 import type { BotConfig } from "../config.js";
@@ -21,8 +22,23 @@ import {
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+import type { SendJournal } from "./send-journal.js";
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
+
+/** A Telegram destination: a chat id plus an optional forum topic (thread) id. */
+export interface NotificationDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
+
+/** Optional dependencies for {@link createNotifier}. */
+export interface NotifierOptions {
+  /** Optional send journal for persisting per-destination delivery outcomes. */
+  sendJournal?: SendJournal | undefined;
+  /** Clock override for journal timestamps (defaults to `Date.now`). */
+  now?: (() => number) | undefined;
+}
 
 /** Extra Telegram send options the poller may attach to a notification. */
 export interface SendExtra {
@@ -46,6 +62,15 @@ export interface SendExtra {
   replyToMessageId?: number | undefined;
   /** Decoded contract event name used to apply silent-notification policy. */
   eventName?: string | undefined;
+  /** Optional Telegram forum topic id (`message_thread_id`) for single-route sends. */
+  topicId?: number | undefined;
+  /** Optional explicit list of destinations (each with chatId and optional topicId). */
+  destinations?: readonly NotificationDestination[] | undefined;
+  /**
+   * When true and a `sendJournal` is attached, only send to destinations that
+   * have an unresolved intent in the journal for `eventRef.eventId`.
+   */
+  recoverOnly?: boolean | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -116,51 +141,32 @@ export const notifierSkips = { emptyText: 0 };
  * 400, and a formatters' `null` must never turn into a doomed send. The skip
  * is counted in {@link notifierSkips} and logged with bounded metadata.
  */
+function destinationKey(chatId: string, topicId?: number): string {
+  return `${chatId}\0${topicId !== undefined ? String(topicId) : ""}`;
+}
+
 export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
     Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  options?: NotifierOptions,
 ) {
-  return async (
-    text: string | null,
-    source?: ContractSource,
+  const sendJournal = options?.sendJournal;
+  const now = options?.now ?? Date.now;
+
+  async function sendToDestination(
+    dest: NotificationDestination,
+    text: string,
+    notificationOptions: {
+      parse_mode: "MarkdownV2";
+      link_preview_options: { is_disabled: boolean };
+      disable_notification?: boolean;
+    },
+    silentOption: { disable_notification?: boolean },
     extra?: SendExtra,
-  ): Promise<void> => {
-    if (typeof text !== "string" || text.trim() === "") {
-      notifierSkips.emptyText += 1;
-      // Only bounded metadata: which chat path and how short the render was —
-      // never the payload itself.
-      console.warn(
-        `[notifier] skipped empty message${eventRefLabel(extra?.eventRef)} ` +
-          `(source=${typeof source === "string" && source ? source.slice(0, 32) : "default"}, ` +
-          `chars=${typeof text === "string" ? text.length : -1})`,
-      );
-      return;
-    }
-
-    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
-    const chatId = source === "market"
-      ? config.marketChatId || defaultChat
-      : source === "squad"
-        ? config.squadChatId || defaultChat
-        : defaultChat;
-
-    // Select link preview settings based on the contract source.
-    // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
-    const linkPreviewDisabled = source === "market"
-      ? !config.linkPreviewMarket
-      : source === "squad"
-        ? !config.linkPreviewSquad
-        : true;
-
-    const silentOption = extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS)
-      ? { disable_notification: true }
-      : {};
-    const notificationOptions = {
-      parse_mode: "MarkdownV2" as const,
-      link_preview_options: { is_disabled: linkPreviewDisabled },
-      ...silentOption,
-    };
+  ): Promise<void> {
+    const { chatId, topicId } = dest;
+    const threadOption = topicId !== undefined ? { message_thread_id: topicId } : {};
 
     // Oversized payloads go out as ordered chunks under Telegram's limit. The
     // thread reply rides on the first chunk and the explorer button on the
@@ -170,6 +176,7 @@ export function createNotifier(
       for (const [index, part] of parts.entries()) {
         await bot.api.sendMessage(chatId, part, {
           ...notificationOptions,
+          ...threadOption,
           ...(index === parts.length - 1 && extra?.reply_markup
             ? { reply_markup: extra.reply_markup }
             : {}),
@@ -184,6 +191,7 @@ export function createNotifier(
     try {
       await bot.api.sendMessage(chatId, text, {
         ...notificationOptions,
+        ...threadOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(extra?.replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
@@ -211,11 +219,144 @@ export function createNotifier(
       await bot.api.sendMessage(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
         ...silentOption,
+        ...threadOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(extra?.replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
           : {}),
       });
     }
+  }
+
+  return async (
+    text: string | null,
+    source?: ContractSource,
+    extra?: SendExtra,
+  ): Promise<void> => {
+    if (typeof text !== "string" || text.trim() === "") {
+      notifierSkips.emptyText += 1;
+      // Only bounded metadata: which chat path and how short the render was —
+      // never the payload itself.
+      console.warn(
+        `[notifier] skipped empty message${eventRefLabel(extra?.eventRef)} ` +
+          `(source=${typeof source === "string" && source ? source.slice(0, 32) : "default"}, ` +
+          `chars=${typeof text === "string" ? text.length : -1})`,
+      );
+      return;
+    }
+
+    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
+    const defaultChatId = source === "market"
+      ? config.marketChatId || defaultChat
+      : source === "squad"
+        ? config.squadChatId || defaultChat
+        : defaultChat;
+
+    const rawDestinations: readonly NotificationDestination[] =
+      extra?.destinations && extra.destinations.length > 0
+        ? extra.destinations
+        : [{ chatId: defaultChatId, topicId: extra?.topicId }];
+
+    // Deduplicate destinations by (chatId, topicId) while preserving order.
+    const seen = new Set<string>();
+    let destinations: NotificationDestination[] = [];
+    for (const dest of rawDestinations) {
+      const key = destinationKey(dest.chatId, dest.topicId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      destinations.push(dest);
+    }
+
+    const eventId = extra?.eventRef?.eventId;
+    if (sendJournal && extra?.recoverOnly && eventId) {
+      const pending = await sendJournal.loadPendingForEvent(eventId);
+      const pendingKeys = new Set(
+        pending.map((entry) => destinationKey(entry.chatId ?? "", entry.topicId)),
+      );
+      destinations = destinations.filter((dest) =>
+        pendingKeys.has(destinationKey(dest.chatId, dest.topicId)),
+      );
+      if (destinations.length === 0) return;
+    }
+
+    // Select link preview settings based on the contract source.
+    // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
+    const linkPreviewDisabled = source === "market"
+      ? !config.linkPreviewMarket
+      : source === "squad"
+        ? !config.linkPreviewSquad
+        : true;
+
+    const silentOption = extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS)
+      ? { disable_notification: true }
+      : {};
+    const notificationOptions = {
+      parse_mode: "MarkdownV2" as const,
+      link_preview_options: { is_disabled: linkPreviewDisabled },
+      ...silentOption,
+    };
+
+    if (sendJournal && eventId && !extra?.recoverOnly) {
+      const textHash = createHash("sha256").update(text).digest("hex").slice(0, 16);
+      const ledger = extra?.eventRef?.ledger ?? 0;
+      const eventName = extra?.eventName ?? "";
+      const eventSource = source ?? extra?.eventRef?.source ?? "";
+      const at = now();
+      for (const dest of destinations) {
+        try {
+          await sendJournal.recordIntent({
+            id: eventId,
+            source: eventSource,
+            ledger,
+            eventName,
+            chatId: dest.chatId,
+            ...(dest.topicId !== undefined ? { topicId: dest.topicId } : {}),
+            textHash,
+            at,
+          });
+        } catch (err) {
+          console.error(
+            `[notifier] send journal intent failed for ${eventId}: ${safeErrorMessage(
+              err,
+              typeof config.botToken === "string" ? [config.botToken] : [],
+            )}`,
+          );
+        }
+      }
+    }
+
+    let firstError: unknown;
+    for (const dest of destinations) {
+      try {
+        await sendToDestination(dest, text, notificationOptions, silentOption, extra);
+        if (sendJournal && eventId) {
+          try {
+            await sendJournal.recordDone(eventId, dest, "sent");
+          } catch (err) {
+            console.error(
+              `[notifier] send journal done failed for ${eventId}: ${safeErrorMessage(
+                err,
+                typeof config.botToken === "string" ? [config.botToken] : [],
+              )}`,
+            );
+          }
+        }
+      } catch (err) {
+        if (sendJournal && eventId) {
+          try {
+            await sendJournal.recordDone(eventId, dest, "failed");
+          } catch (journalErr) {
+            console.error(
+              `[notifier] send journal done failed for ${eventId}: ${safeErrorMessage(
+                journalErr,
+                typeof config.botToken === "string" ? [config.botToken] : [],
+              )}`,
+            );
+          }
+        }
+        if (firstError === undefined) firstError = err;
+      }
+    }
+    if (firstError !== undefined) throw firstError;
   };
 }
