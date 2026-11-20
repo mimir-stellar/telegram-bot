@@ -184,7 +184,7 @@ Translators must **never** wrap `NOTIFICATION_MD` template parameters in `escape
 
 ## 4. Command Autocomplete Strings (`COMMAND_DESCRIPTIONS`)
 
-The `COMMAND_DESCRIPTIONS` object in [`src/i18n.ts`](../src/i18n.ts) defines the descriptions for all nine bot commands:
+The `COMMAND_DESCRIPTIONS` object in [`src/i18n.ts`](../src/i18n.ts) defines the descriptions for all eleven bot commands:
 
 ```ts
 export const COMMAND_DESCRIPTIONS = {
@@ -195,6 +195,7 @@ export const COMMAND_DESCRIPTIONS = {
   contracts: "Contract ids and explorer links",
   health: "Health assessment and operational readiness",
   preview: "Preview channel notification formatting",
+  stats: "Notification and RPC counters with process uptime",
   pause: "Operator only: pause new scans",
   resume: "Operator only: resume polling now",
 } as const;

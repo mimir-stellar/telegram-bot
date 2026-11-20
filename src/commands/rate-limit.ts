@@ -202,7 +202,7 @@ declare module "./registry.js" {
     rateLimiter?: CommandRateLimiter | undefined;
     /** Sampler for the "rate limit exceeded" warning. */
     rateLimitSampler?: LogSampler | undefined;
-    /** Injected clock (epoch ms) for the default rate limiter and sampler. */
+    /** Injected clock (epoch ms) for the rate limiter, sampler and time-dependent replies. */
     now?: (() => number) | undefined;
   }
 }

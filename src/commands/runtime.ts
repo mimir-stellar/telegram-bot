@@ -39,7 +39,7 @@ export async function replyMarkdown(
  *
  * Rules:
  * - If `allowedChatIds` is empty the list is open (any chat may use the
- *   gated commands: /status, /health, /contracts, /preview).
+ *   gated commands: /status, /health, /contracts, /preview, /stats).
  * - Otherwise the incoming chat id must appear in the list. Both the numeric
  *   id (stored as a number in grammy's ctx.chat.id) and its string form are
  *   compared so that negative group ids such as -1001234567890 match correctly.
