@@ -80,6 +80,7 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 * **`0`:** Scan completed successfully (even if some events were skipped, deduplicated, or capped).
 * **`1`:** Fatal runtime error (RPC unreachable, invalid network passphrase, or missing config in `--send` mode).
 * **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, or invalid `--contract`).
+* **`130`:** Replay cancelled by `SIGINT` (Ctrl+C). Only committed page progress is flushed to `--progress-file` with `status: "cancelled"` and `resumable: true` so the run can be safely resumed without reporting success.
 
 ---
 
