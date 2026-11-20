@@ -24,6 +24,11 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  RpcBudgetSaturationTracker,
+  type RpcTargetBudgetSnapshot,
+  type RpcBudgetOptions,
+} from "./stellar/metrics.js";
 
 // ── Metric types ──────────────────────────────────────────────────────────────
 
@@ -89,6 +94,12 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** Tracker for RPC budget saturation per target over a fixed window. */
+  rpcBudgetTracker: RpcBudgetSaturationTracker;
+  /** Record an RPC request towards budget saturation for a target. */
+  recordRpcBudgetRequest(target: string, count?: number): void;
+  /** Get current budget saturation snapshot for a target. */
+  getRpcBudgetSaturation(target: string): RpcTargetBudgetSnapshot;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -146,7 +157,8 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
-export function createMetrics(): MetricsRegistry {
+export function createMetrics(budgetOptions?: RpcBudgetOptions): MetricsRegistry {
+  const rpcBudgetTracker = new RpcBudgetSaturationTracker(budgetOptions);
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -222,6 +234,31 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`# HELP ${g._name} ${g._help}`);
       lines.push(`# TYPE ${g._name} gauge`);
       lines.push(`${g._name} ${g.value()}`);
+    }
+
+    const budgetSnapshots = rpcBudgetTracker.getAllSnapshots();
+    lines.push(
+      `# HELP ${METRICS_PREFIX}rpc_budget_used Requests used within the fixed measurement window per target.`,
+      `# TYPE ${METRICS_PREFIX}rpc_budget_used gauge`,
+    );
+    for (const s of budgetSnapshots) {
+      lines.push(`${METRICS_PREFIX}rpc_budget_used{target="${s.target}"} ${s.used}`);
+    }
+
+    lines.push(
+      `# HELP ${METRICS_PREFIX}rpc_budget_limit Configured request budget limit for the fixed window per target.`,
+      `# TYPE ${METRICS_PREFIX}rpc_budget_limit gauge`,
+    );
+    for (const s of budgetSnapshots) {
+      lines.push(`${METRICS_PREFIX}rpc_budget_limit{target="${s.target}"} ${s.budget}`);
+    }
+
+    lines.push(
+      `# HELP ${METRICS_PREFIX}rpc_budget_saturation Saturation ratio (used / budget) per target over the fixed window.`,
+      `# TYPE ${METRICS_PREFIX}rpc_budget_saturation gauge`,
+    );
+    for (const s of budgetSnapshots) {
+      lines.push(`${METRICS_PREFIX}rpc_budget_saturation{target="${s.target}"} ${s.saturation}`);
     }
 
     // Prometheus text format requires a trailing newline.
@@ -316,6 +353,13 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    rpcBudgetTracker,
+    recordRpcBudgetRequest(target: string, count = 1): void {
+      rpcBudgetTracker.record(target, count);
+    },
+    getRpcBudgetSaturation(target: string): RpcTargetBudgetSnapshot {
+      return rpcBudgetTracker.getSnapshot(target);
+    },
     render,
     startServer,
   };

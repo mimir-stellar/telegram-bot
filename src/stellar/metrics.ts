@@ -13,7 +13,145 @@
  * log and to put in `/status`-style output.
  */
 
+import type { ContractSource } from "./decode.js";
+
 export type RpcOperation = "health" | "events";
+
+/** Supported target sources for RPC budget saturation measurements. */
+export const KNOWN_TARGET_SOURCES: readonly ContractSource[] = ["market", "squad"] as const;
+
+/**
+ * Normalise a raw target identifier to a bounded, known target label.
+ * Returns `"unknown"` if the target identifier is unbounded or not in the allowlist.
+ */
+export function normalizeTargetSource(raw: unknown): ContractSource | "unknown" {
+  if (typeof raw !== "string") return "unknown";
+  const trimmed = raw.trim().toLowerCase();
+  if (trimmed === "market") return "market";
+  if (trimmed === "squad") return "squad";
+  return "unknown";
+}
+
+/** Configuration options for tracking RPC budget saturation. */
+export interface RpcBudgetOptions {
+  /** Configured request budget limit per target across the fixed window. Defaults to 20. */
+  budgetLimit?: number;
+  /** Fixed sliding or reset window duration in milliseconds. Defaults to 60,000 (1 minute). */
+  windowMs?: number;
+  /** Injected clock for deterministic testing (defaults to Date.now). */
+  now?: () => number;
+}
+
+/** Snapshot of RPC budget usage and saturation for one target. */
+export interface RpcTargetBudgetSnapshot {
+  target: ContractSource | "unknown";
+  used: number;
+  budget: number;
+  /** Saturation ratio: used / budget (clamped at >= 0, rounded to 4 decimal places). */
+  saturation: number;
+  /** Window duration in milliseconds. */
+  windowMs: number;
+}
+
+/**
+ * Tracks RPC request budget saturation per target over a fixed window.
+ *
+ * Guarantees:
+ * - O(1) memory per target by pruning timestamps outside the fixed window.
+ * - Bounded label space: target identifiers are strictly bounded to known targets
+ *   or "unknown" to prevent high-cardinality label explosion in metric registries.
+ * - Handles boundary cases: zero or negative budget (saturation clamped cleanly without NaN/Infinity),
+ *   window rollovers, and empty usage.
+ */
+export class RpcBudgetSaturationTracker {
+  private readonly budgetLimit: number;
+  private readonly windowMs: number;
+  private readonly now: () => number;
+  private readonly requestsByTarget: Map<ContractSource | "unknown", number[]> = new Map();
+
+  constructor(opts: RpcBudgetOptions = {}) {
+    const rawBudget = opts.budgetLimit ?? 20;
+    this.budgetLimit = Number.isFinite(rawBudget) && rawBudget > 0 ? Math.floor(rawBudget) : 0;
+    const rawWindow = opts.windowMs ?? 60_000;
+    this.windowMs = Number.isFinite(rawWindow) && rawWindow > 0 ? Math.floor(rawWindow) : 60_000;
+    this.now = opts.now ?? Date.now;
+  }
+
+  /**
+   * Record an RPC request consumed against a target's budget.
+   * Target is bounded to prevent unbounded metric label cardinality.
+   */
+  record(rawTarget: unknown, count = 1): void {
+    if (!Number.isFinite(count) || count <= 0) return;
+    const target = normalizeTargetSource(rawTarget);
+    const currentTime = this.now();
+    let timestamps = this.requestsByTarget.get(target);
+    if (!timestamps) {
+      timestamps = [];
+      this.requestsByTarget.set(target, timestamps);
+    }
+    for (let i = 0; i < Math.floor(count); i++) {
+      timestamps.push(currentTime);
+    }
+    this.prune(target, currentTime);
+  }
+
+  /** Prune requests older than the fixed window. */
+  private prune(target: ContractSource | "unknown", currentTime: number): void {
+    const timestamps = this.requestsByTarget.get(target);
+    if (!timestamps || timestamps.length === 0) return;
+    const threshold = currentTime - this.windowMs;
+    let keepFrom = 0;
+    while (keepFrom < timestamps.length && (timestamps[keepFrom] ?? 0) <= threshold) {
+      keepFrom++;
+    }
+    if (keepFrom > 0) {
+      timestamps.splice(0, keepFrom);
+    }
+  }
+
+  /** Get the used request count for a target in the current window. */
+  getUsed(rawTarget: unknown): number {
+    const target = normalizeTargetSource(rawTarget);
+    const currentTime = this.now();
+    this.prune(target, currentTime);
+    return this.requestsByTarget.get(target)?.length ?? 0;
+  }
+
+  /** Get the snapshot of used, configured budget, and saturation for a target. */
+  getSnapshot(rawTarget: unknown): RpcTargetBudgetSnapshot {
+    const target = normalizeTargetSource(rawTarget);
+    const used = this.getUsed(target);
+    const budget = this.budgetLimit;
+    let saturation = 0;
+    if (budget > 0) {
+      saturation = round(used / budget);
+    } else {
+      saturation = used > 0 ? 1 : 0;
+    }
+    return {
+      target,
+      used,
+      budget,
+      saturation,
+      windowMs: this.windowMs,
+    };
+  }
+
+  /** Get snapshots for all tracked known targets plus unknown if present. */
+  getAllSnapshots(): RpcTargetBudgetSnapshot[] {
+    const targets: Array<ContractSource | "unknown"> = [...KNOWN_TARGET_SOURCES];
+    if (this.requestsByTarget.has("unknown")) {
+      targets.push("unknown");
+    }
+    return targets.map((t) => this.getSnapshot(t));
+  }
+
+  /** Reset all tracked requests. */
+  reset(): void {
+    this.requestsByTarget.clear();
+  }
+}
 
 /** Per-operation aggregate. Every quantity is a count or a duration in ms. */
 export interface RpcOperationTiming {

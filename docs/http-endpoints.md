@@ -328,6 +328,9 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_rpc_budget_used` | gauge | Used RPC request budget within the fixed window per target |
+| `mimir_bot_rpc_budget_limit` | gauge | Configured RPC request budget limit per target |
+| `mimir_bot_rpc_budget_saturation` | gauge | RPC request budget saturation ratio (`used / budget`) per target |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment

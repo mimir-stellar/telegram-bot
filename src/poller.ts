@@ -2574,6 +2574,7 @@ export function createPoller(deps: PollerDeps) {
           );
 
           metrics?.rpcRequests.inc();
+          metrics?.recordRpcBudgetRequest(target.source, scan.pages);
           // Stale-cursor check runs on every successful scan so it catches the
           // condition even when the cursor has not moved (empty pages).
           checkStaleCursors(scan.oldestLedger);

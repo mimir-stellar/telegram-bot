@@ -444,13 +444,14 @@ test("security: /metrics output does not contain any non-numeric metric values",
       .split("\n")
       .filter((l) => l.length > 0 && !l.startsWith("#"));
     for (const line of metricLines) {
+      // Allow label-bearing lines: e.g. mimir_bot_rpc_budget_saturation{target="market"} 0.5
       const parts = line.trim().split(/\s+/);
-      // Each data line must have exactly two parts: name and value.
+      // Each data line must have exactly two parts: name (with optional labels) and value.
       assert.equal(parts.length, 2, `Unexpected metric line format: "${line}"`);
       const value = parts[1];
       assert.ok(
-        /^\d+$/.test(value ?? ""),
-        `Metric value is not a non-negative integer: "${line}"`,
+        /^\d+(?:\.\d+)?$/.test(value ?? ""),
+        `Metric value is not a non-negative number: "${line}"`,
       );
     }
   } finally {
