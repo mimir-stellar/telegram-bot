@@ -17,6 +17,10 @@
  * Needs no Telegram credentials in dry-run mode (the default). Pass --send to
  * load a full bot config (BOT_TOKEN + TELEGRAM_CHAT_ID) and deliver events.
  *
+ * Replay output and progress paths must refer to different files. If both
+ * resolve to the same file, the CLI rejects the configuration with a usage
+ * error before opening either file, so existing bytes are preserved.
+ *
  * Exit codes:
  *   0 — scan completed (even if some events were skipped or capped)
  *   1 — fatal runtime error (RPC failure, config error)
@@ -29,10 +33,12 @@ import { runReplayCli } from "./stellar/replay.js";
 
 const invokedPath = process.argv[1];
 if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {
-  void runReplayCli().then(({ exitCode }) => {
-    if (exitCode !== 0) process.exit(exitCode);
-  }).catch((err: unknown) => {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exit(1);
-  });
+  void runReplayCli()
+    .then(({ exitCode }) => {
+      if (exitCode !== 0) process.exit(exitCode);
+    })
+    .catch((err: unknown) => {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    });
 }
