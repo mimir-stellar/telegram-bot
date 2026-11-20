@@ -21,6 +21,7 @@ import {
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+import { retryDelayMs, type SendJournal } from "./send-journal.js";
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
 
@@ -96,6 +97,49 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
  */
 export const notifierSkips = { emptyText: 0 };
 
+// ── NotifierOptions ──────────────────────────────────────────────────────────
+
+const DEFAULT_NOTIFIER_INITIAL_BACKOFF_MS = 1_000;
+const DEFAULT_NOTIFIER_MAX_BACKOFF_MS = 60_000;
+
+/**
+ * Optional persistent retry scheduling for {@link createNotifier}.
+ *
+ * When configured, failed sends persist their next eligible attempt timestamp
+ * (`nextAttemptAt`) to the send journal, and a restarted notifier hydrates
+ * pending timestamps before sending so pending deliveries honour their
+ * remaining backoff instead of bursting immediately on restart.
+ */
+export interface NotifierRetryOptions {
+  journal: SendJournal;
+  /** Clock used to compute and evaluate `nextAttemptAt` (defaults to `Date.now`). */
+  now?: () => number;
+  /** Sleep function used to wait until a persisted `nextAttemptAt` (defaults to `setTimeout`). */
+  sleep?: (ms: number) => Promise<void>;
+  /** Initial backoff in ms when a failure has no `retry_after` hint (default: 1000). */
+  initialBackoffMs?: number;
+  /** Maximum backoff cap in ms (default: 60_000). */
+  maxBackoffMs?: number;
+}
+
+/** Optional extensions for {@link createNotifier}. */
+export interface NotifierOptions {
+  retry?: NotifierRetryOptions | undefined;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractRetryAfterMs(err: unknown): number | null {
+  if (!err || typeof err !== "object") return null;
+  const params = (err as { parameters?: { retry_after?: unknown } }).parameters;
+  if (params && typeof params.retry_after === "number" && Number.isFinite(params.retry_after) && params.retry_after > 0) {
+    return Math.ceil(params.retry_after * 1_000);
+  }
+  return null;
+}
+
 // ── createNotifier ───────────────────────────────────────────────────────────
 
 /**
@@ -120,7 +164,76 @@ export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
     Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  options?: NotifierOptions,
 ) {
+  const retry = options?.retry;
+  const retryNow = retry?.now ?? Date.now;
+  const retrySleep = retry?.sleep ?? defaultSleep;
+  const initialBackoffMs = Math.max(0, retry?.initialBackoffMs ?? DEFAULT_NOTIFIER_INITIAL_BACKOFF_MS);
+  const maxBackoffMs = Math.max(initialBackoffMs, retry?.maxBackoffMs ?? DEFAULT_NOTIFIER_MAX_BACKOFF_MS);
+  const scheduledRetries = new Map<string, { nextAttemptAt: number; attempts: number }>();
+  let retryStateLoaded = false;
+
+  async function ensureRetryStateLoaded(): Promise<void> {
+    if (!retry || retryStateLoaded) return;
+    retryStateLoaded = true;
+    try {
+      for (const entry of await retry.journal.loadPending()) {
+        if (typeof entry.nextAttemptAt === "number" && Number.isFinite(entry.nextAttemptAt)) {
+          scheduledRetries.set(entry.id, {
+            nextAttemptAt: entry.nextAttemptAt,
+            attempts: typeof entry.attempts === "number" && Number.isFinite(entry.attempts) ? entry.attempts : 1,
+          });
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[notifier] failed to load persisted retry schedule: ${safeErrorMessage(
+          err,
+          typeof config.botToken === "string" ? [config.botToken] : [],
+        )}`,
+      );
+    }
+  }
+
+  async function recordRetryFailure(eventId: string | undefined, err: unknown): Promise<void> {
+    if (!retry || !eventId) return;
+    const prevAttempts = scheduledRetries.get(eventId)?.attempts ?? 0;
+    const retryAfterMs = extractRetryAfterMs(err);
+    const delayMs =
+      retryAfterMs !== null
+        ? retryAfterMs
+        : Math.min(initialBackoffMs * 2 ** prevAttempts, maxBackoffMs);
+    const nextAttemptAt = retryNow() + delayMs;
+    const attempts = prevAttempts + 1;
+    scheduledRetries.set(eventId, { nextAttemptAt, attempts });
+    try {
+      await retry.journal.recordRetry(eventId, nextAttemptAt, attempts);
+    } catch (journalErr) {
+      console.warn(
+        `[notifier] failed to persist retry schedule for ${eventId}: ${safeErrorMessage(
+          journalErr,
+          typeof config.botToken === "string" ? [config.botToken] : [],
+        )}`,
+      );
+    }
+  }
+
+  async function clearRetrySuccess(eventId: string | undefined): Promise<void> {
+    if (!retry || !eventId || !scheduledRetries.has(eventId)) return;
+    scheduledRetries.delete(eventId);
+    try {
+      await retry.journal.recordDone(eventId);
+    } catch (journalErr) {
+      console.warn(
+        `[notifier] failed to clear retry schedule for ${eventId}: ${safeErrorMessage(
+          journalErr,
+          typeof config.botToken === "string" ? [config.botToken] : [],
+        )}`,
+      );
+    }
+  }
+
   return async (
     text: string | null,
     source?: ContractSource,
@@ -136,6 +249,22 @@ export function createNotifier(
           `chars=${typeof text === "string" ? text.length : -1})`,
       );
       return;
+    }
+
+    const eventId =
+      typeof extra?.eventRef?.eventId === "string" && extra.eventRef.eventId.length > 0
+        ? extra.eventRef.eventId
+        : undefined;
+
+    if (retry && eventId) {
+      await ensureRetryStateLoaded();
+      const scheduled = scheduledRetries.get(eventId);
+      if (scheduled) {
+        const waitMs = retryDelayMs(scheduled.nextAttemptAt, retryNow());
+        if (waitMs > 0) {
+          await retrySleep(waitMs);
+        }
+      }
     }
 
     const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
@@ -167,18 +296,24 @@ export function createNotifier(
     // last, so the message reads exactly like the unsplit one.
     const parts = splitTelegramMessage(text);
     if (parts.length > 1) {
-      for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
-          ...notificationOptions,
-          ...(index === parts.length - 1 && extra?.reply_markup
-            ? { reply_markup: extra.reply_markup }
-            : {}),
-          ...(index === 0 && extra?.replyToMessageId !== undefined
-            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-            : {}),
-        });
+      try {
+        for (const [index, part] of parts.entries()) {
+          await bot.api.sendMessage(chatId, part, {
+            ...notificationOptions,
+            ...(index === parts.length - 1 && extra?.reply_markup
+              ? { reply_markup: extra.reply_markup }
+              : {}),
+            ...(index === 0 && extra?.replyToMessageId !== undefined
+              ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+              : {}),
+          });
+        }
+        await clearRetrySuccess(eventId);
+        return;
+      } catch (err) {
+        await recordRetryFailure(eventId, err);
+        throw err;
       }
-      return;
     }
 
     try {
@@ -189,12 +324,14 @@ export function createNotifier(
           ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
           : {}),
       });
+      await clearRetrySuccess(eventId);
       return;
     } catch (err) {
       // A blank fallback is no fallback: sending whitespace-only text would
       // just draw the same 400, so the original parse error propagates.
       const fallback = extra?.plainText;
       if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
+        await recordRetryFailure(eventId, err);
         throw err;
       }
       // Only bounded metadata is logged: the fallback outcome, the safe error
@@ -208,14 +345,20 @@ export function createNotifier(
           )}`,
       );
       // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
-        link_preview_options: notificationOptions.link_preview_options,
-        ...silentOption,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(extra?.replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-          : {}),
-      });
+      try {
+        await bot.api.sendMessage(chatId, fallback, {
+          link_preview_options: notificationOptions.link_preview_options,
+          ...silentOption,
+          ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+          ...(extra?.replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+            : {}),
+        });
+        await clearRetrySuccess(eventId);
+      } catch (fallbackErr) {
+        await recordRetryFailure(eventId, fallbackErr);
+        throw fallbackErr;
+      }
     }
   };
 }

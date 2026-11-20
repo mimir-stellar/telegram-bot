@@ -370,6 +370,8 @@ export {
   createNotifier,
   isMarkdownParseError,
   notifierSkips,
+  type NotifierOptions,
+  type NotifierRetryOptions,
   type SendExtra,
 } from "./notifications/notifier.js";
 
