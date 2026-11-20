@@ -55,6 +55,126 @@ export interface DeadLetterStats {
   dropped: number;
 }
 
+export type DeadLetterReasonCode =
+  | "DLQ_RATE_LIMITED"
+  | "DLQ_AUTH_ERROR"
+  | "DLQ_BAD_REQUEST"
+  | "DLQ_TIMEOUT"
+  | "DLQ_NETWORK_ERROR"
+  | "DLQ_SERVER_ERROR"
+  | "DLQ_UNKNOWN";
+
+export interface DeadLetterIncidentEntry {
+  id: string;
+  enqueuedAt: string;
+  source: string;
+  ledger: number;
+  eventName: string;
+  attempts: number;
+  reasonCode: DeadLetterReasonCode;
+  textBytes: number;
+}
+
+export interface DeadLetterIncidentBundle {
+  schemaVersion: 1;
+  exportedAt: string;
+  queue: {
+    depth: number;
+    maxEntries: number;
+    maxAttempts: number;
+    bySource: Record<string, number>;
+    byReasonCode: Record<string, number>;
+    oldestEnqueuedAt: string | null;
+    newestEnqueuedAt: string | null;
+  };
+  entries: DeadLetterIncidentEntry[];
+}
+
+/** Map a persisted error string to a stable, destination-safe reason code. */
+export function classifyReasonCode(
+  lastError: string | null | undefined,
+): DeadLetterReasonCode {
+  if (!lastError || lastError.trim().length === 0) return "DLQ_UNKNOWN";
+  const lower = lastError.toLowerCase();
+  if (/\b429\b|too many requests|retry after|rate[- ]limit/.test(lower)) {
+    return "DLQ_RATE_LIMITED";
+  }
+  if (/\b40[13]\b|unauthorized|forbidden|blocked|kicked/.test(lower)) {
+    return "DLQ_AUTH_ERROR";
+  }
+  if (/\b40[04]\b|bad request|chat not found|can't parse|markdown|entity/.test(lower)) {
+    return "DLQ_BAD_REQUEST";
+  }
+  if (/timed? ?out|etimedout|esockettimedout|aborterror|\b408\b/.test(lower)) {
+    return "DLQ_TIMEOUT";
+  }
+  if (/econnrefused|econnreset|enotfound|ehostunreach|eai_again|fetch failed|network|socket/.test(lower)) {
+    return "DLQ_NETWORK_ERROR";
+  }
+  if (/\b50[0234]\b|internal server error|bad gateway|service unavailable/.test(lower)) {
+    return "DLQ_SERVER_ERROR";
+  }
+  return "DLQ_UNKNOWN";
+}
+
+/**
+ * Build a redacted incident bundle containing queue metadata and stable reason
+ * codes while omitting message bodies, bot credentials, and destination ids.
+ */
+export function buildIncidentBundle(
+  entries: readonly DeadLetterEntry[],
+  options: { maxEntries: number; maxAttempts: number; now?: () => number },
+): DeadLetterIncidentBundle {
+  const now = options.now ?? Date.now;
+  const bySource: Record<string, number> = {};
+  const byReasonCode: Record<string, number> = {};
+  let oldestEnqueuedAt: string | null = null;
+  let newestEnqueuedAt: string | null = null;
+
+  const incidentEntries: DeadLetterIncidentEntry[] = entries.map((entry) => {
+    const source = entry.source || "unknown";
+    bySource[source] = (bySource[source] ?? 0) + 1;
+
+    const reasonCode = classifyReasonCode(entry.lastError);
+    byReasonCode[reasonCode] = (byReasonCode[reasonCode] ?? 0) + 1;
+
+    if (typeof entry.enqueuedAt === "string" && entry.enqueuedAt.length > 0) {
+      if (oldestEnqueuedAt === null || entry.enqueuedAt < oldestEnqueuedAt) {
+        oldestEnqueuedAt = entry.enqueuedAt;
+      }
+      if (newestEnqueuedAt === null || entry.enqueuedAt > newestEnqueuedAt) {
+        newestEnqueuedAt = entry.enqueuedAt;
+      }
+    }
+
+    return {
+      id: entry.id,
+      enqueuedAt: entry.enqueuedAt,
+      source,
+      ledger: entry.ledger,
+      eventName: entry.eventName,
+      attempts: entry.attempts,
+      reasonCode,
+      textBytes: Buffer.byteLength(entry.text, "utf8"),
+    };
+  });
+
+  return {
+    schemaVersion: 1,
+    exportedAt: new Date(now()).toISOString(),
+    queue: {
+      depth: entries.length,
+      maxEntries: options.maxEntries,
+      maxAttempts: options.maxAttempts,
+      bySource,
+      byReasonCode,
+      oldestEnqueuedAt,
+      newestEnqueuedAt,
+    },
+    entries: incidentEntries,
+  };
+}
+
 export interface DeadLetterQueueOptions {
   /**
    * Where the queue lives. `null` disables persistence and loading: the queue
@@ -325,6 +445,13 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     flush,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
+    },
+    incidentBundle(): DeadLetterIncidentBundle {
+      return buildIncidentBundle(entries, {
+        maxEntries: options.maxEntries,
+        maxAttempts: options.maxAttempts,
+        now,
+      });
     },
     /** Test helper — snapshot of current entries. */
     snapshot(): DeadLetterEntry[] {

@@ -96,6 +96,14 @@ The queue is strictly bounded across every dimension:
 
 ---
 
+## Incident Bundle Export (`src/dlq-cli.ts`)
+
+Operators can export a redacted incident bundle containing queue metadata and stable reason codes while omitting bot credentials, raw message text, and private destination identifiers:
+
+```bash
+npx tsx src/dlq-cli.ts bundle --file data/dead-letter.json --out /tmp/dlq-incident.json
+```
+
 ## Operator Inspection with `jq`
 
 Because the file contains standard JSON, operators can safely inspect queue status and contents on host or container storage using `jq`.

@@ -16,8 +16,9 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { createDeadLetterQueue } from "../dist/deadLetter.js";
+import { classifyReasonCode, createDeadLetterQueue } from "../dist/deadLetter.js";
 import {
+  exportDeadLetterBundle,
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
@@ -380,4 +381,73 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.equal(parseDurationMs("1h30m"), 5_400_000);
   assert.throws(() => parseDurationMs(""), /requires a duration/);
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
+});
+
+// ── bundle subcommand ─────────────────────────────────────────────────────────
+
+test("bundle exports queue metadata and stable reason codes without credentials or destinations", async () => {
+  const RAW_BODY = "PRIVATE-ALERT-PAYLOAD-98765";
+  await withTempDlq(
+    async ({ directory, filePath }) => {
+      const outFile = path.join(directory, "incident-bundle.json");
+      const io = captureIo();
+      const { exitCode } = await runDlqCli({
+        argv: ["bundle", "--file", filePath, "--out", outFile, "--chat-id", RAW_CHAT_ID],
+        stdout: io.out,
+        stderr: io.err,
+      });
+
+      assert.equal(exitCode, 0);
+      assert.equal(io.stderr.length, 0);
+      assert.match(io.stdout.join("\n"), /exported incident bundle \(depth=2\)/);
+
+      const bundleRaw = await readFile(outFile, "utf8");
+      assert.equal(bundleRaw.includes(RAW_CHAT_ID), false, "raw chat id must be omitted");
+      assert.equal(bundleRaw.includes(REDACTED_CHAT_ID), false, "chat id must not appear in bundle");
+      assert.equal(bundleRaw.includes(RAW_CHANNEL), false, "channel handle must be omitted");
+      assert.equal(bundleRaw.includes(BOT_TOKEN), false, "bot token must be omitted");
+      assert.equal(bundleRaw.includes(RAW_BODY), false, "raw message body must be omitted");
+
+      const bundle = JSON.parse(bundleRaw);
+      assert.equal(bundle.schemaVersion, 1);
+      assert.equal(bundle.queue.depth, 2);
+      assert.deepEqual(bundle.queue.bySource, { market: 1, squad: 1 });
+      assert.deepEqual(bundle.queue.byReasonCode, {
+        DLQ_RATE_LIMITED: 1,
+        DLQ_AUTH_ERROR: 1,
+      });
+      assert.equal(bundle.entries.length, 2);
+      assert.equal(bundle.entries[0].reasonCode, "DLQ_RATE_LIMITED");
+      assert.equal(bundle.entries[1].reasonCode, "DLQ_AUTH_ERROR");
+      assert.equal(bundle.entries[0].text, undefined);
+      assert.equal(bundle.entries[0].lastError, undefined);
+      assert.ok(bundle.entries[0].textBytes > 0);
+    },
+    [
+      {
+        ledger: 201,
+        source: "market",
+        text: `${RAW_BODY} to ${RAW_CHAT_ID}`,
+        error: `429 Too Many Requests for chat ${RAW_CHAT_ID} bot${BOT_TOKEN}`,
+      },
+      {
+        ledger: 202,
+        source: "squad",
+        text: `${RAW_BODY} to ${RAW_CHANNEL}`,
+        error: `403 Forbidden: bot was blocked by ${RAW_CHANNEL}`,
+      },
+    ],
+  );
+});
+
+test("bundle on an empty or missing queue exports empty metadata cleanly", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    const bundle = await exportDeadLetterBundle({ filePath });
+    assert.equal(bundle.schemaVersion, 1);
+    assert.equal(bundle.queue.depth, 0);
+    assert.deepEqual(bundle.queue.byReasonCode, {});
+    assert.deepEqual(bundle.entries, []);
+    assert.equal(classifyReasonCode("ETIMEDOUT"), "DLQ_TIMEOUT");
+    assert.equal(classifyReasonCode(null), "DLQ_UNKNOWN");
+  });
 });
