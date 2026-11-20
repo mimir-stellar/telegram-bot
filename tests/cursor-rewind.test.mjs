@@ -236,7 +236,7 @@ test("a cursor below the retained floor is rewound to the floor and the retained
           "rewind completed",
         );
       } finally {
-        poller.stop();
+        await poller.shutdown();
       }
     });
 
@@ -303,7 +303,7 @@ test("a cursor inside the window is never rewound, even when the RPC calls it st
         await until(() => poller.status().consecutiveFailures >= 1, "failed cycle");
         await sleep(40);
       } finally {
-        poller.stop();
+        await poller.shutdown({ timeoutMs: 1_000 });
       }
     });
     assert.equal(poller.status().cursorRewinds, 0);
@@ -342,7 +342,7 @@ test("an opaque cursor is never rewound", () =>
         await until(() => poller.status().consecutiveFailures >= 1, "failed cycle");
         await sleep(40);
       } finally {
-        poller.stop();
+        await poller.shutdown({ timeoutMs: 1_000 });
       }
     });
     assert.equal(poller.status().cursorRewinds, 0);
@@ -382,7 +382,7 @@ test("a window that cannot be read leaves the stale cursor untouched", () =>
         await until(() => poller.status().consecutiveFailures >= 1, "failed cycle");
         await sleep(40);
       } finally {
-        poller.stop();
+        await poller.shutdown({ timeoutMs: 1_000 });
       }
     });
     assert.equal(poller.status().cursorRewinds, 0, "no rewind without a readable window");
@@ -424,7 +424,7 @@ test("a cursor exactly at the floor is a valid boundary, not a rewind", () =>
         await until(() => poller.status().consecutiveFailures >= 1, "failed cycle");
         await sleep(40);
       } finally {
-        poller.stop();
+        await poller.shutdown({ timeoutMs: 1_000 });
       }
     });
     assert.equal(poller.status().cursorRewinds, 0);
@@ -455,7 +455,7 @@ test("an ahead-of-tip cursor is not rewound and no request is sent", () =>
         await until(() => poller.status().consecutiveFailures >= 1, "refused cursor");
         await sleep(40);
       } finally {
-        poller.stop();
+        await poller.shutdown({ timeoutMs: 1_000 });
       }
     });
     assert.equal(poller.status().cursorRewinds, 0);
@@ -505,7 +505,7 @@ test("a restart mid-rewind resumes from the persisted floor, not a lookback", ()
         await started;
       } finally {
         releaseScan({ events: [], cursor: makeCursor(TIP), latestLedger: TIP });
-        poller.stop();
+        await poller.shutdown({ timeoutMs: 1_000 });
       }
     });
     const marketRequest = server.requests.find((req) => req.startLedger === FLOOR);
@@ -559,7 +559,7 @@ test("a floor walk that keeps returning a below-floor cursor exhausts the rewind
         await until(() => poller.status().cursorRewinds >= 3, "rewind budget reached");
         await sleep(80); // several more cycles must not add another rewind
       } finally {
-        poller.stop();
+        await poller.shutdown({ timeoutMs: 1_000 });
       }
     });
     const status = poller.status();
@@ -594,7 +594,7 @@ test("a cold start with a stale-shaped RPC error is not rewound", () =>
         await until(() => poller.status().consecutiveFailures >= 1, "failed cold cycle");
         await sleep(40);
       } finally {
-        poller.stop();
+        await poller.shutdown({ timeoutMs: 1_000 });
       }
     });
     assert.equal(poller.status().cursorRewinds, 0);

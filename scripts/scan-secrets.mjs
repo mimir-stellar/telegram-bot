@@ -124,13 +124,15 @@ const MAX_BYTES_PER_FILE = 1_000_000;
 const CONTEXT_CHARS = 16;
 
 export function isScannable(relPath) {
-  if (SKIP_FILES.has(relPath)) return false;
-  if (relPath.split(path.sep).some((part) => SKIP_DIRS.has(part))) return false;
-  const base = path.basename(relPath);
+  const normalizedPath = relPath.replace(/\\/g, "/");
+  if (SKIP_FILES.has(normalizedPath)) return false;
+  if (normalizedPath.split("/").some((part) => SKIP_DIRS.has(part))) return false;
+  const base = path.posix.basename(normalizedPath);
   // `.env.example` ships tracked placeholders; it is exactly the file a
   // careless edit turns into a real `.env`, so it is scanned on purpose.
-  if (base === ".env.example" || base.startsWith(".env.")) return true;
-  return TEXT_SUFFIXES.some((suffix) => relPath.endsWith(suffix));
+  if (base === ".env.example") return true;
+  if (base === ".env" || base.startsWith(".env.")) return false;
+  return TEXT_SUFFIXES.some((suffix) => normalizedPath.endsWith(suffix));
 }
 
 /**

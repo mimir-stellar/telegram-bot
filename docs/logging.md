@@ -71,7 +71,7 @@ Emitted by the poller loop during event ingestion, cursor management, cycle exec
 
 | Field | Type | Description |
 |---|---|---|
-| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"persistent_volume_unwritable"`. |
+| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"notification_sent"` (debug level), `"notification_send_failed"`, `"persistent_volume_unwritable"`. |
 | `marketContractId` | `string` | Mimir market contract address watched. |
 | `squadContractId` | `string` | Mimir squad contract address watched. |
 | `pollIntervalMs` | `number` | Polling interval in milliseconds. |
@@ -82,13 +82,28 @@ Emitted by the poller loop during event ingestion, cursor management, cycle exec
 | `source` | `string` | Event origin contract (`"market"` or `"squad"`). |
 | `eventName` | `string` | Bounded contract event topic/name (max 80 chars). |
 | `eventId` | `string` | Unique event ID assigned by Soroban RPC. |
+| `correlationId` | `string` | Stable, opaque `evt_` identifier derived from event identity; shared by delivery and dead-letter records. |
+| `cycleCorrelationId` | `string` | Random ID for the poll cycle, retained separately from per-notification correlation IDs. |
 | `ledger` | `number` | Ledger sequence number of the event. |
 | `reason` | `string` | Reason for skipping, quarantining, or failing. |
 | `error` | `string` | Sanitized error message text. |
 | `maxNotificationsPerCycle` | `number` | The configured per-cycle notification limit. |
 | `droppedEvent` | `string` | Name of event dropped when cycle cap is exceeded. |
 
-### 3. `shutdown`
+### 3. `dead-letter`
+Emitted when a notification is parked, replayed, or dropped from the bounded dead-letter queue.
+
+| Field | Type | Description |
+|---|---|---|
+| `action` | `string` | `"notification_parked"`, `"notification_replayed"`, `"notification_replay_failed"`, `"notification_dropped"`, `"queue_full"`, or `"queue_persist_failed"`. |
+| `correlationId` | `string` | The same event-derived identifier used by the poller delivery record; absent for legacy queue entries. |
+| `source` | `string` | Originating contract source (`"market"` or `"squad"`). |
+| `eventName` | `string` | Contract event name. |
+| `ledger` | `number` | Ledger sequence number of the event. |
+| `attempts` | `number` | Delivery attempt count where applicable. |
+| `error` | `string` | Redacted and bounded delivery error, never the notification body. |
+
+### 4. `shutdown`
 Emitted during process signal trapping and graceful teardown drain.
 
 | Field | Type | Description |
@@ -101,7 +116,7 @@ Emitted during process signal trapping and graceful teardown drain.
 | `cursorFlushed` | `boolean` | Whether cursor state was successfully flushed to disk. |
 | `waitedMs` | `number` | Milliseconds spent waiting for poller drain. |
 
-### 4. `process`
+### 5. `process`
 Emitted by top-level Node.js error listeners.
 
 | Field | Type | Description |
@@ -126,6 +141,11 @@ Every log record is redacted before it leaves the process:
 2. **Telegram Token Pattern**: Any substring matching Telegram bot token shape (`\b\d{5,}:[A-Za-z0-9_-]{20,}/g`) is automatically replaced with `[REDACTED]`, even if not explicitly registered in secrets configuration.
 3. **URL Redaction**: Internal helpers (`redactUrl`) mask HTTP basic auth or query credentials in URLs before logging.
 4. **All Fields Protected**: Redaction applies recursively to both the log `msg` and all string values in custom `fields`.
+
+Per-notification `correlationId` values are the first 96 bits of a SHA-256 digest
+over the event source and chain identity metadata. They do not include formatted
+notification text or credentials. Poll-cycle UUIDs remain separate and continue
+to identify the most recently started cycle in health/status output.
 
 ---
 

@@ -68,12 +68,13 @@ sequenceDiagram
         Poller->>Poller: Update dedupWindow with seenEventIds
 
         opt Has events to notify
-            Poller->>Poller: notify(events, correlationId)
+            Poller->>Poller: notify(events, cycleCorrelationId)
             loop For each DecodedEvent
                 alt Event is admin or unknown or feature-flag disabled
                     Poller->>Poller: Skip notification (increment eventsSkipped)
                 else Event is notifiable
-                    Poller->>Notifier: send(text, source, extra)
+                    Note over Poller: Derive stable opaque correlationId from event identity
+                    Poller->>Notifier: send(text, source, extra + correlationId)
                     loop sendWithRetry (up to 3 attempts with backoff)
                         Notifier->>Telegram: sendMessage(chatId, text, options)
                         alt Send succeeds
@@ -83,7 +84,7 @@ sequenceDiagram
                         end
                     end
                     alt All retries fail
-                        Poller->>DLQ: enqueue({ source, ledger, eventName, text, error })
+                        Poller->>DLQ: enqueue({ source, ledger, eventName, correlationId, text, error })
                         Note over Poller: Counted as failed; cycle continues
                     end
                 end
@@ -128,13 +129,13 @@ Within [`src/poller.ts`](../src/poller.ts), each execution of `cycle()` executes
 4. **Event Notification and Dispatch**
    - The scanner returns `ContractScan` containing decoded events and `seenEventIds`.
    - `seenEventIds` are recorded in the poller's `dedupWindow` before delivery attempts.
-   - `notify(scan.events, correlationId)` is invoked:
+   - `notify(scan.events, cycleCorrelationId)` is invoked. The cycle UUID remains available for cycle/status diagnostics; each event gets its own stable opaque `correlationId`, derived from source and chain identity metadata:
      - Admin events (`isAdminPayload`) and unrecognized events (`event.payload.name === "unknown"`) are skipped and logged.
      - Feature flags (`isNotificationAllowed`) are checked.
      - If shutdown is in progress (`status.stopping`), remaining notifications are dropped.
      - The message is formatted with MarkdownV2 (and fallback plain text).
-     - Delivery is dispatched using `sendWithRetry` to the configured `send` function (created via `createNotifier` in [`src/bot.ts`](../src/bot.ts)).
-     - If all retries fail, the failure counter is incremented, and the message is enqueued into the dead-letter queue via `deadLetter.enqueue()`.
+     - Delivery is dispatched using `sendWithRetry` to the configured `send` function (created via `createNotifier` in [`src/bot.ts`](../src/bot.ts)); the correlation ID travels as bounded log-only event metadata and is not added to the Telegram message.
+     - On successful delivery or exhausted retries, structured logs include the same correlation ID. If all retries fail, the identifier is also persisted in the dead-letter entry and reused on replay.
 
 5. **In-Memory Cursor Advance**
    - If `scan.cursor` has advanced, the in-memory cursor is updated (`current.cursor = scan.cursor`).

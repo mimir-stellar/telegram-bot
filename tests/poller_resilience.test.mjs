@@ -24,8 +24,8 @@ function trackedPoller(deps) {
 /** Poll `predicate` until it holds or `timeoutMs` elapses (no fixed sleeps). */
 async function waitFor(predicate, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) return;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) throw new Error("waitFor timed out");
     await new Promise((r) => setTimeout(r, 10));
   }
 }
@@ -35,7 +35,7 @@ const marketCursor = (poller) =>
 test.afterEach(async () => {
   const pollers = [...livePollers];
   livePollers.clear();
-  await Promise.all(pollers.map((p) => p.stop()));
+  await Promise.all(pollers.map((p) => p.shutdown({ timeoutMs: 1_000 })));
 });
 
 function mockConfig(cursorFile) {
@@ -95,7 +95,7 @@ test("poller initializes and handles cold start when cursor file is missing", as
 
   assert.equal(status.running, true);
   assert.equal(status.targets.length, 2);
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -116,8 +116,16 @@ test("poller persists cursor upon successful cycle and reloads upon restart", as
   const poller = trackedPoller({ config, server, send });
   await poller.start();
 
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  poller.stop();
+  await waitFor(async () => {
+    const raw = await readFile(cursorFile, "utf8").catch(() => null);
+    if (raw === null) return false;
+    try {
+      return JSON.parse(raw).targets?.market?.cursor === CURSOR_1999;
+    } catch {
+      return false;
+    }
+  });
+  await poller.shutdown();
 
   const savedRaw = await readFile(cursorFile, "utf8");
   const saved = JSON.parse(savedRaw);
@@ -129,7 +137,7 @@ test("poller persists cursor upon successful cycle and reloads upon restart", as
   const status2 = poller2.status();
   const marketTarget = status2.targets.find((t) => t.source === "market");
   assert.equal(marketTarget.cursor, CURSOR_1999);
-  poller2.stop();
+  await poller2.shutdown({ timeoutMs: 1_000 });
 
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
@@ -152,16 +160,18 @@ test("poller continues and does not lose cursor state during transient RPC failu
 
   const poller = trackedPoller({ config, server, send: async () => {} });
   await poller.start();
-  await new Promise((r) => setTimeout(r, 80));
+  await waitFor(() => poller.status().cycles >= 1);
 
   failRPC = true;
-  await new Promise((r) => setTimeout(r, 120));
+  await waitFor(() =>
+    poller.status().lastError?.message.includes("RPC Connection Refused"),
+  );
 
   const status = poller.status();
   assert.ok(status.lastError);
   assert.match(status.lastError.message, /RPC Connection Refused/);
 
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -213,7 +223,7 @@ test("poller logs and handles Telegram send retries/failures without stalling cu
   const marketTarget = status.targets.find((t) => t.source === "market");
   assert.equal(marketTarget.cursor, CURSOR_1999);
 
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -268,7 +278,7 @@ test("poller times out a hung Telegram send and continues without stalling curso
   const marketTarget = status.targets.find((t) => t.source === "market");
   assert.equal(marketTarget.cursor, CURSOR_1999, "cursor should advance despite send timeout");
 
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -315,13 +325,15 @@ test("poller send timeout is bounded and does not leak pending timers across cyc
 
   const poller = trackedPoller({ config, server, send, sendOptions: { initialBackoffMs: 1 } });
   await poller.start();
-  await new Promise((r) => setTimeout(r, 200));
+  await waitFor(
+    () => poller.status().notificationsFailed >= 1,
+  );
 
   const status = poller.status();
   assert.ok(status.notificationsFailed >= 1);
   assert.equal(status.running, true, "poller should remain running after send timeouts");
 
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -371,12 +383,12 @@ test("poller respects sendTimeoutMs override via sendOptions", async () => {
     sendOptions: { sendTimeoutMs: 30, sendSpacingMs: 0, initialBackoffMs: 1 },
   });
   await poller.start();
-  await new Promise((r) => setTimeout(r, 200));
+  await waitFor(() => poller.status().notificationsFailed >= 1);
 
   const status = poller.status();
   assert.ok(status.notificationsFailed >= 1, "override timeout should fire");
 
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -422,13 +434,13 @@ test("poller send timeout does not fire when send resolves before deadline", asy
 
   const poller = trackedPoller({ config, server, send, sendOptions: { initialBackoffMs: 1 } });
   await poller.start();
-  await new Promise((r) => setTimeout(r, 200));
+  await waitFor(() => sent.length >= 1);
 
   const status = poller.status();
   assert.ok(sent.length >= 1, "send should have completed");
   assert.equal(status.notificationsFailed, 0, "no failures expected for fast send");
 
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -486,7 +498,7 @@ test("poller send timeout preserves cursor across restart", async () => {
   const status2 = poller2.status();
   const marketTarget = status2.targets.find((t) => t.source === "market");
   assert.equal(marketTarget.cursor, CURSOR_1999);
-  poller2.stop();
+  await poller2.shutdown({ timeoutMs: 1_000 });
 
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
@@ -513,15 +525,14 @@ test("poller circuit breaker opens after consecutive RPC failures", async () => 
   });
 
   await poller.start();
-  // Wait for enough failures to trigger circuit breaker (3 failures)
-  await new Promise((r) => setTimeout(r, 150));
+  await waitFor(() => poller.status().circuitBreaker.open);
 
   const status = poller.status();
   assert.equal(status.circuitBreaker.open, true, "circuit breaker should be open");
   assert.ok(status.circuitBreaker.failureCount >= 3, "failure count should meet threshold");
   assert.ok(status.circuitBreaker.openedAt !== null, "openedAt should be set");
 
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -547,8 +558,7 @@ test("poller circuit breaker skips RPC calls when open", async () => {
   });
 
   await poller.start();
-  // Wait for circuit breaker to open (2 failures)
-  await new Promise((r) => setTimeout(r, 80));
+  await waitFor(() => poller.status().circuitBreaker.open);
 
   const statusAfterOpen = poller.status();
   assert.equal(statusAfterOpen.circuitBreaker.open, true);
@@ -563,7 +573,7 @@ test("poller circuit breaker skips RPC calls when open", async () => {
   // RPC calls should not increase significantly while circuit is open
   assert.ok(callsAfterCooldown <= callsAtOpen + 1, "RPC calls should be skipped while circuit is open");
 
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -591,21 +601,20 @@ test("poller circuit breaker closes after cooldown and successful RPC", async ()
   });
 
   await poller.start();
-  // Wait for circuit breaker to open
-  await new Promise((r) => setTimeout(r, 80));
+  await waitFor(() => poller.status().circuitBreaker.open);
 
   const statusOpen = poller.status();
   assert.equal(statusOpen.circuitBreaker.open, true);
 
   // Allow RPC to succeed and cooldown to elapse
   failRPC = false;
-  await new Promise((r) => setTimeout(r, 200));
+  await waitFor(() => !poller.status().circuitBreaker.open);
 
   const statusClosed = poller.status();
   assert.equal(statusClosed.circuitBreaker.open, false, "circuit breaker should close after successful RPC");
   assert.equal(statusClosed.circuitBreaker.failureCount, 0, "failure count should reset");
 
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -635,12 +644,14 @@ test("poller circuit breaker resets on successful RPC before threshold", async (
   });
 
   await poller.start();
-  await new Promise((r) => setTimeout(r, 80));
+  await waitFor(
+    () => callCount >= 2 && poller.status().circuitBreaker.failureCount === 0,
+  );
 
   const status = poller.status();
   assert.equal(status.circuitBreaker.open, false, "circuit breaker should not open");
   assert.equal(status.circuitBreaker.failureCount, 0, "failure count should reset after success");
 
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });

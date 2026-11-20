@@ -875,9 +875,12 @@ budget as a normal burst, and the file is bounded on every axis:
 
 Identity is the event, not the attempt: the same event failing twice is one
 entry with two attempts, so a failing cycle cannot fill the queue with
-duplicates. Only the already-formatted message and short operational metadata
-(source, ledger, event name, redacted error) are stored — never a signing key —
-and the file is written write-then-rename, so a crash cannot corrupt it.
+duplicates. A stable opaque correlation ID links the event's scan/delivery logs
+to its parked entry and later replay; it is derived from chain identity metadata,
+not the rendered message or credentials. Only the already-formatted message and
+short operational metadata (source, ledger, event name, correlation ID, redacted
+error) are stored — never a signing key — and the file is written
+write-then-rename, so a crash cannot corrupt it.
 
 Two things it deliberately does not do:
 
@@ -1102,11 +1105,12 @@ Configuration (see `.env.example`):
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
 
-Each poll cycle gets a fresh UUID correlation ID. The ID is included in poller
-logs, `/status`, and `/health` so an RPC failure, malformed event, rate-limited
-send, or cycle error can be tied to one bounded cycle. It is not included in
-Telegram messages, persisted cursor data, or carried across a restart; the
-chain remains the source of truth.
+Each poll cycle gets a fresh UUID, reported in `/status` and `/health` for cycle
+diagnostics. Separately, each notification gets a stable opaque event-derived
+correlation ID shared by its delivery logs, send metadata, and (on failure) its
+dead-letter entry and replay logs. The notification ID hashes only source and
+chain identity metadata; it contains no message text or credentials and is not
+added to Telegram messages or cursor data. The chain remains the source of truth.
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the target alert is additive, does not change the

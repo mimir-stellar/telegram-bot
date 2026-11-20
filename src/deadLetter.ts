@@ -27,6 +27,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { Logger } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 
 export interface DeadLetterEntry {
@@ -36,6 +37,8 @@ export interface DeadLetterEntry {
   source: string;
   ledger: number;
   eventName: string;
+  /** Opaque event-derived notification identifier; absent on legacy entries. */
+  correlationId?: string;
   /** Already-formatted MarkdownV2 message body, truncated to {@link TEXT_TRUNCATE}. */
   text: string;
   attempts: number;
@@ -83,6 +86,15 @@ export const DEAD_LETTER_MAX_ATTEMPTS = 10;
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
 const TEXT_TRUNCATE = 4_000;
+const CORRELATION_ID_PATTERN = /^evt_[0-9a-f]{24}$/;
+
+function validCorrelationId(value: unknown): string | undefined {
+  return typeof value === "string" && CORRELATION_ID_PATTERN.test(value) ? value : undefined;
+}
+
+function correlationLabel(correlationId: string | undefined): string {
+  return correlationId ? ` correlation=${correlationId}` : "";
+}
 
 function truncate(value: string, max: number): string {
   if (value.length <= max) return value;
@@ -161,17 +173,21 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
               typeof e.text === "string" &&
               typeof e.ledger === "number",
           )
-          .map((e) => ({
-            id: e.id,
-            enqueuedAt:
-              typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
-            source: typeof e.source === "string" ? e.source : "unknown",
-            ledger: e.ledger,
-            eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
-            text: truncate(e.text, TEXT_TRUNCATE),
-            attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
-            lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
-          }));
+          .map((e) => {
+            const correlationId = validCorrelationId(e.correlationId);
+            return {
+              id: e.id,
+              enqueuedAt:
+                typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
+              source: typeof e.source === "string" ? e.source : "unknown",
+              ledger: e.ledger,
+              eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
+              ...(correlationId ? { correlationId } : {}),
+              text: truncate(e.text, TEXT_TRUNCATE),
+              attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
+              lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
+            };
+          });
         // Bound on load too: the file may have been edited by hand.
         while (entries.length > options.maxEntries) {
           entries.shift();
@@ -190,7 +206,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     }
   }
 
-  async function persist(): Promise<void> {
+  async function persist(correlationId?: string): Promise<void> {
     if (filePath === null) {
       syncDepth();
       return;
@@ -210,12 +226,22 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     } catch (err) {
       // An unwritable queue is degraded observability, never a reason to stop
       // notifying or to throw into the poll loop.
-      console.error(`[dead-letter] could not persist queue: ${safeError(err)}`);
+      const error = safeError(err);
+      Logger.error(
+        "dead-letter",
+        `[dead-letter] could not persist queue: ${error}` + correlationLabel(correlationId),
+        {
+          action: "queue_persist_failed",
+          correlationId,
+          error,
+        },
+      );
     }
     syncDepth();
   }
 
   async function enqueue(input: {
+    correlationId?: string;
     source: string;
     ledger: number;
     eventName: string;
@@ -223,11 +249,13 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     error: unknown;
   }): Promise<DeadLetterEntry> {
     const id = makeEntryId(input.source, input.ledger, input.eventName, input.text);
+    const correlationId = validCorrelationId(input.correlationId);
     const existing = entries.find((e) => e.id === id);
     if (existing) {
       existing.attempts += 1;
       existing.lastError = safeError(input.error);
-      await persist();
+      if (correlationId) existing.correlationId = correlationId;
+      await persist(correlationId);
       return existing;
     }
 
@@ -235,9 +263,18 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       const dropped = entries.shift();
       stats.dropped += 1;
       if (dropped) {
-        console.warn(
+        Logger.warn(
+          "dead-letter",
           `[dead-letter] queue full (max ${options.maxEntries}); dropped oldest ` +
-            `${dropped.source} ${dropped.eventName} @ ledger ${dropped.ledger}`,
+            `${dropped.source} ${dropped.eventName} @ ledger ${dropped.ledger}` +
+            correlationLabel(dropped.correlationId),
+          {
+            action: "queue_full",
+            correlationId: dropped.correlationId,
+            source: dropped.source,
+            eventName: dropped.eventName,
+            ledger: dropped.ledger,
+          },
         );
       }
     }
@@ -248,6 +285,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       source: input.source,
       ledger: input.ledger,
       eventName: input.eventName,
+      ...(correlationId ? { correlationId } : {}),
       text: truncate(input.text, TEXT_TRUNCATE),
       attempts: 1,
       lastError: safeError(input.error),
@@ -255,11 +293,21 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     entries.push(entry);
     stats.enqueued += 1;
     syncDepth();
-    console.warn(
+    Logger.warn(
+      "dead-letter",
       `[dead-letter] parked ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
-        `(depth ${entries.length}/${options.maxEntries}): ${entry.lastError}`,
+        `(depth ${entries.length}/${options.maxEntries}): ${entry.lastError}` +
+        correlationLabel(entry.correlationId),
+      {
+        action: "notification_parked",
+        correlationId: entry.correlationId,
+        source: entry.source,
+        eventName: entry.eventName,
+        ledger: entry.ledger,
+        error: entry.lastError,
+      },
     );
-    await persist();
+    await persist(correlationId);
     return entry;
   }
 
@@ -290,24 +338,54 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         await send(entry.text, entry);
         sent += 1;
         stats.replayed += 1;
-        console.log(
-          `[dead-letter] replayed ${entry.source} ${entry.eventName} @ ledger ${entry.ledger}`,
+        Logger.info(
+          "dead-letter",
+          `[dead-letter] replayed ${entry.source} ${entry.eventName} @ ledger ${entry.ledger}` +
+            correlationLabel(entry.correlationId),
+          {
+            action: "notification_replayed",
+            correlationId: entry.correlationId,
+            source: entry.source,
+            eventName: entry.eventName,
+            ledger: entry.ledger,
+          },
         );
       } catch (err) {
         entry.attempts += 1;
         entry.lastError = safeError(err);
         if (entry.attempts >= options.maxAttempts) {
           stats.dropped += 1;
-          console.error(
+          Logger.error(
+            "dead-letter",
             `[dead-letter] dropping ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
-              `after ${entry.attempts} attempts: ${entry.lastError}`,
+              `after ${entry.attempts} attempts: ${entry.lastError}` +
+              correlationLabel(entry.correlationId),
+            {
+              action: "notification_dropped",
+              correlationId: entry.correlationId,
+              source: entry.source,
+              eventName: entry.eventName,
+              ledger: entry.ledger,
+              attempts: entry.attempts,
+              error: entry.lastError,
+            },
           );
         } else {
           kept.push(entry);
-          console.warn(
+          Logger.warn(
+            "dead-letter",
             `[dead-letter] replay failed for ${entry.source} ${entry.eventName} ` +
               `@ ledger ${entry.ledger} (attempt ${entry.attempts}/${options.maxAttempts}): ` +
-              entry.lastError,
+              `${entry.lastError}${correlationLabel(entry.correlationId)}`,
+            {
+              action: "notification_replay_failed",
+              correlationId: entry.correlationId,
+              source: entry.source,
+              eventName: entry.eventName,
+              ledger: entry.ledger,
+              attempts: entry.attempts,
+              error: entry.lastError,
+            },
           );
         }
       }

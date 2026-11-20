@@ -27,6 +27,7 @@ The dead-letter file is written atomically (via a write-to-temporary-file and re
       "source": "market",
       "ledger": 123456,
       "eventName": "MarketCreated",
+      "correlationId": "evt_0123456789abcdef01234567",
       "text": "Formatted MarkdownV2 message body…",
       "attempts": 1,
       "lastError": "Telegram API 429: Too Many Requests: retry after 5"
@@ -50,6 +51,7 @@ Each entry in `entries` mirrors the `DeadLetterEntry` TypeScript interface defin
 * `source` (`string`): Originating contract source name (e.g. `market` or `squad`).
 * `ledger` (`number`): Stellar ledger sequence number where the event occurred.
 * `eventName` (`string`): Contract event topic/name (e.g. `MarketCreated`, `BetPlaced`, `Resolved`).
+* `correlationId` (`string`, optional): Stable opaque event-derived identifier shared with poller delivery logs. It hashes only the source and chain identity metadata; it never includes message text or credentials. Older entries without this field remain valid.
 * `text` (`string`): The formatted Telegram `MarkdownV2` message body. Bounded and truncated to at most 4,000 characters (`TEXT_TRUNCATE`).
 * `attempts` (`number`): The number of delivery attempts made so far (starts at `1` upon initial enqueue and increments on each failed replay).
 * `lastError` (`string | null`): Scrubbed, redacted error message from the most recent send failure, truncated to at most 200 characters (`ERROR_TRUNCATE`). Sensitive secrets like `BOT_TOKEN` are scrubbed via `safeErrorMessage`.

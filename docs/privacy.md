@@ -24,6 +24,7 @@ The bot reads only public chain data. It does not hold signing keys or any crede
   - Already-formatted MarkdownV2 notification text (truncated to 4,000 characters)
   - Redacted error messages (bot tokens, secrets, and URLs are removed)
   - Ledger numbers, event names, and contract sources (public chain data)
+  - Stable opaque event-derived correlation identifiers (hashes of source and chain identity metadata)
   - Attempt counts
 - **Retention**: Bounded by `DEAD_LETTER_MAX` (default 100); oldest entry is dropped when the queue is full
 - **Redaction**: Error messages pass through redaction rules that remove bot tokens, secret strkeys, URLs, and credential-bearing query strings. Bot tokens are explicitly scrubbed from recorded errors
@@ -91,6 +92,7 @@ The bot reads only public chain data. It does not hold signing keys or any crede
 - **No signing keys**: The bot holds no private keys and signs nothing
 - **No bot tokens in logs**: Bot tokens are redacted from all logs, error messages, and persisted files
 - **No payment amounts**: Notification messages are formatted with amounts displayed, but amounts are not stored separately in files
+- **No notification text in correlation IDs**: Correlation IDs are stable hashes of event identity metadata and do not contain rendered messages or credentials
 - **No Telegram user IDs**: User IDs may appear transiently in log lines (which are redacted) but are not persisted to disk
 
 ## How to delete all stored data

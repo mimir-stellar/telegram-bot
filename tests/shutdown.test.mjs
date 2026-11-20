@@ -40,6 +40,10 @@ import test from "node:test";
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const MOCK_RUN_CLI = fileURLToPath(new URL("../dist/mock-run.js", import.meta.url));
+const WINDOWS_SIGNAL_SKIP =
+  process.platform === "win32"
+    ? "Windows does not deliver child process signals to Node.js handlers"
+    : false;
 
 // The children run in a throwaway cwd: the mock profile keeps its cursor and
 // instance lock under ./data, and other suites running in parallel must not
@@ -298,7 +302,7 @@ test("shutdown: repeated SIGTERM (idempotent via process.once semantics) — sec
 // no live Testnet RPC, and no Telegram are needed. The shutdown path in
 // mock-run.ts mirrors the one in index.ts but closes the mock RPC too.
 
-test("mock:poll exits with code 0 on SIGTERM", async () => {
+test("mock:poll exits with code 0 on SIGTERM", { skip: WINDOWS_SIGNAL_SKIP }, async () => {
   const child = spawn(
     process.execPath,
     [MOCK_RUN_CLI, "--port", "0"],
@@ -332,7 +336,7 @@ test("mock:poll exits with code 0 on SIGTERM", async () => {
   }
 });
 
-test("mock:poll logs SIGTERM received and stopping before exit", async () => {
+test("mock:poll logs SIGTERM received and stopping before exit", { skip: WINDOWS_SIGNAL_SKIP }, async () => {
   const child = spawn(
     process.execPath,
     [MOCK_RUN_CLI, "--port", "0"],
@@ -366,7 +370,7 @@ test("mock:poll logs SIGTERM received and stopping before exit", async () => {
   }
 });
 
-test("mock:poll exits with code 0 on SIGINT", async () => {
+test("mock:poll exits with code 0 on SIGINT", { skip: WINDOWS_SIGNAL_SKIP }, async () => {
   const child = spawn(
     process.execPath,
     [MOCK_RUN_CLI, "--port", "0"],
@@ -399,7 +403,7 @@ test("mock:poll exits with code 0 on SIGINT", async () => {
   }
 });
 
-test("mock:poll logs SIGINT received and stopping before exit", async () => {
+test("mock:poll logs SIGINT received and stopping before exit", { skip: WINDOWS_SIGNAL_SKIP }, async () => {
   const child = spawn(
     process.execPath,
     [MOCK_RUN_CLI, "--port", "0"],
@@ -433,43 +437,47 @@ test("mock:poll logs SIGINT received and stopping before exit", async () => {
   }
 });
 
-test("mock:poll does not exit non-zero on a clean SIGTERM (no error output)", async () => {
-  const child = spawn(
-    process.execPath,
-    [MOCK_RUN_CLI, "--port", "0"],
-    {
-      cwd: CHILD_CWD,
-      env: childEnv({ HEALTH_PORT: "0" }),
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk) => { stdout += chunk; });
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-
-  try {
-    await waitFor(
-      () => stdout.includes("[dry-run] health") && stdout.includes("would send"),
-      "first scan complete with send log",
-      15_000,
+test(
+  "mock:poll does not exit non-zero on a clean SIGTERM (no error output)",
+  { skip: WINDOWS_SIGNAL_SKIP },
+  async () => {
+    const child = spawn(
+      process.execPath,
+      [MOCK_RUN_CLI, "--port", "0"],
+      {
+        cwd: CHILD_CWD,
+        env: childEnv({ HEALTH_PORT: "0" }),
+        stdio: ["ignore", "pipe", "pipe"],
+      },
     );
 
-    child.kill("SIGTERM");
-    const [code] = await once(child, "exit");
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
 
-    assert.equal(code, 0, `expected exit 0\nstdout:\n${stdout}\nstderr:\n${stderr}`);
-    // Graceful shutdown must not produce an uncaught error line.
-    assert.doesNotMatch(
-      stdout + stderr,
-      /\[fatal\]|\[error\] unhandled rejection/,
-      "no fatal errors on clean SIGTERM",
-    );
-  } finally {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-  }
-});
+    try {
+      await waitFor(
+        () => stdout.includes("[dry-run] health") && stdout.includes("would send"),
+        "first scan complete with send log",
+        15_000,
+      );
+
+      child.kill("SIGTERM");
+      const [code] = await once(child, "exit");
+
+      assert.equal(code, 0, `expected exit 0\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+      // Graceful shutdown must not produce an uncaught error line.
+      assert.doesNotMatch(
+        stdout + stderr,
+        /\[fatal\]|\[error\] unhandled rejection/,
+        "no fatal errors on clean SIGTERM",
+      );
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+  },
+);
 
 test("poller is stopped (running=false) by the time SIGTERM shutdown completes", async () => {
   // In-process: verify that poller.stop() flips running=false and the status
