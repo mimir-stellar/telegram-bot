@@ -23,7 +23,8 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Default Path**: `./data/cursor.json` (configured via `DEFAULTS.cursorFile` in [`src/config.ts`](../src/config.ts))
 - **Write Pattern**: Atomic write-then-rename (`${cursorFile}.tmp` -> `${cursorFile}`) on every successful scan commit, graceful shutdown flush, or schema migration.
 - **Deleted**: Poller logs that no cursor was found and falls back to a cold start lookback `START_LOOKBACK_LEDGERS` (default: 60 ledgers) behind the chain tip.
-- **Corrupt**: If JSON is invalid or fails schema validation (or references an unsupported future schema version), `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>` and starts cold.
+- **Corrupt**: If JSON is invalid or fails schema validation (or references an unsupported future schema version), `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>`, sets `cursorLoadError.code = "CURSOR_CORRUPT_JSON"`, and starts cold.
+- **Permission / Operational Failure**: If reading the cursor directory or file fails with `EACCES`, `EPERM`, `EROFS`, or another operational I/O error (not `ENOENT`), the poller and `cursor-cli` preserve all existing files without quarantining or overwriting them, and surface a distinct stable diagnostic (`CURSOR_PERMISSION_DENIED` / `cursor_permission_denied`, or `CURSOR_IO_ERROR` / `cursor_read_failed`).
 
 ### 2. Cursor Backup Copy
 - **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`)
