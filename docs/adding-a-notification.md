@@ -258,6 +258,8 @@ Open `src/notifications/format.ts` and wire the new payload into both `headline`
 
    `groupDigestEvents(events)` groups market events that have a numeric `claimId` property under `market:<claimId>` and squad events that have a numeric `marketId` property under `squad:<marketId>`. Because `claim_escalated` includes `claimId: number` on its payload, `groupDigestEvents` groups it automatically. If your new event uses a different identifier, update `groupKeyForEvent` in `src/notifications/digest-grouping.ts`.
 
+   For quiet-hours-aware digest deferral, `DigestDeferralBuffer` (and `partitionDigestEvents`) in `src/notifications/digest-grouping.ts` keep critical `alwaysSend` events immediate, cap accumulated deferred entries at `maxEntries` (default `1000`), and flush grouped digests via `flushIfAllowed(now)` once outside quiet hours. In `src/notifications/schedule.ts`, `nextAllowedWindowStart`, `nextAllowedRun`, and `SchedulerOptions.quietHours` defer scheduled digest runs that fall inside quiet hours until the allowed window opens.
+
 ---
 
 ### Step 5: Filters and Feature Flags (`src/notifications/format.ts` & `src/notifications/featureFlags.ts`)

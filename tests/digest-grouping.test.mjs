@@ -11,7 +11,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { groupDigestEvents } from "../dist/notifications/digest-grouping.js";
+import {
+  groupDigestEvents,
+  partitionDigestEvents,
+  DigestDeferralBuffer,
+} from "../dist/notifications/digest-grouping.js";
 import { formatDigest } from "../dist/notifications/format.js";
 
 // ---------------------------------------------------------------------------
@@ -266,4 +270,89 @@ test("formatDigest grouped: mixed burst — header only for multi-event groups",
 
   const nonIndentedBullets = lines.filter((l) => l.match(/^· /));
   assert.equal(nonIndentedBullets.length, 1, "squad singleton should produce 1 non-indented bullet");
+});
+
+// ---------------------------------------------------------------------------
+// Quiet-hours-aware digest deferral
+// ---------------------------------------------------------------------------
+
+test("DigestDeferralBuffer: defers non-critical events in quiet hours, keeps critical alerts immediate, and flushes in allowed window", () => {
+  const policy = { window: { start: 22, end: 6 } };
+  const buffer = new DigestDeferralBuffer({ policy, maxEntries: 10 });
+
+  const normal1 = marketEvent(1, 2000);
+  const critical = makeEvent({
+    source: "market",
+    ledger: 2001,
+    payload: {
+      name: "claim_resolved",
+      claimId: 1,
+      category: "test",
+      creator: "GBMGZ3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+    },
+  });
+  const normal2 = squadEvent(5, 2002);
+
+  // During quiet hours (23:00 UTC): critical is immediate, normal events are buffered
+  const ingest1 = buffer.ingest([normal1, critical, normal2], "2026-10-19T23:00:00Z");
+  assert.equal(ingest1.immediate.length, 1);
+  assert.equal(ingest1.immediate[0].eventId, critical.eventId);
+  assert.equal(ingest1.deferredCount, 2);
+  assert.equal(ingest1.droppedCount, 0);
+  assert.equal(buffer.size, 2);
+
+  // Still in quiet hours (05:59 UTC): flushIfAllowed returns null
+  assert.equal(buffer.flushIfAllowed("2026-10-20T05:59:00Z"), null);
+  assert.equal(buffer.size, 2);
+
+  // Allowed window (06:00 UTC): flushIfAllowed drains and groups buffered entries
+  const flushed = buffer.flushIfAllowed("2026-10-20T06:00:00Z");
+  assert.ok(flushed !== null);
+  assert.equal(flushed.events.length, 2);
+  assert.equal(flushed.groups.length, 2);
+  assert.equal(flushed.droppedCount, 0);
+  assert.equal(buffer.size, 0);
+});
+
+test("DigestDeferralBuffer: caps accumulated entries and counts overflow drops", () => {
+  const buffer = new DigestDeferralBuffer({
+    policy: { window: { start: 22, end: 6 } },
+    maxEntries: 2,
+  });
+
+  const events = [marketEvent(1, 2100), marketEvent(1, 2101), marketEvent(2, 2102)];
+  const res = buffer.ingest(events, "2026-10-19T23:30:00Z");
+  assert.equal(res.deferredCount, 2);
+  assert.equal(res.droppedCount, 1);
+  assert.equal(res.bufferedCount, 2);
+  assert.equal(buffer.droppedCount, 1);
+
+  const flushed = buffer.flushIfAllowed("2026-10-20T06:00:00Z");
+  assert.ok(flushed !== null);
+  assert.equal(flushed.events.length, 2);
+  assert.equal(flushed.groups.length, 1);
+  assert.equal(flushed.groups[0].key, "market:1");
+  assert.equal(flushed.droppedCount, 1);
+  assert.equal(buffer.droppedCount, 0);
+});
+
+test("DigestDeferralBuffer & partitionDigestEvents: boundary and invalid maxEntries handling", () => {
+  assert.throws(
+    () => new DigestDeferralBuffer({ maxEntries: -1 }),
+    RangeError,
+  );
+  assert.throws(
+    () => new DigestDeferralBuffer({ maxEntries: 1.5 }),
+    RangeError,
+  );
+
+  // Outside quiet hours, all events are immediate
+  const normal = marketEvent(3, 2200);
+  const partitioned = partitionDigestEvents(
+    [normal],
+    { window: { start: 22, end: 6 } },
+    "2026-10-20T12:00:00Z",
+  );
+  assert.equal(partitioned.immediate.length, 1);
+  assert.equal(partitioned.deferred.length, 0);
 });
