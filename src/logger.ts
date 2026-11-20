@@ -30,6 +30,7 @@
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import { redactText } from "./redact.js";
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -296,10 +297,10 @@ function defaultState(): LoggerState {
 let state = defaultState();
 
 function redactLogText(text: string): string {
-  let out = text;
-  for (const secret of state.secrets) {
-    if (secret.length > 0) out = out.split(secret).join(LOG_REDACTED);
-  }
+  const out = redactText(text, {
+    secrets: state.secrets,
+    maxLen: Number.MAX_SAFE_INTEGER,
+  });
   return out.replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED);
 }
 
@@ -358,6 +359,15 @@ export const Logger = {
   },
   reset(): void {
     state = defaultState();
+  },
+  runWithConfig<T>(options: Partial<LoggerState>, fn: () => T): T {
+    const previous = { ...state, secrets: [...state.secrets] };
+    state = { ...state, ...options };
+    try {
+      return fn();
+    } finally {
+      state = previous;
+    }
   },
   getLevel(): LogLevel {
     return state.level;
