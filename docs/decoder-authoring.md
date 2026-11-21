@@ -276,6 +276,7 @@ Failure detection in `decodeEvent` follows a strict sequence:
      - Individual topic XDR $\le$ `MAX_EVENT_TOPIC_XDR_BYTES` (1,024 bytes / 1 KiB).
      - Thrown before `scValToNative(event.value)` allocates JavaScript objects.
 3. **Value Deserialization (Guarded Catch):**
+   - [`findDuplicateMapKey`](../src/stellar/generic-decode.ts) inspects `ScVal` maps (and nested vectors/maps) for conflicting duplicate keys (including cross-type JS property key collisions such as `scvSymbol("stake")` vs `scvString("stake")`) **before** conversion to JavaScript objects. Both `decodeEvent` and `decodeGenericEvent` reject colliding maps with a bounded `unknown` event diagnostic (`reason` $\le 200$ chars).
    - Deserialization errors from `scValToNative(event.value)` return `{ name: "unknown", eventName, reason: "malformed XDR value: ..." }`.
 4. **Field-Level Validation Errors (Caught by Outer Catch):**
    - Thrown by scalar helpers when a field is missing, has an unexpected type, or exceeds bounds. Caught by the outer `try/catch` and formatted using `diagnostic(err)`.
