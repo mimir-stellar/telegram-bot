@@ -213,6 +213,7 @@ checkout; the Docker image already includes the compiled CLI.
 npm run cursor -- backup
 npm run cursor -- backup --out /safe-storage/cursor-before-deploy.json
 npm run cursor -- restore --from /safe-storage/cursor-before-deploy.json --force
+npm run cursor -- history
 ```
 
 Restore validates and normalizes the backup to the current version-1 cursor
@@ -223,6 +224,14 @@ command fail; stale locks are handled by the same PID check used at startup.
 Restoring an existing cursor requires `--force`; malformed or future-version
 files are always rejected. The command prints only paths, schema version, and
 target count, never opaque cursor contents.
+
+Cursor recovery actions (automatic floor rewinds, operator restores, and
+corrupt-file quarantines) append a bounded entry to `recoveryHistory` (at most
+20 most-recent entries) inside `CURSOR_FILE`. Each entry records the UTC
+timestamp, reason, and before/after target positions (`cursor`,
+`lastEventLedger`, and optional `rewindFromLedger`) — never event payloads,
+event IDs, or secrets. Run `npm run cursor -- history` to inspect a summary of
+retained recovery entries without printing opaque cursor strings.
 
 Keep backups on persistent storage separate from the deployment's writable
 cursor when possible. On Railway, a one-off command must use the same attached
@@ -1097,6 +1106,7 @@ Configuration (see `.env.example`):
 - `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
+- `HEALTH_AUTH_TOKEN` — optional bearer token for all health/metrics routes; an Authorization header over 4096 UTF-8 bytes (including `Bearer `) is rejected with the same empty `401` as any malformed value
 - A stale cursor rejection independently makes `GET /health` return `503` until its target scans successfully; `HEALTH_STALE_MS` does not disable this cursor alert.
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)

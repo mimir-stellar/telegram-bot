@@ -1,0 +1,45 @@
+{
+  "contractVersion": 1,
+  "additions": [
+    { "path": ["futureField"], "value": true },
+    { "path": ["poller", "futureField"], "value": 2 },
+    { "path": ["poller", "deadLetter", "futureField"], "value": 2 },
+    { "path": ["poller", "lastError", "futureField"], "value": true },
+    { "path": ["poller", "lastRestartGap", "futureField"], "value": true },
+    { "path": ["poller", "targets", 1, "futureField"], "value": "added" },
+    { "path": ["config", "futureField"], "value": true },
+    { "path": ["config", "envFile", "futureField"], "value": true },
+    { "path": ["config", "entries", 0, "futureField"], "value": true },
+    { "path": ["config", "counts", "future-source"], "value": 0 }
+  ],
+  "breakingChanges": [
+    {
+      "operation": "remove",
+      "path": ["status"],
+      "errors": ["$: missing required property \"status\""]
+    },
+    {
+      "operation": "remove",
+      "path": ["poller", "cycles"],
+      "errors": ["$.poller: missing required property \"cycles\""]
+    },
+    {
+      "operation": "rename",
+      "path": ["status"],
+      "newPath": ["state"],
+      "errors": ["$: missing required property \"status\""]
+    },
+    {
+      "operation": "replace",
+      "path": ["poller", "targets", 1, "lastEventLedger"],
+      "value": "4950",
+      "errors": ["$.poller.targets[1].lastEventLedger: expected integer or null, got string"]
+    },
+    {
+      "operation": "replace",
+      "path": ["status"],
+      "value": "warning",
+      "errors": ["$.status: \"warning\" is not one of \"ok\", \"degraded\", \"stopped\""]
+    }
+  ]
+}

@@ -72,6 +72,13 @@ export interface MetricsRegistry {
   /** Total events the decoder handed back with payload.name === "unknown", plus
    *  those dropped by the MAX_NOTIFICATIONS_PER_CYCLE cap. */
   eventsSkipped: Counter;
+  /** Total events intentionally filtered out (e.g. feature flags or filter rules).
+   *  Excluded from the delivery failure-rate denominator. */
+  eventsFiltered: Counter;
+  /** Intentionally filtered events dropped by NOTIFY_* feature flags. */
+  eventsFilteredFeatureFlag: Counter;
+  /** Intentionally filtered events dropped by category/filter rules (null formatted text). */
+  eventsFilteredRule: Counter;
   /** Total Telegram messages successfully sent. */
   notificationsSent: Counter;
   /** Total Telegram sends that threw (the cursor still advances). */
@@ -89,6 +96,24 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /** Total confirmed notifications with a known ledger close time (includes 0ms lag). */
+  notificationAgeSamples: Counter;
+  /** Total confirmed notifications whose event lacked a valid ledger close time. */
+  notificationAgeMissingLedgerTime: Counter;
+  /** Cumulative end-to-end notification age in milliseconds across known-ledger-time samples. */
+  notificationAgeTotalMs: Counter;
+  /** End-to-end age in ms of the most recent confirmed notification with a known ledger time. */
+  lastNotificationAgeMs: Gauge;
+  /** Maximum observed end-to-end notification age in ms across confirmed sends. */
+  maxNotificationAgeMs: Gauge;
+
+  /**
+   * Record one confirmed notification's end-to-end age in milliseconds, or `null`
+   * when the source event lacked a valid ledger close time. Distinguishes missing
+   * ledger time (`notificationAgeMissingLedgerTime`) from zero delivery lag
+   * (`notificationAgeSamples` incremented with `0` ms).
+   */
+  recordNotificationAge(ageMs: number | null): void;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -167,6 +192,18 @@ export function createMetrics(): MetricsRegistry {
     `${METRICS_PREFIX}events_skipped_total`,
     "Total events not notified: unknown type, no formatter, or MAX_NOTIFICATIONS_PER_CYCLE cap.",
   );
+  const eventsFiltered = makeCounter(
+    `${METRICS_PREFIX}events_filtered_total`,
+    "Total events intentionally filtered out (excluded from failure-rate denominator).",
+  );
+  const eventsFilteredFeatureFlag = makeCounter(
+    `${METRICS_PREFIX}events_filtered_feature_flag_total`,
+    "Total events intentionally filtered out by NOTIFY_* feature flags.",
+  );
+  const eventsFilteredRule = makeCounter(
+    `${METRICS_PREFIX}events_filtered_rule_total`,
+    "Total events intentionally filtered out by category or filter rules.",
+  );
   const notificationsSent = makeCounter(
     `${METRICS_PREFIX}notifications_sent_total`,
     "Total Telegram messages successfully sent.",
@@ -195,6 +232,26 @@ export function createMetrics(): MetricsRegistry {
     `${METRICS_PREFIX}activity_anomalies_total`,
     "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
   );
+  const notificationAgeSamples = makeCounter(
+    `${METRICS_PREFIX}notification_age_samples_total`,
+    "Total confirmed notifications with a known ledger close time (includes 0ms lag).",
+  );
+  const notificationAgeMissingLedgerTime = makeCounter(
+    `${METRICS_PREFIX}notification_age_missing_ledger_time_total`,
+    "Total confirmed notifications whose event lacked a valid ledger close time.",
+  );
+  const notificationAgeTotalMs = makeCounter(
+    `${METRICS_PREFIX}notification_age_ms_total`,
+    "Cumulative end-to-end notification age in milliseconds from ledger close time to confirmed send.",
+  );
+  const lastNotificationAgeMs = makeGauge(
+    `${METRICS_PREFIX}last_notification_age_ms`,
+    "End-to-end age in milliseconds of the most recent confirmed notification with a known ledger close time.",
+  );
+  const maxNotificationAgeMs = makeGauge(
+    `${METRICS_PREFIX}max_notification_age_ms`,
+    "Maximum observed end-to-end notification age in milliseconds from ledger close time to confirmed send.",
+  );
 
   const counters = [
     pollCycles,
@@ -202,12 +259,38 @@ export function createMetrics(): MetricsRegistry {
     rpcErrors,
     eventsDecoded,
     eventsSkipped,
+    eventsFiltered,
+    eventsFilteredFeatureFlag,
+    eventsFilteredRule,
     notificationsSent,
     notificationsFailed,
     staleCursorEvents,
     activityAnomalies,
+    notificationAgeSamples,
+    notificationAgeMissingLedgerTime,
+    notificationAgeTotalMs,
   ];
-  const gauges = [consecutiveFailures, lastCycleEvents, activityBaselineEvents];
+  const gauges = [
+    consecutiveFailures,
+    lastCycleEvents,
+    activityBaselineEvents,
+    lastNotificationAgeMs,
+    maxNotificationAgeMs,
+  ];
+
+  function recordNotificationAge(ageMs: number | null): void {
+    if (ageMs === null || typeof ageMs !== "number" || !Number.isFinite(ageMs)) {
+      notificationAgeMissingLedgerTime.inc();
+      return;
+    }
+    const clampedMs = Math.max(0, Math.round(ageMs));
+    notificationAgeSamples.inc();
+    notificationAgeTotalMs.inc(clampedMs);
+    lastNotificationAgeMs.set(clampedMs);
+    if (clampedMs > maxNotificationAgeMs.value()) {
+      maxNotificationAgeMs.set(clampedMs);
+    }
+  }
 
   function render(): string {
     const lines: string[] = [];
@@ -234,7 +317,11 @@ export function createMetrics(): MetricsRegistry {
 
     // Only GET is meaningful for a read-only metrics endpoint.
     if (method !== "GET") {
-      res.writeHead(405, { "Content-Type": "text/plain", Allow: "GET" });
+      res.writeHead(405, {
+        "Content-Type": "text/plain",
+        Allow: "GET",
+        "Cache-Control": "no-store",
+      });
       res.end("Method Not Allowed\n");
       return;
     }
@@ -255,12 +342,18 @@ export function createMetrics(): MetricsRegistry {
     }
 
     if (path === "/health") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.writeHead(200, {
+        "Content-Type": "text/plain",
+        "Cache-Control": "no-store",
+      });
       res.end("OK\n");
       return;
     }
 
-    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.writeHead(404, {
+      "Content-Type": "text/plain",
+      "Cache-Control": "no-store",
+    });
     res.end("Not Found\n");
   }
 
@@ -299,6 +392,9 @@ export function createMetrics(): MetricsRegistry {
     rpcErrors,
     eventsDecoded,
     eventsSkipped,
+    eventsFiltered,
+    eventsFilteredFeatureFlag,
+    eventsFilteredRule,
     notificationsSent,
     notificationsFailed,
     staleCursorEvents,
@@ -306,9 +402,25 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    notificationAgeSamples,
+    notificationAgeMissingLedgerTime,
+    notificationAgeTotalMs,
+    lastNotificationAgeMs,
+    maxNotificationAgeMs,
+    recordNotificationAge,
     render,
     startServer,
   };
 }
 
 export type Metrics = ReturnType<typeof createMetrics>;
+
+/**
+ * Compute the delivery failure rate over actual delivery attempts (`sent + failed`).
+ * Intentionally filtered events are excluded from the denominator.
+ */
+export function deliveryFailureRate(sent: number, failed: number): number {
+  const attempts = sent + failed;
+  if (attempts <= 0 || !Number.isFinite(attempts)) return 0;
+  return failed / attempts;
+}

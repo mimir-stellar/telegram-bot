@@ -115,17 +115,20 @@ Emitted by top-level Node.js error listeners.
 ### Field Bounds
 To protect log aggregators and prevent denial-of-service via massive RPC payloads:
 - **String length truncation**: Any string field value longer than `MAX_LOG_FIELD_CHARS` (`1,000` characters) is truncated to 999 characters and suffixed with an ellipsis (`…`).
-- **Object depth limit**: Deeply nested JSON structures are traversed up to `MAX_FIELD_DEPTH` (`4` levels). Anything deeper is replaced with `"[depth-limit]"`, protecting against circular references.
+- **Object depth limit & circular references**: Deeply nested JSON structures are traversed up to `MAX_FIELD_DEPTH` (`4` levels). Anything deeper is replaced with `"[depth-limit]"`, and circular references encountered during error redaction (`redactError`) are replaced with `"[circular]"`.
 - **BigInt serialization**: `BigInt` values are converted to standard numeric strings (`value.toString()`).
-- **Undefined & Functions**: Object keys whose values are `undefined` or functions are stripped before JSON serialization.
-- **Fail-safe fallback**: If serializing `fields` throws unexpectedly, the logger emits the bare sanitized `msg` string so the process never crashes on logging.
+- **Unsupported & Exotic values**: Symbols and functions are safely replaced with bounded sentinels (`"[unsupported:symbol]"`, `"[unsupported:function]"`), or omitted when undefined.
+- **Fail-safe fallback**: If serializing `fields` throws unexpectedly (e.g., via a throwing property getter), the logger retains the original event level and emits the sanitized `msg` string so polling and the process never terminate on logging.
 
 ### Redaction Rules
-Every log record is redacted before it leaves the process:
+Every log record is redacted before it leaves the process via the shared redaction policy in `src/redact.ts`:
 1. **Registered Secrets**: Explicit secrets such as `config.botToken` and `config.chatId` are replaced with `[REDACTED]`.
-2. **Telegram Token Pattern**: Any substring matching Telegram bot token shape (`\b\d{5,}:[A-Za-z0-9_-]{20,}/g`) is automatically replaced with `[REDACTED]`, even if not explicitly registered in secrets configuration.
+2. **Credential Patterns**: Telegram bot tokens (`bot<digits>:<token>` and `<digits>:<token>`), Stellar `S…` seed strkeys, URL userinfo and credential-bearing query parameters, `Bearer …` headers, and `TOKEN=`/`SECRET=`/`PASSWORD=`/`AUTHORIZATION:` key-value pairs are automatically replaced with `[REDACTED]`.
 3. **URL Redaction**: Internal helpers (`redactUrl`) mask HTTP basic auth or query credentials in URLs before logging.
 4. **All Fields Protected**: Redaction applies recursively to both the log `msg` and all string values in custom `fields`.
+
+### Redaction Policy Self-Check (`npm run doctor`)
+`npm run doctor` runs a `redaction-policy` self-check that passes synthetic secret probes (registered secret, Telegram bot token, Stellar seed strkey, URL userinfo/query credentials, Bearer token, and env key-value secret) through all configured log formats (`text`, `json`). If any probe leaks, the check fails and reports only the leaked field names—never the probe values or raw log lines.
 
 ---
 

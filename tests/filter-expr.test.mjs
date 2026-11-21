@@ -3,7 +3,12 @@ import test from "node:test";
 
 import {
   EVENT_PAYLOAD_SCHEMAS,
+  FilterDepthLimitError,
   FilterParseError,
+  FilterTokenLimitError,
+  MAX_FILTER_DEPTH,
+  MAX_FILTER_TOKENS,
+  countFilterTokens,
   evaluateFilterRule,
   parseFilterExpression,
   parseUsdcStringToUnits,
@@ -289,4 +294,188 @@ test("parseUsdcStringToUnits: atomic unit conversion utility", () => {
   assert.equal(parseUsdcStringToUnits("100"), 1_000_000_000n);
   assert.equal(parseUsdcStringToUnits("0.0000001"), 1n);
   assert.equal(parseUsdcStringToUnits("2.5"), 25_000_000n);
+
+  // Canonical equivalent decimal strings normalize identically
+  for (const equivalent of ["10.5", "010.5", "10.50", "10.5000000", " 010.50 "]) {
+    assert.equal(parseUsdcStringToUnits(equivalent), 105_000_000n);
+  }
+
+  // Values exceeding 7 fractional digits (including trailing zeros) are rejected
+  assert.throws(
+    () => parseUsdcStringToUnits("1.00000000"),
+    (err) => err instanceof FilterParseError && /exceeds maximum precision of 7 decimals/.test(err.message),
+  );
 });
+
+test("evaluateFilterRule: normalizes equivalent decimal USDC thresholds before comparison", () => {
+  const equivalentExpressions = [
+    "claim_challenged where stake >= 10.5",
+    "claim_challenged where stake >= 10.50",
+    "claim_challenged where stake >= 010.5000000",
+    "claim_challenged where stake >= 10.5 USDC",
+    "claim_challenged where stake >= $10.50",
+  ];
+
+  const belowEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    stake: 104_999_999n, // 10.4999999 USDC
+  });
+  const exactEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    stake: 105_000_000n, // 10.5000000 USDC
+  });
+  const aboveEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    stake: 105_000_001n, // 10.5000001 USDC
+  });
+
+  for (const expr of equivalentExpressions) {
+    const rule = parseFilterExpression(expr);
+    assert.equal(evaluateFilterRule(rule, belowEvent), false, `belowEvent failed for: ${expr}`);
+    assert.equal(evaluateFilterRule(rule, exactEvent), true, `exactEvent failed for: ${expr}`);
+    assert.equal(evaluateFilterRule(rule, aboveEvent), true, `aboveEvent failed for: ${expr}`);
+  }
+});
+
+test("parseFilterExpression: rejects bare and explicit decimal USDC thresholds exceeding 7 fractional digits", () => {
+  const invalidExpressions = [
+    "claim_challenged where stake >= 1.12345678",
+    "deposited where amount >= 1.00000000",
+    "claim_challenged where stake >= $1.00000000",
+    "deposited where amount == 0.00000001 USDC",
+  ];
+
+  for (const expr of invalidExpressions) {
+    assert.throws(
+      () => parseFilterExpression(expr),
+      (err) => err instanceof FilterParseError && /exceeds maximum precision of 7 decimals/.test(err.message),
+      `Expected FilterParseError for: ${expr}`,
+    );
+  }
+});
+
+// ----------------------------------------------------
+// Bounded Token Count & Nesting Depth Security Limits
+// ----------------------------------------------------
+
+test("countFilterTokens: accurately counts non-EOF tokens in valid expression", () => {
+  const count = countFilterTokens("claim_challenged where stake >= 100");
+  assert.equal(count, 5);
+});
+
+test("countFilterTokens: throws FilterTokenLimitError when token count exceeds limit", () => {
+  assert.throws(
+    () => countFilterTokens("claim_challenged where stake >= 100", 4),
+    (err) => {
+      assert.ok(err instanceof FilterTokenLimitError);
+      assert.equal(err.count, 5);
+      assert.equal(err.limit, 4);
+      assert.match(err.message, /exceeds maximum token limit of 4 \(got 5\)/);
+      return true;
+    },
+  );
+});
+
+test("parseFilterExpression: accepts expression within MAX_FILTER_TOKENS limit", () => {
+  // Build an expression with exactly MAX_FILTER_TOKENS tokens (100 tokens)
+  // "where category == 'cat'" is 4 tokens ("where", "category", "==", "'cat'")
+  // Each " or category == 'cat'" adds 4 tokens ("or", "category", "==", "'cat'")
+  // 4 + 24 * 4 = 100 tokens
+  const parts = ["where category == 'cat'"];
+  for (let i = 0; i < 24; i++) {
+    parts.push("or category == 'cat'");
+  }
+  const expr = parts.join(" ");
+  assert.equal(countFilterTokens(expr), MAX_FILTER_TOKENS);
+  const rule = parseFilterExpression(expr);
+  assert.ok(rule.condition);
+});
+
+test("parseFilterExpression: rejects expressions exceeding MAX_FILTER_TOKENS before AST parsing", () => {
+  // 101 tokens: 100 tokens + 1 extra
+  const parts = ["where category == 'cat'"];
+  for (let i = 0; i < 32; i++) {
+    parts.push("or category == 'cat'");
+  }
+  parts.push("or true"); // 2 more tokens -> 102 tokens
+  const expr = parts.join(" ");
+
+  assert.throws(
+    () => parseFilterExpression(expr),
+    (err) => {
+      assert.ok(err instanceof FilterTokenLimitError);
+      assert.equal(err.limit, MAX_FILTER_TOKENS);
+      assert.ok(err.count > MAX_FILTER_TOKENS);
+      assert.match(err.message, /exceeds maximum token limit/);
+      return true;
+    },
+  );
+});
+
+test("parseFilterExpression: respects custom maxTokens option", () => {
+  const expr = "claim_challenged where stake >= 100";
+  // 5 tokens, limit to 4
+  assert.throws(
+    () => parseFilterExpression(expr, { maxTokens: 4 }),
+    (err) => {
+      assert.ok(err instanceof FilterTokenLimitError);
+      assert.equal(err.limit, 4);
+      assert.equal(err.count, 5);
+      return true;
+    },
+  );
+
+  // limit to 5 succeeds
+  const rule = parseFilterExpression(expr, { maxTokens: 5 });
+  assert.equal(rule.eventName, "claim_challenged");
+});
+
+test("parseFilterExpression: accepts nesting depth up to MAX_FILTER_DEPTH", () => {
+  // Nesting depth 10: ((((((((((active == true))))))))))
+  const leftParens = "(".repeat(MAX_FILTER_DEPTH);
+  const rightParens = ")".repeat(MAX_FILTER_DEPTH);
+  const expr = `where ${leftParens}active == true${rightParens}`;
+  const rule = parseFilterExpression(expr);
+  assert.ok(rule.condition);
+});
+
+test("parseFilterExpression: rejects expressions exceeding MAX_FILTER_DEPTH to prevent call stack recursion", () => {
+  // Nesting depth 11: (((((((((((active == true)))))))))))
+  const leftParens = "(".repeat(MAX_FILTER_DEPTH + 1);
+  const rightParens = ")".repeat(MAX_FILTER_DEPTH + 1);
+  const expr = `where ${leftParens}active == true${rightParens}`;
+
+  assert.throws(
+    () => parseFilterExpression(expr),
+    (err) => {
+      assert.ok(err instanceof FilterDepthLimitError);
+      assert.equal(err.limit, MAX_FILTER_DEPTH);
+      assert.equal(err.depth, MAX_FILTER_DEPTH + 1);
+      assert.match(err.message, /exceeds maximum nesting depth of 10/);
+      return true;
+    },
+  );
+});
+
+test("parseFilterExpression: respects custom maxDepth option", () => {
+  const expr = "where ((active == true))"; // depth 2
+  assert.throws(
+    () => parseFilterExpression(expr, { maxDepth: 1 }),
+    (err) => {
+      assert.ok(err instanceof FilterDepthLimitError);
+      assert.equal(err.limit, 1);
+      assert.equal(err.depth, 2);
+      return true;
+    },
+  );
+
+  const rule = parseFilterExpression(expr, { maxDepth: 2 });
+  assert.ok(rule.condition);
+});
+

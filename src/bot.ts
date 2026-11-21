@@ -66,6 +66,7 @@ export {
 export { TELEGRAM_OPTIONS, isChatAllowed, isOperator } from "./commands/runtime.js";
 export {
   aboutMessage,
+  categoriesMessage,
   helpMessage,
   contractsMessage,
   healthMessage,
@@ -99,6 +100,7 @@ export {
   registerBroadcastHandlers,
   handleBroadcastCommand,
   getConfiguredBroadcastChats,
+  fingerprintDestinationSet,
   BroadcastStore,
   sendBroadcast,
 } from "./commands/broadcast.js";

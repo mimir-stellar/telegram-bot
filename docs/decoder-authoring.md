@@ -343,6 +343,14 @@ Every decoder PR must add or update tests in [`tests/version-decoders.test.mjs`]
 * **`tests/version-decoders.test.mjs`:** **Mandatory.** Construct focused synthetic `ScVal` events inline using `@stellar/stellar-sdk` (`xdr.ScVal.scvSymbol`, `xdr.ScVal.scvMap`, etc.).
 * **`tests/fixtures/events.mjs` and `tests/decode-fixtures.test.mjs`:** **Optional for incremental fields.** Only update these golden fixtures if introducing a brand new top-level event type that belongs in the general end-to-end event fixture suite.
 
+### 7.4 Semantic Fingerprint & Drift Detection
+
+Decoder output drift is tracked with a versioned SHA-256 semantic fingerprint in [`src/stellar/decoder-fingerprint.ts`](../src/stellar/decoder-fingerprint.ts) (re-exported from `src/stellar/decode.ts` and `src/stellar/generic-decode.ts`):
+
+* **Canonical hashing (`DECODER_FINGERPRINT_VERSION = "v1"`):** `fingerprintDecodedEvent`, `fingerprintGenericEvent`, and `fingerprintDecoderOutput` hash only canonical metadata and payload fields with sorted keys and explicit type tags (`$bigint`, `$bytes`, `$nonFinite`). Presentation-only text—such as `GenericDecodedEvent.summary`, `topicSummary`, `valueSummary`, `payload.summary`, and `UnknownPayload.reason`—is excluded so formatting or diagnostic prose tweaks do not cause false-positive drift.
+* **Reviewed fixture baseline:** [`tests/fixtures/decoder-fingerprints.v1.json`](../tests/fixtures/decoder-fingerprints.v1.json) stores the reviewed semantic fingerprints for typed (`market`, `squad`, `admin`, `unknown`) and generic decoder fixtures.
+* **Breaking-change reporting:** `compareFixtureFingerprints` and `formatDriftReport` classify removed fields, value changes, type changes, version mismatches, and missing fixtures as **breaking** (`hasBreakingChanges: true`), while additive optional fields are reported as **non-breaking**. Run `node --test tests/decoder-fingerprint.test.mjs` to verify decoder output stability against the reviewed fixtures.
+
 ---
 
 ## 8. Contributor PR Checklist

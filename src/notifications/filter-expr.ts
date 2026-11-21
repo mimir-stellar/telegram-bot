@@ -10,9 +10,20 @@
  *     USDC amounts with optional USDC suffix (e.g. 100 USDC or $100 or 100), and booleans (true, false).
  *   - Pure evaluation over DecodedEvent without eval or dynamic code execution.
  *   - Static field validation and type compatibility checking against known payload types.
+ *   - Bounded token count (max 100 tokens) and nesting depth (max 10) to guard against
+ *     hostile allocation spikes or recursion depth exhaustion before and during parsing.
+ *   - Dry-run diagnostics that report a missing payload field separately from a false
+ *     predicate (`evaluateFilterRuleDiagnostic`, `evaluateFilterDryRun`), while
+ *     `evaluateFilterRule` keeps its existing boolean allow-or-deny contract.
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
+import {
+  evaluateThresholdDiagnostic,
+  InvalidThresholdError,
+  parseUsdcThreshold,
+  type AmountThresholds,
+} from "./amount-threshold.js";
 
 /** USDC atomic unit divisor (7 decimal places). */
 export const USDC_SCALE = 10_000_000n;
@@ -158,6 +169,40 @@ export const EVENT_PAYLOAD_SCHEMAS: Record<string, Record<string, FieldDefinitio
   },
 };
 
+/** Maximum allowed non-EOF tokens in a single filter expression before parsing. */
+export const MAX_FILTER_TOKENS = 100;
+
+/** Maximum allowed nesting depth for parentheses in filter expressions. */
+export const MAX_FILTER_DEPTH = 10;
+
+/** Error thrown when a filter expression exceeds the maximum allowed token count. */
+export class FilterTokenLimitError extends Error {
+  public readonly count: number;
+  public readonly limit: number;
+
+  constructor(count: number, limit: number = MAX_FILTER_TOKENS) {
+    super(`Filter expression exceeds maximum token limit of ${limit} (got ${count})`);
+    this.name = "FilterTokenLimitError";
+    this.count = count;
+    this.limit = limit;
+  }
+}
+
+/** Error thrown when a filter expression exceeds the maximum allowed nesting depth. */
+export class FilterDepthLimitError extends Error {
+  public readonly depth: number;
+  public readonly limit: number;
+  public readonly position: number;
+
+  constructor(depth: number, limit: number = MAX_FILTER_DEPTH, position = 0) {
+    super(`At character ${position}: Filter expression exceeds maximum nesting depth of ${limit} (depth ${depth})`);
+    this.name = "FilterDepthLimitError";
+    this.depth = depth;
+    this.limit = limit;
+    this.position = position;
+  }
+}
+
 /** Parse / Validation Error with character position. */
 export class FilterParseError extends Error {
   public readonly position: number;
@@ -175,7 +220,7 @@ export type ComparisonOp = "==" | "!=" | "<" | "<=" | ">" | ">=";
 /** Value literals supported by the AST. */
 export type LiteralValue =
   | { kind: "string"; value: string }
-  | { kind: "number"; value: number }
+  | { kind: "number"; value: number; raw?: string }
   | { kind: "boolean"; value: boolean }
   | { kind: "usdc"; atomic: bigint; rawDecimal: string };
 
@@ -430,20 +475,62 @@ class Lexer {
 
 /** Convert a decimal string to 7-decimal atomic bigint. */
 export function parseUsdcStringToUnits(numStr: string, pos = 0): bigint {
-  const parts = numStr.split(".");
-  const wholeStr = parts[0] ?? "";
-  const fracStr = parts[1] ?? "";
-
-  if (fracStr.length > 7) {
+  const trimmed = numStr.trim();
+  const parts = trimmed.split(".");
+  if (parts.length === 2 && (parts[1]?.length ?? 0) > 7) {
     throw new FilterParseError(
-      `USDC amount "${numStr}" exceeds maximum precision of 7 decimals`,
+      `USDC amount "${trimmed}" exceeds maximum precision of 7 decimals`,
       pos,
     );
   }
 
-  const whole = BigInt(wholeStr);
-  const frac = BigInt(fracStr.padEnd(7, "0"));
-  return whole * USDC_SCALE + frac;
+  try {
+    return parseUsdcThreshold(trimmed);
+  } catch (err) {
+    if (err instanceof InvalidThresholdError) {
+      throw new FilterParseError(err.message, pos);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Options for configuring filter expression parsing.
+ */
+export interface FilterParserOptions {
+  /**
+   * Maximum allowed non-EOF tokens in the expression.
+   * Defaults to {@link MAX_FILTER_TOKENS} (100).
+   */
+  maxTokens?: number;
+  /**
+   * Maximum allowed nesting depth for parentheses.
+   * Defaults to {@link MAX_FILTER_DEPTH} (10).
+   */
+  maxDepth?: number;
+}
+
+/**
+ * Counts the tokens in a filter expression by running a streaming lexer pass
+ * without allocating an AST or holding an array of tokens.
+ *
+ * @throws {@link FilterTokenLimitError} if token count exceeds maxTokens.
+ * @throws {@link FilterParseError} on lexical syntax errors.
+ */
+export function countFilterTokens(input: string, maxTokens: number = MAX_FILTER_TOKENS): number {
+  const lexer = new Lexer(input);
+  let count = 0;
+  while (true) {
+    const token = lexer.nextToken();
+    if (token.type === "EOF") {
+      break;
+    }
+    count++;
+    if (count > maxTokens) {
+      throw new FilterTokenLimitError(count, maxTokens);
+    }
+  }
+  return count;
 }
 
 // ----------------------------------------------------
@@ -453,14 +540,30 @@ export function parseUsdcStringToUnits(numStr: string, pos = 0): bigint {
 export class FilterParser {
   private lexer: Lexer;
   private currentToken: Token;
+  private tokenCount = 0;
+  private currentDepth = 0;
+  private readonly maxTokens: number;
+  private readonly maxDepth: number;
 
-  constructor(input: string) {
+  constructor(input: string, options?: FilterParserOptions) {
+    this.maxTokens = options?.maxTokens ?? MAX_FILTER_TOKENS;
+    this.maxDepth = options?.maxDepth ?? MAX_FILTER_DEPTH;
+
+    // Bound token count upfront to reject excessive tokens and avoid deep recursion/allocation spikes
+    countFilterTokens(input, this.maxTokens);
+
     this.lexer = new Lexer(input);
-    this.currentToken = this.lexer.nextToken();
+    this.currentToken = this.advance();
   }
 
   private advance(): Token {
     this.currentToken = this.lexer.nextToken();
+    if (this.currentToken.type !== "EOF") {
+      this.tokenCount++;
+      if (this.tokenCount > this.maxTokens) {
+        throw new FilterTokenLimitError(this.tokenCount, this.maxTokens);
+      }
+    }
     return this.currentToken;
   }
 
@@ -549,11 +652,17 @@ export class FilterParser {
 
   private parsePrimary(): ExprNode {
     if (this.currentToken.type === "LPAREN") {
+      const parenPos = this.currentToken.pos;
+      this.currentDepth++;
+      if (this.currentDepth > this.maxDepth) {
+        throw new FilterDepthLimitError(this.currentDepth, this.maxDepth, parenPos);
+      }
       this.advance();
       const expr = this.parseExpression();
       if ((this.currentToken.type as TokenType) !== "RPAREN") {
         throw new FilterParseError("Expected closing ')'", this.currentToken.pos);
       }
+      this.currentDepth--;
       this.advance();
       return expr;
     }
@@ -611,7 +720,7 @@ export class FilterParser {
 
     if (tok.type === "NUMBER") {
       this.advance();
-      return { kind: "number", value: tok.value as number };
+      return { kind: "number", value: tok.value as number, raw: tok.text };
     }
 
     if (tok.type === "IDENTIFIER") {
@@ -690,6 +799,10 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
             node.valuePos,
           );
         }
+        if (node.value.kind === "number") {
+          const raw = node.value.raw ?? String(node.value.value);
+          parseUsdcStringToUnits(raw, node.valuePos);
+        }
         break;
 
       case "number":
@@ -712,17 +825,75 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
 
 /**
  * Parses a filter expression string into a structured {@link FilterRule}.
+ * Bounds token count and nesting depth upfront to prevent allocation spikes
+ * or deep recursion on hostile input.
  *
+ * @param input The raw filter expression string.
+ * @param options Optional limits on tokens ({@link MAX_FILTER_TOKENS}) and depth ({@link MAX_FILTER_DEPTH}).
+ * @throws {@link FilterTokenLimitError} if token count exceeds maxTokens.
+ * @throws {@link FilterDepthLimitError} if parentheses nesting depth exceeds maxDepth.
  * @throws {@link FilterParseError} on invalid syntax, unknown fields, or type mismatches.
  */
-export function parseFilterExpression(input: string): FilterRule {
-  const parser = new FilterParser(input.trim());
+export function parseFilterExpression(input: string, options?: FilterParserOptions): FilterRule {
+  const parser = new FilterParser(input.trim(), options);
   return parser.parseRule(input);
 }
 
 // ----------------------------------------------------
 // Evaluator
 // ----------------------------------------------------
+
+/** Why a filter rule allowed or denied an event, for dry-run diagnostics. */
+export type FilterRuleDiagnosticReason =
+  | "event-name-mismatch"
+  | "missing-field"
+  | "predicate-false";
+
+/** Diagnostic result of evaluating one filter rule against one event. */
+export interface FilterRuleDiagnostic {
+  matched: boolean;
+  /** Set when `matched` is false. */
+  reason?: FilterRuleDiagnosticReason;
+  /** Payload field responsible for a `missing-field` result. */
+  field?: string;
+}
+
+/**
+ * Evaluates a parsed FilterRule and explains a denial.
+ *
+ * A comparison against an absent (or null) payload field reports
+ * `"missing-field"`; the same comparison against a present field that does
+ * not satisfy the predicate reports `"predicate-false"`. Both deny, so live
+ * allow-or-deny behavior is unchanged.
+ *
+ * @param rule The parsed filter rule.
+ * @param event The DecodedEvent to evaluate.
+ */
+export function evaluateFilterRuleDiagnostic(
+  rule: FilterRule,
+  event: DecodedEvent,
+): FilterRuleDiagnostic {
+  const payload = event.payload as Record<string, unknown>;
+
+  // Check event name match if specified
+  if (rule.eventName && rule.eventName !== payload.name) {
+    return { matched: false, reason: "event-name-mismatch" };
+  }
+
+  // If there's no condition, matching event name (or any event if unset) is enough
+  if (!rule.condition) {
+    return { matched: true };
+  }
+
+  const result = evaluateNode(rule.condition, payload);
+  if (result.matched) {
+    return { matched: true };
+  }
+  if (result.missingField !== undefined) {
+    return { matched: false, reason: "missing-field", field: result.missingField };
+  }
+  return { matched: false, reason: "predicate-false" };
+}
 
 /**
  * Evaluates a parsed FilterRule against a DecodedEvent purely (no eval, no side effects).
@@ -732,41 +903,97 @@ export function parseFilterExpression(input: string): FilterRule {
  * @returns boolean true if the event satisfies the rule, false otherwise.
  */
 export function evaluateFilterRule(rule: FilterRule, event: DecodedEvent): boolean {
-  const payload = event.payload as Record<string, unknown>;
-
-  // Check event name match if specified
-  if (rule.eventName && rule.eventName !== payload.name) {
-    return false;
-  }
-
-  // If there's no condition, matching event name (or any event if unset) is enough
-  if (!rule.condition) {
-    return true;
-  }
-
-  return evaluateNode(rule.condition, payload);
+  return evaluateFilterRuleDiagnostic(rule, event).matched;
 }
 
-function evaluateNode(node: ExprNode, payload: Record<string, unknown>): boolean {
+interface NodeResult {
+  matched: boolean;
+  /** Set when a comparison could not run because the payload field is absent. */
+  missingField?: string;
+}
+
+function evaluateNode(node: ExprNode, payload: Record<string, unknown>): NodeResult {
   if (node.type === "logical") {
     if (node.op === "and") {
-      return evaluateNode(node.left, payload) && evaluateNode(node.right, payload);
+      const left = evaluateNode(node.left, payload);
+      return left.matched ? evaluateNode(node.right, payload) : left;
     }
-    if (node.op === "or") {
-      return evaluateNode(node.left, payload) || evaluateNode(node.right, payload);
+    const left = evaluateNode(node.left, payload);
+    if (left.matched) {
+      return left;
     }
+    const right = evaluateNode(node.right, payload);
+    if (right.matched) {
+      return right;
+    }
+    // Neither branch matched. Prefer the missing field: it is the actionable
+    // difference between a false predicate and an event that lacks the field.
+    return left.missingField !== undefined ? left : right;
   }
 
   if (node.type === "comparison") {
     const rawVal = payload[node.field];
     if (rawVal === undefined || rawVal === null) {
-      return false;
+      return { matched: false, missingField: node.field };
     }
 
-    return compareValues(rawVal, node.op, node.value);
+    return { matched: compareValues(rawVal, node.op, node.value) };
   }
 
-  return false;
+  return { matched: false };
+}
+
+/** Combined dry-run outcome for expression and amount-threshold filtering. */
+export type FilterDryRunDiagnosticReason =
+  | "matched"
+  | FilterRuleDiagnosticReason
+  | "below-threshold";
+
+/** Diagnostic result of a dry-run filter evaluation. */
+export interface FilterDryRunDiagnostic {
+  matched: boolean;
+  reason: FilterDryRunDiagnosticReason;
+  /** Payload field responsible for a `missing-field` or `below-threshold` result. */
+  field?: string;
+  /** Configured minimum, in atomic 7-decimal units, for a threshold denial. */
+  threshold?: bigint;
+}
+
+/**
+ * Dry-run evaluation of a filter expression plus optional USDC thresholds.
+ *
+ * Reports one reason per event: `"matched"`, `"event-name-mismatch"`,
+ * `"missing-field"`, `"predicate-false"`, or `"below-threshold"`. The
+ * expression is evaluated first (as in the live path), then the threshold.
+ * Live callers should keep using {@link evaluateFilterRule} and
+ * {@link meetsThreshold}; this helper only adds diagnostics.
+ */
+export function evaluateFilterDryRun(
+  rule: FilterRule,
+  event: DecodedEvent,
+  thresholds?: AmountThresholds,
+): FilterDryRunDiagnostic {
+  const ruleDiagnostic = evaluateFilterRuleDiagnostic(rule, event);
+  if (!ruleDiagnostic.matched) {
+    return ruleDiagnostic.reason === "missing-field"
+      ? { matched: false, reason: "missing-field", field: ruleDiagnostic.field }
+      : { matched: false, reason: ruleDiagnostic.reason ?? "predicate-false" };
+  }
+
+  const thresholdDiagnostic = evaluateThresholdDiagnostic(event, thresholds);
+  if (!thresholdDiagnostic.passed) {
+    if (thresholdDiagnostic.reason === "missing-field") {
+      return { matched: false, reason: "missing-field", field: thresholdDiagnostic.field };
+    }
+    return {
+      matched: false,
+      reason: "below-threshold",
+      field: thresholdDiagnostic.field,
+      threshold: thresholdDiagnostic.threshold,
+    };
+  }
+
+  return { matched: true, reason: "matched" };
 }
 
 function compareValues(
@@ -780,7 +1007,8 @@ function compareValues(
     if (literal.kind === "usdc") {
       targetBigInt = literal.atomic;
     } else if (literal.kind === "number") {
-      targetBigInt = BigInt(Math.floor(literal.value)) * USDC_SCALE;
+      const raw = literal.raw ?? String(literal.value);
+      targetBigInt = parseUsdcStringToUnits(raw);
     } else {
       return false;
     }

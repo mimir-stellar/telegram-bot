@@ -655,3 +655,10 @@ export function decodeGenericEvent(
     },
   };
 }
+
+export {
+  DECODER_FINGERPRINT_VERSION,
+  fingerprintGenericEvent,
+  fingerprintDecoderOutput,
+  type SemanticFingerprint,
+} from "./decoder-fingerprint.js";

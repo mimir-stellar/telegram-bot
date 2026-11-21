@@ -8,8 +8,78 @@
 
 import type { rpc } from "@stellar/stellar-sdk";
 
+import { resolveMaxBackoffMs } from "./client.js";
+
 /** Default ceiling on the number of events permitted in a single RPC response. */
 export const DEFAULT_MAX_EVENTS_PER_RESPONSE = 1_000;
+
+export type RpcNetworkIdentityProblem =
+  | "not-an-object"
+  | "malformed-passphrase"
+  | "passphrase-mismatch";
+
+/**
+ * Error thrown when an RPC endpoint's `getNetwork` response fails network
+ * identity validation.
+ *
+ * Messages are strictly bounded and never echo configured or reported
+ * passphrases.
+ */
+export class RpcNetworkIdentityError extends Error {
+  readonly problem: RpcNetworkIdentityProblem;
+
+  constructor(problem: RpcNetworkIdentityProblem, message: string) {
+    super(message);
+    this.name = "RpcNetworkIdentityError";
+    this.problem = problem;
+  }
+}
+
+export interface VerifiedNetworkIdentity {
+  passphrase: string;
+}
+
+/**
+ * Validate a `getNetwork` RPC response against the configured network passphrase.
+ *
+ * Rejects non-object payloads, missing or non-string passphrases, and endpoints
+ * reporting a different network passphrase than configured. Error messages are
+ * bounded and never echo the raw passphrases.
+ *
+ * @param value The raw `getNetwork` response value to validate.
+ * @param expectedPassphrase The configured Stellar network passphrase.
+ * @returns The verified network identity.
+ * @throws {RpcNetworkIdentityError} When the response is malformed or serves another network.
+ */
+export function assertNetworkIdentity(
+  value: unknown,
+  expectedPassphrase: string,
+): VerifiedNetworkIdentity {
+  if (!isRecord(value)) {
+    throw new RpcNetworkIdentityError(
+      "not-an-object",
+      `RPC getNetwork response must be an object; got ${value === null ? "null" : typeof value}`,
+    );
+  }
+
+  const rpcPassphrase = value.passphrase;
+  if (typeof rpcPassphrase !== "string") {
+    throw new RpcNetworkIdentityError(
+      "malformed-passphrase",
+      `RPC getNetwork returned a malformed passphrase (expected a string; got ${typeof rpcPassphrase})`,
+    );
+  }
+
+  if (rpcPassphrase !== expectedPassphrase) {
+    throw new RpcNetworkIdentityError(
+      "passphrase-mismatch",
+      `RPC network passphrase does not match the configured value ` +
+        `(configured=${expectedPassphrase.length} chars, received=${rpcPassphrase.length} chars)`,
+    );
+  }
+
+  return { passphrase: rpcPassphrase };
+}
 
 export type RpcGuardProblem =
   | "not-an-object"
@@ -138,4 +208,65 @@ export function assertEventsResponse(
   }
 
   return value as unknown as rpc.Api.GetEventsResponse;
+}
+
+// ── Untrusted RPC retry-delay clamping ───────────────────────────────────────
+
+/**
+ * Clamp a numeric retry delay (in milliseconds) against the configured
+ * authoritative maximum backoff.
+ *
+ * Rejects negative, non-finite (`NaN`, `Infinity`, `-Infinity`), and
+ * non-numeric values by returning `null`, and clamps oversized finite values to
+ * `resolveMaxBackoffMs(maxBackoffMs)`.
+ */
+export function clampRetryDelayMs(
+  delayMs: unknown,
+  maxBackoffMs?: number,
+): number | null {
+  const authoritativeMax = resolveMaxBackoffMs(maxBackoffMs);
+  if (typeof delayMs !== "number" || !Number.isFinite(delayMs) || delayMs < 0) {
+    return null;
+  }
+  return Math.min(delayMs, authoritativeMax);
+}
+
+/**
+ * Parse and clamp a `Retry-After` header value (in seconds) from an untrusted
+ * RPC response against the configured maximum backoff.
+ *
+ * Rejects negative, non-finite, empty, or trailing-garbage values (e.g.
+ * `"-5"`, `"NaN"`, `"Infinity"`, `"10abc"`), rejects overflow to `Infinity`
+ * when converting seconds to milliseconds, and clamps oversized delays to
+ * `resolveMaxBackoffMs(maxBackoffMs)`.
+ */
+export function parseRetryAfterHeaderMs(
+  headerValue: unknown,
+  maxBackoffMs?: number,
+): number | null {
+  const authoritativeMax = resolveMaxBackoffMs(maxBackoffMs);
+
+  let seconds: number;
+  if (typeof headerValue === "number") {
+    seconds = headerValue;
+  } else if (typeof headerValue === "string") {
+    const trimmed = headerValue.trim();
+    if (!/^\d+(?:\.\d+)?$/.test(trimmed)) {
+      return null;
+    }
+    seconds = Number(trimmed);
+  } else {
+    return null;
+  }
+
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return null;
+  }
+
+  const delayMs = seconds * 1000;
+  if (!Number.isFinite(delayMs)) {
+    return null;
+  }
+
+  return Math.min(delayMs, authoritativeMax);
 }

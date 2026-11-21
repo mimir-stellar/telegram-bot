@@ -222,6 +222,113 @@ test("renderLogExport boundary: oversized output is hard-capped and keeps head a
   assert.ok(text.includes("line 39"), "newest line kept");
 });
 
+// ── Truncation reporting (counts, time bounds, and size limits) ──────────────
+
+test("renderLogExport reports retained vs omitted counts and time bounds when not truncated", () => {
+  const times = [1_700_000_000_000, 1_700_000_060_000];
+  let idx = 0;
+  const capture = createLogCapture(5, () => times[idx++]);
+  capture.add("info", "first");
+  capture.add("warn", "second");
+
+  assert.deepEqual(capture.stats(), {
+    retained: 2,
+    omitted: 0,
+    capacity: 5,
+    oldestAt: 1_700_000_000_000,
+    newestAt: 1_700_000_060_000,
+  });
+
+  const text = renderLogExport(baseConfig(), baseStatus(), capture, 1_700_000_120_000);
+  assert.ok(
+    text.includes(
+      "log capture: retained 2 · omitted 0 · truncated: no · window: 2023-11-14T22:13:20.000Z..2023-11-14T22:14:20.000Z",
+    ),
+    `unexpected truncation header in:\n${text}`,
+  );
+});
+
+test("renderLogExport reports omitted count and advancing time bounds after ring eviction", () => {
+  const times = [
+    1_700_000_000_000,
+    1_700_000_010_000,
+    1_700_000_020_000,
+    1_700_000_030_000,
+    1_700_000_040_000,
+  ];
+  let idx = 0;
+  const capture = createLogCapture(3, () => times[idx++]);
+  for (let i = 0; i < 5; i += 1) {
+    capture.add("info", `entry-${i}`);
+  }
+
+  assert.deepEqual(capture.stats(), {
+    retained: 3,
+    omitted: 2,
+    capacity: 3,
+    oldestAt: 1_700_000_020_000,
+    newestAt: 1_700_000_040_000,
+  });
+
+  const text = renderLogExport(baseConfig(), baseStatus(), capture, 1_700_000_050_000);
+  assert.ok(
+    text.includes(
+      "log capture: retained 3 · omitted 2 · truncated: yes · window: 2023-11-14T22:13:40.000Z..2023-11-14T22:14:00.000Z",
+    ),
+    `unexpected truncation header in:\n${text}`,
+  );
+});
+
+test("renderLogExport reports empty window when no lines are captured or capture is disabled", () => {
+  const empty = createLogCapture(10);
+  const emptyText = renderLogExport(baseConfig(), baseStatus(), empty, 5_500);
+  assert.ok(emptyText.includes("log capture: retained 0 · omitted 0 · truncated: no · window: none"));
+
+  const disabled = createLogCapture(0);
+  disabled.add("info", "ignored");
+  const disabledText = renderLogExport(baseConfig(), baseStatus(), disabled, 5_500);
+  assert.ok(disabledText.includes("log capture: retained 0 · omitted 0 · truncated: no · window: none"));
+});
+
+test("renderLogExport preserves truncation summary within MAX_EXPORT_CHARS when both ring and size caps trigger", () => {
+  let ts = 1_700_000_000_000;
+  const capture = createLogCapture(40, () => {
+    const current = ts;
+    ts += 1_000;
+    return current;
+  });
+  for (let i = 0; i < 65; i += 1) {
+    capture.add("info", `line-${i} ${"x".repeat(1_000)}`);
+  }
+
+  const text = renderLogExport(baseConfig(), baseStatus(), capture, ts + 1_000);
+  assert.ok(text.length <= MAX_EXPORT_CHARS, `length ${text.length} exceeds ${MAX_EXPORT_CHARS}`);
+  assert.ok(text.includes("log capture: retained 40 · omitted 25 · truncated: yes · window: "));
+  assert.ok(text.includes("…[older log lines omitted]…"));
+});
+
+test("renderLogExport falls back cleanly for custom LogCapture implementations without stats()", () => {
+  const legacyCapture = {
+    add() {},
+    lines() {
+      return [{ seq: 0, at: 1_700_000_000_000, level: "info", text: "legacy" }];
+    },
+    size() {
+      return 1;
+    },
+    capacity() {
+      return 10;
+    },
+  };
+
+  const text = renderLogExport(baseConfig(), baseStatus(), legacyCapture, 1_700_000_005_000);
+  assert.ok(
+    text.includes(
+      "log capture: retained 1 · omitted 0 · truncated: no · window: 2023-11-14T22:13:20.000Z..2023-11-14T22:13:20.000Z",
+    ),
+  );
+});
+
 // ── Restart semantics ─────────────────────────────────────────────────────────
 
 test("restart: a fresh capture starts empty (log history is not persisted)", () => {

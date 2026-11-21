@@ -9,11 +9,13 @@ import { buildHealthReport } from "../dist/health.js";
 import { createPoller } from "../dist/poller.js";
 import { validate } from "./helpers/json-schema-lite.mjs";
 
-// docs/schemas/health-report.schema.json is the published shape of GET /health.
-// Every object in it is closed, so a field added, renamed or removed in
-// buildHealthReport fails here until the schema is updated with it.
+// docs/schemas/health-report.schema.json is the v1 baseline for GET /health.
+// It requires the v1 fields and types while permitting additive fields.
 const schema = JSON.parse(
   readFileSync(new URL("../docs/schemas/health-report.schema.json", import.meta.url), "utf8"),
+);
+const compatibilityFixture = JSON.parse(
+  readFileSync(new URL("./fixtures/health-report.compatibility.v1.json", import.meta.url), "utf8"),
 );
 
 const MARKET_ID = "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI";
@@ -228,6 +230,25 @@ function served(status, provenance, cfg = config()) {
   return JSON.parse(JSON.stringify(buildHealthReport(cfg, status, NOW, provenance)));
 }
 
+function applyFixtureChange(report, change) {
+  const parent = change.path.slice(0, -1).reduce((value, key) => value[key], report);
+  const key = change.path.at(-1);
+  if (change.operation === "remove") delete parent[key];
+  else if (change.operation === "rename") {
+    const newParent = change.newPath.slice(0, -1).reduce((value, nextKey) => value[nextKey], report);
+    newParent[change.newPath.at(-1)] = parent[key];
+    delete parent[key];
+  } else {
+    parent[key] = change.value;
+  }
+}
+
+test("the published health response baseline is explicitly versioned", () => {
+  assert.equal(schema.$id, "health-report.v1.schema.json");
+  assert.equal(schema.title, "Health report v1");
+  assert.equal(compatibilityFixture.contractVersion, 1);
+});
+
 test("the provenance fixtures exercise every optional config field", () => {
   const entries = provenanceDerivedAndEmpty.entries;
   assert.ok(entries.some((e) => e.source === "derived" && e.derivedFrom === "TELEGRAM_CHAT_ID"));
@@ -288,61 +309,30 @@ test("a report built from a real poller's own status matches the schema", () => 
   assert.deepEqual(validate(schema, report), []);
 });
 
-test("adding a field anywhere in the report fails validation", () => {
+test("adding fields anywhere in the report is backward-compatible", () => {
   const base = served(healthyStatus(), provenanceDerivedAndEmpty);
-  const places = [
-    ["$", (r) => r],
-    ["$.poller", (r) => r.poller],
-    ["$.poller.deadLetter", (r) => r.poller.deadLetter],
-    ["$.poller.lastError", (r) => r.poller.lastError],
-    ["$.poller.lastRestartGap", (r) => r.poller.lastRestartGap],
-    ["$.poller.targets[1]", (r) => r.poller.targets[1]],
-    ["$.config", (r) => r.config],
-    ["$.config.envFile", (r) => r.config.envFile],
-    ["$.config.entries[0]", (r) => r.config.entries[0]],
-    ["$.config.counts", (r) => r.config.counts],
-  ];
-  for (const [where, pick] of places) {
+  for (const addition of compatibilityFixture.additions) {
     const report = structuredClone(base);
-    pick(report).newField = 1;
-    assert.deepEqual(validate(schema, report), [`${where}.newField: not in the schema`], where);
+    applyFixtureChange(report, { ...addition, operation: "replace" });
+    assert.deepEqual(validate(schema, report), []);
   }
 });
 
 test("removing, renaming or retyping a field fails validation", () => {
   const base = served(healthyStatus(), provenanceDerivedAndEmpty);
-
-  const removed = structuredClone(base);
-  delete removed.poller.cycles;
-  assert.deepEqual(validate(schema, removed), ['$.poller: missing required property "cycles"']);
-
-  const renamed = structuredClone(base);
-  renamed.state = renamed.status;
-  delete renamed.status;
-  assert.deepEqual(validate(schema, renamed), [
-    '$: missing required property "status"',
-    "$.state: not in the schema",
-  ]);
-
-  const retyped = structuredClone(base);
-  retyped.poller.targets[1].lastEventLedger = "4950";
-  assert.deepEqual(validate(schema, retyped), [
-    "$.poller.targets[1].lastEventLedger: expected integer or null, got string",
-  ]);
-
-  const unknownStatus = structuredClone(base);
-  unknownStatus.status = "warning";
-  assert.deepEqual(validate(schema, unknownStatus), [
-    '$.status: "warning" is not one of "ok", "degraded", "stopped"',
-  ]);
+  for (const change of compatibilityFixture.breakingChanges) {
+    const report = structuredClone(base);
+    applyFixtureChange(report, change);
+    assert.deepEqual(validate(schema, report), change.errors);
+  }
 });
 
-test("every object in the schema is closed and lists each emitted field as required", () => {
+test("every v1 object permits additions and requires each stable field", () => {
   // Only these two are left out of a provenance entry when they do not apply.
   const optional = new Set(["$.config.entries[].derivedFrom", "$.config.entries[].emptyDeclaration"]);
   const visit = (node, where) => {
     if (node.properties !== undefined) {
-      assert.equal(node.additionalProperties, false, `${where} must set additionalProperties: false`);
+      assert.equal(node.additionalProperties, true, `${where} must permit additive fields`);
       for (const [key, child] of Object.entries(node.properties)) {
         const childPath = `${where}.${key}`;
         assert.equal(node.required.includes(key), !optional.has(childPath), `${childPath} required`);

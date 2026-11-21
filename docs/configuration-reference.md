@@ -13,7 +13,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 
 ### Telegram Settings
 - `BOT_TOKEN`: The API token for the Telegram bot. Required.
-- `TELEGRAM_CHAT_ID`: The numeric ID or `@channelusername` where notifications are posted. Required.
+- `TELEGRAM_CHAT_ID`: The chat identifier where notifications are posted. Required. Accepts either an integer decimal string (positive or negative, arbitrarily large, e.g. `-1001234567890123456`), or a channel handle such as `@channelusername`. Fractional values (`-100.5`) and exponent notation (`-1e12`) are rejected at startup; identifiers are kept as strings and never converted through JavaScript numbers.
 - `MIMIR_LOCALE`: Language for bot replies and notifications. Supported: `en` (default) and `es`; region tags such as `es-MX` resolve to the base language. Any other value fails fast at startup. See [Translator Guide](translating.md).
 
 ### Mimir Contract Settings
@@ -36,10 +36,12 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - `SILENT_EVENTS`: Comma-separated event names sent without sound. Defaults to deposits, withdrawals, and fee claims; unknown names fail configuration validation.
 - `NOTIFY_CATEGORIES` (along with aliases `NOTIFICATION_CATEGORIES`, `NOTIFY_EVENT_CATEGORIES`, `EVENT_CATEGORIES`, and `CLAIM_CATEGORIES`): Optional allowlist restricting `mimir-market` `claim_created` notifications by category.
 - For full details on defaults, evaluation precedence, and worked examples, see [Notification Filters](notification-filters.md).
+- **Zero active routes**: When every configured route is disabled (`NOTIFY_ENABLED=false`, or both `NOTIFY_MARKET` and `NOTIFY_SQUAD` set to `false`), the notifier reports an explicit `no-active-routes` status instead of a healthy delivery status. No notification is ever reported as delivered in this state; each would-be event is counted as suppressed and logged at warn level with the reason `no active routes`.
 
 ### Health Reporting
 - `HEALTH_HOST` & `HEALTH_PORT`: Binds a local HTTP endpoint for health probes (e.g., Kubernetes liveness probes). Set port to 0 to disable.
 - `HEALTH_STALE_MS`: Marks the health endpoint as degraded if no successful poll completes within this window (e.g., 90000ms).
+- `HEALTH_AUTH_TOKEN`: Optional bearer token for all health/metrics routes. Authorization headers over 4096 UTF-8 bytes (including `Bearer `) are rejected with the same empty `401` as other malformed values.
 
 ## Operational Behavior
 

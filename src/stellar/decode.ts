@@ -1671,3 +1671,10 @@ export function decodeRawEvent(
   const event = buildRawEvent(input);
   return decodeEvent(source, event, version);
 }
+
+export {
+  DECODER_FINGERPRINT_VERSION,
+  fingerprintDecodedEvent,
+  fingerprintDecoderOutput,
+  type SemanticFingerprint,
+} from "./decoder-fingerprint.js";

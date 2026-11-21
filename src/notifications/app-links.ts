@@ -87,7 +87,8 @@ export function appTargetFor(event: DecodedEvent): AppTarget | null {
  * Trailing slashes on the base are collapsed so `https://app.example/` and
  * `https://app.example` produce the same link, and the id goes through
  * `encodeURIComponent` so an unexpected payload value cannot inject a query,
- * fragment or extra path segment.
+ * fragment or extra path segment. Base URLs that are not `https:`, lack a
+ * host, or contain userinfo (`username` / `password`) are rejected.
  */
 export function appUrlFor(
   event: DecodedEvent,
@@ -104,6 +105,8 @@ export function appUrlFor(
     return null;
   }
   if (base.protocol !== "https:") return null;
+  if (base.username !== "" || base.password !== "") return null;
+  if (!base.hostname) return null;
 
   base.search = "";
   base.hash = "";

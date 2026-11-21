@@ -336,3 +336,19 @@ test("regression: writeStatusFile output never contains a full chat id", () => {
   assert.equal(source.includes("redactChatId"), true);
   assert.equal(source.includes("boundText"), true);
 });
+
+test("redactError safely handles circular objects, symbols, and functions", () => {
+  const cyclic = { info: "poll failed" };
+  cyclic.self = cyclic;
+
+  const outCyclic = redactError(cyclic);
+  assert.equal(outCyclic.includes("[circular]"), true);
+  assert.equal(outCyclic.includes("poll failed"), true);
+
+  const outSym = redactError(Symbol("secret_sym"));
+  assert.equal(outSym, "[unsupported:symbol]");
+
+  const outFn = redactError(() => {});
+  assert.equal(outFn, "[unsupported:function]");
+});
+

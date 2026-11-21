@@ -136,3 +136,131 @@ export function formatRpcTiming(summary: RpcTimingSummary): string {
     `health=${operations.health.requests} events=${operations.events.requests}`
   );
 }
+
+// ── End-to-end notification age ───────────────────────────────────────────────
+
+/**
+ * Bounded, secret-free summary of end-to-end notification age from Stellar
+ * ledger close time to confirmed Telegram send.
+ */
+export interface NotificationAgeSummary {
+  /** Confirmed sends that had a valid ledger close time (includes 0ms lag). */
+  samples: number;
+  /** Confirmed sends whose event lacked a valid ledger close time. */
+  missingLedgerTime: number;
+  /** Cumulative end-to-end age in ms across all known-ledger-time samples. */
+  totalMs: number;
+  /** Minimum observed age in ms, or `null` when no known-ledger-time sample has been recorded. */
+  minMs: number | null;
+  /** Maximum observed age in ms, or `null` when no known-ledger-time sample has been recorded. */
+  maxMs: number | null;
+  /** Mean observed age in ms, or `null` when no known-ledger-time sample has been recorded. */
+  avgMs: number | null;
+  /** Most recent observed age in ms, or `null` when no known-ledger-time sample has been recorded. */
+  lastMs: number | null;
+}
+
+/** Monotonic-anchored ingestion instant paired with a wall-clock timestamp. */
+export interface NotificationIngestionMark {
+  wallMs: number;
+  monoMs: number;
+}
+
+/**
+ * Tracks end-to-end notification age from ledger close time to confirmed send.
+ *
+ * Distinguishes missing ledger time (`ledgerTimeSec` absent, `<= 0`, or
+ * non-finite) from zero delivery lag (`0` ms): missing ledger time increments
+ * `missingLedgerTime` without altering `samples`, `minMs`, `maxMs`, `avgMs`,
+ * or `lastMs` (which remain `null` until a known-ledger-time sample arrives).
+ *
+ * Uses a monotonic `clock` (defaulting to `performance.now()`) to measure
+ * in-process elapsed time from ingestion to confirmed send so wall-clock
+ * adjustments backwards during retries never reduce the measured send time.
+ */
+export class NotificationAge {
+  private samples = 0;
+  private missingLedgerTime = 0;
+  private totalMs = 0;
+  private minMs: number | null = null;
+  private maxMs: number | null = null;
+  private lastMs: number | null = null;
+  private readonly clock: () => number;
+
+  constructor(clock: () => number = () => performance.now()) {
+    this.clock = clock;
+  }
+
+  /**
+   * Capture a wall-clock + monotonic-clock anchor at event ingestion so
+   * {@link recordFromIngestion} can compute a monotonic confirmed-send time.
+   */
+  markIngested(wallNowMs: number): NotificationIngestionMark {
+    return { wallMs: wallNowMs, monoMs: this.clock() };
+  }
+
+  /**
+   * Compute confirmed-send wall-clock time from `ingested` using the monotonic
+   * clock, then record the age from `ledgerTimeSec` (Unix seconds).
+   * Returns the recorded age in ms, or `null` when ledger time is missing.
+   */
+  recordFromIngestion(
+    ledgerTimeSec: number | null | undefined,
+    ingested: NotificationIngestionMark,
+  ): number | null {
+    const elapsedMonoMs = Math.max(0, this.clock() - ingested.monoMs);
+    const confirmedWallMs = ingested.wallMs + elapsedMonoMs;
+    return this.record(ledgerTimeSec, confirmedWallMs);
+  }
+
+  /**
+   * Record one confirmed send given `ledgerTimeSec` (Unix seconds; `<= 0` or
+   * non-finite is treated as missing) and `confirmedWallMs` (Unix ms).
+   * Negative age from slight chain-vs-host clock skew is clamped to `0` ms and
+   * still counted as a valid `0` ms sample, distinct from missing ledger time.
+   */
+  record(ledgerTimeSec: number | null | undefined, confirmedWallMs: number): number | null {
+    if (
+      typeof ledgerTimeSec !== "number" ||
+      !Number.isFinite(ledgerTimeSec) ||
+      ledgerTimeSec <= 0 ||
+      !Number.isFinite(confirmedWallMs)
+    ) {
+      this.missingLedgerTime += 1;
+      return null;
+    }
+
+    const ledgerTimeMs = ledgerTimeSec * 1000;
+    const ageMs = round(Math.max(0, confirmedWallMs - ledgerTimeMs));
+
+    this.samples += 1;
+    this.totalMs += ageMs;
+    this.lastMs = ageMs;
+    this.minMs = this.minMs === null ? ageMs : Math.min(this.minMs, ageMs);
+    this.maxMs = this.maxMs === null ? ageMs : Math.max(this.maxMs, ageMs);
+    return ageMs;
+  }
+
+  summary(): NotificationAgeSummary {
+    return {
+      samples: this.samples,
+      missingLedgerTime: this.missingLedgerTime,
+      totalMs: round(this.totalMs),
+      minMs: this.minMs === null ? null : round(this.minMs),
+      maxMs: this.maxMs === null ? null : round(this.maxMs),
+      avgMs: this.samples > 0 ? round(this.totalMs / this.samples) : null,
+      lastMs: this.lastMs === null ? null : round(this.lastMs),
+    };
+  }
+}
+
+/** One-line, secret-free notification age string for logs and summaries. */
+export function formatNotificationAge(summary: NotificationAgeSummary): string {
+  const last = summary.lastMs === null ? "none" : `${summary.lastMs}ms`;
+  const avg = summary.avgMs === null ? "none" : `${summary.avgMs}ms`;
+  const max = summary.maxMs === null ? "none" : `${summary.maxMs}ms`;
+  return (
+    `notification_age samples=${summary.samples} missing=${summary.missingLedgerTime} ` +
+    `last=${last} avg=${avg} max=${max}`
+  );
+}

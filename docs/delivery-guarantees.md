@@ -229,3 +229,52 @@ A single poll cycle executes four distinct phases ([`src/poller.ts`](../src/poll
 - [`tests/cursor-backup.test.mjs`](../tests/cursor-backup.test.mjs) — Atomic `.tmp` write-then-rename and `.bak` backup preservation
 - [`tests/shutdown.test.mjs`](../tests/shutdown.test.mjs) — Graceful shutdown mid-RPC read, mid-`notify()` batch abort, and shutdown timeout dirty-cursor flush
 - [`tests/instance-lock.test.mjs`](../tests/instance-lock.test.mjs) — Single-instance lock enforcement and dead-PID stale lock recovery
+
+---
+
+## Offline Delivery Reconciliation Report
+
+`src/notifications/delivery-report.ts` provides a read-only reconciliation of the two
+delivery-tracking stores — the send journal and the message index — to surface delivery
+inconsistencies without contacting Telegram or mutating any file.
+
+### What it compares
+
+| Store | Contains |
+|---|---|
+| Send journal (`SEND_JOURNAL_FILE`) | Intent/done pairs. Pending intents (intent with no matching done) represent sends whose outcome is unknown. |
+| Message index (`MESSAGE_INDEX_FILE`) | `(chatId, ref) → messageId`. A record here means Telegram returned a message ID, confirming delivery. |
+
+### Inconsistency kinds
+
+**`UNRESOLVED_INTENT`** — The journal has a pending intent for `(source, ledger)` but the
+message index has no corresponding record.  The notification may or may not have reached
+Telegram; the process was killed between the `sendMessage` call and the `done` write.
+Operators should decide whether to re-send manually or let the bot's crash-recovery path
+handle it on the next restart.
+
+**`ORPHANED_INDEX`** — The message index has a record for `(ref)` but the journal has no
+pending intent for the same `(source, ledger)`.  This is the normal post-delivery state:
+the intent was settled by a `done` and compacted away.  It is surfaced so operators can
+confirm the population is expected.
+
+### Programmatic API
+
+```typescript
+import { buildDeliveryReport } from "./src/notifications/delivery-report.js";
+
+const report = await buildDeliveryReport({
+  journalFile: "./data/send-journal.jsonl",
+  indexFile:   "./data/message-index.json",
+});
+// report.readOnly === true — no mutations made
+// report.unresolvedIntents — count of UNRESOLVED_INTENT entries
+// report.orphanedIndexEntries — count of ORPHANED_INDEX entries
+// report.inconsistencies — full detail array
+```
+
+### Tests
+
+[`tests/delivery-report.test.mjs`](../tests/delivery-report.test.mjs) covers read-only
+guarantee, UNRESOLVED\_INTENT detection, settled-intent clean state, ORPHANED\_INDEX
+detection, mixed inconsistencies, and both-files-absent boundary.

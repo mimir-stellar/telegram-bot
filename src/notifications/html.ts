@@ -18,7 +18,15 @@ import {
   type DecodedEvent,
 } from "../stellar/decode.js";
 import { confidenceIndicator } from "./confidence.js";
-import { clip, eventExplorerUrl, eventAllowedByCategory, safeErrorMessage } from "./format.js";
+import {
+  clip,
+  clipUtf16,
+  eventExplorerUrl,
+  eventAllowedByCategory,
+  safeErrorMessage,
+  TELEGRAM_MAX_MESSAGE_LENGTH,
+  utf16Length,
+} from "./format.js";
 import type { StellarConfig } from "../config.js";
 
 /**
@@ -190,11 +198,13 @@ export function formatFallbackEventHtml(
   const txPart = event.txHash
     ? ` · <a href="${escapeHtmlAttr(txExplorerUrl(config, event.txHash))}">tx</a>`
     : "";
-  return (
+  const message =
     `⚠️ <b>Event Notification Fallback</b> (${source})\n` +
     `Contract: <code>${contract}</code> · Ledger: ${ledger}${txPart}\n` +
-    `Reason: <i>${safeReason}</i>`
-  );
+    `Reason: <i>${safeReason}</i>`;
+  return utf16Length(message) <= TELEGRAM_MAX_MESSAGE_LENGTH
+    ? message
+    : clipUtf16(message, TELEGRAM_MAX_MESSAGE_LENGTH);
 }
 
 /**
@@ -213,10 +223,15 @@ export function formatEventHtml(
     const head = headlineHtml(event);
     if (head === null) return null;
     const body = `${head}\n${footerHtml(config, event)}`;
-    if (config.channelPreviewMode) {
-      return `🧪 <b>[PREVIEW MODE]</b>\n${body}`;
-    }
-    return body;
+    const withPrefix = config.channelPreviewMode
+      ? `🧪 <b>[PREVIEW MODE]</b>\n${body}`
+      : body;
+    // Telegram measures the 4096 limit in UTF-16 units AFTER entity handling.
+    // The string we send is the source the API parses, so measure that source
+    // and truncate on a safe boundary rather than let the API reject us.
+    return utf16Length(withPrefix) <= TELEGRAM_MAX_MESSAGE_LENGTH
+      ? withPrefix
+      : clipUtf16(withPrefix, TELEGRAM_MAX_MESSAGE_LENGTH);
   } catch (err) {
     return formatFallbackEventHtml(config, event, safeErrorMessage(err));
   }

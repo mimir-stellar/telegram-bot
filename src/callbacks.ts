@@ -9,7 +9,9 @@
  *
  * Two families of callbacks share this module:
  *  - navigation/operator actions (`status`, `contracts`, `help`, `pause`,
- *    `resume`, `broadcast`), handled by {@link handleCallbackQuery}
+ *    `resume`, `broadcast`), handled by {@link handleCallbackQuery}. Broadcast
+ *    confirmations are bound to a fingerprint of the reviewed destination set
+ *    and cancel if route configuration changes before confirmation.
  *  - the `/pause` confirmation buttons, which carry their own payloads and a
  *    TTL, handled by {@link handlePauseConfirmCallback}
  */

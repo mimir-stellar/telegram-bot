@@ -188,6 +188,91 @@ export interface StellarConfig {
 export interface TelegramRoute {
   chatId: string;
   channelPreviewMode: boolean;
+  /** Previous group chat id recorded when Telegram migrated the chat to a supergroup. */
+  migratedFromChatId?: string;
+}
+
+/**
+ * Update configured chat routes in-place after Telegram reports a group-to-supergroup
+ * migration (`migrate_to_chat_id`). Returns `true` if any route changed.
+ */
+export function applyChatMigration(
+  config: Partial<
+    Pick<BotConfig, "chatId" | "chatIds" | "marketChatId" | "squadChatId" | "routes">
+  >,
+  fromChatId: string,
+  toChatId: string,
+): boolean {
+  const from = fromChatId.trim();
+  const to = toChatId.trim();
+  if (!from || !to || from === to) return false;
+
+  let changed = false;
+  if (config.chatId === from) {
+    config.chatId = to;
+    changed = true;
+  }
+  if (config.marketChatId === from) {
+    config.marketChatId = to;
+    changed = true;
+  }
+  if (config.squadChatId === from) {
+    config.squadChatId = to;
+    changed = true;
+  }
+  if (Array.isArray(config.chatIds)) {
+    const next: string[] = [];
+    for (const id of config.chatIds) {
+      const mapped = id === from ? to : id;
+      if (id === from) changed = true;
+      if (!next.includes(mapped)) next.push(mapped);
+    }
+    if (changed) config.chatIds = next;
+  }
+  if (Array.isArray(config.routes)) {
+    for (const route of config.routes) {
+      if (route.chatId === from) {
+        route.chatId = to;
+        route.migratedFromChatId = from;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+/**
+ * Result of resolving the configured Telegram routes for delivery.
+ *
+ * `zero-active-routes` means every configured route is disabled, so no
+ * notification can be delivered. It is reported distinctly from `healthy`
+ * and must never be presented as a successful delivery.
+ */
+export type RouteDeliveryStatus =
+  | { status: "healthy"; activeRouteCount: number }
+  | {
+      status: "zero-active-routes";
+      activeRouteCount: 0;
+      message: string;
+    };
+
+/**
+ * Derives the delivery status from the configured routes. A route counts as
+ * active unless it is explicitly disabled. Delivery is never claimed here.
+ */
+export function resolveRouteDeliveryStatus(
+  routes: ReadonlyArray<TelegramRoute & { enabled?: boolean }>,
+): RouteDeliveryStatus {
+  const activeRouteCount = routes.filter((route) => route.enabled !== false).length;
+  if (activeRouteCount === 0) {
+    return {
+      status: "zero-active-routes",
+      activeRouteCount: 0,
+      message:
+        "No active Telegram routes: every configured route is disabled. Notifications will not be delivered until at least one route is enabled.",
+    };
+  }
+  return { status: "healthy", activeRouteCount };
 }
 
 export interface BotConfig extends StellarConfig {
@@ -304,7 +389,7 @@ export interface BotConfig extends StellarConfig {
    * an https URL at load time.
    */
   mimirAppUrl: string | null;
-  /** Optional bearer token for health endpoint authentication. Null disables auth. */
+  /** Optional bearer token for health endpoint authentication. Null disables auth. The server rejects Authorization headers over 4096 UTF-8 bytes before comparison. */
   healthAuthToken: string | null;
 }
 
@@ -656,14 +741,14 @@ function collector(profile: Record<string, string>) {
     chatIds(name: string): string[] {
       const value = this.required(name);
       if (value === "") return [];
-      
+
       const ids = value.split(",").map(s => s.trim()).filter(s => s !== "");
       if (ids.length === 0) {
         problems.push(`${name} is required but not set`);
         return [];
       }
       for (const id of ids) {
-        if (!/^-?\d+$/.test(id) && !/^@[A-Za-z0-9_]{4,}$/.test(id)) {
+        if (!/^-?[1-9]\d*$/.test(id) && !/^-?0$/.test(id) && !/^@[A-Za-z0-9_]{4,}$/.test(id)) {
           problems.push(
             `${name} must contain numeric chat ids or @channelusernames; got "${id}"`,
           );

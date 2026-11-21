@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 import { get } from "node:http";
 import test from "node:test";
 
-import { createMetrics } from "../dist/metrics.js";
+import { createMetrics, deliveryFailureRate } from "../dist/metrics.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -163,6 +163,40 @@ test("activity baseline: rendered metrics expose the last count and baseline", (
   assert.ok(output.includes("mimir_bot_activity_anomalies_total 2"), output);
 });
 
+test("notification age: distinguishes missing ledger time from zero delivery lag", () => {
+  const m = createMetrics();
+
+  // Zero delivery lag is a valid sample.
+  m.recordNotificationAge(0);
+  assert.equal(m.notificationAgeSamples.value(), 1);
+  assert.equal(m.notificationAgeMissingLedgerTime.value(), 0);
+  assert.equal(m.notificationAgeTotalMs.value(), 0);
+  assert.equal(m.lastNotificationAgeMs.value(), 0);
+  assert.equal(m.maxNotificationAgeMs.value(), 0);
+
+  // Positive age updates last, max, and cumulative total.
+  m.recordNotificationAge(1250.4);
+  assert.equal(m.notificationAgeSamples.value(), 2);
+  assert.equal(m.notificationAgeTotalMs.value(), 1250);
+  assert.equal(m.lastNotificationAgeMs.value(), 1250);
+  assert.equal(m.maxNotificationAgeMs.value(), 1250);
+
+  // Missing ledger time increments missing counter without overwriting last/max/samples.
+  m.recordNotificationAge(null);
+  assert.equal(m.notificationAgeSamples.value(), 2);
+  assert.equal(m.notificationAgeMissingLedgerTime.value(), 1);
+  assert.equal(m.notificationAgeTotalMs.value(), 1250);
+  assert.equal(m.lastNotificationAgeMs.value(), 1250);
+  assert.equal(m.maxNotificationAgeMs.value(), 1250);
+
+  const output = m.render();
+  assert.ok(output.includes("mimir_bot_notification_age_samples_total 2"), output);
+  assert.ok(output.includes("mimir_bot_notification_age_missing_ledger_time_total 1"), output);
+  assert.ok(output.includes("mimir_bot_notification_age_ms_total 1250"), output);
+  assert.ok(output.includes("mimir_bot_last_notification_age_ms 1250"), output);
+  assert.ok(output.includes("mimir_bot_max_notification_age_ms 1250"), output);
+});
+
 // ── render() format tests ─────────────────────────────────────────────────────
 
 test("render: output ends with a newline", () => {
@@ -188,6 +222,11 @@ test("render: contains all expected metric names", () => {
     "mimir_bot_last_cycle_events",
     "mimir_bot_activity_baseline_events",
     "mimir_bot_activity_anomalies_total",
+    "mimir_bot_notification_age_samples_total",
+    "mimir_bot_notification_age_missing_ledger_time_total",
+    "mimir_bot_notification_age_ms_total",
+    "mimir_bot_last_notification_age_ms",
+    "mimir_bot_max_notification_age_ms",
   ];
 
   for (const name of expectedNames) {
@@ -350,6 +389,26 @@ test("server: /metrics response includes Cache-Control: no-store", async () => {
   }
 });
 
+test("server: /health, 404, and 405 responses include Cache-Control: no-store", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const healthRes = await httpGet(`http://127.0.0.1:${srv.port}/health`);
+    assert.equal(healthRes.statusCode, 200);
+    assert.equal(healthRes.headers["cache-control"], "no-store");
+
+    const notFoundRes = await httpGet(`http://127.0.0.1:${srv.port}/unknown`);
+    assert.equal(notFoundRes.statusCode, 404);
+    assert.equal(notFoundRes.headers["cache-control"], "no-store");
+
+    const methodNotAllowedRes = await httpRequest("POST", `http://127.0.0.1:${srv.port}/metrics`);
+    assert.equal(methodNotAllowedRes.statusCode, 405);
+    assert.equal(methodNotAllowedRes.headers["cache-control"], "no-store");
+  } finally {
+    await srv.close();
+  }
+});
+
 test("server: live counter updates are reflected in subsequent /metrics responses", async () => {
   const m = createMetrics();
   const srv = await m.startServer(0);
@@ -448,4 +507,52 @@ test("security: /health response does not echo request headers", async () => {
   } finally {
     await srv.close();
   }
+});
+
+// ── Filtered event counters & failure-rate denominator ────────────────────────
+
+test("filtered counters: start at zero and increment independently by reason", () => {
+  const m = createMetrics();
+  assert.equal(m.eventsFiltered.value(), 0);
+  assert.equal(m.eventsFilteredFeatureFlag.value(), 0);
+  assert.equal(m.eventsFilteredRule.value(), 0);
+
+  m.eventsFiltered.inc();
+  m.eventsFilteredFeatureFlag.inc();
+  assert.equal(m.eventsFiltered.value(), 1);
+  assert.equal(m.eventsFilteredFeatureFlag.value(), 1);
+  assert.equal(m.eventsFilteredRule.value(), 0);
+  assert.equal(m.notificationsFailed.value(), 0);
+
+  m.eventsFiltered.inc();
+  m.eventsFilteredRule.inc();
+  assert.equal(m.eventsFiltered.value(), 2);
+  assert.equal(m.eventsFilteredFeatureFlag.value(), 1);
+  assert.equal(m.eventsFilteredRule.value(), 1);
+});
+
+test("filtered counters: rendered output includes stable filtered metric names", () => {
+  const m = createMetrics();
+  m.eventsFiltered.inc(3);
+  m.eventsFilteredFeatureFlag.inc(2);
+  m.eventsFilteredRule.inc(1);
+  const out = m.render();
+  assert.ok(out.includes("mimir_bot_events_filtered_total 3"));
+  assert.ok(out.includes("mimir_bot_events_filtered_feature_flag_total 2"));
+  assert.ok(out.includes("mimir_bot_events_filtered_rule_total 1"));
+});
+
+test("deliveryFailureRate: excludes filtered events from denominator and handles zero attempts", () => {
+  assert.equal(deliveryFailureRate(0, 0), 0);
+  assert.equal(deliveryFailureRate(8, 2), 0.2);
+
+  // Filtered events do not affect the failure rate denominator
+  const m = createMetrics();
+  m.notificationsSent.inc(8);
+  m.notificationsFailed.inc(2);
+  m.eventsFiltered.inc(100);
+  assert.equal(
+    deliveryFailureRate(m.notificationsSent.value(), m.notificationsFailed.value()),
+    0.2,
+  );
 });

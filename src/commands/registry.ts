@@ -23,6 +23,7 @@ import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
 import type { BroadcastStore } from "./broadcast.js";
+import type { FollowStore } from "../subscriptions/store.js";
 
 /** Everything a command handler may need, supplied once by `createBot`. */
 export interface CommandDeps {
@@ -45,6 +46,12 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /**
+   * Follow store for subscription data. When provided, the operator can use
+   * `/matchpreview` to count how many chats follow a given event reference.
+   * Absent means that command reports zero matches.
+   */
+  followStore?: FollowStore | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */

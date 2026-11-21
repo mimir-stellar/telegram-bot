@@ -254,9 +254,11 @@ Open `src/notifications/format.ts` and wire the new payload into both `headline`
 
    `formatEvent(config, event)`, `formatPlainTextEvent(config, event)`, `formatLastEvent(config, event)`, and `formatDigest(events, options)` all delegate to `headline` and `plainHeadline`, so updating those two functions automatically enables single-event notifications, `/last` previews, plain-text fallback, and digest summaries.
 
-3. **Check digest grouping (`src/notifications/digest-grouping.ts`)**:
+3. **Check digest grouping and period completeness (`src/notifications/digest-grouping.ts` & `src/notifications/schedule.ts`)**:
 
-   `groupDigestEvents(events)` groups market events that have a numeric `claimId` property under `market:<claimId>` and squad events that have a numeric `marketId` property under `squad:<marketId>`. Because `claim_escalated` includes `claimId: number` on its payload, `groupDigestEvents` groups it automatically. If your new event uses a different identifier, update `groupKeyForEvent` in `src/notifications/digest-grouping.ts`.
+   `groupDigestEvents(events)` groups market events that have a numeric `claimId` property under `market:<claimId>` and squad events that have a numeric `marketId` property under `squad:<marketId>`. Because `claim_escalated` includes `claimId: number` on its payload, `groupDigestEvents` groups it automatically. If your new event uses a different identifier, update `groupKeyFor` in `src/notifications/digest-grouping.ts`.
+
+   When a digest period is affected by an RPC gap or restart, pass `completeness: { complete: false, reasons: ["rpc_gap" | "restart"] }` (or build the period with `buildDigestPeriod(events, completeness)` and forward `ScheduledRunContext.completeness` from `createScheduler` in `src/notifications/schedule.ts`) to `formatDigest(events, { grouped, completeness })`. Incomplete periods are explicitly labeled and report observed counts as partial so a partial count is never presented as a complete ledger summary.
 
 ---
 

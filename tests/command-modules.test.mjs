@@ -37,6 +37,7 @@ const MENU = [
   "contracts",
   "health",
   "preview",
+  "categories",
   "pause",
   "resume",
 ];

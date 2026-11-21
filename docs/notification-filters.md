@@ -153,3 +153,12 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_created` events**: Muted by `eventAllowedByCategory` because `config.notificationCategories` is non-empty (`["__none__"]`) and no real on-chain claim category matches `"__none__"`.
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
+
+---
+
+## 4. Decimal USDC Threshold Normalization
+
+Both [`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts) and [`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts) normalize equivalent decimal USDC thresholds to 7-decimal atomic units (`bigint`) before comparison:
+
+- **Canonical equivalence**: Equivalent decimal strings (for example `"1"`, `"01"`, `"1.0"`, `"1.00"`, and `"1.0000000"`) normalize identically via `parseUsdcThreshold` / `normalizeUsdcThreshold` and in filter expression comparisons (both explicit `USDC` / `$` literals and bare decimal literals such as `stake >= 10.50`).
+- **Precision limit**: Values exceeding seven fractional digits (for example `"1.00000000"` or `"0.00000001"`) are rejected with `InvalidThresholdError` or `FilterParseError`.
