@@ -25,15 +25,21 @@ export interface VolumeBucket {
   depositCount: number;
   /** Total events aggregated into this bucket. */
   eventCount: number;
+  /**
+   * True when no valid events fell into this bucket. Zero-filled buckets carry
+   * `empty: true` so consumers can distinguish an absent observation from a
+   * real zero total.
+   */
+  empty: boolean;
 }
 
 export interface VolumeSeriesResult {
-  /** Contiguous time buckets (zero-filled) between earliest and latest event, or empty if no valid events. */
+  /** Contiguous time buckets (zero-filled, flagged `empty`) between earliest and latest event, or empty if no valid events. */
   buckets: VolumeBucket[];
-  /** Total challenge stake across all buckets as bigint string. */
-  totalChallengeStake: string;
-  /** Total squad deposit across all buckets as bigint string. */
-  totalSquadDeposit: string;
+  /** Total challenge stake across all buckets as bigint string, or null when no valid observations exist. */
+  totalChallengeStake: string | null;
+  /** Total squad deposit across all buckets as bigint string, or null when no valid observations exist. */
+  totalSquadDeposit: string | null;
   /** Count of events skipped due to missing or invalid `at` timestamp. */
   skippedWithoutAt: number;
   /** Total valid events processed. */
@@ -56,8 +62,10 @@ export function floorToBucketUtc(unixSeconds: number, bucket: VolumeBucketUnit):
 /**
  * Produce time-bucketed volume series for stakes and deposits.
  *
- * Empty buckets between earliest and latest events are filled with zero values.
- * Events without a valid `at` timestamp are skipped and counted in `skippedWithoutAt`.
+ * Empty buckets between earliest and latest events are zero-filled but marked
+ * `empty: true`. Totals are `null` when there are no valid observations, so an
+ * absent series is never reported as a misleading zero. Events without a valid
+ * `at` timestamp are skipped and counted in `skippedWithoutAt`.
  */
 export function volumeSeries(
   events: readonly DecodedEvent[] | null | undefined,
@@ -76,8 +84,8 @@ export function volumeSeries(
   if (!events || !Array.isArray(events)) {
     return {
       buckets: [],
-      totalChallengeStake: "0",
-      totalSquadDeposit: "0",
+      totalChallengeStake: null,
+      totalSquadDeposit: null,
       skippedWithoutAt: 0,
       processedEvents: 0,
     };
@@ -186,14 +194,14 @@ export function volumeSeries(
   if (minBucketStart === null || maxBucketStart === null) {
     return {
       buckets: [],
-      totalChallengeStake: "0",
-      totalSquadDeposit: "0",
+      totalChallengeStake: null,
+      totalSquadDeposit: null,
       skippedWithoutAt,
       processedEvents,
     };
   }
 
-  // Generate contiguous buckets from minBucketStart to maxBucketStart (zero-filled)
+  // Generate contiguous buckets from minBucketStart to maxBucketStart (zero-filled, flagged empty)
   const buckets: VolumeBucket[] = [];
 
   for (let t = minBucketStart; t <= maxBucketStart; t += stepSeconds) {
@@ -214,6 +222,7 @@ export function volumeSeries(
       challengeCount,
       depositCount,
       eventCount,
+      empty: eventCount === 0,
     });
   }
 
