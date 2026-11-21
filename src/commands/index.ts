@@ -23,16 +23,42 @@ import "./audit.js";
 import "./contracts.js";
 import "./health.js";
 import "./preview.js";
+import "./categories.js";
 import "./pause.js";
 import "./resume.js";
 import "./log-export.js"; // hidden: operator log export
+import "./match-preview.js"; // hidden: operator subscription match count
+
+import { COMMAND_DETAILS } from "./help-detail.js";
+import {
+  validateCommandConsistency,
+  type CommandConsistencyOptions,
+} from "./registry.js";
+
+/**
+ * Validate that the live command catalogue, Telegram menu descriptions
+ * (`COMMAND_DESCRIPTIONS`), and `/help` detail entries (`COMMAND_DETAILS`) are
+ * consistent. Throws {@link CommandConsistencyError} naming any missing or
+ * mismatched command so an invalid deployment stops at startup.
+ */
+export function validateCommandCatalogue(options?: CommandConsistencyOptions): void {
+  validateCommandConsistency({
+    helpDetails: COMMAND_DETAILS,
+    ...options,
+  });
+}
 
 export {
+  CommandConsistencyError,
   commandMetadata,
   commandModule,
   defineCommand,
+  findCommandConsistencyIssues,
   registeredCommands,
+  validateCommandConsistency,
   visibleCommandMetadata,
+  type CommandConsistencyIssue,
+  type CommandConsistencyOptions,
   type CommandDeps,
   type CommandHandler,
   type CommandMetadata,
@@ -62,6 +88,18 @@ export { contractsCommand, contractsMessage } from "./contracts.js";
 export { healthCommand, healthMessage } from "./health.js";
 export { pauseCommand, pauseMessage, PAUSE_PROMPT } from "./pause.js";
 export { previewCommand } from "./preview.js";
+export {
+  CategoryCounter,
+  categoriesCommand,
+  categoriesMessage,
+  createCategoryCounter,
+} from "./categories.js";
 export { resumeCommand, resumeMessage } from "./resume.js";
 export { lastEventMessage, statusCommand, statusMessage } from "./status.js";
 export { logExportCommand } from "./log-export.js";
+export {
+  matchPreviewCommand,
+  matchPreviewMessage,
+  matchPreviewInvalidMessage,
+  MATCH_PREVIEW_USAGE,
+} from "./match-preview.js";

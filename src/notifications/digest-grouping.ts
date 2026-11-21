@@ -22,6 +22,88 @@ export interface DigestGroup {
   events: DecodedEvent[];
 }
 
+/** Reasons why a digest period does not have complete ledger coverage. */
+export type DigestIncompleteReason = "rpc_gap" | "restart";
+
+/** Explicit completeness metadata for a digest period. */
+export interface DigestPeriodCompleteness {
+  /** Whether the digest period has complete ledger coverage. */
+  complete: boolean;
+  /**
+   * Reasons why the period is incomplete.
+   * Always empty when `complete` is `true`.
+   */
+  reasons: DigestIncompleteReason[];
+}
+
+/** Grouped digest payload paired with explicit period completeness metadata. */
+export interface DigestPeriod {
+  groups: DigestGroup[];
+  eventCount: number;
+  completeness: DigestPeriodCompleteness;
+}
+
+const VALID_INCOMPLETE_REASONS = new Set<DigestIncompleteReason>(["rpc_gap", "restart"]);
+
+const REASON_LABELS: Record<DigestIncompleteReason, string> = {
+  rpc_gap: "RPC gap",
+  restart: "restart",
+};
+
+/**
+ * Normalize digest period completeness metadata.
+ *
+ * Deduplicates valid reasons in first-seen order and enforces the invariant
+ * that any period with one or more incomplete reasons is never marked complete.
+ */
+export function normalizeDigestCompleteness(
+  input?: Partial<DigestPeriodCompleteness>,
+): DigestPeriodCompleteness {
+  if (!input) {
+    return { complete: true, reasons: [] };
+  }
+
+  const reasons: DigestIncompleteReason[] = [];
+  if (Array.isArray(input.reasons)) {
+    for (const reason of input.reasons) {
+      if (VALID_INCOMPLETE_REASONS.has(reason) && !reasons.includes(reason)) {
+        reasons.push(reason);
+      }
+    }
+  }
+
+  const complete = reasons.length === 0 && input.complete !== false;
+  return { complete, reasons };
+}
+
+/**
+ * Format a human-readable label for an incomplete digest period, or `null`
+ * when the period is complete.
+ */
+export function formatCompletenessLabel(
+  completeness: Partial<DigestPeriodCompleteness>,
+): string | null {
+  const normalized = normalizeDigestCompleteness(completeness);
+  if (normalized.complete) return null;
+  if (normalized.reasons.length === 0) return "Incomplete period";
+  const detail = normalized.reasons.map((r) => REASON_LABELS[r]).join(", ");
+  return `Incomplete period (${detail})`;
+}
+
+/**
+ * Group `events` and attach normalized period completeness metadata.
+ */
+export function buildDigestPeriod(
+  events: readonly DecodedEvent[],
+  completeness?: Partial<DigestPeriodCompleteness>,
+): DigestPeriod {
+  return {
+    groups: groupDigestEvents(events),
+    eventCount: events.length,
+    completeness: normalizeDigestCompleteness(completeness),
+  };
+}
+
 /**
  * Derive the Group_Key for a single event.
  *

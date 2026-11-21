@@ -10,6 +10,14 @@
  * `baseUrl` is `MIMIR_APP_URL`, validated as an https origin when the config
  * is loaded. It is checked again here so a hand-built config object cannot
  * point the button at a non-https or unparseable origin.
+ *
+ * ── Privacy contract (#924) ────────────────────────────────────────────────
+ * Every emitted URL passes through {@link sanitizeShareLink}. That helper
+ * keeps a public allowlist of query keys (`id`, `market`, `claim`, `side`,
+ * `tab`, `view`, `lang`) and drops an explicit private-key denylist
+ * (`token`, `invite`, `ref`, `access`, `key`, `secret`, `sig`, `signature`,
+ * `auth`, `password`, `code`). The fragment is dropped whenever a private
+ * key was present. A URL with no private keys is returned byte-identical.
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
@@ -82,12 +90,108 @@ export function appTargetFor(event: DecodedEvent): AppTarget | null {
 }
 
 /**
+ * Query keys that identify a *public* market/claim/squad and are safe to
+ * preserve verbatim.
+ */
+const PUBLIC_QUERY_KEYS: ReadonlySet<string> = new Set([
+  "id",
+  "market",
+  "claim",
+  "side",
+]);
+
+/**
+ * Query keys that must never appear in a general notification. These are the
+ * standard shapes an invite/access/share-link uses to carry a secret, plus
+ * the generic credential keys already known to `redact.ts`.
+ */
+const PRIVATE_QUERY_KEYS: ReadonlySet<string> = new Set([
+  "token",
+  "invite",
+  "ref",
+  "access",
+  "key",
+  "secret",
+  "sig",
+  "signature",
+  "auth",
+  "password",
+  "code",
+]);
+
+/**
+ * Neutral query keys that may pass through unchanged: they do not identify a
+ * user and are useful for deep-link routing.
+ */
+const NEUTRAL_QUERY_KEYS: ReadonlySet<string> = new Set([
+  "tab",
+  "view",
+  "lang",
+]);
+
+/**
+ * Return a sanitized copy of `url` with private query keys and (when one was
+ * present) the fragment removed, or `null` when the input is not a usable
+ * absolute http(s) URL.
+ *
+ * - Public and neutral query keys are preserved verbatim, in original order.
+ * - Any other query key is preserved as-is (unknown ≠ private).
+ * - Private query keys are dropped from every occurrence.
+ * - The fragment is dropped when the URL carried a private key; otherwise it
+ *   is preserved verbatim.
+ * - A URL with no private keys is returned byte-identical to its input.
+ * - Embedded userinfo (user/password) is always removed.
+ */
+export function sanitizeShareLink(url: string | null | undefined): string | null {
+  if (!url || typeof url !== "string") return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+  if (parsed.username || parsed.password) {
+    parsed.username = "";
+    parsed.password = "";
+  }
+
+  const entries: [string, string][] = [];
+  let sawPrivate = false;
+  for (const [key, value] of parsed.searchParams.entries()) {
+    if (PRIVATE_QUERY_KEYS.has(key)) {
+      sawPrivate = true;
+      continue;
+    }
+    if (PUBLIC_QUERY_KEYS.has(key) || NEUTRAL_QUERY_KEYS.has(key)) {
+      entries.push([key, value]);
+    } else {
+      entries.push([key, value]);
+    }
+  }
+
+  if (sawPrivate) {
+    parsed.hash = "";
+  }
+
+  const next = new URLSearchParams();
+  for (const [k, v] of entries) next.append(k, v);
+  parsed.search = next.toString();
+
+  const serialized = parsed.toString();
+  return serialized === url ? url : serialized;
+}
+
+/**
  * The Mimir web-app URL for an event, or null when there is nothing to open.
  *
  * Trailing slashes on the base are collapsed so `https://app.example/` and
  * `https://app.example` produce the same link, and the id goes through
  * `encodeURIComponent` so an unexpected payload value cannot inject a query,
- * fragment or extra path segment.
+ * fragment or extra path segment. Base URLs that are not `https:`, lack a
+ * host, or contain userinfo (`username` / `password`) are rejected. The final
+ * URL is passed through {@link sanitizeShareLink} so private query keys cannot
+ * leak into a notification.
  */
 export function appUrlFor(
   event: DecodedEvent,
@@ -104,10 +208,12 @@ export function appUrlFor(
     return null;
   }
   if (base.protocol !== "https:") return null;
+  if (base.username !== "" || base.password !== "") return null;
+  if (!base.hostname) return null;
 
   base.search = "";
   base.hash = "";
   const prefix = base.pathname.replace(/\/+$/, "");
   base.pathname = `${prefix}/${target.route}/${encodeURIComponent(target.id)}`;
-  return base.toString();
+  return sanitizeShareLink(base.toString());
 }

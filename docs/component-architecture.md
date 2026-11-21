@@ -104,6 +104,21 @@ The scanner handles cursor-paginated event retrieval from Soroban RPC. It is des
 - `readContractEvents()`: High-level scan with event decoding
 - `eventCursorLedger()`: Extracts ledger sequence from opaque cursor
 
+### Event Archive (`src/stellar/archive.ts`, `src/stellar/scan-jsonl.ts`)
+
+The archive persists decoded events as rotating canonical JSONL files for offline analysis and replay, and the scanner's `--jsonl` export adds a trailing `{ "type": "summary" }` metadata line. `compactArchive()` and `compactScanJsonl()` are explicit maintenance operations that reduce a settled capture to an inclusive ledger range.
+
+**Key behaviors:**
+- **Range retention**: Only events with `firstLedger <= ledger <= lastLedger` are kept; both endpoints are inclusive. The range is validated up front (safe integers, `firstLedger >= 1`, not inverted) and invalid input throws `RangeError` without touching the source.
+- **Rebuilt metadata**: A compacted archive rebuilds its rotation layout, and `compactScanJsonl()` regenerates the summary line's `eventCount` and histogram from the retained events. A stale summary is never carried forward.
+- **Verify before replace**: `compactArchive()` writes to a temporary sibling directory, reads it back, and checks the record count, a SHA-256 digest of the canonical JSONL records, and every ledger bound. Only then does it rename the compacted directory into place. A malformed source record, I/O error, or verification failure aborts with the source byte-for-byte unchanged.
+- **Compatible format**: Retained records keep the existing archive/JSONL encoding (canonical LF, bigint values as decimal strings), so `readArchive()` and downstream replay tooling need no changes.
+
+**API surface:**
+- `compactArchive(dir, range, options?)`: Atomic, verified archive compaction; returns `{ retained, dropped, files, digest }`.
+- `compactScanJsonl(input, range)`: Returns the re-serialized JSONL plus `{ retained, dropped }`.
+- `validateLedgerRange(range)`: Shared inclusive-range validation.
+
 ### Event Decoder (`src/stellar/decode.ts`)
 
 The decoder converts raw Soroban events into typed TypeScript objects. It handles both `mimir-market` and `mimir-squad` contracts with specific decoders for each event type.

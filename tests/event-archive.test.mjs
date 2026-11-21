@@ -214,3 +214,64 @@ test("archive reports malformed record line without payload and retains valid pr
     assert.equal(retainedEvents[0].eventId, "event-1");
   });
 });
+
+test("archive accepts LF and CRLF input without changing record identities and writes canonical LF", async () => {
+  await withTempDataDir(async (tmp) => {
+    const lfDir = tmp.file("events-lf");
+    const crlfDir = tmp.file("events-crlf");
+
+    const archive = createEventArchive({ dir: lfDir });
+    const event1 = makeDummyEvent(1, 1000n);
+    const event2 = makeDummyEvent(2, 2000n);
+    await archive.append([event1, event2]);
+    await archive.close();
+
+    const fs = await import("node:fs/promises");
+    const lfFiles = await fs.readdir(lfDir);
+    assert.equal(lfFiles.length, 1);
+    const lfRaw = await fs.readFile(path.join(lfDir, lfFiles[0]), "utf8");
+    assert.equal(lfRaw.includes("\r\n"), false, "canonical archive output must use LF, not CRLF");
+    assert.equal(lfRaw.endsWith("\n"), true);
+
+    await mkdir(crlfDir, { recursive: true });
+    // Write same records with CRLF and a blank CRLF line
+    const crlfRaw = lfRaw.replace(/\n/g, "\r\n") + "\r\n";
+    await writeFile(path.join(crlfDir, lfFiles[0]), crlfRaw, "utf8");
+
+    const fromLf = [];
+    for await (const ev of readArchive(lfDir)) fromLf.push(ev);
+
+    const fromCrlf = [];
+    for await (const ev of readArchive(crlfDir)) fromCrlf.push(ev);
+
+    assert.deepEqual(fromCrlf, fromLf);
+    assert.equal(fromCrlf[0].eventId, "event-1");
+    assert.equal(fromCrlf[1].eventId, "event-2");
+  });
+});
+
+test("archive reports exact line number for malformed record in CRLF input", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-crlf-malformed");
+    await mkdir(archiveDir, { recursive: true });
+    const fileName = "events-2026-01-01T00-00-00-000Z-000001.jsonl";
+    await writeFile(
+      path.join(archiveDir, fileName),
+      `{"eventId":"event-1"}\r\n\r\n{"eventId":bad}\r\n`,
+      "utf8",
+    );
+
+    let caught;
+    try {
+      for await (const _ of readArchive(archiveDir)) {
+        // drain
+      }
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.ok(caught instanceof MalformedArchiveRecordError);
+    assert.equal(caught.fileName, fileName);
+    assert.equal(caught.lineNumber, 3);
+  });
+});

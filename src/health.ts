@@ -43,12 +43,32 @@ export interface HealthServer {
   url: string | null;
   /** Port actually bound (0 when disabled). */
   port: number;
+  /**
+   * Transition the server into shutdown drain mode before stopping polling.
+   * Readiness probes immediately report not ready (HTTP 503) and operational
+   * HTTP work stops being accepted, while liveness stays 200 until `close()`.
+   * Idempotent.
+   */
+  beginShutdown(): void;
+  /** Whether `beginShutdown()` has been called. */
+  isShuttingDown(): boolean;
   close(): Promise<void>;
+}
+
+/** Optional overrides for {@link buildHealthReport}. */
+export interface HealthReportOptions {
+  /** True once shutdown readiness transition has started, before poller.stopping flips. */
+  draining?: boolean;
 }
 
 /** Safe, redacted snapshot for HTTP clients. Never includes secrets. */
 export interface HealthReport {
   ok: boolean;
+  /**
+   * Operational readiness: true only when `status === "ok"` and the process is
+   * not draining for shutdown. Readiness probes return HTTP 200 iff `ready`.
+   */
+  ready: boolean;
   status: "ok" | "degraded" | "stopped";
   service: "mimir-telegram-bot";
   /** Semver string from `package.json`, or `"unknown"` if unavailable. */
@@ -164,6 +184,12 @@ export interface HealthReport {
 
 const CURSOR_PREVIEW_LEN = 24;
 
+/**
+ * Maximum UTF-8 byte length of an Authorization header accepted by the health
+ * server, including the `Bearer ` scheme prefix. Longer values are malformed.
+ */
+export const MAX_AUTH_HEADER_BYTES = 4096;
+
 function iso(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString();
 }
@@ -180,6 +206,8 @@ function constantTimeEquals(a: string, b: string): boolean {
 /**
  * Extract and validate the bearer token from the Authorization header.
  * Returns true if the token matches the expected value (or if auth is disabled).
+ * The header's UTF-8 byte length is bounded before parsing or comparison, so
+ * oversized values take the same unauthorised path as other malformed headers.
  */
 function isValidAuth(
   authHeader: string | undefined,
@@ -189,6 +217,7 @@ function isValidAuth(
   // the server is loopback-only, which config validation enforces.
   if (expectedToken === null || expectedToken === undefined) return true;
   if (authHeader === undefined) return false;
+  if (Buffer.byteLength(authHeader, "utf8") > MAX_AUTH_HEADER_BYTES) return false;
 
   const match = authHeader.match(/^Bearer\s+(.+)$/i);
   if (!match || match[1] === undefined) return false;
@@ -249,6 +278,7 @@ export function buildHealthReport(
   poller: PollerStatus,
   nowMs: number = Date.now(),
   provenance: ConfigProvenance = configProvenance(),
+  options: HealthReportOptions = {},
 ): HealthReport {
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
   // Tolerate a status snapshot that never learned about the chain clock (and
@@ -284,8 +314,12 @@ export function buildHealthReport(
     status = tooManyFailures || stale || hasStaleCursor || hasStalledCursor ? "degraded" : "ok";
   }
 
+  const draining = options.draining === true || poller.stopping === true;
+  const ready = status === "ok" && !draining;
+
   return {
     ok: status === "ok",
+    ready,
     status,
     service: "mimir-telegram-bot",
     version: config.version,
@@ -298,5 +332,256 @@ export function buildHealthReport(
       stopping: poller.stopping === true,
     },
     config: provenance,
+  };
+}
+
+/**
+ * Render poller status as Prometheus metrics.
+ */
+export function buildMetricsReport(
+  config: BotConfig,
+  poller: PollerStatus,
+  nowMs: number = Date.now(),
+): string {
+  const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
+  const network = networkLabel(config);
+  const activity = poller.activityBaseline ?? emptyActivityBaseline();
+
+  const lines: string[] = [
+    `# HELP mimir_telegram_uptime_ms Uptime in milliseconds`,
+    `# TYPE mimir_telegram_uptime_ms gauge`,
+    `mimir_telegram_uptime_ms{network="${network}"} ${uptimeMs}`,
+    ``,
+    `# HELP mimir_telegram_poller_running Whether the poller is currently running (1) or stopped/paused (0)`,
+    `# TYPE mimir_telegram_poller_running gauge`,
+    `mimir_telegram_poller_running{network="${network}"} ${poller.running && !poller.paused ? 1 : 0}`,
+    ``,
+    `# HELP mimir_telegram_poller_cycles_total Total number of completed poll cycles`,
+    `# TYPE mimir_telegram_poller_cycles_total counter`,
+    `mimir_telegram_poller_cycles_total{network="${network}"} ${poller.cycles}`,
+    ``,
+    `# HELP mimir_telegram_notifications_sent_total Total number of Telegram messages successfully sent`,
+    `# TYPE mimir_telegram_notifications_sent_total counter`,
+    `mimir_telegram_notifications_sent_total{network="${network}"} ${poller.notificationsSent}`,
+    ``,
+    `# HELP mimir_telegram_notifications_failed_total Total number of Telegram messages that failed to send after retries`,
+    `# TYPE mimir_telegram_notifications_failed_total counter`,
+    `mimir_telegram_notifications_failed_total{network="${network}"} ${poller.notificationsFailed}`,
+    ``,
+    `# HELP mimir_telegram_events_skipped_total Total number of events skipped (unrecognized, unformatted, or rate-limited)`,
+    `# TYPE mimir_telegram_events_skipped_total counter`,
+    `mimir_telegram_events_skipped_total{network="${network}"} ${poller.eventsSkipped}`,
+    ``,
+    `# HELP mimir_telegram_consecutive_failures Current number of consecutive failed poll cycles`,
+    `# TYPE mimir_telegram_consecutive_failures gauge`,
+    `mimir_telegram_consecutive_failures{network="${network}"} ${poller.consecutiveFailures}`,
+    ``,
+    `# HELP mimir_telegram_activity_last_cycle_events Events observed in the most recent complete poll cycle`,
+    `# TYPE mimir_telegram_activity_last_cycle_events gauge`,
+    `mimir_telegram_activity_last_cycle_events{network="${network}"} ${activity.lastValue ?? 0}`,
+    ``,
+    `# HELP mimir_telegram_activity_baseline_events Mean events per cycle in the rolling baseline (0 while warming up)`,
+    `# TYPE mimir_telegram_activity_baseline_events gauge`,
+    `mimir_telegram_activity_baseline_events{network="${network}"} ${activity.baselineMean ?? 0}`,
+    ``,
+    `# HELP mimir_telegram_activity_deviation Z-score of the latest complete cycle against the rolling baseline (0 while warming up)`,
+    `# TYPE mimir_telegram_activity_deviation gauge`,
+    `mimir_telegram_activity_deviation{network="${network}"} ${activity.zScore ?? 0}`,
+    ``,
+    `# HELP mimir_telegram_activity_anomalies_total Complete cycles classified as a spike or drop against the rolling baseline`,
+    `# TYPE mimir_telegram_activity_anomalies_total counter`,
+    `mimir_telegram_activity_anomalies_total{network="${network}"} ${activity.anomalies}`,
+  ];
+
+  if (poller.latestLedger !== null) {
+    lines.push(
+      ``,
+      `# HELP mimir_telegram_latest_ledger Highest ledger seen by the poller`,
+      `# TYPE mimir_telegram_latest_ledger gauge`,
+      `mimir_telegram_latest_ledger{network="${network}"} ${poller.latestLedger}`
+    );
+  }
+
+  const targetsWithLedgers = poller.targets.filter((t) => t.lastEventLedger !== null);
+  if (targetsWithLedgers.length > 0) {
+    lines.push(
+      ``,
+      `# HELP mimir_telegram_target_last_event_ledger Highest ledger in which an event was processed for a target`,
+      `# TYPE mimir_telegram_target_last_event_ledger gauge`,
+    );
+    for (const target of targetsWithLedgers) {
+      lines.push(
+        `mimir_telegram_target_last_event_ledger{network="${network}",source="${target.source}",contract="${target.contractId}"} ${target.lastEventLedger}`
+      );
+    }
+  }
+
+  return lines.join("\\n") + "\\n";
+}
+
+function sendJson(
+  res: http.ServerResponse,
+  statusCode: number,
+  body: unknown,
+): void {
+  const payload = `${JSON.stringify(body)}\n`;
+  res.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
+
+const HEALTH_GET_ROUTES = new Set([
+  "/",
+  "/health",
+  "/healthz",
+  "/health/live",
+  "/livez",
+  "/metrics",
+]);
+
+function sendMethodNotAllowed(res: http.ServerResponse, allow: string): void {
+  const payload = `${JSON.stringify({ ok: false, error: "method_not_allowed" })}\n`;
+  res.writeHead(405, {
+    "allow": allow,
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
+
+function sendUnauthorized(res: http.ServerResponse): void {
+  res.writeHead(401, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": "0",
+  });
+  res.end();
+}
+
+/**
+ * Start the local health HTTP server.
+ *
+ * `HEALTH_PORT=0` (or a resolved port of 0) disables the listener entirely —
+ * useful for unit tests and one-shot CLI runs that must not bind a port.
+ */
+export function startHealthServer(deps: HealthDeps): HealthServer {
+  const { config, status, logs, webhookHandler } = deps;
+  const now = deps.now ?? Date.now;
+  const provenance = deps.provenance ?? configProvenance;
+  let draining = false;
+
+  const beginShutdown = (): void => {
+    draining = true;
+  };
+  const isShuttingDown = (): boolean => draining;
+
+  if (config.healthPort === 0) {
+    console.log("[health] disabled (HEALTH_PORT=0)");
+    return {
+      url: null,
+      port: 0,
+      beginShutdown,
+      isShuttingDown,
+      close: async () => undefined,
+    };
+  }
+
+  const server = http.createServer((req, res) => {
+    const method = req.method ?? "GET";
+    const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
+
+    // Webhook deliveries carry Telegram's own secret-token header rather than
+    // the health bearer token, and stop being accepted as soon as drain starts.
+    if (webhookHandler && method === "POST" && url.pathname === "/telegram-webhook") {
+      if (draining || status().stopping === true) {
+        sendJson(res, 503, { ok: false, ready: false, error: "shutting_down" });
+        return;
+      }
+      webhookHandler(req, res);
+      return;
+    }
+
+    // Check authentication for all routes when token is configured
+    if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
+      sendUnauthorized(res);
+      return;
+    }
+
+    if (HEALTH_GET_ROUTES.has(url.pathname) && method !== "GET") {
+      sendMethodNotAllowed(res, "GET");
+      return;
+    }
+
+    if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
+      const report = buildHealthReport(config, status(), now(), provenance(), { draining });
+      sendJson(res, report.ready ? 200 : 503, report);
+      return;
+    }
+
+    if (method === "GET" && (url.pathname === "/health/live" || url.pathname === "/livez")) {
+      // Liveness: the process is up and the HTTP server can answer. Do not
+      // reflect poller degradation here — supervisors use /health for that.
+      sendJson(res, 200, {
+        ok: true,
+        status: "live",
+        service: "mimir-telegram-bot",
+        version: config.version,
+        checkedAt: new Date(now()).toISOString(),
+      });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/metrics") {
+      const metrics = buildMetricsReport(config, status(), now());
+      res.writeHead(200, {
+        "content-type": "text/plain; version=0.0.4; charset=utf-8",
+        "cache-control": "no-store",
+        "content-length": Buffer.byteLength(metrics),
+      });
+      res.end(metrics);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/") {
+      sendJson(res, 200, {
+        service: "mimir-telegram-bot",
+        health: "/health",
+        live: "/health/live",
+        metrics: "/metrics",
+      });
+      return;
+    }
+
+    sendJson(res, 404, { ok: false, error: "not_found" });
+  });
+
+  // Failures after listen (e.g. client aborts) must not take down the notifier.
+  server.on("error", (err) => {
+    console.error(`[health] server error: ${safeErrorMessage(err)}`);
+  });
+
+  server.listen(config.healthPort, config.healthHost);
+
+  const address = server.address() as AddressInfo | null;
+  const port = address?.port ?? config.healthPort;
+  const url = `http://${config.healthHost}:${port}`;
+  console.log(
+    `[health] listening on ${url} (GET /health, GET /health/live` +
+      `${logs && logs.capacity() > 0 ? ", GET /health/diag" : ""})`,
+  );
+
+  return {
+    url,
+    port,
+    beginShutdown,
+    isShuttingDown,
+    close: () =>
+      new Promise((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      }),
   };
 }

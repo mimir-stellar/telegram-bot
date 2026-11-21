@@ -27,7 +27,12 @@ import {
 import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
 import { iconForCategory } from "./category-icons.js";
-import { groupDigestEvents } from "./digest-grouping.js";
+import {
+  formatCompletenessLabel,
+  groupDigestEvents,
+  normalizeDigestCompleteness,
+  type DigestPeriodCompleteness,
+} from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
@@ -51,6 +56,27 @@ export {
 
 /** Telegram's MarkdownV2 reserved set. All of it must be escaped, everywhere. */
 const MDV2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
+/**
+ * Unicode First-Strong-Isolate / Pop-Directional-Isolate.
+ *
+ * Wrapping an already-formatted amount in FSI…PDI keeps the digits
+ * and the "USDC" unit readable left-to-right regardless of the
+ * surrounding text direction, while leaving the string's bytes intact
+ * (the isolate is a Unicode control, not a markup change).
+ */
+const FSI = "\u2068";
+const PDI = "\u2069";
+
+/**
+ * Isolate a displayed amount from the surrounding text direction (#920).
+ *
+ * The exact numeric text is preserved; only the two invisible control
+ * characters FSI/PDI surround it. Use this on every user-visible amount.
+ */
+export function isolateAmount(text: string): string {
+  return `${FSI}${text}${PDI}`;
+}
+
 const MAX_EVENT_FIELD_LENGTH = 200;
 const MAX_TX_HASH_LENGTH = 128;
 
@@ -61,6 +87,44 @@ export function escapeMd(text: string): string {
 
 /** Telegram Bot API hard limit for sendMessage / editMessageText text. */
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+
+/**
+ * UTF-16 code-unit length of `text`.
+ *
+ * Telegram measures its 4096-character limit in UTF-16 code units, after
+ * entity / markup handling. JavaScript's `string.length` is exactly that
+ * unit — one code unit per `charCodeAt` index — so this helper exists to
+ * make the unit explicit at every call site and keep one definition.
+ *
+ * Do NOT replace this with `Array.from(s).length`: that counts Unicode code
+ * points, which is a different (smaller) number for any string containing an
+ * astral character (every emoji, most CJK extensions). A message that fits
+ * under a code-point budget can still exceed Telegram's UTF-16 limit.
+ */
+export function utf16Length(text: string): number {
+  return text.length;
+}
+
+/**
+ * Clip `text` to at most `max` UTF-16 code units without splitting a
+ * surrogate pair. The returned string is <= `max` UTF-16 units (the ellipsis
+ * is one unit). Returns `text` unchanged when it already fits.
+ */
+export function clipUtf16(text: string, max: number): string {
+  if (!Number.isFinite(max) || max < 1) return "";
+  if (utf16Length(text) <= max) return text;
+  // Reserve one unit for the trailing ellipsis.
+  const budget = max - 1;
+  let used = 0;
+  const out: string[] = [];
+  for (const cp of Array.from(text)) {
+    const w = cp.length; // 1 for BMP, 2 for astral code points
+    if (used + w > budget) break;
+    out.push(cp);
+    used += w;
+  }
+  return `${out.join("")}…`;
+}
 
 /**
  * Split a MarkdownV2 (or plain) payload so each chunk fits Telegram's size limit.
@@ -77,7 +141,7 @@ export function splitTelegramMessage(
   if (!Number.isFinite(limit) || limit < 1) {
     throw new RangeError(`splitTelegramMessage limit must be >= 1, got ${limit}`);
   }
-  if (text.length <= limit) return [text];
+  if (utf16Length(text) <= limit) return [text];
 
   const parts: string[] = [];
   let remaining = text;
@@ -94,7 +158,7 @@ export function splitTelegramMessage(
     return cut - ((cut - start) % 2);
   }
 
-  while (remaining.length > limit) {
+  while (utf16Length(remaining) > limit) {
     let cut = remaining.lastIndexOf("\n", limit);
     if (cut <= 0) cut = Math.floor(limit);
     cut = safeCut(cut);
@@ -109,7 +173,7 @@ export function splitTelegramMessage(
     if (remaining.startsWith("\n")) remaining = remaining.slice(1);
   }
 
-  if (remaining.length > 0) parts.push(remaining);
+  if (utf16Length(remaining) > 0) parts.push(remaining);
   return parts;
 }
 
@@ -201,7 +265,7 @@ export function safeErrorMessage(error: unknown, secrets: readonly string[] = []
 }
 
 function usdc(units: bigint): string {
-  return escapeMd(`${formatUsdc(units)} USDC`);
+  return escapeMd(isolateAmount(`${formatUsdc(units)} USDC`));
 }
 
 function who(address: string): string {
@@ -326,6 +390,23 @@ export interface FormatDigestOptions {
    * option is omitted or set to `false`.
    */
   grouped?: boolean;
+  /**
+   * Completeness metadata for the digest period.
+   *
+   * When incomplete (e.g. affected by an RPC gap or restart), the header
+   * explicitly labels the period as incomplete and marks the event count as a
+   * partial observation rather than a complete ledger summary.
+   */
+  completeness?: Partial<DigestPeriodCompleteness>;
+}
+
+function digestHeader(count: number, completeness: DigestPeriodCompleteness): string {
+  if (completeness.complete) {
+    return `*Mimir Digest* — ${count} events in this cycle`;
+  }
+  const label = formatCompletenessLabel(completeness) ?? "Incomplete period";
+  const noun = count === 1 ? "event" : "events";
+  return `*Mimir Digest* — ${escapeMd(label)} \\(${count} observed ${noun}, partial\\)`;
 }
 
 /**
@@ -340,9 +421,12 @@ function flatLine(event: DecodedEvent): string {
 /**
  * Render a grouped digest.  Called only when `options.grouped` is `true`.
  */
-function renderGroupedDigest(events: readonly DecodedEvent[]): string {
+function renderGroupedDigest(
+  events: readonly DecodedEvent[],
+  completeness: DigestPeriodCompleteness,
+): string {
   const groups = groupDigestEvents(events);
-  const header = `*Mimir Digest* — ${events.length} events in this cycle`;
+  const header = digestHeader(events.length, completeness);
   const body: string[] = [];
 
   for (const group of groups) {
@@ -365,19 +449,31 @@ function renderGroupedDigest(events: readonly DecodedEvent[]): string {
 
 /**
  * One MarkdownV2 message summarising a burst of events: a header with the count
- * and one bounded line per event. Returns null when there is nothing to send.
+ * and one bounded line per event. Returns null when there is nothing to send
+ * and the digest period is complete.
  *
  * Pass `{ grouped: true }` to group consecutive events by claim / squad market.
+ * Pass `{ completeness: { complete: false, reasons: ["rpc_gap"] } }` (or
+ * `"restart"`) to label an incomplete period explicitly so partial counts are
+ * never presented as complete ledger summaries.
  * The default (`{}` or no second argument) produces the unchanged flat layout.
  */
 export function formatDigest(
   events: readonly DecodedEvent[],
   options: FormatDigestOptions = {},
 ): string | null {
-  if (events.length === 0) return null;
-  if (options.grouped) return renderGroupedDigest(events);
+  const completeness = normalizeDigestCompleteness(options.completeness);
+  if (events.length === 0) {
+    if (completeness.complete) return null;
+    return [
+      digestHeader(0, completeness),
+      "",
+      "_No events observed; ledger coverage for this period is incomplete\\._",
+    ].join("\n");
+  }
+  if (options.grouped) return renderGroupedDigest(events, completeness);
   const lines = events.map(flatLine);
-  return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
+  return [digestHeader(events.length, completeness), "", ...lines].join("\n");
 }
 
 /**
@@ -582,6 +678,8 @@ export function formatEvent(
 const MAX_PLAIN_TEXT_LENGTH = 4000;
 
 function plainUsdc(units: bigint): string {
+  // Plaintext is not a Telegram renderer; the isolate belongs on the
+  // Markdown and HTML paths, where the client applies bidi layout.
   return `${formatUsdc(units)} USDC`;
 }
 
@@ -730,11 +828,11 @@ function plainHeadline(
 }
 
 /**
- * Clip a finished plain-text message without splitting a Unicode code point.
+ * Clip a finished plain-text message to Telegram's UTF-16 budget without
+ * splitting a surrogate pair. See {@link clipUtf16} for the unit contract.
  */
 function clipPlainText(text: string, max = MAX_PLAIN_TEXT_LENGTH): string {
-  const characters = Array.from(text);
-  return characters.length <= max ? text : `${characters.slice(0, max - 1).join("")}…`;
+  return clipUtf16(text, max);
 }
 
 /**

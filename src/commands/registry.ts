@@ -23,6 +23,7 @@ import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
 import type { BroadcastStore } from "./broadcast.js";
+import type { FollowStore } from "../subscriptions/store.js";
 
 /** Everything a command handler may need, supplied once by `createBot`. */
 export interface CommandDeps {
@@ -45,6 +46,12 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /**
+   * Follow store for subscription data. When provided, the operator can use
+   * `/matchpreview` to count how many chats follow a given event reference.
+   * Absent means that command reports zero matches.
+   */
+  followStore?: FollowStore | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */
@@ -85,6 +92,38 @@ export interface CommandMetadata {
   readonly command: string;
   readonly description: string;
   readonly operatorOnly: boolean;
+}
+
+/** One consistency mismatch between the command catalogue, menu, and `/help`. */
+export interface CommandConsistencyIssue {
+  readonly command: string;
+  readonly source: "catalogue" | "menu" | "help";
+  readonly message: string;
+}
+
+/** Inputs for {@link findCommandConsistencyIssues} and {@link validateCommandConsistency}. */
+export interface CommandConsistencyOptions {
+  /** Registered command modules (defaults to the live registry). */
+  readonly modules?: readonly CommandModule[];
+  /** Menu/autocomplete descriptions (defaults to `COMMAND_DESCRIPTIONS`). */
+  readonly menuDescriptions?: Readonly<Record<string, string>>;
+  /** Detailed `/help <command>` entries (pass `COMMAND_DETAILS` to check help parity). */
+  readonly helpDetails?: Readonly<Record<string, { readonly operatorOnly?: boolean }>>;
+}
+
+/**
+ * Thrown at startup when an advertised command has no live registered handler
+ * or when the catalogue, menu descriptions, and `/help` details disagree.
+ */
+export class CommandConsistencyError extends Error {
+  readonly issues: readonly CommandConsistencyIssue[];
+
+  constructor(issues: readonly CommandConsistencyIssue[]) {
+    const summary = issues.map((issue) => `/${issue.command}: ${issue.message}`).join("; ");
+    super(`command consistency check failed: ${summary}`);
+    this.name = "CommandConsistencyError";
+    this.issues = issues;
+  }
 }
 
 const registered = new Map<string, CommandModule>();
@@ -158,4 +197,113 @@ export function visibleCommandMetadata(config?: BotConfig): CommandMetadata[] {
         descriptionFor(module.command),
       operatorOnly: module.operatorOnly === true,
     }));
+}
+
+/**
+ * Inspect the command catalogue, menu descriptions, and `/help` detail entries
+ * for drift — in particular, any advertised command without a live registered
+ * handler.
+ */
+export function findCommandConsistencyIssues(
+  options?: CommandConsistencyOptions,
+): CommandConsistencyIssue[] {
+  const modules = options?.modules ?? registeredCommands();
+  const menuDescriptions =
+    options?.menuDescriptions ?? (COMMAND_DESCRIPTIONS as Readonly<Record<string, string>>);
+  const helpDetails = options?.helpDetails;
+
+  const issues: CommandConsistencyIssue[] = [];
+  const byName = new Map<string, CommandModule>();
+
+  for (const module of modules) {
+    byName.set(module.command, module);
+
+    if (typeof module.handler !== "function") {
+      issues.push({
+        command: module.command,
+        source: "catalogue",
+        message: "registered command has no callable handler",
+      });
+    }
+
+    if (module.hidden !== true) {
+      const description = menuDescriptions[module.command];
+      if (typeof description !== "string" || description.trim().length === 0) {
+        issues.push({
+          command: module.command,
+          source: "menu",
+          message: "advertised command is missing a menu description in COMMAND_DESCRIPTIONS",
+        });
+      }
+
+      if (helpDetails !== undefined) {
+        const detail = helpDetails[module.command];
+        if (detail === undefined) {
+          issues.push({
+            command: module.command,
+            source: "help",
+            message: "advertised command is missing a help entry in COMMAND_DETAILS",
+          });
+        } else if (
+          detail.operatorOnly !== undefined &&
+          Boolean(detail.operatorOnly) !== Boolean(module.operatorOnly)
+        ) {
+          issues.push({
+            command: module.command,
+            source: "help",
+            message: "help entry operatorOnly flag disagrees with registered module",
+          });
+        }
+      }
+    }
+  }
+
+  for (const command of Object.keys(menuDescriptions)) {
+    const module = byName.get(command);
+    if (module === undefined) {
+      issues.push({
+        command,
+        source: "menu",
+        message: "advertised in COMMAND_DESCRIPTIONS without a live registered handler",
+      });
+    } else if (module.hidden === true) {
+      issues.push({
+        command,
+        source: "menu",
+        message: "hidden command must not be advertised in COMMAND_DESCRIPTIONS",
+      });
+    }
+  }
+
+  if (helpDetails !== undefined) {
+    for (const command of Object.keys(helpDetails)) {
+      const module = byName.get(command);
+      if (module === undefined) {
+        issues.push({
+          command,
+          source: "help",
+          message: "advertised in COMMAND_DETAILS without a live registered handler",
+        });
+      } else if (module.hidden === true) {
+        issues.push({
+          command,
+          source: "help",
+          message: "hidden command must not be advertised in COMMAND_DETAILS",
+        });
+      }
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Throw {@link CommandConsistencyError} naming every inconsistent command if
+ * the catalogue, menu, and `/help` tables disagree.
+ */
+export function validateCommandConsistency(options?: CommandConsistencyOptions): void {
+  const issues = findCommandConsistencyIssues(options);
+  if (issues.length > 0) {
+    throw new CommandConsistencyError(issues);
+  }
 }

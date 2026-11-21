@@ -34,6 +34,11 @@ that restricts who can reach the port. The health response includes
 configuration provenance (which env var supplied each setting) and poller
 counters. It contains no secrets, but it does confirm what is running.
 
+All operational HTTP responses on both listeners — including health, readiness,
+liveness, metrics, unauthorized (`401`), and error (`404`/`405`) responses —
+set `Cache-Control: no-store` so reverse proxies and intermediaries never cache
+live operational state.
+
 ---
 
 ## Health server — `HEALTH_PORT` (default 8787)
@@ -72,13 +77,15 @@ response fields is backward-compatible with v1; removing or renaming a v1 field,
 changing its type, or changing a fixed enum requires a new contract version.
 The v1 fixture remains the compatibility baseline for future response shapes.
 
-| Condition | `status` | `ok` | HTTP |
-|---|---|---|---|
-| Poller running, recent successful poll | `"ok"` | `true` | 200 |
-| Poller running but paused by operator | `"ok"` | `true` | 200 |
-| Poller draining (graceful shutdown) | `"ok"` | `true` | 200 |
-| Too many consecutive failures, stale, stale/stalled cursor | `"degraded"` | `false` | 503 |
-| Poller not running | `"stopped"` | `false` | 503 |
+| Condition | `status` | `ok` | `ready` | HTTP |
+|---|---|---|---|---|
+| Poller running, recent successful poll | `"ok"` | `true` | `true` | 200 |
+| Poller running but paused by operator | `"ok"` | `true` | `true` | 200 |
+| Poller draining (graceful shutdown) | `"ok"` | `true` | `false` | 503 |
+| Too many consecutive failures, stale, stale/stalled cursor | `"degraded"` | `false` | `false` | 503 |
+| Poller not running | `"stopped"` | `false` | `false` | 503 |
+
+During graceful shutdown, the health server transitions readiness to `false` (HTTP `503`) and stops accepting operational HTTP work (such as webhook deliveries) before polling stops and before the HTTP server closes, while `GET /health/live` (and `GET /livez`) continues returning HTTP `200` until the server closes.
 
 **Response body fields**
 
@@ -284,6 +291,22 @@ curl -s -o /dev/null -w "%{http_code}" \
 
 ---
 
+### Unsupported HTTP methods on health routes
+
+Any non-`GET` request (such as `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, or
+`HEAD`) to a health-server `GET` route (`/`, `/health`, `/healthz`,
+`/health/live`, `/livez`, or `/metrics`) is rejected without reading or mutating
+poller state. When `HEALTH_AUTH_TOKEN` is configured, authentication is still
+checked first and unauthenticated requests receive `401`.
+
+**Response — 405**, `Allow: GET`, `Cache-Control: no-store`
+
+```json
+{ "ok": false, "error": "method_not_allowed" }
+```
+
+---
+
 ### `GET <any other path>`
 
 **Response — 404**
@@ -323,6 +346,16 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_last_cycle_events` | gauge | Events observed in the most recent complete poll cycle |
+| `mimir_bot_activity_baseline_events` | gauge | Rolling mean events per cycle at the most recent baseline comparison |
+| `mimir_bot_activity_anomalies_total` | counter | Complete cycles classified as a spike or drop against the rolling baseline |
+| `mimir_bot_notification_age_samples_total` | counter | Confirmed notifications with a known ledger close time (includes `0` ms lag) |
+| `mimir_bot_notification_age_missing_ledger_time_total` | counter | Confirmed notifications whose event lacked a valid ledger close time |
+| `mimir_bot_notification_age_ms_total` | counter | Cumulative end-to-end age (ms) from ledger close time to confirmed send |
+| `mimir_bot_last_notification_age_ms` | gauge | End-to-end age (ms) of the most recent confirmed notification with a known ledger time |
+| `mimir_bot_max_notification_age_ms` | gauge | Maximum observed end-to-end notification age (ms) across confirmed sends |
+
+> **Note:** Missing ledger close times increment `mimir_bot_notification_age_missing_ledger_time_total` without incrementing `mimir_bot_notification_age_samples_total` or overwriting `mimir_bot_last_notification_age_ms`, distinguishing absent chain timestamps from `0` ms delivery lag.
 
 ```bash
 METRICS_PORT=9090  # in .env or environment
@@ -374,6 +407,7 @@ methods (`Allow: GET` header set).
 | Health | GET | `/livez` | 200 | Alias for `/health/live` |
 | Health | GET | `/metrics` | 200 | Prometheus text (poller-level) |
 | Health | POST | `/telegram-webhook` | 200, 401, 404 | Webhook updates (webhook mode only) |
+| Health | non-GET | `/`, `/health`, `/healthz`, `/health/live`, `/livez`, `/metrics` | 405 | Method not allowed (`Allow: GET`) |
 | Health | GET | `<other>` | 404 | — |
 | Metrics | GET | `/metrics` | 200 | Prometheus text (registry-level) |
 | Metrics | GET | `/health` | 200 | Plain-text liveness |
@@ -389,6 +423,7 @@ methods (`Allow: GET` header set).
 | `HEALTH_HOST` | `127.0.0.1` | Bind address for the health server |
 | `HEALTH_PORT` | `8787` (or `PORT` if set by platform) | TCP port; `0` disables the listener |
 | `HEALTH_STALE_MS` | `90000` | `/health` returns 503 if no successful poll within this window |
+| `HEALTH_AUTH_TOKEN` | _(unset — auth disabled)_ | Bearer token required for every health-server route; headers over 4096 UTF-8 bytes get the same empty 401 as malformed values |
 | `METRICS_PORT` | _(unset — disabled)_ | TCP port for the separate metrics server; omit to disable |
 
 See [configuration-reference.md](configuration-reference.md) for all

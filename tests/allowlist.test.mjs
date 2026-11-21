@@ -355,9 +355,9 @@ test("config: single numeric id (positive) is valid", async () => {
   assert.deepEqual(config.allowedChatIds, ["123456789"]);
 });
 
-// /health, /contracts and /preview expose deployment details just like /status,
+// /health, /contracts, /preview and /categories expose deployment details just like /status,
 // so they share its ALLOWED_CHAT_IDS gate.
-for (const command of ["health", "contracts", "preview"]) {
+for (const command of ["health", "contracts", "preview", "categories"]) {
   test(`/${command} is silently ignored for a chat not in the allowlist`, async () => {
     const config = makeConfig(["-1001234567890"]);
     const bot = createBot({ config, status: makeStatus, botInfo: FAKE_BOT_INFO });

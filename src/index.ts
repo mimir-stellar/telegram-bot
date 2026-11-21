@@ -25,6 +25,7 @@ import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
 import { attachConsole, createLogCapture, Logger, secretsFor } from "./logger.js";
 import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
+import { validateCommandCatalogue } from "./commands/index.js";
 import { startHealthServer } from "./health.js";
 import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
@@ -107,6 +108,10 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
+
+  // Fail fast if any advertised command (menu or /help) lacks a live
+  // registered handler, or if catalogue/help/menu metadata has drifted.
+  validateCommandCatalogue();
 
   // Register this process's secrets before anything can fail: every
   // operator-facing error goes through the scrubber, so a call site cannot
@@ -347,6 +352,10 @@ async function main(): Promise<void> {
     }
     shuttingDown = true;
     Logger.info("shutdown", `[shutdown] ${signal} received, draining`, { signal });
+
+    // Transition readiness to false immediately before stopping polling so
+    // supervisors stop routing probes/work while liveness stays 200 during drain.
+    healthServer.beginShutdown();
 
     // A clean-stop marker closes the audit window: anything after it belongs to
     // the next run, which is how an operator tells a crash from a restart.

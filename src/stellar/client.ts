@@ -15,6 +15,10 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import {
+  assertNetworkIdentity,
+  RpcNetworkIdentityError,
+} from "./rpc-guard.js";
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -40,6 +44,32 @@ export function createRpcServer(config: StellarConfig): rpc.Server {
 
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */
 export const DEFAULT_EXPLORER_BASE_URL = "https://stellar.expert/explorer";
+
+/** Default authoritative ceiling (ms) for RPC retry / backoff delays. */
+export const DEFAULT_RPC_MAX_BACKOFF_MS = 60_000;
+
+/**
+ * Resolve the authoritative maximum RPC backoff in milliseconds.
+ *
+ * Returns {@link DEFAULT_RPC_MAX_BACKOFF_MS} when `configuredMaxBackoffMs` is
+ * omitted; throws a bounded `RangeError` if a configured value is negative,
+ * non-finite, or not a number so a bad config cannot disable the cap.
+ */
+export function resolveMaxBackoffMs(configuredMaxBackoffMs?: number): number {
+  if (configuredMaxBackoffMs === undefined) {
+    return DEFAULT_RPC_MAX_BACKOFF_MS;
+  }
+  if (
+    typeof configuredMaxBackoffMs !== "number" ||
+    !Number.isFinite(configuredMaxBackoffMs) ||
+    configuredMaxBackoffMs < 0
+  ) {
+    throw new RangeError(
+      `maxBackoffMs must be a finite non-negative number; got ${typeof configuredMaxBackoffMs}`,
+    );
+  }
+  return configuredMaxBackoffMs;
+}
 
 /**
  * Resolve the explorer network path segment from the configured network name.
@@ -174,21 +204,81 @@ export async function validateNetworkPassphrase(
     );
   }
 
-  const rpcPassphrase = (network as Record<string, unknown> | null)?.passphrase;
-  if (typeof rpcPassphrase !== "string") {
-    throw new NetworkPassphraseMismatchError(
-      "malformed",
-      `RPC getNetwork returned a malformed passphrase (expected a string; got ${typeof rpcPassphrase})`,
+  try {
+    assertNetworkIdentity(network, config.networkPassphrase);
+  } catch (err) {
+    if (err instanceof RpcNetworkIdentityError) {
+      const problem: NetworkPassphraseProblem =
+        err.problem === "passphrase-mismatch" ? "mismatch" : "malformed";
+      throw new NetworkPassphraseMismatchError(problem, err.message);
+    }
+    throw err;
+  }
+}
+
+/** Minimal RPC provider surface required for admission validation. */
+export interface RpcProviderCandidate {
+  getHealth: () => Promise<{
+    status?: unknown;
+    oldestLedger?: unknown;
+    latestLedger?: unknown;
+  }>;
+  getNetwork: () => Promise<unknown>;
+}
+
+/** An RPC provider that has passed both health and network identity checks. */
+export interface AdmittedRpcProvider<
+  T extends RpcProviderCandidate = RpcProviderCandidate,
+> {
+  server: T;
+  health: LedgerWindow & { status: string };
+  network: { passphrase: string };
+}
+
+/**
+ * Validate endpoint health and network identity before admitting an RPC provider.
+ *
+ * Checks `getHealth()` (including retained ledger window bounds) and then
+ * verifies `getNetwork()` against `config.networkPassphrase`. A healthy
+ * provider serving another network is rejected with
+ * {@link NetworkPassphraseMismatchError} before it can be admitted for event
+ * ingestion.
+ *
+ * @param server Candidate RPC provider to validate.
+ * @param config Stellar configuration supplying `networkPassphrase`.
+ * @returns The admitted provider alongside its verified health and network identity.
+ */
+export async function admitRpcProvider<T extends RpcProviderCandidate>(
+  server: T,
+  config: Pick<StellarConfig, "networkPassphrase">,
+): Promise<AdmittedRpcProvider<T>> {
+  const rawHealth = await server.getHealth();
+  const status = typeof rawHealth?.status === "string" ? rawHealth.status.trim() : "";
+  if (status !== "healthy") {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `RPC provider health status is not healthy (got ${boundedLedgerValue(rawHealth?.status)})`,
     );
   }
 
-  if (rpcPassphrase !== config.networkPassphrase) {
-    throw new NetworkPassphraseMismatchError(
-      "mismatch",
-      `RPC network passphrase does not match the configured value ` +
-        `(configured=${config.networkPassphrase.length} chars, received=${rpcPassphrase.length} chars)`,
-    );
-  }
+  const window = validateLedgerWindow(rawHealth);
+
+  await validateNetworkPassphrase(
+    server as unknown as Pick<rpc.Server, "getNetwork">,
+    config,
+  );
+
+  return {
+    server,
+    health: {
+      status,
+      oldestLedger: window.oldestLedger,
+      latestLedger: window.latestLedger,
+    },
+    network: {
+      passphrase: config.networkPassphrase,
+    },
+  };
 }
 
 /**

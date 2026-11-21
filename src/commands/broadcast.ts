@@ -9,10 +9,12 @@
  */
 
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
+import { createHash } from "node:crypto";
 import type { BotConfig } from "../config.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
+import { isNoncanonicalNumericId, handleCallbackQuery } from "../callbacks.js";
 
 /** Telegram Bot API maximum message length limit. */
 export const MAX_BROADCAST_LENGTH = 4096;
@@ -28,11 +30,11 @@ export const BROADCAST_NO_CHATS_MESSAGE = "No notification chats configured.";
 /**
  * Extracts and deduplicates all unique configured notification chats from config.
  * Chats come from TELEGRAM_CHAT_ID (chatId / chatIds), TELEGRAM_MARKET_CHAT_ID,
- * and TELEGRAM_SQUAD_CHAT_ID.
+ * TELEGRAM_SQUAD_CHAT_ID, and per-chat routes.
  */
 export function getConfiguredBroadcastChats(
   config: Pick<BotConfig, "chatId"> &
-    Partial<Pick<BotConfig, "chatIds" | "marketChatId" | "squadChatId">>,
+    Partial<Pick<BotConfig, "chatIds" | "marketChatId" | "squadChatId" | "routes">>,
 ): string[] {
   const candidates: string[] = [];
   if (Array.isArray(config.chatIds) && config.chatIds.length > 0) {
@@ -45,6 +47,13 @@ export function getConfiguredBroadcastChats(
   }
   if (config.squadChatId) {
     candidates.push(config.squadChatId);
+  }
+  if (Array.isArray(config.routes)) {
+    for (const r of config.routes) {
+      if (r && typeof r.chatId === "string") {
+        candidates.push(r.chatId);
+      }
+    }
   }
 
   const seen = new Set<string>();
@@ -80,6 +89,25 @@ export function getConfiguredBroadcastChats(
   return unique;
 }
 
+/**
+ * Computes a deterministic, order-independent SHA-256 fingerprint for a destination set.
+ * - Trims each chat identifier.
+ * - Filters empty or blank values.
+ * - Deduplicates unique destinations.
+ * - Lexicographically sorts destination identifiers for canonical representation.
+ * - Hashes the canonical newline-delimited sequence with SHA-256.
+ */
+export function fingerprintDestinationSet(chats: readonly string[]): string {
+  const unique = Array.from(
+    new Set(
+      chats
+        .map((c) => (typeof c === "string" ? c.trim() : String(c ?? "").trim()))
+        .filter((c) => c.length > 0),
+    ),
+  ).sort();
+  return createHash("sha256").update(unique.join("\n")).digest("hex");
+}
+
 export interface PendingBroadcast {
   id: string;
   operatorId: string;
@@ -88,10 +116,12 @@ export interface PendingBroadcast {
   expiresAt: number;
   chats: readonly string[];
   confirmed: boolean;
+  destinationFingerprint?: string;
 }
 
 export class BroadcastStore {
   private readonly items = new Map<string, PendingBroadcast>();
+  private readonly cancelledReasons = new Map<string, "route-change" | "user-cancelled">();
   private readonly defaultTtlMs: number;
   private counter = 0;
 
@@ -104,6 +134,7 @@ export class BroadcastStore {
     message: string,
     chats: readonly string[],
     ttlMs?: number,
+    destinationFingerprint?: string,
   ): PendingBroadcast {
     this.cleanup();
     this.counter = (this.counter + 1) % 1_000_000;
@@ -117,18 +148,46 @@ export class BroadcastStore {
       expiresAt: now + (ttlMs ?? this.defaultTtlMs),
       chats,
       confirmed: false,
+      ...(destinationFingerprint !== undefined ? { destinationFingerprint } : {}),
     };
     this.items.set(id, item);
     return item;
   }
 
   get(id: string, now: number = Date.now()): PendingBroadcast | undefined {
+    if (isNoncanonicalNumericId(id)) return undefined;
     this.cleanup(now);
     return this.items.get(id);
   }
 
   delete(id: string): boolean {
+    if (isNoncanonicalNumericId(id)) return false;
     return this.items.delete(id);
+  }
+
+  /**
+   * Cancels and removes all pending broadcast confirmations whose reviewed destination
+   * fingerprint does not match the provided current destination set (or fingerprint).
+   * Returns the list of cancelled broadcast IDs.
+   */
+  cancelOnRouteChange(currentChatsOrFingerprint: readonly string[] | string): string[] {
+    const targetFingerprint =
+      typeof currentChatsOrFingerprint === "string"
+        ? currentChatsOrFingerprint
+        : fingerprintDestinationSet(currentChatsOrFingerprint);
+    const cancelled: string[] = [];
+    for (const [id, item] of this.items.entries()) {
+      if (item.destinationFingerprint && item.destinationFingerprint !== targetFingerprint) {
+        this.items.delete(id);
+        this.cancelledReasons.set(id, "route-change");
+        cancelled.push(id);
+      }
+    }
+    return cancelled;
+  }
+
+  getCancelReason(id: string): "route-change" | "user-cancelled" | undefined {
+    return this.cancelledReasons.get(id);
   }
 
   cleanup(now: number = Date.now()): void {
@@ -137,10 +196,14 @@ export class BroadcastStore {
         this.items.delete(id);
       }
     }
+    if (this.cancelledReasons.size > 1000) {
+      this.cancelledReasons.clear();
+    }
   }
 
   clear(): void {
     this.items.clear();
+    this.cancelledReasons.clear();
   }
 
   size(): number {
@@ -151,16 +214,25 @@ export class BroadcastStore {
 export const defaultBroadcastStore = new BroadcastStore();
 
 export function broadcastKeyboard(id: string): InlineKeyboard {
+  if (isNoncanonicalNumericId(id)) {
+    throw new Error(`Invalid broadcast ID: noncanonical numeric identifier "${id}"`);
+  }
   return new InlineKeyboard()
     .text("✅ Confirm", `broadcast:confirm:${id}`)
     .text("❌ Cancel", `broadcast:cancel:${id}`);
 }
 
-export function formatBroadcastPreview(message: string, chats: readonly string[]): string {
+export function formatBroadcastPreview(
+  message: string,
+  chats: readonly string[],
+  destinationFingerprint?: string,
+): string {
   const chatList = chats.map((c) => `• ${c}`).join("\n");
+  const fp = destinationFingerprint ?? fingerprintDestinationSet(chats);
   return (
     `📢 Broadcast Preview\n\n` +
     `Target chats (${chats.length}):\n${chatList}\n\n` +
+    `Route fingerprint: \`${fp.slice(0, 12)}\`\n\n` +
     `Message:\n${message}\n\n` +
     `Click Confirm to send or Cancel to abort.`
   );
@@ -266,15 +338,17 @@ export async function handleBroadcastCommand(
     return;
   }
 
+  const fingerprint = fingerprintDestinationSet(chats);
   const store = deps.broadcastStore ?? defaultBroadcastStore;
   const pending = store.create(
     String(ctx.from?.id),
     text,
     chats,
     deps.broadcastExpiryMs,
+    fingerprint,
   );
 
-  const previewText = formatBroadcastPreview(text, chats);
+  const previewText = formatBroadcastPreview(text, chats, fingerprint);
   const keyboard = broadcastKeyboard(pending.id);
 
   await ctx.reply(previewText, {
@@ -313,7 +387,12 @@ export async function handleBroadcastCallback(
   const subAction = parts[1];
   const broadcastId = parts[2];
 
-  if (!broadcastId || (subAction !== "confirm" && subAction !== "cancel")) {
+  if (
+    parts.length !== 3 ||
+    !broadcastId ||
+    (subAction !== "confirm" && subAction !== "cancel") ||
+    isNoncanonicalNumericId(broadcastId)
+  ) {
     await safeAnswerCallback(ctx, config, { text: "Invalid broadcast action" });
     return;
   }
@@ -322,6 +401,24 @@ export async function handleBroadcastCallback(
   const pending = store.get(broadcastId);
 
   if (!pending) {
+    const cancelReason = store.getCancelReason?.(broadcastId);
+    if (cancelReason === "route-change") {
+      await safeAnswerCallback(ctx, config, {
+        text: "Route configuration changed. New preview required.",
+        show_alert: true,
+      });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText(
+            "⚠️ Route configuration changed since preview. Broadcast confirmation cancelled. Run /broadcast again for an updated preview.",
+          );
+        } catch {
+          // ignore edit failure
+        }
+      }
+      return;
+    }
+
     await safeAnswerCallback(ctx, config, {
       text: "Broadcast expired or already processed",
       show_alert: true,
@@ -350,6 +447,30 @@ export async function handleBroadcastCallback(
       }
     }
     return;
+  }
+
+  // Cancel pending broadcast confirmation if route configuration has changed since preview
+  if (pending.destinationFingerprint !== undefined) {
+    const currentChats = getConfiguredBroadcastChats(config);
+    const currentFingerprint = fingerprintDestinationSet(currentChats);
+
+    if (pending.destinationFingerprint !== currentFingerprint) {
+      store.delete(broadcastId);
+      await safeAnswerCallback(ctx, config, {
+        text: "Route configuration changed. New preview required.",
+        show_alert: true,
+      });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText(
+            "⚠️ Route configuration changed since preview. Broadcast confirmation cancelled. Run /broadcast again for an updated preview.",
+          );
+        } catch {
+          // ignore edit failure
+        }
+      }
+      return;
+    }
   }
 
   if (subAction === "cancel") {
@@ -419,5 +540,190 @@ export function registerBroadcastHandlers(
 ): void {
   bot.command("broadcast", async (ctx: CommandContext<Context>) => {
     await handleBroadcastCommand(ctx, deps);
+  });
+}
+
+/**
+ * Returns an ordered, deduplicated list of target chat IDs configured
+ * for broadcast delivery (chatId / chatIds, marketChatId, squadChatId).
+ */
+export function targetChatIds(config: {
+  chatId?: string;
+  chatIds?: string[];
+  marketChatId?: string;
+  squadChatId?: string;
+}): string[] {
+  const candidates: string[] = [];
+  if (Array.isArray(config.chatIds)) {
+    candidates.push(...config.chatIds);
+  } else if (config.chatId) {
+    candidates.push(config.chatId);
+  }
+  if (config.marketChatId) candidates.push(config.marketChatId);
+  if (config.squadChatId) candidates.push(config.squadChatId);
+
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const id of candidates) {
+    const str = typeof id === "string" ? id.trim() : String(id ?? "").trim();
+    if (str.length > 0 && !seen.has(str)) {
+      seen.add(str);
+      result.push(str);
+    }
+  }
+  return result;
+}
+
+export interface PendingBroadcastEntry {
+  token: string;
+  text: string;
+  chatIds: string[];
+  operatorChatId: number;
+}
+
+export class PendingBroadcastStore {
+  private readonly capacity: number;
+  private readonly items = new Map<string, PendingBroadcastEntry>();
+
+  constructor(capacity = 20) {
+    this.capacity = capacity;
+  }
+
+  add(entry: PendingBroadcastEntry): void {
+    if (this.items.has(entry.token)) {
+      this.items.delete(entry.token);
+    } else if (this.items.size >= this.capacity) {
+      const oldestKey = this.items.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.items.delete(oldestKey);
+      }
+    }
+    this.items.set(entry.token, entry);
+  }
+
+  consume(token: string): PendingBroadcastEntry | undefined {
+    const entry = this.items.get(token);
+    if (entry !== undefined) {
+      this.items.delete(token);
+    }
+    return entry;
+  }
+
+  size(): number {
+    return this.items.size;
+  }
+}
+
+export interface RegisterBroadcastCommandDeps {
+  config: any;
+  store?: PendingBroadcastStore;
+  targetChatIds?: string[];
+  sendMessage?: (chatId: string, text: string) => Promise<any>;
+}
+
+export function registerBroadcastCommand(
+  bot: {
+    command: (name: string, fn: (ctx: any) => Promise<void>) => void;
+    on: (event: string, fn: (ctx: any) => Promise<void>) => void;
+  },
+  deps: RegisterBroadcastCommandDeps,
+): void {
+  const store = deps.store ?? new PendingBroadcastStore();
+  let tokenSeq = 0;
+
+  bot.command("broadcast", async (ctx: any) => {
+    const operatorId = String(deps.config?.operatorTelegramUserId ?? "");
+    const senderId = String(ctx.from?.id ?? "");
+    if (!operatorId || senderId !== operatorId) {
+      console.warn(`[broadcast] unauthorized access from user ${senderId}`);
+      return;
+    }
+
+    const raw = ctx.message?.text ?? "";
+    const text = raw.replace(/^\/broadcast(?:@\w+)?\s*/, "").trim();
+    if (!text) {
+      await ctx.reply("Usage: /broadcast <message>");
+      return;
+    }
+
+    const chats = Array.isArray(deps.targetChatIds)
+      ? deps.targetChatIds
+      : targetChatIds(deps.config);
+
+    if (chats.length === 0) {
+      await ctx.reply("No target chats configured.");
+      return;
+    }
+
+    tokenSeq += 1;
+    const token = `bc_${Date.now().toString(36)}_${tokenSeq}_${Math.random().toString(36).slice(2, 6)}`;
+    store.add({
+      token,
+      text,
+      chatIds: chats,
+      operatorChatId: ctx.from?.id ?? 0,
+    });
+
+    await ctx.reply(`Broadcast preview:\n${text}`, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "Confirm", callback_data: `broadcast:confirm:${token}` },
+            { text: "Cancel", callback_data: `broadcast:cancel:${token}` },
+          ],
+        ],
+      },
+    });
+  });
+
+  bot.on("callback_query:data", async (ctx: any) => {
+    const data = ctx.callbackQuery?.data;
+    if (typeof data !== "string") return;
+    if (!data.startsWith("broadcast:confirm:") && !data.startsWith("broadcast:cancel:")) {
+      return;
+    }
+
+    await handleCallbackQuery(
+      ctx,
+      async () => {
+        const operatorId = String(deps.config?.operatorTelegramUserId ?? "");
+        const senderId = String(ctx.from?.id ?? "");
+        if (!operatorId || senderId !== operatorId) {
+          console.warn(`[broadcast] unauthorized callback from user ${senderId}`);
+          await ctx.answerCallbackQuery({ text: "Unauthorized: operator only", show_alert: true });
+          return;
+        }
+
+        const isConfirm = data.startsWith("broadcast:confirm:");
+        const token = data.slice(isConfirm ? "broadcast:confirm:".length : "broadcast:cancel:".length);
+
+        const entry = store.consume(token);
+        if (!entry) {
+          await ctx.answerCallbackQuery({ text: "Broadcast expired or already processed" });
+          return;
+        }
+
+        if (!isConfirm) {
+          await ctx.editMessageText("Broadcast cancelled.");
+          await ctx.answerCallbackQuery({ text: "Cancelled" });
+          return;
+        }
+
+        const sendFn = deps.sendMessage ?? (async (chatId: string, msg: string) => {
+          await ctx.api?.sendMessage(chatId, msg);
+        });
+
+        for (const chatId of entry.chatIds) {
+          await sendFn(chatId, entry.text);
+        }
+
+        await ctx.editMessageText(`Broadcast sent to ${entry.chatIds.length} chat(s).`);
+        await ctx.answerCallbackQuery({ text: "Broadcast sent." });
+      },
+      {
+        deletedToast: "The original message was deleted.",
+        deletedFallbackReply: "The confirmation message was deleted. Please retry with /broadcast.",
+      },
+    );
   });
 }

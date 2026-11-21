@@ -6,6 +6,22 @@ All notable changes to this project are documented here.
 
 ### Added
 
+**Filter explanation tree**
+
+- `explainFilterRule(rule, event, options?)` in `src/notifications/filter-expr.ts`
+  returns a deterministic tree mirroring the filter expression AST (`rule`,
+  `event-name`, `and`/`or`, `comparison`, and an optional `threshold` node), with
+  each node's `matched`, `outcome` and a short reason. Short-circuited branches are
+  reported as `not-evaluated`; the root always agrees with `evaluateFilterRule` /
+  `evaluateFilterDryRun`, whose behavior is unchanged.
+- Reasons never include payload values, and string literals from the rule are shown
+  as `<redacted>`, so addresses, route identities and message text stay out of the
+  output. The tree is bounded by node count, depth and reason length
+  (`MAX_EXPLANATION_NODES`, `MAX_EXPLANATION_DEPTH`,
+  `MAX_EXPLANATION_REASON_LENGTH`); `renderFilterExplanation` renders it as text.
+- Documented in `docs/notification-filters.md` §5; covered by
+  `tests/filter-explanation.test.mjs`.
+
 **Selectable bot language**
 
 - `src/i18n.ts` now ships a message catalog per locale behind
