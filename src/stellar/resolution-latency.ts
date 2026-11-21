@@ -1,4 +1,20 @@
 import type { DecodedEvent } from "./decode.js";
+import {
+  computeCaptureCompleteness,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+} from "./capture-completeness.js";
+
+export {
+  assertCompleteCapture,
+  computeCaptureCompleteness,
+  IncompleteCaptureError,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+  type CaptureGap,
+  type CaptureGapInput,
+  type LedgerRange,
+} from "./capture-completeness.js";
 
 export interface LatencyDuration {
   seconds: number;
@@ -25,10 +41,16 @@ export interface LatencyGroup {
   summary: LatencySummary | null;
 }
 
+export interface ResolutionLatencyOptions extends CaptureCompletenessOptions {}
+
 export interface ResolutionLatencyReport {
   resolved: LatencyGroup;
   cancelled: LatencyGroup;
   excludedCount: number;
+  /** Capture completeness metadata including ledger range and gap information. */
+  completeness: CaptureCompleteness;
+  /** Alias for completeness metadata. */
+  capture: CaptureCompleteness;
 }
 
 /**
@@ -75,15 +97,32 @@ function computeSummary(claims: ClaimLatency[]): LatencySummary | null {
  * Excludes claims missing either creation or resolution/cancellation event.
  * If multiple creation or resolution events exist for the same claimId, deterministic
  * earliest creation and earliest resolution/cancellation are used.
+ * Annotates results with capture completeness metadata (ledger range and gaps).
  *
  * Uses integer math only.
  */
-export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLatencyReport {
+export function resolutionLatency(
+  events: readonly DecodedEvent[] | null | undefined,
+  options?: ResolutionLatencyOptions,
+): ResolutionLatencyReport {
+  const completeness = computeCaptureCompleteness(events, options);
+
+  if (!events || !Array.isArray(events) || events.length === 0) {
+    return {
+      resolved: { claims: [], summary: null },
+      cancelled: { claims: [], summary: null },
+      excludedCount: 0,
+      completeness,
+      capture: completeness,
+    };
+  }
+
   const creations = new Map<number, { at: number; ledger: number }>();
   const resolutions = new Map<number, { at: number; ledger: number }>();
   const cancellations = new Map<number, { at: number; ledger: number }>();
 
   for (const event of events) {
+    if (!event || typeof event !== "object") continue;
     const payload = event.payload;
     if (!payload || !("name" in payload) || !("claimId" in payload)) {
       continue;
@@ -200,5 +239,7 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
       summary: computeSummary(cancelledClaims),
     },
     excludedCount,
+    completeness,
+    capture: completeness,
   };
 }

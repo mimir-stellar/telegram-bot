@@ -1,8 +1,24 @@
 import type { DecodedEvent } from "./decode.js";
+import {
+  computeCaptureCompleteness,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+} from "./capture-completeness.js";
+
+export {
+  assertCompleteCapture,
+  computeCaptureCompleteness,
+  IncompleteCaptureError,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+  type CaptureGap,
+  type CaptureGapInput,
+  type LedgerRange,
+} from "./capture-completeness.js";
 
 export type VolumeBucketUnit = "hour" | "day";
 
-export interface VolumeSeriesOptions {
+export interface VolumeSeriesOptions extends CaptureCompletenessOptions {
   bucket: VolumeBucketUnit;
 }
 
@@ -30,14 +46,27 @@ export interface VolumeBucket {
 export interface VolumeSeriesResult {
   /** Contiguous time buckets (zero-filled) between earliest and latest event, or empty if no valid events. */
   buckets: VolumeBucket[];
-  /** Total challenge stake across all buckets as bigint string. */
+  /** Total challenge stake across all buckets in this captured series as bigint string. */
   totalChallengeStake: string;
-  /** Total squad deposit across all buckets as bigint string. */
+  /** Total squad deposit across all buckets in this captured series as bigint string. */
   totalSquadDeposit: string;
   /** Count of events skipped due to missing or invalid `at` timestamp. */
   skippedWithoutAt: number;
   /** Total valid events processed. */
   processedEvents: number;
+  /** Capture completeness metadata including ledger range and gap information. */
+  completeness: CaptureCompleteness;
+  /** Alias for completeness metadata. */
+  capture: CaptureCompleteness;
+  /**
+   * Verified global market totals across the entire market lifetime.
+   * Only populated when `completeness.isComplete` is true.
+   * `null` for partial captures to prevent partial captures from being presented as global market totals.
+   */
+  globalMarketTotals: {
+    totalChallengeStake: string;
+    totalSquadDeposit: string;
+  } | null;
 }
 
 const SECONDS_PER_HOUR = 3600;
@@ -58,6 +87,9 @@ export function floorToBucketUtc(unixSeconds: number, bucket: VolumeBucketUnit):
  *
  * Empty buckets between earliest and latest events are filled with zero values.
  * Events without a valid `at` timestamp are skipped and counted in `skippedWithoutAt`.
+ * Annotates results with capture completeness metadata (ledger range and gaps).
+ * Partial captures keep `globalMarketTotals: null` to prevent presenting partial captures
+ * as global market totals.
  */
 export function volumeSeries(
   events: readonly DecodedEvent[] | null | undefined,
@@ -67,6 +99,9 @@ export function volumeSeries(
   if (bucketUnit !== "hour" && bucketUnit !== "day") {
     throw new Error(`Invalid bucket unit: expected "hour" or "day", got ${String(bucketUnit)}`);
   }
+
+  // Derive capture completeness metadata (and enforce requireComplete if requested)
+  const completeness = computeCaptureCompleteness(events, options);
 
   const stepSeconds = bucketUnit === "hour" ? SECONDS_PER_HOUR : SECONDS_PER_DAY;
 
@@ -80,6 +115,11 @@ export function volumeSeries(
       totalSquadDeposit: "0",
       skippedWithoutAt: 0,
       processedEvents: 0,
+      completeness,
+      capture: completeness,
+      globalMarketTotals: completeness.isComplete
+        ? { totalChallengeStake: "0", totalSquadDeposit: "0" }
+        : null,
     };
   }
 
@@ -190,6 +230,11 @@ export function volumeSeries(
       totalSquadDeposit: "0",
       skippedWithoutAt,
       processedEvents,
+      completeness,
+      capture: completeness,
+      globalMarketTotals: completeness.isComplete
+        ? { totalChallengeStake: "0", totalSquadDeposit: "0" }
+        : null,
     };
   }
 
@@ -217,11 +262,22 @@ export function volumeSeries(
     });
   }
 
+  const totalChallengeStakeStr = totalChallengeStakeBigInt.toString();
+  const totalSquadDepositStr = totalSquadDepositBigInt.toString();
+
   return {
     buckets,
-    totalChallengeStake: totalChallengeStakeBigInt.toString(),
-    totalSquadDeposit: totalSquadDepositBigInt.toString(),
+    totalChallengeStake: totalChallengeStakeStr,
+    totalSquadDeposit: totalSquadDepositStr,
     skippedWithoutAt,
     processedEvents,
+    completeness,
+    capture: completeness,
+    globalMarketTotals: completeness.isComplete
+      ? {
+          totalChallengeStake: totalChallengeStakeStr,
+          totalSquadDeposit: totalSquadDepositStr,
+        }
+      : null,
   };
 }
