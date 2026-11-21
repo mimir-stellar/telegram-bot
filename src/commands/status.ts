@@ -6,14 +6,12 @@
 
 import { performance } from "node:perf_hooks";
 
-import {
-  escapeMd,
-  formatLastEvent,
-} from "../notifications/format.js";
+import { escapeMd, formatLastEvent } from "../notifications/format.js";
 import { networkLabel, type BotConfig } from "../config.js";
 import { chainClockLabel } from "../health.js";
 import { formatFeatureFlags } from "../notifications/featureFlags.js";
 import type { PollerStatus } from "../poller.js";
+import { redactDestination } from "../redact.js";
 import { defineCommand } from "./registry.js";
 import { TELEGRAM_OPTIONS } from "./runtime.js";
 
@@ -29,6 +27,16 @@ function cursorPreview(cursor: string | null): string {
   if (cursor === null) return "none (cold start)";
   const compact = cursor.replace(/\s+/g, " ").replace(/[`\\]/g, "?").trim() || "empty";
   return compact.length <= 24 ? compact : `${compact.slice(0, 23)}…`;
+}
+
+/**
+ * Describes a Telegram destination for operator diagnostics without exposing
+ * the chat identifier. Separate topics within the same chat are distinguished
+ * by a short, non-reversible fingerprint; the chat and topic ids are never
+ * printed in full.
+ */
+export function routeLabel(route: { chatId: string | number; topicId?: number | null }): string {
+  return redactDestination(route.chatId, route.topicId ?? null);
 }
 
 export function statusMessage(

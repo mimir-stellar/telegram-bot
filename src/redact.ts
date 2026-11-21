@@ -20,6 +20,11 @@
  * `token=…`/`authorization: …` pairs — is scrubbed, and the result is length
  * bounded so a hostile endpoint cannot write an unbounded blob into a log line
  * or a health response.
+ *
+ * Destination identifiers (Telegram chat ids and topic/thread ids) are
+ * redacted from public diagnostics by `redactDestination`, which keeps only a
+ * short, non-reversible fingerprint so distinct topics within one chat remain
+ * distinguishable to operators without revealing the raw identifiers.
  */
 
 /** Placeholder, matching the wording the status/health surfaces already use. */
@@ -175,12 +180,51 @@ export function redactText(input: string, options: RedactOptions = {}): string {
   }
 
   for (const rule of ERROR_REDACTION_RULES) {
-    out = typeof rule.replacement === "string"
-      ? out.replace(rule.pattern, rule.replacement)
-      : out.replace(rule.pattern, rule.replacement);
+    out = out.replace(rule.pattern, rule.replacement as never);
   }
 
   return clamp(out, options.maxLen);
+}
+
+/**
+ * Public diagnostic label for a Telegram destination (chat id, optional topic /
+ * message-thread id). Raw ids are never printed. Instead a short, stable,
+ * non-reversible fingerprint is produced per component, so two different topics
+ * in the same chat render differently while the chat and topic themselves stay
+ * unrecoverable from the output.
+ *
+ * Format: `chat:<fp>` or `chat:<fp>/topic:<fp>`. The fingerprint is a 32-bit
+ * FNV-1a hash rendered in hex; it is for distinguishing, not for security, and
+ * the ids are low-entropy enough that operators correlating against their own
+ * config still get a match via `fingerprint`.
+ */
+export function redactDestination(chatId: string | number, topicId?: string | number | null): string {
+  const chat = `chat:${fingerprint(String(chatId))}`;
+  if (topicId === undefined || topicId === null || String(topicId) === "") return chat;
+  return `${chat}/topic:${fingerprint(String(topicId))}`;
+}
+
+/**
+ * Format a Telegram destination (chat id plus optional topic/thread id) for an
+ * operator route diagnostic line. Identifiers are fingerprinted, never printed.
+ */
+export function describeRoute(chatId: string | number, topicId?: string | number | null): string {
+  return redactDestination(chatId, topicId);
+}
+
+/** Reference to a route for diagnostics, identifiers fingerprinted. */
+export function routeLabel(chatId: string | number, topicId?: string | number | null): string {
+  return describeRoute(chatId, topicId);
+}
+
+/** Stable 8-hex-char FNV-1a fingerprint of a string. Not reversible to the input. */
+export function fingerprint(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
 }
 
 /** Redacted, bounded text for anything thrown at us. */

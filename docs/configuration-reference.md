@@ -14,6 +14,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Telegram Settings
 - `BOT_TOKEN`: The API token for the Telegram bot. Required.
 - `TELEGRAM_CHAT_ID`: The chat identifier where notifications are posted. Required. Accepts either an integer decimal string (positive or negative, arbitrarily large, e.g. `-1001234567890123456`), or a channel handle such as `@channelusername`. Fractional values (`-100.5`) and exponent notation (`-1e12`) are rejected at startup; identifiers are kept as strings and never converted through JavaScript numbers.
+- `TELEGRAM_TOPIC_ID`: Optional numeric message thread (topic) ID within `TELEGRAM_CHAT_ID`. When set, notifications are posted to that specific topic in a forum-enabled supergroup. Topics are distinct routes even when they share a chat: operator diagnostics report each route's topic identifier separately so operators can tell apart two topics in the same chat. Topic identifiers are shown in operator diagnostics only in redacted form (see below); they are never printed in full in public diagnostics, logs, or health output.
 - `MIMIR_LOCALE`: Language for bot replies and notifications. Supported: `en` (default) and `es`; region tags such as `es-MX` resolve to the base language. Any other value fails fast at startup. See [Translator Guide](translating.md).
 
 ### Mimir Contract Settings
@@ -52,6 +53,12 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Telegram Failures and Rate Limits
 - **Behavior**: If Telegram's API is unreachable or rate-limits the bot (HTTP 429), the `grammy` framework handles standard retry-after backoffs. If the dispatch completely fails, the bot logs the failure.
 - **Safeguard**: `MAX_NOTIFICATIONS_PER_CYCLE` prevents internal bursts from hitting Telegram's strict anti-spam rate limits.
+- **Delivery Semantics**: Notification delivery is at-least-once in the best case and is not guaranteed to be exactly-once. Diagnostics must not claim otherwise.
+
+### Route Diagnostics and Redaction
+- Operator route diagnostics list each configured Telegram route with its destination chat and topic identifiers so that separate topics within the same chat can be distinguished. Topic identifiers are reported per route, even when multiple routes share the same chat.
+- Destination identifiers (chat IDs, channel usernames, and topic IDs) are redacted from public diagnostics (health endpoints, public metrics, and shared logs). Only a short masked form such as `***1234` is displayed.
+- Full identifiers appear only in operator-only diagnostics that require `HEALTH_AUTH_TOKEN` authorization. Topic identifiers follow the same rule: they are masked in every public surface and are never emitted in full outside authorized operator diagnostics.
 
 ### Cursor Management and Restarts
 - **Behavior**: The cursor (the last ingested event's ledger sequence and ID) is persisted to `CURSOR_FILE` after events are dispatched.
@@ -65,7 +72,8 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 
 ### Logs
 - Operational outputs are structured and actionable.
-- **Redaction**: Bot tokens and private payloads are never logged.
+- Diagnostic test output (CI) must not expose bot tokens, chat IDs, or topic IDs in full; regression checks enforce this for log exports.
+- **Redaction**: Bot tokens, private payloads, and destination identifiers (chat IDs and topic IDs) are never logged in full. Logged route references use the same masked form (for example `***1234`) as public diagnostics.
 
 ## Deployment & Rollback
 
