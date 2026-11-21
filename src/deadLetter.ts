@@ -57,6 +57,24 @@ export interface DeadLetterStats {
   dropped: number;
 }
 
+/**
+ * Bounded, content-free utilization report for the queue. Carries only counts
+ * and capacity — never message bodies, error text, or identifiers — so it is
+ * safe to expose on a gauge or a status endpoint.
+ *
+ * When the queue is disabled (`maxEntries` below 1) `enabled` is `false`,
+ * `maxEntries` is `0`, and `utilization` is `0`: a disabled queue has no
+ * capacity to be utilized, and reporting `0` keeps the gauge bounded in
+ * `[0, 1]` rather than dividing by zero or emitting `NaN`.
+ */
+export interface DeadLetterCapacity {
+  enabled: boolean;
+  used: number;
+  maxEntries: number;
+  /** `used / maxEntries`, clamped to `[0, 1]`; `0` when disabled. */
+  utilization: number;
+}
+
 export interface DeadLetterQueueOptions {
   /**
    * Where the queue lives. `null` disables persistence and loading: the queue
@@ -414,10 +432,27 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     return { sent, remaining: entries.length, rejectedNetworkMismatch };
   }
 
+  /**
+   * Content-free capacity snapshot. A queue is considered disabled when it has
+   * no capacity (`maxEntries` below 1) — the same condition under which
+   * `enqueue` would otherwise evict on every insert. Disabled reports
+   * `enabled: false`, `maxEntries: 0`, `utilization: 0`.
+   */
+  function capacity(): DeadLetterCapacity {
+    const enabled = options.maxEntries >= 1;
+    if (!enabled) {
+      return { enabled: false, used: 0, maxEntries: 0, utilization: 0 };
+    }
+    const used = entries.length;
+    const utilization = Math.min(1, Math.max(0, used / options.maxEntries));
+    return { enabled: true, used, maxEntries: options.maxEntries, utilization };
+  }
+
   return {
     load,
     enqueue,
     flush,
+    capacity,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
     },

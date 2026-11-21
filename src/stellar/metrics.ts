@@ -127,6 +127,39 @@ export class RpcTiming {
   }
 }
 
+/**
+ * Bounded capacity gauge for a dead-letter queue.
+ *
+ * Reports only counts (used / max entries and a utilization ratio) and never
+ * message bodies. When the queue is disabled (`maxEntries` of 0 or less, or
+ * not finite), the gauge reports `enabled: false` with zero capacity and a
+ * utilization of 0, so consumers can render "disabled" without dividing by zero.
+ */
+export interface DeadLetterCapacityGauge {
+  enabled: boolean;
+  used: number;
+  max: number;
+  utilization: number;
+}
+
+export function deadLetterCapacityGauge(
+  used: number,
+  maxEntries: number,
+): DeadLetterCapacityGauge {
+  const enabled = Number.isFinite(maxEntries) && maxEntries > 0;
+  if (!enabled) {
+    return { enabled: false, used: 0, max: 0, utilization: 0 };
+  }
+  const max = Math.floor(maxEntries);
+  const safeUsed = Number.isFinite(used) && used > 0 ? Math.min(Math.floor(used), max) : 0;
+  return {
+    enabled: true,
+    used: safeUsed,
+    max,
+    utilization: round(safeUsed / max),
+  };
+}
+
 /** One-line, secret-free timing string for logs and the scan summary. */
 export function formatRpcTiming(summary: RpcTimingSummary): string {
   const { requests, failures, totalMs, avgMs, maxMs, operations } = summary;

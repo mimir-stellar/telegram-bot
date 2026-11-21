@@ -97,6 +97,19 @@ The queue is strictly bounded across every dimension:
 
 ---
 
+## Capacity Utilization Gauge
+
+The queue exposes a bounded capacity gauge for dashboards and alerting. It reports only counts and never message bodies (`text`) or error text, so it is safe to publish to metrics backends.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `used` | `number` | Current number of parked entries. |
+| `max` | `number` | Configured depth limit (`DEAD_LETTER_MAX`, default `100`). |
+| `utilization` | `number` | `used / max`, bounded to the range `0`–`1`. |
+
+* When the queue is **disabled** (`DEAD_LETTER_FILE` unset or empty, or the queue is otherwise turned off), the gauge reports `used: 0`, `max: 0`, and `utilization: 0`. A disabled queue never parks entries, so the gauge reads as idle rather than as an error, and no division by zero occurs.
+* `utilization` is clamped to `1` so that transient overshoot never reports above full capacity.
+
 ## Offline Inspection CLI (`src/dlq-cli.ts`)
 
 Operators can inspect and purge `DEAD_LETTER_FILE` offline without contacting Stellar or Telegram:

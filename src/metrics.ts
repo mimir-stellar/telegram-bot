@@ -133,6 +133,10 @@ export interface MetricsRegistry {
   lastNotificationAgeMs: Gauge;
   /** Maximum observed end-to-end notification age in ms across confirmed sends. */
   maxNotificationAgeMs: Gauge;
+  /** Entries currently held in the dead-letter queue (0 when the queue is disabled). */
+  deadLetterEntries: Gauge;
+  /** Maximum entries the dead-letter queue can hold (0 when the queue is disabled). */
+  deadLetterCapacity: Gauge;
 
   /**
    * Record one confirmed notification's end-to-end age in milliseconds, or `null`
@@ -290,6 +294,14 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     `${METRICS_PREFIX}activity_anomalies_total`,
     "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
   );
+  const deadLetterEntries = makeGauge(
+    `${METRICS_PREFIX}dead_letter_entries`,
+    "Entries currently held in the dead-letter queue (0 when the queue is disabled).",
+  );
+  const deadLetterCapacity = makeGauge(
+    `${METRICS_PREFIX}dead_letter_capacity`,
+    "Maximum entries the dead-letter queue can hold (0 when the queue is disabled).",
+  );
   const notificationAgeSamples = makeCounter(
     `${METRICS_PREFIX}notification_age_samples_total`,
     "Total confirmed notifications with a known ledger close time (includes 0ms lag).",
@@ -334,6 +346,8 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     activityBaselineEvents,
     lastNotificationAgeMs,
     maxNotificationAgeMs,
+    deadLetterEntries,
+    deadLetterCapacity,
   ];
 
   const baseFailedInc = notificationsFailed.inc;
@@ -495,6 +509,8 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     notificationAgeTotalMs,
     lastNotificationAgeMs,
     maxNotificationAgeMs,
+    deadLetterEntries,
+    deadLetterCapacity,
     recordNotificationAge,
     serviceLevel,
     serviceLevelReport(): ServiceLevelWindowReport {
