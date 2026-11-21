@@ -134,6 +134,16 @@ The decoder converts raw Soroban events into typed TypeScript objects. It handle
 - **Squad**: `market_created`, `deposited`, `withdrawn`, `resolved`, `claimed`, `fees_claimed`
 - **Admin**: Recognized but not notified (`oracle_changed`, `ownership_transferred`, `fee_policy_*`, etc.)
 
+### Analytical Reducers (`src/stellar/*.ts`)
+
+Pure reducers derive aggregate metrics and reports from observed chain events without holding keys or modifying state:
+- **Volume Series** (`src/stellar/volume-series.ts`): Time-bucketed challenge stakes and squad deposits in UTC intervals.
+- **Resolution Latency** (`src/stellar/resolution-latency.ts`): Duration percentiles (p50, p90, max) for resolved claims.
+- **Closing Soon** (`src/stellar/closing-soon.ts`): Squad markets approaching their deadline within a bounded horizon.
+- **Stale Market Watch** (`src/stellar/stale-market.ts`): Identifies open squad markets and prediction claims exceeding a bounded age threshold, labeling all inferred states and maintaining read-only guarantees (no settlement transactions submitted).
+- **Fee Accrual** (`src/stellar/fee-accrual.ts`): Protocol fee accruals from admin events.
+- **Squad Flows & Payouts** (`src/stellar/squad-flows.ts`, `src/stellar/squad-payouts.ts`): Net liquidity and payout invariant accounting.
+
 ### Notification Formatter (`src/notifications/format.ts`)
 
 Transforms decoded events into MarkdownV2 messages for Telegram. Uses Telegram's MarkdownV2 format (not legacy Markdown) for reliable rendering.
