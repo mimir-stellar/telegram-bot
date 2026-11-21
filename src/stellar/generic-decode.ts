@@ -16,6 +16,7 @@
  */
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
+import type { EventQuarantine } from "./quarantine.js";
 
 // ── Bounded Limits ───────────────────────────────────────────────────────────
 
@@ -43,6 +44,12 @@ export interface GenericRenderOptions {
   maxVecItems?: number;
   maxStringChars?: number;
   maxBytesChars?: number;
+  /**
+   * Optional quarantine instance to preserve undecodable event envelopes.
+   * When provided and an event cannot be decoded cleanly (e.g. malformed XDR or unknown payload),
+   * the raw envelope and source identity are preserved to the quarantine.
+   */
+  quarantine?: EventQuarantine;
 }
 
 export interface GenericEventPayload {
@@ -624,6 +631,23 @@ export function decodeGenericEvent(
   const eventName = rawTopics.length > 0 ? extractEventName(rawTopics[0]) : "unknown";
   const topics = renderTopics(rawTopics, options);
   const value = renderGenericScVal(event.value, 0, options);
+
+  if (options?.quarantine) {
+    const isUndecodable =
+      eventName === "unknown" ||
+      rawTopics.length === 0 ||
+      topics.some((t) => t === "malformed") ||
+      value === "malformed";
+    if (isUndecodable) {
+      const reason =
+        eventName === "unknown"
+          ? "unrecognized event name"
+          : value === "malformed"
+            ? "malformed value"
+            : "malformed topics";
+      void options.quarantine.quarantine(event, source, reason).catch(() => {});
+    }
+  }
 
   const topicSummary = topics.length > 0 ? topics.join(" | ") : "(none)";
   const valueSummary = value;

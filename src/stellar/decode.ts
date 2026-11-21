@@ -32,6 +32,7 @@ import { eventKey } from "../dedup.js";
 import { txExplorerUrl } from "./client.js";
 import { redactText } from "../redact.js";
 import { peekEventName } from "./peek.js";
+import type { EventQuarantine } from "./quarantine.js";
 
 export { peekEventName };
 
@@ -49,6 +50,12 @@ export interface DecodeOptions {
    * the event name and metadata for metrics and filtering.
    */
   shouldDecode?: (name: string) => boolean;
+  /**
+   * Optional quarantine instance to preserve undecodable event envelopes.
+   * When provided and an event cannot be decoded (malformed XDR or unknown
+   * payload), the raw envelope and source identity are preserved to the quarantine.
+   */
+  quarantine?: EventQuarantine;
 }
 
 export const DEFAULT_CONTRACT_VERSION: ContractVersion = "v1";
@@ -1118,20 +1125,24 @@ export function decodeEvent(
   const normVersion = normalizeContractVersion(version);
   const meta: EventMeta = { ...safeMeta(source, event), version: normVersion };
 
-  if (!event || !Array.isArray(event.topic)) {
-    recordDecodeOutcome(source, "", "malformed");
+  const handleUndecodable = (reason: string, eventName: string = ""): DecodedEvent => {
+    if (opts?.quarantine) {
+      void opts.quarantine.quarantine(event as unknown as Record<string, unknown>, source, reason).catch(() => {});
+    }
     return {
       ...meta,
-      payload: { name: "unknown", eventName: "", reason: "missing or invalid topic array" },
+      payload: { name: "unknown", eventName, reason },
     };
+  };
+
+  if (!event || !Array.isArray(event.topic)) {
+    recordDecodeOutcome(source, "", "malformed");
+    return handleUndecodable("missing or invalid topic array");
   }
 
   if (event.topic.length === 0) {
     recordDecodeOutcome(source, "", "malformed");
-    return {
-      ...meta,
-      payload: { name: "unknown", eventName: "", reason: "empty topic array" },
-    };
+    return handleUndecodable("empty topic array");
   }
 
   let eventName = "";
@@ -1145,10 +1156,7 @@ export function decodeEvent(
     if (eventName === "") {
       // Without a name no decoder can be chosen; say why instead of "no decoder".
       recordDecodeOutcome(source, eventName, "malformed");
-      return {
-        ...meta,
-        payload: { name: "unknown", eventName, reason: "topic[0] is not an event name string" },
-      };
+      return handleUndecodable("topic[0] is not an event name string", eventName);
     }
 
     // If caller provided shouldDecode, and it returned false, and the event is neither admin nor unknown:
@@ -1182,16 +1190,10 @@ export function decodeEvent(
         decodedValue = native(event.value);
       } catch (err) {
         recordDecodeOutcome(source, eventName, "malformed");
-        return {
-          ...meta,
-          payload: {
-            name: "unknown",
-            eventName,
-            reason: diagnostic(
-              `malformed XDR value: ${err instanceof Error ? err.message : String(err)}`,
-            ),
-          },
-        };
+        const reason = diagnostic(
+          `malformed XDR value: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return handleUndecodable(reason, eventName);
       }
     }
 
@@ -1210,17 +1212,11 @@ export function decodeEvent(
       return { ...meta, payload } as DecodedEvent;
     }
     recordDecodeOutcome(source, eventName, "unknown");
-    return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
+    return handleUndecodable("no decoder", eventName);
   } catch (err) {
     recordDecodeOutcome(source, eventName, "malformed");
-    return {
-      ...meta,
-      payload: {
-        name: "unknown",
-        eventName,
-        reason: diagnostic(err instanceof Error ? err.message : err),
-      },
-    };
+    const reason = diagnostic(err instanceof Error ? err.message : err);
+    return handleUndecodable(reason, eventName);
   }
 }
 

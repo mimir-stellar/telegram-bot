@@ -282,7 +282,14 @@ Failure detection in `decodeEvent` follows a strict sequence:
 5. **Missing Decoder:**
    - When the decoder returns `null`, yields `{ name: "unknown", eventName, reason: "no decoder" }`.
 
-### 6.2 Scalar Parsing Helpers
+### 6.2 Undecodable Event Quarantine (`src/stellar/quarantine.ts`)
+
+For offline reprocessing, both `decodeEvent` (in `src/stellar/decode.ts`) and `decodeGenericEvent` (in `src/stellar/generic-decode.ts`) support an opt-in `quarantine` option (`EventQuarantine`):
+- When an event envelope is undecodable (missing/malformed topics, malformed XDR value, oversized wire XDR, or unrecognized payload), its bounded raw XDR envelope and source contract identity are captured to a local quarantine file (`quarantine-*.jsonl`).
+- The quarantine enforces byte limits (`DEFAULT_QUARANTINE_MAX_BYTES` = 10 MiB, `DEFAULT_QUARANTINE_ROTATION_BYTES` = 1 MiB) and age limits (`DEFAULT_QUARANTINE_MAX_AGE_MS` = 7 days) via FIFO rotation and pruning. Single envelope payloads exceeding `MAX_QUARANTINE_ENVELOPE_BYTES` (64 KiB) are rejected to prevent storage denial-of-service.
+- Persisted records can be offline reprocessed in typed mode (`reprocess({ mode: "typed" })`) or generic mode (`reprocess({ mode: "generic" })`).
+
+### 6.3 Scalar Parsing Helpers
 
 Always parse fields using the tested helpers in `src/stellar/decode.ts`:
 
