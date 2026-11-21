@@ -112,6 +112,66 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+export interface UtcPeriod {
+  /** Inclusive start of the UTC period in epoch milliseconds. */
+  startMs: number;
+  /** Exclusive end of the UTC period in epoch milliseconds. */
+  endMs: number;
+  /** ISO-8601 UTC timestamp for `startMs`. */
+  startIso: string;
+  /** ISO-8601 UTC timestamp for `endMs`. */
+  endIso: string;
+}
+
+/**
+ * Compute the explicit UTC period `[startMs, endMs)` containing `atMs` for
+ * the given `schedule` (start-inclusive, end-exclusive).
+ *
+ * All calculations use UTC epoch milliseconds and ISO-8601 UTC strings so
+ * results are deterministic across host time zones.
+ */
+export function utcPeriodFor(schedule: Schedule, atMs: number): UtcPeriod {
+  if (!Number.isFinite(atMs)) {
+    throw new ScheduleParseError("atMs must be a finite number");
+  }
+  const dayStart = startOfUtcDay(atMs);
+  let startMs: number;
+  let endMs: number;
+
+  if (schedule.kind === "daily") {
+    const todayRun = dayStart + schedule.minuteOfDay * 60 * 1000;
+    if (todayRun <= atMs) {
+      startMs = todayRun;
+      endMs = todayRun + MS_PER_DAY;
+    } else {
+      startMs = todayRun - MS_PER_DAY;
+      endMs = todayRun;
+    }
+  } else {
+    const targetDay = schedule.dayOfWeek;
+    if (targetDay === undefined) {
+      throw new ScheduleParseError("Weekly schedule is missing dayOfWeek");
+    }
+    const currentDay = utcWeekday(atMs);
+    const dayDelta = (targetDay - currentDay + 7) % 7;
+    const candidate = dayStart + dayDelta * MS_PER_DAY + schedule.minuteOfDay * 60 * 1000;
+    if (candidate <= atMs) {
+      startMs = candidate;
+      endMs = candidate + MS_PER_WEEK;
+    } else {
+      startMs = candidate - MS_PER_WEEK;
+      endMs = candidate;
+    }
+  }
+
+  return {
+    startMs,
+    endMs,
+    startIso: new Date(startMs).toISOString(),
+    endIso: new Date(endMs).toISOString(),
+  };
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;
