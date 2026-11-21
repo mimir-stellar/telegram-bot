@@ -297,6 +297,35 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
 
 // ── Message helpers ──────────────────────────────────────────────────────────
 
+/**
+ * Detects errors indicating that the Telegram message being edited or deleted
+ * no longer exists on Telegram's servers (error_code 400 or matching message).
+ */
+export function isDeletedMessageError(err: unknown): boolean {
+  if (err === null || typeof err !== "object") {
+    return false;
+  }
+  const errorObj = err as Record<string, unknown>;
+  if (typeof errorObj.error_code === "number" && errorObj.error_code !== 400) {
+    return false;
+  }
+  const text =
+    typeof errorObj.description === "string"
+      ? errorObj.description
+      : typeof errorObj.message === "string"
+      ? errorObj.message
+      : undefined;
+  if (!text) {
+    return false;
+  }
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("message to edit not found") ||
+    lower.includes("message can't be edited") ||
+    lower.includes("message to delete not found")
+  );
+}
+
 function isMessageNotModified(err: unknown): boolean {
   if (!err) return false;
   const msg = err instanceof Error ? err.message : String(err);
@@ -337,10 +366,59 @@ export async function updateOrReplyMessage(
 
 // ── Action callbacks ─────────────────────────────────────────────────────────
 
+export interface HandleCallbackQueryOptions {
+  deletedToast?: string;
+  deletedFallbackReply?: string;
+}
+
 export async function handleCallbackQuery(
   ctx: Context,
   deps: CommandDeps,
+): Promise<void>;
+export async function handleCallbackQuery(
+  ctx: Context,
+  handler: (data: string) => Promise<void>,
+  opts?: HandleCallbackQueryOptions,
+): Promise<void>;
+export async function handleCallbackQuery(
+  ctx: Context,
+  depsOrHandler: CommandDeps | ((data: string) => Promise<void>),
+  opts?: HandleCallbackQueryOptions,
 ): Promise<void> {
+  if (typeof depsOrHandler === "function") {
+    const rawData = ctx.callbackQuery?.data ?? "";
+    try {
+      await depsOrHandler(rawData);
+    } catch (err) {
+      if (isDeletedMessageError(err)) {
+        try {
+          let toast = opts?.deletedToast ?? "The original message was deleted.";
+          if (Array.from(toast).length > 200) {
+            toast = Array.from(toast).slice(0, 199).join("") + "…";
+          }
+          await ctx.answerCallbackQuery({
+            text: toast,
+            show_alert: false,
+          });
+        } catch {
+          // swallow answerCallbackQuery failure
+        }
+
+        if (opts?.deletedFallbackReply) {
+          let replyText = opts.deletedFallbackReply;
+          if (Array.from(replyText).length > 4000) {
+            replyText = Array.from(replyText).slice(0, 4000).join("");
+          }
+          await ctx.reply(replyText);
+        }
+        return;
+      }
+      throw err;
+    }
+    return;
+  }
+
+  const deps = depsOrHandler;
   const { config, status } = deps;
   const pause = deps.pause ?? (() => "stopped");
   const resume = deps.resume ?? (() => "stopped");

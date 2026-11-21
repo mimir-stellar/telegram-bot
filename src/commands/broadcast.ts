@@ -14,7 +14,7 @@ import type { BotConfig } from "../config.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
-import { isNoncanonicalNumericId } from "../callbacks.js";
+import { isNoncanonicalNumericId, handleCallbackQuery } from "../callbacks.js";
 
 /** Telegram Bot API maximum message length limit. */
 export const MAX_BROADCAST_LENGTH = 4096;
@@ -540,5 +540,190 @@ export function registerBroadcastHandlers(
 ): void {
   bot.command("broadcast", async (ctx: CommandContext<Context>) => {
     await handleBroadcastCommand(ctx, deps);
+  });
+}
+
+/**
+ * Returns an ordered, deduplicated list of target chat IDs configured
+ * for broadcast delivery (chatId / chatIds, marketChatId, squadChatId).
+ */
+export function targetChatIds(config: {
+  chatId?: string;
+  chatIds?: string[];
+  marketChatId?: string;
+  squadChatId?: string;
+}): string[] {
+  const candidates: string[] = [];
+  if (Array.isArray(config.chatIds)) {
+    candidates.push(...config.chatIds);
+  } else if (config.chatId) {
+    candidates.push(config.chatId);
+  }
+  if (config.marketChatId) candidates.push(config.marketChatId);
+  if (config.squadChatId) candidates.push(config.squadChatId);
+
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const id of candidates) {
+    const str = typeof id === "string" ? id.trim() : String(id ?? "").trim();
+    if (str.length > 0 && !seen.has(str)) {
+      seen.add(str);
+      result.push(str);
+    }
+  }
+  return result;
+}
+
+export interface PendingBroadcastEntry {
+  token: string;
+  text: string;
+  chatIds: string[];
+  operatorChatId: number;
+}
+
+export class PendingBroadcastStore {
+  private readonly capacity: number;
+  private readonly items = new Map<string, PendingBroadcastEntry>();
+
+  constructor(capacity = 20) {
+    this.capacity = capacity;
+  }
+
+  add(entry: PendingBroadcastEntry): void {
+    if (this.items.has(entry.token)) {
+      this.items.delete(entry.token);
+    } else if (this.items.size >= this.capacity) {
+      const oldestKey = this.items.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.items.delete(oldestKey);
+      }
+    }
+    this.items.set(entry.token, entry);
+  }
+
+  consume(token: string): PendingBroadcastEntry | undefined {
+    const entry = this.items.get(token);
+    if (entry !== undefined) {
+      this.items.delete(token);
+    }
+    return entry;
+  }
+
+  size(): number {
+    return this.items.size;
+  }
+}
+
+export interface RegisterBroadcastCommandDeps {
+  config: any;
+  store?: PendingBroadcastStore;
+  targetChatIds?: string[];
+  sendMessage?: (chatId: string, text: string) => Promise<any>;
+}
+
+export function registerBroadcastCommand(
+  bot: {
+    command: (name: string, fn: (ctx: any) => Promise<void>) => void;
+    on: (event: string, fn: (ctx: any) => Promise<void>) => void;
+  },
+  deps: RegisterBroadcastCommandDeps,
+): void {
+  const store = deps.store ?? new PendingBroadcastStore();
+  let tokenSeq = 0;
+
+  bot.command("broadcast", async (ctx: any) => {
+    const operatorId = String(deps.config?.operatorTelegramUserId ?? "");
+    const senderId = String(ctx.from?.id ?? "");
+    if (!operatorId || senderId !== operatorId) {
+      console.warn(`[broadcast] unauthorized access from user ${senderId}`);
+      return;
+    }
+
+    const raw = ctx.message?.text ?? "";
+    const text = raw.replace(/^\/broadcast(?:@\w+)?\s*/, "").trim();
+    if (!text) {
+      await ctx.reply("Usage: /broadcast <message>");
+      return;
+    }
+
+    const chats = Array.isArray(deps.targetChatIds)
+      ? deps.targetChatIds
+      : targetChatIds(deps.config);
+
+    if (chats.length === 0) {
+      await ctx.reply("No target chats configured.");
+      return;
+    }
+
+    tokenSeq += 1;
+    const token = `bc_${Date.now().toString(36)}_${tokenSeq}_${Math.random().toString(36).slice(2, 6)}`;
+    store.add({
+      token,
+      text,
+      chatIds: chats,
+      operatorChatId: ctx.from?.id ?? 0,
+    });
+
+    await ctx.reply(`Broadcast preview:\n${text}`, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "Confirm", callback_data: `broadcast:confirm:${token}` },
+            { text: "Cancel", callback_data: `broadcast:cancel:${token}` },
+          ],
+        ],
+      },
+    });
+  });
+
+  bot.on("callback_query:data", async (ctx: any) => {
+    const data = ctx.callbackQuery?.data;
+    if (typeof data !== "string") return;
+    if (!data.startsWith("broadcast:confirm:") && !data.startsWith("broadcast:cancel:")) {
+      return;
+    }
+
+    await handleCallbackQuery(
+      ctx,
+      async () => {
+        const operatorId = String(deps.config?.operatorTelegramUserId ?? "");
+        const senderId = String(ctx.from?.id ?? "");
+        if (!operatorId || senderId !== operatorId) {
+          console.warn(`[broadcast] unauthorized callback from user ${senderId}`);
+          await ctx.answerCallbackQuery({ text: "Unauthorized: operator only", show_alert: true });
+          return;
+        }
+
+        const isConfirm = data.startsWith("broadcast:confirm:");
+        const token = data.slice(isConfirm ? "broadcast:confirm:".length : "broadcast:cancel:".length);
+
+        const entry = store.consume(token);
+        if (!entry) {
+          await ctx.answerCallbackQuery({ text: "Broadcast expired or already processed" });
+          return;
+        }
+
+        if (!isConfirm) {
+          await ctx.editMessageText("Broadcast cancelled.");
+          await ctx.answerCallbackQuery({ text: "Cancelled" });
+          return;
+        }
+
+        const sendFn = deps.sendMessage ?? (async (chatId: string, msg: string) => {
+          await ctx.api?.sendMessage(chatId, msg);
+        });
+
+        for (const chatId of entry.chatIds) {
+          await sendFn(chatId, entry.text);
+        }
+
+        await ctx.editMessageText(`Broadcast sent to ${entry.chatIds.length} chat(s).`);
+        await ctx.answerCallbackQuery({ text: "Broadcast sent." });
+      },
+      {
+        deletedToast: "The original message was deleted.",
+        deletedFallbackReply: "The confirmation message was deleted. Please retry with /broadcast.",
+      },
+    );
   });
 }

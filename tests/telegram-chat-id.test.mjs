@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeTelegramChatId } from "../src/telegram.ts";
+import { normalizeTelegramChatId } from "../dist/telegram.js";
 
 test("preserves large negative identifiers as decimal strings", () => {
   assert.equal(

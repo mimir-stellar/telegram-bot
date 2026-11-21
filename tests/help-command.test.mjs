@@ -54,7 +54,7 @@ for (const operatorId of [null, "42"]) {
       assert.ok(handlers.has(command), `${command} has a handler`);
       assert.ok(description.length >= 1 && description.length <= 256);
     }
-    assert.equal(handlers.size, 12, "disabled operator handlers still enforce authorization");
+    assert.equal(handlers.size, 13, "disabled operator handlers still enforce authorization");
   });
 }
 
