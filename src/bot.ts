@@ -39,6 +39,7 @@ import {
   handlePauseConfirmCallback,
   registerCallbackHandlers,
   validatePauseConfirmData,
+  formatCallbackErrorLog,
 } from "./callbacks.js";
 import { registerBroadcastHandlers } from "./commands/broadcast.js";
 import { pauseConfirmKeyboard } from "./commands/keyboards.js";
@@ -83,6 +84,9 @@ export {
   CALLBACK_UNAUTHORIZED_PAYLOAD,
   PAUSE_CONFIRM_TTL_MS,
   TELEGRAM_CALLBACK_DATA_MAX_BYTES,
+  classifyCallbackError,
+  extractCallbackLogIds,
+  formatCallbackErrorLog,
   handleCallbackQuery,
   handlePauseConfirmCallback,
   registerCallbackHandlers,
@@ -93,6 +97,8 @@ export {
   isNoncanonicalNumericId,
   MAX_CANONICAL_NUMERIC_DIGITS,
   type CallbackActionType,
+  type CallbackErrorLogParams,
+  type CallbackLogIds,
   type CallbackValidationResult,
   type ValidCallbackAction,
 } from "./callbacks.js";
@@ -362,6 +368,18 @@ export function createBot(deps: BotDeps): Bot {
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.
   bot.catch((err) => {
+    if (err.ctx?.callbackQuery) {
+      console.error(
+        formatCallbackErrorLog({
+          ctx: err.ctx,
+          action: "callback_query",
+          prefix: "[bot] handler error",
+          error: err.error,
+          secrets: [deps.config.botToken],
+        }),
+      );
+      return;
+    }
     console.error(
       `[bot] handler error on update ${err.ctx.update.update_id}: ` +
         safeErrorMessage(err.error, [deps.config.botToken]),

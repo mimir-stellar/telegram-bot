@@ -18,7 +18,12 @@ import * as path from "path";
 import { createHash, randomBytes } from "crypto";
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { BotConfig } from "../config.js";
-import { isOperator, safeAnswerCallback } from "./runtime.js";
+import {
+  extractCallbackLogIds,
+  formatCallbackErrorLog,
+  isOperator,
+  safeAnswerCallback,
+} from "./runtime.js";
 import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
 import { isNoncanonicalNumericId, handleCallbackQuery } from "../callbacks.js";
@@ -548,8 +553,9 @@ export async function handleBroadcastCallback(
   const isPrivate = chatType === "private";
 
   if (!isOperator(ctx, config) || !isPrivate) {
+    const ids = extractCallbackLogIds(ctx, [config.botToken]);
     console.warn(
-      `[bot] ignored unauthorized broadcast callback on update ${ctx.update?.update_id}`,
+      `[bot] ignored unauthorized broadcast callback update_id=${ids.updateId} callback_query_id=${ids.callbackQueryId}`,
     );
     await safeAnswerCallback(ctx, config, {
       text: "Unauthorized: operator in private chat only",
@@ -690,25 +696,38 @@ export async function handleBroadcastCallback(
     }
   }
 
-  const interSendDelayMs = config.interSendDelayMs ?? 1500;
-  const results = await sendBroadcast({
-    api: ctx.api,
-    chats: pending.chats,
-    message: pending.message,
-    interSendDelayMs,
-    sleep: deps.sleep,
-  });
+  try {
+    const interSendDelayMs = config.interSendDelayMs ?? 1500;
+    const results = await sendBroadcast({
+      api: ctx.api,
+      chats: pending.chats,
+      message: pending.message,
+      interSendDelayMs,
+      sleep: deps.sleep,
+    });
 
-  const report = formatBroadcastReport(results);
-  if (ctx.callbackQuery?.message) {
-    try {
-      await ctx.editMessageText(report);
-      return;
-    } catch {
-      // fallback to reply
+    const report = formatBroadcastReport(results);
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText(report);
+        return;
+      } catch {
+        // fallback to reply
+      }
     }
+    await ctx.reply(report);
+  } catch (err) {
+    console.error(
+      formatCallbackErrorLog({
+        ctx,
+        action: "broadcast",
+        broadcastId,
+        error: err,
+        secrets: [config.botToken],
+      }),
+    );
+    await safeAnswerCallback(ctx, config, { text: "Broadcast failed" });
   }
-  await ctx.reply(report);
 }
 
 /**

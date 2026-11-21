@@ -18,7 +18,6 @@
 
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
-import { safeErrorMessage } from "./notifications/format.js";
 import { handleBroadcastCallback } from "./commands/broadcast.js";
 import {
   CALLBACK_PAUSE_CANCEL,
@@ -33,7 +32,24 @@ import { pauseMessage } from "./commands/pause.js";
 import { resumeMessage } from "./commands/resume.js";
 import { statusMessage } from "./commands/status.js";
 import type { CommandDeps } from "./commands/registry.js";
-import { TELEGRAM_OPTIONS, isOperator, safeAnswerCallback } from "./commands/runtime.js";
+import {
+  TELEGRAM_OPTIONS,
+  classifyCallbackError,
+  extractCallbackLogIds,
+  formatCallbackErrorLog,
+  isOperator,
+  safeAnswerCallback,
+  type CallbackErrorLogParams,
+  type CallbackLogIds,
+} from "./commands/runtime.js";
+
+export {
+  classifyCallbackError,
+  extractCallbackLogIds,
+  formatCallbackErrorLog,
+  type CallbackErrorLogParams,
+  type CallbackLogIds,
+};
 
 // ── Callback payload validation ──────────────────────────────────────────────
 
@@ -433,8 +449,9 @@ export async function handleCallbackQuery(
   const validation = validateCallbackData(rawData);
 
   if (!validation.ok) {
+    const ids = extractCallbackLogIds(ctx, [config.botToken]);
     console.warn(
-      `[bot] rejected invalid callback query (${validation.reason}) on update ${ctx.update.update_id}`,
+      `[bot] rejected invalid callback query (${validation.reason}) update_id=${ids.updateId} callback_query_id=${ids.callbackQueryId}`,
     );
     await safeAnswerCallback(ctx, config, {
       text: validation.fallbackText,
@@ -448,8 +465,9 @@ export async function handleCallbackQuery(
   // Enforce operator role authorization
   if (action.type === "pause" || action.type === "resume" || action.type === "broadcast") {
     if (!isOperator(ctx, config)) {
+      const ids = extractCallbackLogIds(ctx, [config.botToken]);
       console.warn(
-        `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
+        `[bot] ignored unauthorized callback action=${action.type} update_id=${ids.updateId} callback_query_id=${ids.callbackQueryId}`,
       );
       await safeAnswerCallback(ctx, config, {
         text: CALLBACK_UNAUTHORIZED_FEEDBACK,
@@ -533,7 +551,12 @@ export async function handleCallbackQuery(
     }
   } catch (err) {
     console.error(
-      `[bot] callback error on action ${action.type}: ${safeErrorMessage(err, [config.botToken])}`,
+      formatCallbackErrorLog({
+        ctx,
+        action: action.type,
+        error: err,
+        secrets: [config.botToken],
+      }),
     );
     await safeAnswerCallback(ctx, config, { text: "Action failed" });
   }
@@ -596,24 +619,37 @@ export async function handlePauseConfirmCallback(
   // Reject stale confirmations so an old message cannot stop the poller later.
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
   const ageMs = nowMs - messageDate * 1000;
-  if (ageMs > PAUSE_CONFIRM_TTL_MS) {
-    await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
-    await ctx.editMessageText(
-      "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
-      TELEGRAM_OPTIONS,
+  const actionName = action === CALLBACK_PAUSE_CONFIRM ? "pause_confirm" : "pause_cancel";
+  try {
+    if (ageMs > PAUSE_CONFIRM_TTL_MS) {
+      await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
+      await ctx.editMessageText(
+        "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
+        TELEGRAM_OPTIONS,
+      );
+      return;
+    }
+
+    if (action === CALLBACK_PAUSE_CONFIRM) {
+      const result = pause();
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Cancelled." });
+    await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
+  } catch (err) {
+    console.error(
+      formatCallbackErrorLog({
+        ctx,
+        action: actionName,
+        error: err,
+        secrets: [config.botToken],
+      }),
     );
-    return;
+    await safeAnswerCallback(ctx, config, { text: "Action failed" });
   }
-
-  if (action === CALLBACK_PAUSE_CONFIRM) {
-    const result = pause();
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
-    return;
-  }
-
-  await ctx.answerCallbackQuery({ text: "Cancelled." });
-  await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
