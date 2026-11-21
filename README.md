@@ -453,7 +453,7 @@ end. `npm test` covers all of it (`tests/mock-*.test.mjs`); run just those with
 
 ## Decoded event payload caps
 
-Each Soroban event is size-checked **before** native decoding in
+Each Soroban event is size- and depth-checked **before** native decoding in
 `src/stellar/decode.ts`:
 
 | Cap | Default | Failure mode |
@@ -461,6 +461,13 @@ Each Soroban event is size-checked **before** native decoding in
 | Event `value` XDR | 16 KiB (`MAX_DECODED_EVENT_XDR_BYTES`) | Event becomes `unknown` with a short reason; cursor still advances |
 | Per-topic XDR | 1 KiB (`MAX_EVENT_TOPIC_XDR_BYTES`) | Same |
 | Decoded string field | 2048 chars (`MAX_DECODED_STRING_CHARS`) | Same |
+| Nested collection depth | 5 (`MAX_DECODED_COLLECTION_DEPTH`, shared with `MAX_GENERIC_DEPTH`) | Event becomes `unknown` with reason `collection depth limit exceeded`; cursor still advances |
+
+Depth is bounded independently of byte size: a small payload made of many
+nested vecs/maps is rejected before `scValToNative` recurses. The generic
+decoder (`src/stellar/generic-decode.ts`) keeps its bounded rendering and exposes
+the same `DEPTH_LIMIT_REASON` on `payload.reason`. Callers can override the typed
+bound per call with `DecodeOptions.maxDepth`.
 
 Oversized or malformed events never crash the poller and are never re-logged as
 raw remote bytes — only a truncated reason string is kept. No configuration

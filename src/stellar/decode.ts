@@ -32,8 +32,13 @@ import { eventKey } from "../dedup.js";
 import { txExplorerUrl } from "./client.js";
 import { redactText } from "../redact.js";
 import { peekEventName } from "./peek.js";
+import {
+  DEPTH_LIMIT_REASON,
+  MAX_DECODED_COLLECTION_DEPTH,
+  scValCollectionDepth,
+} from "./generic-decode.js";
 
-export { peekEventName };
+export { peekEventName, DEPTH_LIMIT_REASON, MAX_DECODED_COLLECTION_DEPTH, scValCollectionDepth };
 
 /** Which of the two Mimir contracts an event came from. */
 export type ContractSource = "market" | "squad";
@@ -49,6 +54,12 @@ export interface DecodeOptions {
    * the event name and metadata for metrics and filtering.
    */
   shouldDecode?: (name: string) => boolean;
+  /**
+   * Maximum nested vec/map collection depth, in `event.value` or any topic.
+   * Defaults to {@link MAX_DECODED_COLLECTION_DEPTH}. Deeper events become
+   * `unknown` with reason {@link DEPTH_LIMIT_REASON} before native conversion.
+   */
+  maxDepth?: number;
 }
 
 export const DEFAULT_CONTRACT_VERSION: ContractVersion = "v1";
@@ -58,6 +69,12 @@ export function normalizeContractVersion(raw?: string): string {
   if (!raw) return DEFAULT_CONTRACT_VERSION;
   const v = raw.trim().toLowerCase();
   return v || DEFAULT_CONTRACT_VERSION;
+}
+
+/** A finite, non-negative depth bound; malformed overrides fall back to the default. */
+export function normalizeMaxDepth(raw?: number): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return MAX_DECODED_COLLECTION_DEPTH;
+  return Math.max(0, Math.floor(raw));
 }
 
 /** 1 USDC in atomic units. */
@@ -1151,6 +1168,18 @@ export function decodeEvent(
       };
     }
 
+    const rawTopics = Array.isArray(event.topic) ? event.topic : [];
+    const maxDepth = normalizeMaxDepth(opts?.maxDepth);
+    // Depth is checked independently of XDR byte size: a handful of nested
+    // collections is small on the wire but can still exhaust native recursion.
+    // This probe never serializes or converts the value, so it is safe first.
+    if (
+      scValCollectionDepth(event.value, maxDepth) > maxDepth ||
+      rawTopics.some((topic) => scValCollectionDepth(topic, maxDepth) > maxDepth)
+    ) {
+      throw new DecodeError(DEPTH_LIMIT_REASON);
+    }
+
     // If caller provided shouldDecode, and it returned false, and the event is neither admin nor unknown:
     // skip full value XDR decoding and return a minimal decoded event.
     if (opts?.shouldDecode && !opts.shouldDecode(eventName)) {
@@ -1162,7 +1191,6 @@ export function decodeEvent(
       }
     }
 
-    const rawTopics = Array.isArray(event.topic) ? event.topic : [];
     const topics = rawTopics.map((t) => {
       try {
         return native(t as xdr.ScVal);

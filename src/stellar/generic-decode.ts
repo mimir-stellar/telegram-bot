@@ -13,6 +13,8 @@
  * 2. Every ScVal type maps to a stable, unambiguous textual representation with a type tag.
  * 3. Hostile nesting (deep maps/vectors, excessive keys, oversized strings/bytes) is strictly bounded.
  * 4. Strings are sanitized to prevent newline/control character injection in logs/chat.
+ * 5. Depth truncation is surfaced as the stable `DEPTH_LIMIT_REASON` rather than
+ *    being silently swallowed, so callers can tell a deep payload from a shallow one.
  */
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
@@ -36,6 +38,18 @@ export const MAX_GENERIC_BYTES_CHARS = 64;
 
 /** Hard ceiling on total rendered string representation. */
 export const MAX_GENERIC_TOTAL_CHARS = 2048;
+
+/**
+ * Maximum nested vec/map collection depth in an event payload.
+ *
+ * Independent of XDR byte size: a handful of nested collections is a small
+ * wire value but can still exhaust the recursion budget of native conversion.
+ * The typed decoder applies the same bound before `scValToNative` runs.
+ */
+export const MAX_DECODED_COLLECTION_DEPTH = MAX_GENERIC_DEPTH;
+
+/** Stable reason reported when an event's collection depth exceeds the bound. */
+export const DEPTH_LIMIT_REASON = "collection depth limit exceeded";
 
 export interface GenericRenderOptions {
   maxDepth?: number;
@@ -71,6 +85,8 @@ export interface GenericDecodedEvent {
   topicSummary: string;
   valueSummary: string;
   summary: string;
+  /** Set to {@link DEPTH_LIMIT_REASON} when collection depth exceeded the bound. */
+  reason?: string;
   payload: GenericEventPayload;
 }
 
@@ -121,6 +137,114 @@ function scValSwitchName(val: xdr.ScVal): string {
 function scValPayload(val: xdr.ScVal): unknown {
   const raw = (val as unknown as { value?: unknown }).value;
   return typeof raw === "function" ? (raw as () => unknown).call(val) : raw;
+}
+
+// ── Collection Depth Probe ───────────────────────────────────────────────────
+
+/** Upper bound on nodes visited by the depth probe, so wide payloads stay cheap. */
+const MAX_DEPTH_SCAN_NODES = 10_000;
+
+/** Read an ScVal's arm name and payload without trusting getters. */
+function scValArm(val: unknown): { name: string; payload: unknown } | null {
+  if (val === null || typeof val !== "object") return null;
+  try {
+    const raw = val as { switch?: unknown; type?: unknown; value?: unknown };
+    let name: string;
+    if (typeof raw.switch === "function") {
+      const sw = (raw.switch as () => unknown).call(val);
+      name =
+        typeof sw === "object" && sw !== null && "name" in sw
+          ? String((sw as { name: unknown }).name)
+          : String(sw);
+    } else if (typeof raw.type === "string") {
+      name = raw.type;
+    } else {
+      return null;
+    }
+    let payload: unknown = raw.value;
+    if (typeof payload === "function") payload = (payload as () => unknown).call(val);
+    return { name, payload };
+  } catch {
+    return null;
+  }
+}
+
+/** Read one field of an ScMapEntry (method in SDK 16, getter in SDK 17). */
+function mapEntryField(entry: unknown, field: "key" | "val"): unknown {
+  if (entry === null || typeof entry !== "object") return undefined;
+  try {
+    const raw = (entry as Record<string, unknown>)[field];
+    return typeof raw === "function" ? (raw as () => unknown).call(entry) : raw;
+  } catch {
+    return undefined;
+  }
+}
+
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  if (val === null || typeof val !== "object" || Array.isArray(val)) return false;
+  if (val instanceof Map || val instanceof Date || ArrayBuffer.isView(val)) return false;
+  const proto = Object.getPrototypeOf(val);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Children of a collection, plus whether `val` is a collection at all. */
+function collectionChildren(val: unknown): { children: unknown[]; isCollection: boolean } {
+  const arm = scValArm(val);
+  if (arm) {
+    if (arm.name !== "scvVec" && arm.name !== "scvMap") {
+      return { children: [], isCollection: false };
+    }
+    if (!Array.isArray(arm.payload)) return { children: [], isCollection: true };
+    const children: unknown[] = [];
+    for (const entry of arm.payload) {
+      if (scValArm(entry)) children.push(entry);
+      else children.push(mapEntryField(entry, "key"), mapEntryField(entry, "val"));
+    }
+    return { children, isCollection: true };
+  }
+  if (Array.isArray(val)) return { children: val, isCollection: true };
+  try {
+    if (val instanceof Map) {
+      return { children: Array.from(val.entries()).flat(), isCollection: true };
+    }
+    if (isPlainObject(val)) return { children: Object.values(val), isCollection: true };
+  } catch {
+    // A hostile getter must not turn the depth probe into an exception.
+    return { children: [], isCollection: true };
+  }
+  return { children: [], isCollection: false };
+}
+
+/**
+ * Deepest nested vec/map (or native array/object) in `val`, stopping as soon as
+ * `maxDepth` is exceeded. Iterative and exception-safe: it never serializes or
+ * natively converts the payload, so a small but deeply nested value can be
+ * rejected before either operation recurses.
+ */
+export function scValCollectionDepth(
+  val: unknown,
+  maxDepth: number = MAX_DECODED_COLLECTION_DEPTH,
+): number {
+  const pending: Array<{ val: unknown; depth: number }> = [{ val, depth: 0 }];
+  const seen = new WeakSet<object>();
+  let deepest = 0;
+  let scanned = 0;
+
+  while (pending.length > 0) {
+    const item = pending.pop()!;
+    if (++scanned > MAX_DEPTH_SCAN_NODES) break;
+    const { children, isCollection } = collectionChildren(item.val);
+    if (!isCollection) continue;
+    const childDepth = item.depth + 1;
+    if (childDepth > deepest) deepest = childDepth;
+    if (deepest > maxDepth) return deepest;
+    if (typeof item.val === "object" && item.val !== null) {
+      if (seen.has(item.val)) continue;
+      seen.add(item.val);
+    }
+    for (const child of children) pending.push({ val: child, depth: childDepth });
+  }
+  return deepest;
 }
 
 // ── Recursive Renderer ───────────────────────────────────────────────────────
@@ -622,6 +746,10 @@ export function decodeGenericEvent(
       : [];
 
   const eventName = rawTopics.length > 0 ? extractEventName(rawTopics[0]) : "unknown";
+  const maxDepth = options?.maxDepth ?? MAX_GENERIC_DEPTH;
+  const depthExceeded =
+    scValCollectionDepth(event.value, maxDepth) > maxDepth ||
+    rawTopics.some((topic) => scValCollectionDepth(topic, maxDepth) > maxDepth);
   const topics = renderTopics(rawTopics, options);
   const value = renderGenericScVal(event.value, 0, options);
 
@@ -646,12 +774,14 @@ export function decodeGenericEvent(
     topicSummary,
     valueSummary,
     summary,
+    ...(depthExceeded ? { reason: DEPTH_LIMIT_REASON } : {}),
     payload: {
       name: "generic",
       eventName,
       topics,
       value,
       summary,
+      ...(depthExceeded ? { reason: DEPTH_LIMIT_REASON } : {}),
     },
   };
 }
