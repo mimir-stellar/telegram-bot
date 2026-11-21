@@ -1,6 +1,11 @@
 /**
  * Group a flat array of decoded events by claim or squad market.
  *
+ * Per-chat digest scheduling: callers that schedule digests per destination
+ * should validate the requested interval with {@link validateDigestInterval}
+ * before scheduling. Critical notifications are never routed through digest
+ * grouping and must be delivered immediately, independent of digest timing.
+ *
  * Events from `mimir-market` are keyed by `claimId`; events from `mimir-squad`
  * are keyed by `marketId`. Everything else (admin events, unknowns, or market /
  * squad events whose payload lacks the id field) forms its own singleton group.

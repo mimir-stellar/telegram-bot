@@ -21,6 +21,10 @@ export const DEFAULT_MAX_PER_CHAT = 50;
 
 export const DEFAULT_MAX_TOTAL = 5000;
 
+export const DIGEST_INTERVAL_MIN_SECONDS = 60;
+
+export const DIGEST_INTERVAL_MAX_SECONDS = 7 * 24 * 60 * 60;
+
 /** Version of the portable chat export format. */
 export const EXPORT_VERSION = 1;
 

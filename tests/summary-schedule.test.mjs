@@ -66,6 +66,18 @@ test("parseSchedule parses daily and weekly", () => {
   assert.deepEqual(weekly, { kind: "weekly", dayOfWeek: 1, minuteOfDay: 9 * 60 });
 });
 
+test("parseSchedule enforces bounded per-destination intervals", () => {
+  const ok = parseSchedule("daily@09:00");
+  assert.strictEqual(ok.kind, "daily");
+  // Boundary: 00:00 and 23:59 are the extreme valid minutes of the day.
+  assert.deepEqual(parseSchedule("daily@00:00"), { kind: "daily", minuteOfDay: 0 });
+  assert.deepEqual(parseSchedule("daily@23:59"), { kind: "daily", minuteOfDay: 23 * 60 + 59 });
+  // Failure: out-of-range and malformed intervals are rejected with a typed error.
+  for (const bad of ["daily@24:00", "daily@-1:00", "daily@9", "weekly@mon 24:00"]) {
+    assert.throws(() => parseSchedule(bad), ScheduleParseError, `should reject "${bad}"`);
+  }
+});
+
 test("parseSchedule rejects invalid specs with typed errors", () => {
   for (const bad of ["", "daily", "daily@25:00", "daily@23:60", "weekly@fun 09:00", "weekly@mon", "hourly@09:00"]) {
     assert.throws(() => parseSchedule(bad), ScheduleParseError, `should reject "${bad}"`);

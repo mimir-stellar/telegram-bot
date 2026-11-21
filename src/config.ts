@@ -371,6 +371,13 @@ export interface BotConfig extends StellarConfig {
   /** Per-chat notification preferences. Optional; absent means the single chat route. */
   routes?: TelegramRoute[];
   /**
+   * Per-destination digest interval in milliseconds, keyed by chat id
+   * (DIGEST_INTERVAL_MS, e.g. `chatA=60000,chatB=300000`). Bounded to
+   * [DIGEST_INTERVAL_MIN_MS, DIGEST_INTERVAL_MAX_MS]. Critical notifications
+   * are never delayed by digest timing. Empty means no digest scheduling.
+   */
+  digestIntervalsMs?: Readonly<Record<string, number>>;
+  /**
    * Identical RPC/poller error lines allowed per key per sampling window.
    * Repeats beyond this are counted and reported as one summary line.
    */

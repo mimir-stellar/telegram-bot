@@ -20,6 +20,31 @@ export class ScheduleParseError extends Error {
   }
 }
 
+/**
+ * Bounds for per-destination digest intervals. A digest interval must be at
+ * least one minute and at most one week so a misconfigured destination cannot
+ * either spam every poll cycle or silently stall for months.
+ */
+export const MIN_DIGEST_INTERVAL_MS = 60 * 1000;
+export const MAX_DIGEST_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Validate a digest interval (in milliseconds) for a destination.
+ * Throws {@link ScheduleParseError} when the value is non-finite, non-integer,
+ * or outside [MIN_DIGEST_INTERVAL_MS, MAX_DIGEST_INTERVAL_MS].
+ */
+export function validateDigestIntervalMs(intervalMs: number): number {
+  if (typeof intervalMs !== "number" || !Number.isFinite(intervalMs) || !Number.isInteger(intervalMs)) {
+    throw new ScheduleParseError("Digest interval must be a finite integer number of milliseconds");
+  }
+  if (intervalMs < MIN_DIGEST_INTERVAL_MS || intervalMs > MAX_DIGEST_INTERVAL_MS) {
+    throw new ScheduleParseError(
+      `Digest interval ${intervalMs}ms is out of bounds: must be between ${MIN_DIGEST_INTERVAL_MS}ms (1 minute) and ${MAX_DIGEST_INTERVAL_MS}ms (1 week)`,
+    );
+  }
+  return intervalMs;
+}
+
 const WEEKDAYS: Record<string, number> = {
   sun: 0,
   mon: 1,
