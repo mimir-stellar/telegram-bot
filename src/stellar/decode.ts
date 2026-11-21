@@ -18,11 +18,13 @@
  * looks up the appropriate decoder function while safely falling back to v1 or
  * unknown payloads if an unrecognised version or event shape is encountered.
  *
- * ── Amounts ──────────────────────────────────────────────────────────────────
+ * ── Amounts & Numeric Safety ─────────────────────────────────────────────────
  *
  * All money is atomic USDC in `i128`. Stellar's USDC Stellar Asset Contract has
  * **7 decimals**, not the 6 of the ERC-20. Amounts stay `bigint` through
  * decoding and are only converted for display, at the formatting edge.
+ * Large integers are represented as decimal strings or `bigint`; lossy number
+ * coercion in IDs, amounts, and ordering positions is strictly rejected.
  */
 
 import { recordDecodeOutcome } from "./decode-stats.js";
@@ -424,8 +426,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function big(value: unknown, what: string): bigint {
   if (typeof value === "bigint") return value;
-  if (typeof value === "number" && Number.isInteger(value)) return BigInt(value);
-  if (typeof value === "string" && /^-?\d+$/.test(value)) return BigInt(value);
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      throw new DecodeError(`${what}: expected safe integer number, got ${value}`);
+    }
+    return BigInt(value);
+  }
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
+    return BigInt(value.trim());
+  }
   throw new DecodeError(`${what}: expected an integer, got ${typeof value}`);
 }
 
@@ -1226,30 +1235,44 @@ export function decodeEvent(
 
 // ── Ordering metadata (issue #48) ────────────────────────────────────────────
 
-/** Ledger sequence: a finite non-negative integer, else 0. Never `NaN`. */
+/** Ledger sequence: a safe non-negative integer, else 0. Never `NaN` or lossy float. */
 function toLedger(value: unknown): number {
-  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
-  if (typeof n !== "number" || !Number.isFinite(n)) return 0;
-  const floored = Math.floor(n);
-  return floored >= 0 ? floored : 0;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) return 0;
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    try {
+      const bn = BigInt(value.trim());
+      if (bn < 0n || bn > BigInt(Number.MAX_SAFE_INTEGER)) return 0;
+      return Number(bn);
+    } catch {
+      return 0;
+    }
+  }
+  return 0;
 }
 
 /**
- * Transaction/operation position: a non-negative integer when the RPC provides
- * one (number or numeric string), else `null`. `null` means "the chain did not
+ * Transaction/operation position: a non-negative safe integer when the RPC provides
+ * one (safe number or decimal string), else `null`. `null` means "the chain did not
  * say" — sorting orders it after known positions instead of inventing one.
  */
 function toPosition(value: unknown): number | null {
-  let n: number;
   if (typeof value === "number") {
-    n = value;
-  } else if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
-    n = Number(value.trim());
-  } else {
-    return null;
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    return value;
   }
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) return null;
-  return n;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    try {
+      const bn = BigInt(value.trim());
+      if (bn < 0n || bn > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      return Number(bn);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 /** Trimmed transaction hash, or `""` when absent. Kept verbatim, not dropped. */

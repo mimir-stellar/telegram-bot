@@ -13,6 +13,7 @@
  * 2. Every ScVal type maps to a stable, unambiguous textual representation with a type tag.
  * 3. Hostile nesting (deep maps/vectors, excessive keys, oversized strings/bytes) is strictly bounded.
  * 4. Strings are sanitized to prevent newline/control character injection in logs/chat.
+ * 5. Large integers are represented as decimal strings; lossy/unsafe numbers (> MAX_SAFE_INTEGER, non-finite) render as malformed.
  */
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
@@ -163,6 +164,22 @@ export function renderGenericScVal(
 /** Alias of `renderGenericScVal` */
 export const renderScVal = renderGenericScVal;
 
+function renderIntegerNative(native: unknown, typeName: string): string {
+  if (typeof native === "bigint") {
+    return `${typeName}:${native.toString(10)}`;
+  }
+  if (typeof native === "number") {
+    if (!Number.isSafeInteger(native)) {
+      return `${typeName}:malformed`;
+    }
+    return `${typeName}:${native}`;
+  }
+  if (typeof native === "string" && /^-?\d+$/.test(native.trim())) {
+    return `${typeName}:${native.trim()}`;
+  }
+  return `${typeName}:malformed`;
+}
+
 function renderScValInstance(
   val: xdr.ScVal,
   depth: number,
@@ -203,7 +220,7 @@ function renderScValInstance(
     case "scvU32": {
       try {
         const native = scValToNative(val);
-        return `u32:${native}`;
+        return renderIntegerNative(native, "u32");
       } catch {
         return "u32:malformed";
       }
@@ -212,7 +229,7 @@ function renderScValInstance(
     case "scvI32": {
       try {
         const native = scValToNative(val);
-        return `i32:${native}`;
+        return renderIntegerNative(native, "i32");
       } catch {
         return "i32:malformed";
       }
@@ -221,7 +238,7 @@ function renderScValInstance(
     case "scvU64": {
       try {
         const native = scValToNative(val);
-        return `u64:${native}`;
+        return renderIntegerNative(native, "u64");
       } catch {
         return "u64:malformed";
       }
@@ -230,7 +247,7 @@ function renderScValInstance(
     case "scvI64": {
       try {
         const native = scValToNative(val);
-        return `i64:${native}`;
+        return renderIntegerNative(native, "i64");
       } catch {
         return "i64:malformed";
       }
@@ -239,7 +256,7 @@ function renderScValInstance(
     case "scvTimepoint": {
       try {
         const native = scValToNative(val);
-        return `timepoint:${native}`;
+        return renderIntegerNative(native, "timepoint");
       } catch {
         return "timepoint:malformed";
       }
@@ -248,7 +265,7 @@ function renderScValInstance(
     case "scvDuration": {
       try {
         const native = scValToNative(val);
-        return `duration:${native}`;
+        return renderIntegerNative(native, "duration");
       } catch {
         return "duration:malformed";
       }
@@ -257,7 +274,7 @@ function renderScValInstance(
     case "scvU128": {
       try {
         const native = scValToNative(val);
-        return `u128:${native}`;
+        return renderIntegerNative(native, "u128");
       } catch {
         return "u128:malformed";
       }
@@ -266,7 +283,7 @@ function renderScValInstance(
     case "scvI128": {
       try {
         const native = scValToNative(val);
-        return `i128:${native}`;
+        return renderIntegerNative(native, "i128");
       } catch {
         return "i128:malformed";
       }
@@ -275,7 +292,7 @@ function renderScValInstance(
     case "scvU256": {
       try {
         const native = scValToNative(val);
-        return `u256:${native}`;
+        return renderIntegerNative(native, "u256");
       } catch {
         return "u256:malformed";
       }
@@ -284,7 +301,7 @@ function renderScValInstance(
     case "scvI256": {
       try {
         const native = scValToNative(val);
-        return `i256:${native}`;
+        return renderIntegerNative(native, "i256");
       } catch {
         return "i256:malformed";
       }
@@ -436,11 +453,14 @@ function renderNativeValue(
   }
 
   if (typeof val === "number") {
-    return Number.isInteger(val) ? `number:${val}` : `number:${val}`;
+    if (!Number.isFinite(val) || (Number.isInteger(val) && !Number.isSafeInteger(val))) {
+      return "number:malformed";
+    }
+    return `number:${val}`;
   }
 
   if (typeof val === "bigint") {
-    return `bigint:${val}`;
+    return `bigint:${val.toString(10)}`;
   }
 
   if (typeof val === "string") {
@@ -542,23 +562,37 @@ export function renderTopics(
 }
 
 function toLedger(value: unknown): number {
-  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
-  if (typeof n !== "number" || !Number.isFinite(n)) return 0;
-  const floored = Math.floor(n);
-  return floored >= 0 ? floored : 0;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) return 0;
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    try {
+      const bn = BigInt(value.trim());
+      if (bn < 0n || bn > BigInt(Number.MAX_SAFE_INTEGER)) return 0;
+      return Number(bn);
+    } catch {
+      return 0;
+    }
+  }
+  return 0;
 }
 
 function toPosition(value: unknown): number | null {
-  let n: number;
   if (typeof value === "number") {
-    n = value;
-  } else if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
-    n = Number(value.trim());
-  } else {
-    return null;
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    return value;
   }
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) return null;
-  return n;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    try {
+      const bn = BigInt(value.trim());
+      if (bn < 0n || bn > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      return Number(bn);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function toTxHash(value: unknown): string {

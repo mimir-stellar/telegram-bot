@@ -634,9 +634,11 @@ The decoder is deliberately forward-compatible at the event boundary:
 - Events that are valid on-chain but unknown to this version are retained as
   `unknown` for bounded logs and are skipped for Telegram. They are not
   invented, retried, or treated as current contract state.
-- Amounts remain `bigint` atomic USDC values until formatting; no floating-point
-  conversion is used. Contract strings are clipped at the notification and
-  diagnostic boundaries, and scanner output is bounded.
+- Amounts remain `bigint` atomic USDC values until formatting; large integers
+  are represented as decimal strings or `bigint`, and lossy floating-point or
+  unsafe number conversions in IDs, amounts, and generic event decoding are
+  rejected. Contract strings are clipped at the notification and diagnostic
+  boundaries, and scanner output is bounded.
 
 The compatibility promise is for the deployed event wire shape and the public
 decoded payload names above, not for arbitrary XDR or future contract fields.

@@ -288,9 +288,9 @@ Always parse fields using the tested helpers in `src/stellar/decode.ts`:
 
 | Helper | Input Type | Validation & Bounds | Throws |
 | :--- | :--- | :--- | :--- |
-| `num(val, what)` | `number \| bigint` | Non-negative integer $\le \text{Number.MAX\_SAFE\_INTEGER}$. | `DecodeError` |
-| `big(val, what)` | `bigint \| number` | Valid integer. | `DecodeError` |
-| `amount(val, what)` | `bigint \| number` | Non-negative integer `bigint`. Never converted to floating-point `number`. | `DecodeError` |
+| `num(val, what)` | `number \| bigint \| string` | Non-negative integer $\le \text{Number.MAX\_SAFE\_INTEGER}$. Rejects unsafe numbers and lossy coercion. | `DecodeError` |
+| `big(val, what)` | `bigint \| number \| string` | Valid integer. Rejects unsafe floating-point numbers outside safe integer range. | `DecodeError` |
+| `amount(val, what)` | `bigint \| number \| string` | Non-negative integer `bigint`. Rejects unsafe numbers and lossy number coercion. Large integers must be represented as `bigint` or decimal strings. | `DecodeError` |
 | `str(val, what)` | `string \| Uint8Array` | String trimmed and capped at `MAX_DECODED_STRING_CHARS` (2,048 chars). | `DecodeError` |
 | `optStr(val, what)` | `unknown` | Returns trimmed string $\le 2048$ chars, or `undefined` if nullish. | `DecodeError` |
 | `addr(val, what)` | `string` | 56-character Stellar strkey (`/^[GC][A-Z2-7]{55}$/`). | `DecodeError` |
@@ -298,11 +298,12 @@ Always parse fields using the tested helpers in `src/stellar/decode.ts`:
 | `hex(val, what)` | `Uint8Array \| string` | 32-byte hash formatted as lowercase hex string. | `DecodeError` |
 | `topicAt(topics, idx, what)` | `unknown[]` | Bounds-checked index retrieval from topic array. | `DecodeError` |
 
-### 6.3 Preserving Token Amounts as `bigint`
+### 6.3 Preserving Token Amounts as `bigint` and Rejecting Lossy Numeric Coercion
 
 All Mimir contract currency is atomic USDC with 7 decimal places (`USDC_UNIT = 10_000_000n`), represented on-chain as an `i128`.
 
-* **Rule:** Decoders must never cast token amounts to JavaScript `number` (float). Floating-point conversion causes precision loss on amounts over $2^{53}-1$ atomic units.
+* **Rule:** Decoders must never cast token amounts to JavaScript `number` (float), nor accept unsafe numbers exceeding `Number.MAX_SAFE_INTEGER`. Floating-point conversion causes precision loss on amounts over $2^{53}-1$ atomic units.
+* **Large Integers as Decimal Strings:** Amounts and IDs that exceed JavaScript's safe integer range must be provided as exact decimal strings or `bigint` types. Lossy number coercion (e.g. floats or integers $> \text{Number.MAX\_SAFE\_INTEGER}$) is rejected with a `DecodeError`.
 * **Storage:** Store token amounts as `bigint` in payload types.
 * **Formatting:** Defer formatting to the presentation layer via `formatUsdc(amount: bigint)`.
 
