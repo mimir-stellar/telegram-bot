@@ -45,6 +45,7 @@ export {
   chatAllowed,
   commandArgument,
   isChatAllowed,
+  isCommandForAnotherBot,
   isOperator,
   operatorAllowed,
   replyMarkdown,
