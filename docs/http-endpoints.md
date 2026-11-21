@@ -152,6 +152,28 @@ During graceful shutdown, the health server transitions readiness to `false` (HT
     "persistentVolumeAvailable": true,
     "persistentVolumeError": null
   },
+  "dependencies": {
+    // Per-dependency readiness: *why* the bot is not ready, separated into the
+    // four dependencies it relies on. Additive; the overall ok/status above are
+    // unchanged. Every reason is counts + public source names only — never a
+    // token, a chat id, or another private destination identifier.
+    "rpc": {
+      "ready": true,                    // Stellar RPC reachability
+      "reason": null                    // value-free reason, or null when ready
+    },
+    "cursor": {
+      "ready": true,                    // cursor / resume-position usability
+      "reason": null
+    },
+    "route": {
+      "ready": true,                    // a destination is configured per contract
+      "reason": null                    // names the source (market/squad), never the chat id
+    },
+    "delivery": {
+      "ready": true,                    // sends are landing (dead-letter queue empty)
+      "reason": null
+    }
+  },
   "config": {
     // Key names and their source (env var name, default, etc.). No values.
     "BOT_TOKEN": { "source": "env" },
@@ -159,6 +181,43 @@ During graceful shutdown, the health server transitions readiness to `false` (HT
     // … one entry per recognised config key
   }
 }
+```
+
+#### Dependency readiness (`dependencies`)
+
+The `dependencies` object separates *why* the bot is not ready into the four
+dependencies it relies on, so a probe or dashboard can name the bottleneck
+rather than only seeing `status: "degraded"`. It is additive detail: the
+overall `ok` / `status` (and HTTP status code) are unchanged.
+
+| Dependency | Ready when | Not-ready reason (value-free) |
+|---|---|---|
+| `rpc` | RPC is reachable and polls are fresh | `circuit breaker open after N consecutive RPC failures`, `consecutive failures (N) exceed budget (M)`, `no successful poll within <healthStaleMs> ms` |
+| `cursor` | Every watched target's cursor is usable | `stale cursor on market`, `stalled cursor on squad`, or both joined by `;` |
+| `route` | A destination is configured for each watched contract | `no destination configured for market, squad` (names the source, never the chat id) |
+| `delivery` | No sends are parked in the dead-letter queue | `N send(s) awaiting replay in the dead-letter queue` |
+
+`rpc` and `cursor` reuse the same signals that drive the `"degraded"` verdict
+and are suppressed during an intentional operator pause or graceful drain
+(consistent with `status` staying `"ok"` for those states). `route` is
+config-derived and independent of poller state. `delivery` follows the
+dead-letter queue depth and is reported whenever the poller is running, since
+a backlog persists across a pause or drain. When the poller is stopped,
+`rpc`, `cursor` and `delivery` report `poller not running`; `route` still
+reflects configuration.
+
+Every reason is built from counts and public source names (`market`/`squad`)
+only. No token, chat id, or other private destination identifier is ever
+included — the route reason names *which* source lacks a destination, never
+*what* that destination is.
+
+```bash
+# Which dependency is the bottleneck when degraded
+curl -s http://127.0.0.1:8787/health | \
+  jq '.dependencies | to_entries[] | select(.value.ready == false)'
+
+# Delivery backlog depth
+curl -s http://127.0.0.1:8787/health | jq '.dependencies.delivery.ready'
 ```
 
 ```bash
