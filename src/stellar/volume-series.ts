@@ -6,6 +6,11 @@ export interface VolumeSeriesOptions {
   bucket: VolumeBucketUnit;
 }
 
+/**
+ * Summary of the volume series. Conflicting terminal events are not silently
+ * resolved; they are reported via `inconsistencies`.
+ */
+
 export interface VolumeBucket {
   /** UTC ISO string representing the start of the bucket (e.g. "2026-10-20T16:00:00.000Z" or "2026-10-20T00:00:00.000Z"). */
   timestamp: string;
