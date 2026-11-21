@@ -37,12 +37,16 @@ export const MAX_GENERIC_BYTES_CHARS = 64;
 /** Hard ceiling on total rendered string representation. */
 export const MAX_GENERIC_TOTAL_CHARS = 2048;
 
+/** Maximum number of topics allowed on a single Soroban event (protocol max is 4). */
+export const MAX_GENERIC_TOPICS = 4;
+
 export interface GenericRenderOptions {
   maxDepth?: number;
   maxKeys?: number;
   maxVecItems?: number;
   maxStringChars?: number;
   maxBytesChars?: number;
+  maxTopics?: number;
 }
 
 export interface GenericEventPayload {
@@ -615,13 +619,52 @@ export function decodeGenericEvent(
   const inSuccessfulContractCall =
     typeof event.inSuccessfulContractCall === "boolean" ? event.inSuccessfulContractCall : null;
 
+  const maxTopics = options?.maxTopics ?? MAX_GENERIC_TOPICS;
+  const hasTopicArray =
+    Array.isArray(event.topic) || Array.isArray((event as { topics?: unknown }).topics);
   const rawTopics = Array.isArray(event.topic)
     ? event.topic
     : Array.isArray((event as { topics?: unknown }).topics)
       ? (event as { topics: unknown[] }).topics
       : [];
 
-  const eventName = rawTopics.length > 0 ? extractEventName(rawTopics[0]) : "unknown";
+  // Validate topic count before accessing variant positions or parsing payload.
+  if (!hasTopicArray || rawTopics.length === 0 || rawTopics.length > maxTopics) {
+    const reason = !hasTopicArray
+      ? "missing or invalid topic array"
+      : rawTopics.length === 0
+        ? "empty topic array"
+        : `topic count ${rawTopics.length} exceeds maximum of ${maxTopics}`;
+    const summary = `[unknown] (malformed: ${reason})`;
+    return {
+      source,
+      contractId,
+      ledger,
+      txHash,
+      at,
+      eventId,
+      eventType,
+      transactionIndex,
+      operationIndex,
+      inSuccessfulContractCall,
+      eventName: "unknown",
+      topics: [],
+      value: "void",
+      topicSummary: "(none)",
+      valueSummary: "void",
+      summary,
+      payload: {
+        name: "generic",
+        eventName: "unknown",
+        topics: [],
+        value: "void",
+        summary,
+        reason,
+      },
+    };
+  }
+
+  const eventName = extractEventName(rawTopics[0]);
   const topics = renderTopics(rawTopics, options);
   const value = renderGenericScVal(event.value, 0, options);
 

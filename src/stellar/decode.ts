@@ -359,6 +359,9 @@ export const MAX_DECODED_EVENT_XDR_BYTES = 16_384;
 /** Per-topic XDR budget — event names, ids and addresses are all tiny. */
 export const MAX_EVENT_TOPIC_XDR_BYTES = 1_024;
 
+/** Maximum number of topics allowed on a single Soroban event (protocol max is 4). */
+export const MAX_EVENT_TOPICS = 4;
+
 /** Hard ceiling on any single decoded string field after native conversion. */
 export const MAX_DECODED_STRING_CHARS = 2_048;
 
@@ -1148,6 +1151,35 @@ export function decodeEvent(
       return {
         ...meta,
         payload: { name: "unknown", eventName, reason: "topic[0] is not an event name string" },
+      };
+    }
+
+    // Validate topic count before accessing variant positions or parsing payload.
+    if (event.topic.length > MAX_EVENT_TOPICS) {
+      recordDecodeOutcome(source, eventName, "malformed");
+      return {
+        ...meta,
+        payload: {
+          name: "unknown",
+          eventName,
+          reason: `${eventName}: topic count ${event.topic.length} exceeds maximum of ${MAX_EVENT_TOPICS}`,
+        },
+      };
+    }
+
+    const schemas = source === "market" ? MARKET_TOPIC_SCHEMAS : SQUAD_TOPIC_SCHEMAS;
+    const schema = Object.prototype.hasOwnProperty.call(schemas, eventName)
+      ? schemas[eventName]
+      : undefined;
+    if (schema && event.topic.length !== schema.expectedCount) {
+      recordDecodeOutcome(source, eventName, "malformed");
+      return {
+        ...meta,
+        payload: {
+          name: "unknown",
+          eventName,
+          reason: `${eventName}: invalid topic[] count (expected ${schema.expectedCount}, got ${event.topic.length})`,
+        },
       };
     }
 
