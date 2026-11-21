@@ -4,10 +4,8 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { access, link, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { config as loadDotenv } from "dotenv";
-import { pathToFileURL } from "node:url";
 
 import { acquireInstanceLock } from "./instanceLock.js";
 import {
@@ -63,6 +61,12 @@ async function exists(filePath: string): Promise<boolean> {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw err;
+  }
+}
+
+async function assertDifferentPaths(cursorFile: string, backupFile: string): Promise<void> {
+  if (path.resolve(cursorFile) === path.resolve(backupFile)) {
+    throw new Error("cursor file and backup file must be different paths");
   }
 }
 
@@ -233,7 +237,7 @@ export async function previewRecovery(options: RecoveryPreviewOptions): Promise<
   return { schemaVersion: parsed.file.version, entries };
 }
 
-function formatRecoveryPreview(preview: RecoveryPreview): string {
+export function formatRecoveryPreview(preview: RecoveryPreview): string {
   const lines = [`[cursor] recovery preview schema=v${preview.schemaVersion} targets=${preview.entries.length}`];
   for (const entry of preview.entries) {
     const current = entry.currentLedger === null ? "unknown" : String(entry.currentLedger);
@@ -256,7 +260,7 @@ function formatRecoveryPreview(preview: RecoveryPreview): string {
   return lines.join("\n");
 }
 
-function summarizePositions(positions: Record<string, CursorRecoveryPosition>): string {
+export function summarizePositions(positions: Record<string, CursorRecoveryPosition>): string {
   const entries = Object.entries(positions);
   if (entries.length === 0) return "none";
   return entries
@@ -298,7 +302,7 @@ function parseOptions(args: string[]): CliOptions {
   const valued = new Set(["--file", "--out", "--from", "--target", "--to", "--retained-start", "--retained-end"]);
 
   for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
+    const arg = args[index] ?? "";
     if (arg === "--force") {
       if (seen.has(arg)) throw new Error("duplicate --force option");
       seen.add(arg);
@@ -325,122 +329,4 @@ function parseLedger(value: string, label: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed)) throw new Error(`${label} is out of range`);
   return parsed;
-}
-
-function resolvePath(value: string): string {
-  return path.resolve(process.cwd(), value);
-}
-
-async function canonicalizePath(filePath: string): Promise<string> {
-  const resolved = path.resolve(filePath);
-  const normalizeCase = (value: string) =>
-    process.platform === "win32" ? value.toLowerCase() : value;
-
-  try {
-    return normalizeCase(await realpath(resolved));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw err;
-    }
-  }
-
-  // If the leaf does not exist yet, resolve symlinks on the nearest existing ancestor.
-  const segments: string[] = [];
-  let current = resolved;
-  for (;;) {
-    const parent = path.dirname(current);
-    if (parent === current) {
-      return normalizeCase(resolved);
-    }
-    segments.unshift(path.basename(current));
-    current = parent;
-    try {
-      const realParent = await realpath(current);
-      return normalizeCase(path.join(realParent, ...segments));
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw err;
-      }
-    }
-  }
-}
-
-export async function assertDifferentPaths(left: string, right: string): Promise<void> {
-  const [canonicalLeft, canonicalRight] = await Promise.all([
-    canonicalizePath(left),
-    canonicalizePath(right),
-  ]);
-  if (canonicalLeft === canonicalRight) {
-    throw new Error("backup and live cursor paths must be different");
-  }
-}
-
-async function main(): Promise<void> {
-  loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
-  const [action, ...args] = process.argv.slice(2);
-  if (action !== "backup" && action !== "restore" && action !== "preview" && action !== "history") {
-    throw new Error(
-      "usage: npm run cursor -- <backup|restore|preview|history> [--file PATH] [--out PATH|--from PATH] " +
-        "[--target NAME --to LEDGER --retained-start LEDGER --retained-end LEDGER] [--force]",
-    );
-  }
-
-  const options = parseOptions(args);
-  const cursorFile = resolvePath(options.file ?? process.env.CURSOR_FILE ?? "./data/cursor.json");
-  if (action === "preview") {
-    if (options.to === undefined) throw new Error("preview requires --to LEDGER");
-    const retainedStart = options.retainedStart === undefined ? undefined : parseLedger(options.retainedStart, "--retained-start");
-    const retainedEnd = options.retainedEnd === undefined ? undefined : parseLedger(options.retainedEnd, "--retained-end");
-    const preview = await previewRecovery({
-      cursorFile,
-      target: options.target,
-      proposedLedger: parseLedger(options.to, "--to"),
-      retainedWindowStart: retainedStart,
-      retainedWindowEnd: retainedEnd,
-    });
-    console.log(formatRecoveryPreview(preview));
-    return;
-  }
-
-  if (action === "history") {
-    const history = await readCursorRecoveryHistory(cursorFile);
-    console.log(`[cursor] recovery history (${history.length}) for ${cursorFile}`);
-    for (const record of history) {
-      const targetPart = record.source ? ` source=${record.source}` : "";
-      console.log(
-        `  ${record.at} reason=${record.reason}${targetPart} ` +
-          `before=[${summarizePositions(record.before)}] after=[${summarizePositions(record.after)}]`,
-      );
-    }
-    return;
-  }
-
-  if (action === "backup") {
-    const backupFile = resolvePath(
-      options.out ?? `${cursorFile}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`,
-    );
-    await assertDifferentPaths(cursorFile, backupFile);
-    await backupCursor({ cursorFile, backupFile, force: options.force });
-    return;
-  }
-
-  if (!options.from) throw new Error("restore requires --from PATH");
-  const backupFile = resolvePath(options.from);
-  await assertDifferentPaths(cursorFile, backupFile);
-  const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
-  await restoreCursor({
-    cursorFile,
-    backupFile,
-    lockFile,
-    force: options.force,
-  });
-}
-
-const invokedPath = process.argv[1];
-if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {
-  main().catch((err: unknown) => {
-    const message = err instanceof Error ? err.message : "cursor command failed";
-    console.error(`[cursor] ${message.replace(/\s+/g, " ").slice(0, 300)}`);
-    process.exit(1);
-  });
 }
