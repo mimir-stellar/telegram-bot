@@ -93,6 +93,17 @@ The bot reads only public chain data. It does not hold signing keys or any crede
 - **No payment amounts**: Notification messages are formatted with amounts displayed, but amounts are not stored separately in files
 - **No Telegram user IDs**: User IDs may appear transiently in log lines (which are redacted) but are not persisted to disk
 
+## Privacy review mode for shareable archives
+
+Before sharing an event archive (JSONL capture) outside the operator's environment, run the privacy review mode. It scans the archive for:
+
+- **Private chat identifiers**: numeric Telegram chat ids and `@username` handles
+- **Secret-shaped values**: Telegram bot tokens, secret/seed strkeys (`S…`, `D…`, `B…`, `T…`), URLs, and opaque tokens of 40 or more characters
+
+The review is deterministic and offline. It does not contact Telegram, Soroban RPC, or any other service. It produces a findings report listing each finding's line number, category, and a redacted preview; the raw matched value is never echoed in the report. Findings are sorted by line and category so repeated runs over the same input produce identical output.
+
+The review only reports; it does not modify the archive. Operators should review the findings and remove or redact the flagged lines before sharing the file.
+
 ## How to delete all stored data
 
 To fully reset the bot's state:

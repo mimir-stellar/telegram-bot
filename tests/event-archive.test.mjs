@@ -8,6 +8,7 @@ import {
   MalformedArchiveRecordError,
   readArchive,
 } from "../dist/stellar/archive.js";
+import { buildPrivacyReviewReport } from "../dist/stellar/privacy-review.js";
 import { withTempDataDir } from "./helpers/temp-data.mjs";
 
 function makeDummyEvent(id, amountBigInt = 10000000n) {

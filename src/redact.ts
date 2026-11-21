@@ -66,6 +66,67 @@ export function clearSecrets(): void {
 }
 
 /**
+ * Privacy review mode for shareable event archives. Detects private chat
+ * identifiers and secret-shaped values in a text payload and produces a
+ * deterministic findings report. Pure: no network, no I/O.
+ */
+export interface PrivacyFinding {
+  kind: "telegram_chat_id" | "secret";
+  rule: string;
+  offset: number;
+  length: number;
+  preview: string;
+}
+
+export interface PrivacyReport {
+  ok: boolean;
+  count: number;
+  findings: PrivacyFinding[];
+}
+
+const PRIVACY_RULES: readonly { kind: PrivacyFinding["kind"]; rule: string; pattern: RegExp }[] = [
+  // Private chat ids: negative group/supergroup ids and large positive user ids.
+  { kind: "telegram_chat_id", rule: "chat_id_negative", pattern: /(?<![\w-])-100\d{7,}\b/g },
+  { kind: "telegram_chat_id", rule: "chat_id_positive", pattern: /(?<![\w.-])\d{9,12}(?![\w.-])/g },
+  { kind: "secret", rule: "telegram_bot_token", pattern: /\b\d{6,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g },
+  { kind: "secret", rule: "stellar_seed", pattern: /\bS[A-Z2-7]{55}\b/g },
+  { kind: "secret", rule: "bearer_token", pattern: /\bBearer\s+[A-Za-z0-9._+/=-]{8,}/gi },
+  { kind: "secret", rule: "url_userinfo", pattern: /\bhttps?:\/\/[^/\s:@]+:[^/\s@]+@/gi },
+];
+
+function previewOf(value: string): string {
+  if (value.length <= 4) return "****";
+  return `${value.slice(0, 2)}…${value.slice(-2)}`;
+}
+
+/**
+ * Scan text for private chat identifiers and secret-shaped values. Findings are
+ * sorted by offset then rule so the report is deterministic. Matches are
+ * previewed, never echoed in full.
+ */
+export function privacyReview(input: string): PrivacyReport {
+  const findings: PrivacyFinding[] = [];
+  if (input) {
+    for (const { kind, rule, pattern } of PRIVACY_RULES) {
+      for (const match of input.matchAll(pattern)) {
+        const value = match[0];
+        findings.push({
+          kind,
+          rule,
+          offset: match.index ?? 0,
+          length: value.length,
+          preview: previewOf(value),
+        });
+      }
+    }
+  }
+  findings.sort((a, b) =>
+    a.offset - b.offset || a.rule.localeCompare(b.rule) || a.length - b.length
+  );
+  return { ok: findings.length === 0, count: findings.length, findings };
+}
+
+/**
  * One redaction rule: a pattern and its replacement. A function replacement
  * decides per match, which is how public chain identifiers survive.
  */

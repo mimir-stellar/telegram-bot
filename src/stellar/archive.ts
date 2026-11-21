@@ -23,6 +23,23 @@ export interface ReadArchiveOptions {
   retainCommitted?: boolean;
 }
 
+export type PrivacyFindingKind = "private_chat_id" | "secret_value";
+
+export interface PrivacyFinding {
+  kind: PrivacyFindingKind;
+  fileName: string;
+  lineNumber: number;
+  jsonPath: string;
+  /** Redacted preview of the matched value; never the raw secret. */
+  preview: string;
+}
+
+export interface PrivacyReviewReport {
+  filesScanned: number;
+  recordsScanned: number;
+  findings: PrivacyFinding[];
+}
+
 export class MalformedArchiveRecordError extends Error {
   readonly fileName: string;
   readonly lineNumber: number;
@@ -43,6 +60,14 @@ export class MalformedArchiveRecordError extends Error {
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
 const DEFAULT_MAX_FILES = 10;
 const FILE_MODE = 0o600;
+
+// Telegram chat ids: private chats are positive integers; groups/channels are negative.
+const PRIVATE_CHAT_KEY_PATTERN = /^(chat_?id|chatId|chat_id_private|private_chat_id|from_?id|user_?id)$/i;
+const SECRET_KEY_PATTERN = /(secret|token|password|passwd|api[_-]?key|private[_-]?key|seed|mnemonic)/i;
+// Stellar secret seed (S...), 56 base32 chars.
+const STELLAR_SECRET_SEED_PATTERN = /\bS[A-Z2-7]{55}\b/;
+// Bot token shaped values: <digits>:<35+ url-safe chars>.
+const BOT_TOKEN_PATTERN = /\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/;
 
 function formatArchiveFilename(index: number, timestamp: number): string {
   const ts = new Date(timestamp).toISOString().replace(/[:.]/g, "-");
@@ -399,4 +424,87 @@ export async function* readArchive(
   for (const event of stagedEvents) {
     yield event;
   }
+}
+
+function redactPreview(value: string): string {
+  if (value.length <= 4) return "****";
+  return `${value.slice(0, 2)}***${value.slice(-2)}`;
+}
+
+function scanValue(
+  value: unknown,
+  jsonPath: string,
+  keyHint: string | undefined,
+  emit: (kind: PrivacyFindingKind, jsonPath: string, raw: string) => void,
+): void {
+  if (typeof value === "string") {
+    if (keyHint && PRIVATE_CHAT_KEY_PATTERN.test(keyHint) && /^\d+$/.test(value)) {
+      emit("private_chat_id", jsonPath, value);
+    } else if (keyHint && SECRET_KEY_PATTERN.test(keyHint) && value.length > 0) {
+      emit("secret_value", jsonPath, value);
+    } else {
+      const seed = value.match(STELLAR_SECRET_SEED_PATTERN);
+      if (seed) emit("secret_value", jsonPath, seed[0]);
+      const token = value.match(BOT_TOKEN_PATTERN);
+      if (token) emit("secret_value", jsonPath, token[0]);
+    }
+    return;
+  }
+  if (typeof value === "number" && keyHint && PRIVATE_CHAT_KEY_PATTERN.test(keyHint)) {
+    if (Number.isInteger(value) && value > 0) {
+      emit("private_chat_id", jsonPath, String(value));
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, i) => scanValue(item, `${jsonPath}[${i}]`, undefined, emit));
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      scanValue(child, `${jsonPath}.${key}`, key, emit);
+    }
+  }
+}
+
+/**
+ * Deterministically scan archived JSONL records for private chat identifiers and
+ * secret-shaped values. Reads only local archive files; performs no network I/O.
+ */
+export async function reviewArchivePrivacy(dir: string): Promise<PrivacyReviewReport> {
+  const files = await listArchiveFiles(dir);
+  const findings: PrivacyFinding[] = [];
+  let recordsScanned = 0;
+
+  for (const file of files) {
+    const handle = await open(path.join(dir, file), "r");
+    try {
+      const content = await handle.readFile({ encoding: "utf8" });
+      const lines = content.split("\n");
+      for (let index = 0; index < lines.length; index += 1) {
+        const trimmed = lines[index]!.trim();
+        if (!trimmed) continue;
+        recordsScanned += 1;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          throw new MalformedArchiveRecordError(file, index + 1);
+        }
+        scanValue(parsed, "$", undefined, (kind, jsonPath, raw) => {
+          findings.push({
+            kind,
+            fileName: file,
+            lineNumber: index + 1,
+            jsonPath,
+            preview: redactPreview(raw),
+          });
+        });
+      }
+    } finally {
+      await handle.close();
+    }
+  }
+
+  return { filesScanned: files.length, recordsScanned, findings };
 }
