@@ -349,3 +349,220 @@ test("categoriesMessage: pure across multiple calls with same inputs", () => {
 
   assert.equal(first, second);
 });
+
+// ── Command registration & handler integration ────────────────────────────────
+
+test("/categories is registered in the command catalogue with chatAllowlist gate", async () => {
+  const { COMMANDS, createBot } = await import("../dist/bot.js");
+  const { commandModule } = await import("../dist/commands/index.js");
+
+  const meta = COMMANDS.find((c) => c.command === "categories");
+  assert.ok(meta, "/categories must be advertised in COMMANDS");
+  assert.equal(meta.operatorOnly, false);
+
+  const mod = commandModule("categories");
+  assert.ok(mod, "/categories module must be registered");
+  assert.equal(mod.chatAllowlist, true);
+  assert.notEqual(mod.operatorOnly, true);
+
+  assert.equal(typeof createBot, "function");
+});
+
+test("/categories command replies with bounded category summary and empty boundary case", async () => {
+  const { createBot } = await import("../dist/bot.js");
+
+  const config = {
+    marketContractId: "C" + "A".repeat(55),
+    squadContractId: "C" + "B".repeat(55),
+    rpcUrl: "https://example.invalid/rpc",
+    horizonUrl: "https://example.invalid/horizon",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://example.invalid/explorer",
+    botToken: "123456789:TEST-ONLY-TOKEN-NEVER-USE",
+    chatId: "-1001234567890",
+    allowedChatIds: [],
+    operatorTelegramUserId: null,
+    pollIntervalMs: 30_000,
+    startLookbackLedgers: 60,
+    cursorFile: "/tmp/unused-cursor.json",
+    maxNotificationsPerCycle: 20,
+    healthHost: "127.0.0.1",
+    healthPort: 0,
+    healthStaleMs: 90_000,
+    channelPreviewMode: false,
+    notificationCategories: ["crypto"],
+  };
+
+  let currentCategories;
+  const bot = createBot({
+    config,
+    status: () => ({
+      running: true,
+      paused: false,
+      startedAt: 1,
+      cycles: 1,
+      lastPollAt: null,
+      lastSuccessAt: null,
+      latestLedger: null,
+      oldestLedger: null,
+      notificationsSent: 0,
+      notificationsFailed: 0,
+      eventsSkipped: 0,
+      consecutiveFailures: 0,
+      lastError: null,
+      targets: [],
+      ...(currentCategories !== undefined ? { categories: currentCategories } : {}),
+    }),
+    pause: () => "paused",
+    resume: () => "resumed",
+    botInfo: {
+      id: 999,
+      is_bot: true,
+      first_name: "MimirTestBot",
+      username: "mimir_test_bot",
+      can_join_groups: true,
+      can_read_all_group_messages: false,
+      supports_inline_queries: false,
+      can_connect_to_business: false,
+      has_main_web_app: false,
+    },
+  });
+
+  const sent = [];
+  bot.api.config.use((prev, method, payload) => {
+    if (method === "sendMessage") {
+      sent.push(payload);
+      return Promise.resolve({
+        ok: true,
+        result: {
+          message_id: sent.length,
+          date: 0,
+          chat: { id: payload.chat_id, type: "private" },
+          text: payload.text,
+        },
+      });
+    }
+    return prev(method, payload);
+  });
+
+  const makeUpdate = (id) => ({
+    update_id: id,
+    message: {
+      message_id: id,
+      date: 1700000000,
+      chat: { id: 12345, type: "private" },
+      from: { id: 12345, is_bot: false, first_name: "User" },
+      text: "/categories",
+      entities: [{ offset: 0, length: 11, type: "bot_command" }],
+    },
+  });
+
+  // Boundary case: undefined categories in status
+  await bot.handleUpdate(makeUpdate(1));
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /No claim categories recorded yet/);
+
+  // Observed categories, including one filtered out by notificationCategories
+  currentCategories = { crypto: 3, sports: 1 };
+  await bot.handleUpdate(makeUpdate(2));
+  assert.equal(sent.length, 2);
+  assert.match(sent[1].text, /• `crypto`: 3/);
+  assert.match(sent[1].text, /• `sports`: 1 \\\(filtered\\\)/);
+});
+
+test("poller derives status().categories from observed claim_created events", async () => {
+  const path = await import("node:path");
+  const { rpc } = await import("@stellar/stellar-sdk");
+  const { createPoller } = await import("../dist/poller.js");
+  const {
+    MOCK_BOT_TOKEN,
+    MOCK_MARKET_CONTRACT_ID,
+    MOCK_NETWORK_PASSPHRASE,
+    MOCK_SQUAD_CONTRACT_ID,
+  } = await import("../dist/stellar/mock-constants.js");
+  const { startMockRpc } = await import("../dist/stellar/mock-rpc.js");
+  const { withTempDataDir } = await import("./helpers/temp-data.mjs");
+
+  const CAPTAIN = "GCLJONJVCLJGE6CSMCHCGYA563ADTCK5YGF3KERDMSNS3MNNDAIXHFA5";
+
+  await withTempDataDir(async (dataDir) => {
+    const mock = await startMockRpc({
+      port: 0,
+      scenario: {
+        latestLedger: 12,
+        oldestLedger: 1,
+        ledgersPerPage: 50,
+        events: [
+          {
+            source: "market",
+            ledger: 9,
+            eventName: "claim_created",
+            topics: [1, { address: CAPTAIN }],
+            fields: { category: "crypto" },
+          },
+          {
+            source: "market",
+            ledger: 10,
+            eventName: "claim_created",
+            topics: [2, { address: CAPTAIN }],
+            fields: { category: "sports" },
+          },
+          {
+            source: "market",
+            ledger: 11,
+            eventName: "claim_created",
+            topics: [3, { address: CAPTAIN }],
+            fields: { category: "crypto" },
+          },
+          {
+            source: "squad",
+            ledger: 12,
+            eventName: "market_created",
+            topics: [5, { address: CAPTAIN }],
+            fields: { name: "Test Squad" },
+          },
+        ],
+      },
+    });
+
+    try {
+      const poller = createPoller({
+        config: {
+          version: "0.1.0",
+          marketContractId: MOCK_MARKET_CONTRACT_ID,
+          squadContractId: MOCK_SQUAD_CONTRACT_ID,
+          rpcUrl: mock.url,
+          horizonUrl: "https://example.invalid/horizon",
+          networkPassphrase: MOCK_NETWORK_PASSPHRASE,
+          explorerBaseUrl: "https://example.invalid/explorer",
+          botToken: MOCK_BOT_TOKEN,
+          chatId: "-1001234567890",
+          operatorTelegramUserId: null,
+          pollIntervalMs: 30_000,
+          startLookbackLedgers: 10,
+          cursorFile: dataDir.file("cursor.json"),
+          maxNotificationsPerCycle: 20,
+          healthHost: "127.0.0.1",
+          healthPort: 0,
+          healthStaleMs: 90_000,
+          notificationCategories: ["crypto"],
+        },
+        server: new rpc.Server(mock.url, { allowHttp: true }),
+        send: async () => undefined,
+      });
+
+      await poller.pollOnce();
+
+      const status = poller.status();
+      assert.deepEqual(status.categories, { crypto: 2, sports: 1 });
+
+      const message = categoriesMessage(status.categories, {
+        notificationCategories: ["crypto"],
+      });
+      assert.match(message, /• `crypto`: 2/);
+      assert.match(message, /• `sports`: 1 \\\(filtered\\\)/);
+    } finally {
+      await mock.close();
+    }
+  });
+});

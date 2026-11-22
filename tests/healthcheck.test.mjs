@@ -26,9 +26,9 @@ test("healthcheck exits 0 on HTTP 200", async () => {
   });
 
   const { port } = server.address();
-  
+
   try {
-    const { stdout, stderr } = await execFileAsync("node", ["dist/healthcheck.js"], {
+    const { stdout } = await execFileAsync("node", ["dist/healthcheck.js"], {
       env: { ...process.env, HEALTH_HOST: "127.0.0.1", HEALTH_PORT: String(port) },
     });
     assert.match(stdout, /\[healthcheck\] OK/);
@@ -44,7 +44,7 @@ test("healthcheck exits 1 on HTTP 503", async () => {
   });
 
   const { port } = server.address();
-  
+
   try {
     await execFileAsync("node", ["dist/healthcheck.js"], {
       env: { ...process.env, HEALTH_HOST: "127.0.0.1", HEALTH_PORT: String(port) },
@@ -77,4 +77,43 @@ test("healthcheck exits 0 when disabled via HEALTH_PORT=0", async () => {
     env: { ...process.env, HEALTH_PORT: "0" },
   });
   assert.match(stdout, /Disabled/);
+});
+
+test("offline health report reads a persisted status file without a server", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "health-report-"));
+  const file = join(dir, "status.json");
+  try {
+    await writeFile(file, JSON.stringify({ status: "ok", updatedAt: new Date().toISOString() }));
+    const { stdout } = await execFileAsync("node", ["dist/healthcheck.js", "--report", file], {
+      env: { ...process.env, HEALTH_PORT: "0" },
+    });
+    assert.match(stdout, /status: ok/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("offline health report flags malformed status files explicitly", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "health-report-"));
+  const file = join(dir, "status.json");
+  try {
+    await writeFile(file, "{not json");
+    try {
+      await execFileAsync("node", ["dist/healthcheck.js", "--report", file], {
+        env: { ...process.env, HEALTH_PORT: "0" },
+      });
+      assert.fail("Should have thrown on malformed status");
+    } catch (err) {
+      assert.equal(err.code, 1);
+      assert.match(err.stderr, /malformed/i);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
