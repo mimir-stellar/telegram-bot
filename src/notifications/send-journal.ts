@@ -13,6 +13,9 @@
  *
  * The journal is best-effort: a write failure is logged and the poller carries
  * on, falling back to guessing from the cursor exactly as it does today.
+ *
+ * Routing preview: `previewRoutingDecision` is not part of this module; the
+ * journal only records send intents and outcomes.
  */
 
 import { mkdir, open, readFile, rename } from "node:fs/promises";
