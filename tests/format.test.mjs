@@ -58,7 +58,7 @@ test("formatted money notifications keep explicit decimals and escape the decima
   });
 
   const message = formatEvent(config, event);
-  assert.match(message, /Stake: \*2\\.0000000 USDC\*/);
+  assert.match(message, /Stake: \*\u20682\\.0000000 USDC\u2069\*/);
 });
 
 test("unknown or malformed decoded events stay non-notifying", () => {

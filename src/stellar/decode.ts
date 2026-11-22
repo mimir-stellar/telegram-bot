@@ -18,11 +18,13 @@
  * looks up the appropriate decoder function while safely falling back to v1 or
  * unknown payloads if an unrecognised version or event shape is encountered.
  *
- * ── Amounts ──────────────────────────────────────────────────────────────────
+ * ── Amounts & Numeric Safety ─────────────────────────────────────────────────
  *
  * All money is atomic USDC in `i128`. Stellar's USDC Stellar Asset Contract has
  * **7 decimals**, not the 6 of the ERC-20. Amounts stay `bigint` through
  * decoding and are only converted for display, at the formatting edge.
+ * Large integers are represented as decimal strings or `bigint`; lossy number
+ * coercion in IDs, amounts, and ordering positions is strictly rejected.
  */
 
 import { recordDecodeOutcome } from "./decode-stats.js";
@@ -32,8 +34,9 @@ import { eventKey } from "../dedup.js";
 import { txExplorerUrl } from "./client.js";
 import { redactText } from "../redact.js";
 import { peekEventName } from "./peek.js";
+import { findDuplicateMapKey } from "./generic-decode.js";
 
-export { peekEventName };
+export { peekEventName, getGenericDecoderCapabilityReport };
 
 /** Which of the two Mimir contracts an event came from. */
 export type ContractSource = "market" | "squad";
@@ -359,6 +362,9 @@ export const MAX_DECODED_EVENT_XDR_BYTES = 16_384;
 /** Per-topic XDR budget — event names, ids and addresses are all tiny. */
 export const MAX_EVENT_TOPIC_XDR_BYTES = 1_024;
 
+/** Maximum number of topics allowed on a single Soroban event (protocol max is 4). */
+export const MAX_EVENT_TOPICS = 4;
+
 /** Hard ceiling on any single decoded string field after native conversion. */
 export const MAX_DECODED_STRING_CHARS = 2_048;
 
@@ -414,6 +420,10 @@ function native(value: xdr.ScVal): unknown {
   if (v === null || typeof v !== "object" || typeof v.type !== "string") {
     throw new DecodeError(`expected an ScVal, got ${v === null ? "null" : typeof v}`);
   }
+  const collision = findDuplicateMapKey(value);
+  if (collision) {
+    throw new DecodeError(collision.reason);
+  }
   return scValToNative(value);
 }
 
@@ -424,8 +434,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function big(value: unknown, what: string): bigint {
   if (typeof value === "bigint") return value;
-  if (typeof value === "number" && Number.isInteger(value)) return BigInt(value);
-  if (typeof value === "string" && /^-?\d+$/.test(value)) return BigInt(value);
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      throw new DecodeError(`${what}: expected safe integer number, got ${value}`);
+    }
+    return BigInt(value);
+  }
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
+    return BigInt(value.trim());
+  }
   throw new DecodeError(`${what}: expected an integer, got ${typeof value}`);
 }
 
@@ -1046,6 +1063,293 @@ export const SQUAD_DECODERS: Record<string, SquadDecoderFn> = {
   v2: decodeSquadV2,
 };
 
+// ── Decoder Capabilities & Schemas ──────────────────────────────────────────
+
+/** Canonical admin event names supported across contracts. */
+export const ADMIN_EVENT_NAMES: readonly string[] = [
+  "oracle_changed",
+  "ownership_transferred",
+  "agent_attributed",
+  "fee_accrued",
+  "fee_policy_set",
+  "fee_policy_changed",
+  "fee_policy_updated",
+  "fee_policy_removed",
+  "admin",
+] as const;
+
+/** Schema description of an event decoded by the subsystem. */
+export interface DecoderEventSchema {
+  name: string;
+  expectedTopicCount: number;
+  topicArgs: readonly TopicArgKind[];
+  extensions?: readonly string[];
+  isAdmin?: boolean;
+}
+
+/** Comprehensive capability report for a contract decoder and version. */
+export interface DecoderCapabilityReport {
+  source: string;
+  contractId?: string;
+  version: string;
+  normalizedVersion: string;
+  supported: boolean;
+  decoderKind: "typed" | "generic";
+  fallbackVersion?: string;
+  supportedVersions: readonly string[];
+  eventSchemas: readonly DecoderEventSchema[];
+  events: readonly string[];
+  adminEvents: readonly string[];
+  wildcardSupport: boolean;
+}
+
+/** Description of an unsupported combination flagged before polling starts. */
+export interface UnsupportedCombinationFlag {
+  source: string;
+  version?: string;
+  normalizedVersion: string;
+  contractId?: string;
+  fallbackVersion: string;
+  reason: string;
+}
+
+/** Configuration targets used to resolve decoder capabilities. */
+export interface DecoderTargetConfig {
+  marketContractId?: string;
+  squadContractId?: string;
+  marketContractVersion?: string;
+  squadContractVersion?: string;
+}
+
+/**
+ * Check whether a given contract version is explicitly supported for a source.
+ */
+export function isContractVersionSupported(
+  source: ContractSource | "generic" | string,
+  version?: string,
+): boolean {
+  const norm = normalizeContractVersion(version);
+  if (source === "generic") {
+    return true;
+  }
+  if (source === "market") {
+    return Object.prototype.hasOwnProperty.call(MARKET_DECODERS, norm);
+  }
+  if (source === "squad") {
+    return Object.prototype.hasOwnProperty.call(SQUAD_DECODERS, norm);
+  }
+  return false;
+}
+
+/**
+ * List supported event schemas for a contract source and version.
+ */
+export function listSupportedEventSchemas(
+  source: ContractSource | "generic" | string,
+  version: string = DEFAULT_CONTRACT_VERSION,
+): readonly DecoderEventSchema[] {
+  const norm = normalizeContractVersion(version);
+  if (source === "generic") {
+    return [
+      {
+        name: "*",
+        expectedTopicCount: -1,
+        topicArgs: [],
+        isAdmin: false,
+      },
+    ];
+  }
+
+  const schemas: DecoderEventSchema[] = [];
+  if (source === "market") {
+    for (const [eventName, schema] of Object.entries(MARKET_TOPIC_SCHEMAS)) {
+      const extensions: string[] = [];
+      if (norm === "v2") {
+        if (eventName === "claim_created") extensions.push("title");
+        if (eventName === "claim_resolved") extensions.push("resolver");
+      }
+      schemas.push({
+        name: eventName,
+        expectedTopicCount: schema.expectedCount,
+        topicArgs: schema.args,
+        ...(extensions.length > 0 ? { extensions } : {}),
+        isAdmin: false,
+      });
+    }
+  } else if (source === "squad") {
+    for (const [eventName, schema] of Object.entries(SQUAD_TOPIC_SCHEMAS)) {
+      const extensions: string[] = [];
+      if (norm === "v2") {
+        if (eventName === "market_created") extensions.push("category");
+      }
+      schemas.push({
+        name: eventName,
+        expectedTopicCount: schema.expectedCount,
+        topicArgs: schema.args,
+        ...(extensions.length > 0 ? { extensions } : {}),
+        isAdmin: false,
+      });
+    }
+  }
+
+  if (source === "market" || source === "squad") {
+    for (const adminName of ADMIN_EVENT_NAMES) {
+      schemas.push({
+        name: adminName,
+        expectedTopicCount: 1,
+        topicArgs: [],
+        isAdmin: true,
+      });
+    }
+  }
+
+  return schemas;
+}
+
+/**
+ * Generate a decoder capability report for a single contract source and version.
+ */
+export function getDecoderCapabilityReport(
+  source: ContractSource | "generic" | string,
+  version?: string,
+  contractId?: string,
+): DecoderCapabilityReport {
+  const rawVersion = version ?? DEFAULT_CONTRACT_VERSION;
+  const normVersion = normalizeContractVersion(rawVersion);
+
+  if (source === "generic") {
+    const genericReport = getGenericDecoderCapabilityReport(contractId);
+    if (version !== undefined) {
+      return {
+        ...genericReport,
+        version,
+        normalizedVersion: normVersion,
+      };
+    }
+    return genericReport;
+  }
+
+  const isMarket = source === "market";
+  const isSquad = source === "squad";
+  const knownSource = isMarket || isSquad;
+
+  const supportedVersions = isMarket
+    ? Object.keys(MARKET_DECODERS)
+    : isSquad
+      ? Object.keys(SQUAD_DECODERS)
+      : [];
+
+  const supported = knownSource && supportedVersions.includes(normVersion);
+  const fallbackVersion = supported ? undefined : DEFAULT_CONTRACT_VERSION;
+  const effectiveVersion = supported ? normVersion : DEFAULT_CONTRACT_VERSION;
+
+  const eventSchemas = knownSource
+    ? listSupportedEventSchemas(source as ContractSource, effectiveVersion)
+    : [];
+
+  const nonAdminEvents = eventSchemas
+    .filter((s) => !s.isAdmin && s.name !== "*")
+    .map((s) => s.name);
+  const adminEvents = eventSchemas.filter((s) => s.isAdmin).map((s) => s.name);
+
+  return {
+    source,
+    ...(contractId ? { contractId } : {}),
+    version: rawVersion,
+    normalizedVersion: normVersion,
+    supported,
+    decoderKind: "typed",
+    ...(fallbackVersion ? { fallbackVersion } : {}),
+    supportedVersions,
+    eventSchemas,
+    events: nonAdminEvents,
+    adminEvents,
+    wildcardSupport: false,
+  };
+}
+
+/**
+ * Generate capability reports for all configured contract versions.
+ */
+export function getConfiguredDecoderCapabilities(
+  config: DecoderTargetConfig,
+): DecoderCapabilityReport[] {
+  const reports: DecoderCapabilityReport[] = [];
+  if (config.marketContractId || config.marketContractVersion) {
+    reports.push(
+      getDecoderCapabilityReport(
+        "market",
+        config.marketContractVersion,
+        config.marketContractId,
+      ),
+    );
+  }
+  if (config.squadContractId || config.squadContractVersion) {
+    reports.push(
+      getDecoderCapabilityReport(
+        "squad",
+        config.squadContractVersion,
+        config.squadContractId,
+      ),
+    );
+  }
+  return reports;
+}
+
+/**
+ * Validate contract version combinations and flag unsupported ones.
+ */
+export function validateDecoderCombinations(
+  targets: readonly { source: string; version?: string; contractId?: string }[],
+): UnsupportedCombinationFlag[] {
+  const flags: UnsupportedCombinationFlag[] = [];
+  for (const t of targets) {
+    const report = getDecoderCapabilityReport(t.source, t.version, t.contractId);
+    if (!report.supported) {
+      let reason = `Version '${t.version ?? ""}' is not supported for contract source '${t.source}'`;
+      if (report.supportedVersions.length > 0) {
+        reason += ` (supported: ${report.supportedVersions.join(', ')})`;
+      } else {
+        reason += ` (unknown source '${t.source}')`;
+      }
+      flags.push({
+        source: t.source,
+        version: t.version,
+        normalizedVersion: report.normalizedVersion,
+        ...(t.contractId ? { contractId: t.contractId } : {}),
+        fallbackVersion: report.fallbackVersion ?? DEFAULT_CONTRACT_VERSION,
+        reason,
+      });
+    }
+  }
+  return flags;
+}
+
+/**
+ * Format a human-readable text summary of a DecoderCapabilityReport.
+ */
+export function formatDecoderCapabilityReport(report: DecoderCapabilityReport): string {
+  const lines: string[] = [];
+  lines.push(
+    `Decoder Capability Report: ${report.source}${report.contractId ? ` (${report.contractId})` : ''}`,
+  );
+  lines.push(`  Decoder Kind: ${report.decoderKind}`);
+  lines.push(`  Version: ${report.version} (normalized: ${report.normalizedVersion})`);
+  lines.push(
+    `  Supported: ${report.supported ? 'yes' : `no (fallback: ${report.fallbackVersion ?? 'none'})`}`,
+  );
+  lines.push(`  Supported Versions: ${report.supportedVersions.join(', ') || 'none'}`);
+  lines.push(`  Wildcard Support: ${report.wildcardSupport ? 'yes' : 'no'}`);
+  if (report.events.length > 0) {
+    lines.push(`  Events (${report.events.length}): ${report.events.join(', ')}`);
+  }
+  if (report.adminEvents.length > 0) {
+    lines.push(`  Admin Events (${report.adminEvents.length}): ${report.adminEvents.join(', ')}`);
+  }
+  return lines.join("\n");
+}
+
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 function contractIdOf(event: rpc.Api.EventResponse): string {
@@ -1151,6 +1455,35 @@ export function decodeEvent(
       };
     }
 
+    // Validate topic count before accessing variant positions or parsing payload.
+    if (event.topic.length > MAX_EVENT_TOPICS) {
+      recordDecodeOutcome(source, eventName, "malformed");
+      return {
+        ...meta,
+        payload: {
+          name: "unknown",
+          eventName,
+          reason: `${eventName}: topic count ${event.topic.length} exceeds maximum of ${MAX_EVENT_TOPICS}`,
+        },
+      };
+    }
+
+    const schemas = source === "market" ? MARKET_TOPIC_SCHEMAS : SQUAD_TOPIC_SCHEMAS;
+    const schema = Object.prototype.hasOwnProperty.call(schemas, eventName)
+      ? schemas[eventName]
+      : undefined;
+    if (schema && event.topic.length !== schema.expectedCount) {
+      recordDecodeOutcome(source, eventName, "malformed");
+      return {
+        ...meta,
+        payload: {
+          name: "unknown",
+          eventName,
+          reason: `${eventName}: expected ${schema.expectedCount} topics, got ${event.topic.length}`,
+        },
+      };
+    }
+
     // If caller provided shouldDecode, and it returned false, and the event is neither admin nor unknown:
     // skip full value XDR decoding and return a minimal decoded event.
     if (opts?.shouldDecode && !opts.shouldDecode(eventName)) {
@@ -1170,6 +1503,19 @@ export function decodeEvent(
         return null;
       }
     });
+
+    const topicCheck = validateTopicSchema(source, eventName, topics);
+    if (!topicCheck.valid) {
+      recordDecodeOutcome(source, eventName, "malformed");
+      return {
+        ...meta,
+        payload: {
+          name: "unknown",
+          eventName,
+          reason: topicCheck.reason,
+        },
+      };
+    }
 
     // Fail closed before native conversion allocates: an oversized value must
     // not turn one hostile event into a multi-megabyte payload. This runs after
@@ -1226,30 +1572,44 @@ export function decodeEvent(
 
 // ── Ordering metadata (issue #48) ────────────────────────────────────────────
 
-/** Ledger sequence: a finite non-negative integer, else 0. Never `NaN`. */
+/** Ledger sequence: a safe non-negative integer, else 0. Never `NaN` or lossy float. */
 function toLedger(value: unknown): number {
-  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
-  if (typeof n !== "number" || !Number.isFinite(n)) return 0;
-  const floored = Math.floor(n);
-  return floored >= 0 ? floored : 0;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) return 0;
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    try {
+      const bn = BigInt(value.trim());
+      if (bn < 0n || bn > BigInt(Number.MAX_SAFE_INTEGER)) return 0;
+      return Number(bn);
+    } catch {
+      return 0;
+    }
+  }
+  return 0;
 }
 
 /**
- * Transaction/operation position: a non-negative integer when the RPC provides
- * one (number or numeric string), else `null`. `null` means "the chain did not
+ * Transaction/operation position: a non-negative safe integer when the RPC provides
+ * one (safe number or decimal string), else `null`. `null` means "the chain did not
  * say" — sorting orders it after known positions instead of inventing one.
  */
 function toPosition(value: unknown): number | null {
-  let n: number;
   if (typeof value === "number") {
-    n = value;
-  } else if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
-    n = Number(value.trim());
-  } else {
-    return null;
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    return value;
   }
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) return null;
-  return n;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    try {
+      const bn = BigInt(value.trim());
+      if (bn < 0n || bn > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      return Number(bn);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 /** Trimmed transaction hash, or `""` when absent. Kept verbatim, not dropped. */
@@ -1472,19 +1832,7 @@ export function squadSideLabel(side: number): string {
 /** Check if a payload represents a decoded admin event. */
 export function isAdminPayload(payload: EventPayload): payload is AdminPayload {
   if (!payload || typeof payload !== "object") return false;
-  if (payload.name === "admin") return true;
-  if (
-    payload.name === "oracle_changed" ||
-    payload.name === "ownership_transferred" ||
-    payload.name === "agent_attributed" ||
-    payload.name === "fee_accrued" ||
-    payload.name === "fee_policy_set" ||
-    payload.name === "fee_policy_changed" ||
-    payload.name === "fee_policy_updated" ||
-    payload.name === "fee_policy_removed"
-  ) {
-    return true;
-  }
+  if ((ADMIN_EVENT_NAMES as readonly string[]).includes(payload.name)) return true;
   if (
     typeof payload.name === "string" &&
     (payload.name.startsWith("fee_policy_") || payload.name.startsWith("admin_"))
@@ -1671,3 +2019,10 @@ export function decodeRawEvent(
   const event = buildRawEvent(input);
   return decodeEvent(source, event, version);
 }
+
+export {
+  DECODER_FINGERPRINT_VERSION,
+  fingerprintDecodedEvent,
+  fingerprintDecoderOutput,
+  type SemanticFingerprint,
+} from "./decoder-fingerprint.js";

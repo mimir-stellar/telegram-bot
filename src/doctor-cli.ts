@@ -13,6 +13,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse as parseDotenv } from "dotenv";
 
 import { EXIT_ERROR, EXIT_OK } from "./exitCodes.js";
+import { LOG_FORMATS, Logger, type LogFormat } from "./logger.js";
 import { redactText, registerSecret } from "./redact.js";
 import { MOCK_BOT_TOKEN } from "./stellar/mock-constants.js";
 import { validateContractId } from "./stellar/client.js";
@@ -30,12 +31,114 @@ export interface DoctorReport {
   checks: CheckResult[];
 }
 
+export interface RedactionProbe {
+  /** Logical field name reported if this probe leaks (value is never reported). */
+  field: string;
+  /** Synthetic secret payload passed through the logger. */
+  value: string;
+  /** Substring that must not appear in emitted log lines. Defaults to `value`. */
+  canary?: string;
+  /** Whether to register `value` as a runtime secret in the logger. */
+  register?: boolean;
+}
+
+export interface RedactionSelfCheckOptions {
+  formats?: readonly LogFormat[];
+  probes?: readonly RedactionProbe[];
+}
+
 export interface DoctorOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   envPath?: string;
   nodeVersion?: string;
   packageJsonPath?: string;
+  logFormats?: readonly LogFormat[];
+  redactionProbes?: readonly RedactionProbe[];
+}
+
+export function defaultRedactionProbes(): RedactionProbe[] {
+  const registeredSecret = ["mimir-probe-", "registered-secret-01"].join("");
+  const botToken = ["123456789:", "AAFakeProbeTokenValue0123456789"].join("");
+  const stellarSeed = `S${"A".repeat(55)}`;
+  const userinfoSecret = ["probe", "pass", "123456"].join("");
+  const querySecret = ["probe", "query", "secret98765"].join("");
+  const bearerSecret = ["probe", "Bearer", "TokenValue12345"].join("");
+  const kvSecret = ["probe", "Kv", "SecretValue98765"].join("");
+
+  return [
+    { field: "registered_secret", value: registeredSecret, register: true },
+    { field: "bot_token", value: botToken },
+    { field: "stellar_seed", value: stellarSeed },
+    {
+      field: "rpc_url_userinfo",
+      value: `https://probeuser:${userinfoSecret}@rpc.example.invalid`,
+      canary: userinfoSecret,
+    },
+    {
+      field: "rpc_url_query",
+      value: `https://rpc.example.invalid/soroban${["?", "api_key", "="].join("")}${querySecret}`,
+      canary: querySecret,
+    },
+    {
+      field: "bearer_token",
+      value: `Bearer ${bearerSecret}`,
+      canary: bearerSecret,
+    },
+    {
+      field: "env_kv_secret",
+      value: `BOT_SECRET=${kvSecret}`,
+      canary: kvSecret,
+    },
+  ];
+}
+
+export function runRedactionSelfCheck(options: RedactionSelfCheckOptions = {}): CheckResult {
+  const formats = options.formats && options.formats.length > 0 ? options.formats : LOG_FORMATS;
+  const probes = options.probes ?? defaultRedactionProbes();
+  const leakedFields = new Set<string>();
+  const registeredSecrets = probes.filter((probe) => probe.register).map((probe) => probe.value);
+
+  for (const format of formats) {
+    const captured: string[] = [];
+    Logger.runWithConfig(
+      {
+        level: "debug",
+        format,
+        secrets: registeredSecrets,
+        sink: (_level, line) => {
+          captured.push(line);
+        },
+      },
+      () => {
+        for (const probe of probes) {
+          captured.length = 0;
+          Logger.info("doctor", `redaction self-check ${probe.field}=${probe.value}`, {
+            [probe.field]: probe.value,
+            nested: { [probe.field]: probe.value },
+          });
+          const canary = probe.canary ?? probe.value;
+          if (canary.length > 0 && captured.some((line) => line.includes(canary))) {
+            leakedFields.add(probe.field);
+          }
+        }
+      },
+    );
+  }
+
+  if (leakedFields.size > 0) {
+    return {
+      name: "redaction-policy",
+      status: "FAIL",
+      message: `Redaction policy self-check failed; leaked fields: ${[...leakedFields].join(", ")}`,
+    };
+  }
+
+  return {
+    name: "redaction-policy",
+    status: "OK",
+    message: `Redaction policy self-check passed (${probes.length} probes across ${formats.join(", ")} log formats)`,
+  };
 }
 
 export function parseSemver(v: string): [number, number, number] | null {
@@ -318,6 +421,14 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
       });
     }
   }
+
+  // 7. Redaction policy self-check across all configured log formats
+  checks.push(
+    runRedactionSelfCheck({
+      formats: options.logFormats,
+      probes: options.redactionProbes,
+    }),
+  );
 
   const ok = !checks.some((c) => c.status === "FAIL");
   return { ok, checks };

@@ -116,60 +116,10 @@ export interface ReplayTargetResult {
   lastProcessedEventId?: string | null | undefined;
   /** Failed send attempts (counted under skipped, never sent). */
   failedSends?: number | undefined;
-  /** Deterministic completeness certificate for this target. */
-  certificate?: ReplayTargetCertificate | undefined;
-}
-
-export type ReplayGapKind =
-  | "pruned-history"
-  | "truncated-pages"
-  | "beyond-tip"
-  | "scan-error";
-
-export interface ReplayCompletenessGap {
-  source: ContractSource;
-  kind: ReplayGapKind;
-  fromLedger: number | null;
-  toLedger: number | null;
-  reason: string;
-}
-
-export interface ReplayTargetRange {
-  from: string;
-  fromLedger: number | null;
-  toLedger: number | null;
-}
-
-export interface ReplayObservedRange {
-  fromLedger: number | null;
-  toLedger: number | null;
-}
-
-export interface ReplayTargetCertificate {
-  source: ContractSource;
-  contractId: string;
-  complete: boolean;
-  requestedRange: ReplayTargetRange;
-  observedRange: ReplayObservedRange;
-  retainedFloorLedger: number | null;
-  chainTipLedger: number | null;
-  pruned: boolean;
-  partial: boolean;
-  gaps: ReplayCompletenessGap[];
-}
-
-export interface ReplayCompletenessCertificate {
-  format: "mimir-replay-certificate-v1";
-  version: 1;
-  network: string;
-  rpcUrl: string;
-  dryRun: boolean;
-  complete: boolean;
-  requestedRange: ReplayTargetRange;
-  observedRange: ReplayObservedRange;
-  gaps: ReplayCompletenessGap[];
-  targets: ReplayTargetCertificate[];
-  digest: string;
+  /** True when stopped because the configured --max-events budget was reached before completion. */
+  budgetExhausted?: boolean | undefined;
+  /** True when the target completed its entire requested range. */
+  completed?: boolean | undefined;
 }
 
 export interface ReplayReport {
@@ -179,6 +129,9 @@ export interface ReplayReport {
   fromLedger: number;
   toLedger: number | null;
   dryRun: boolean;
+  maxEvents?: number | undefined;
+  budgetExhausted: boolean;
+  completed: boolean;
   targets: ReplayTargetResult[];
   /** Total across all targets. */
   totals: {
@@ -211,6 +164,7 @@ export interface ReplayProgressTarget {
   adminLogged: number;
   duplicates: number;
   completed: boolean;
+  budgetExhausted?: boolean | undefined;
   failedSends?: number | undefined;
   observedFromLedger?: number | null | undefined;
   observedToLedger?: number | null | undefined;
@@ -231,6 +185,8 @@ export interface ReplayProgressFile {
     to: number | null;
   };
   contracts: ContractSource[];
+  /** Normalized SHA-256 fingerprint of the replay filter set (network, range, contracts, contractIds). */
+  filterFingerprint?: string | undefined;
   targets: Partial<Record<ContractSource, ReplayProgressTarget>>;
 }
 
@@ -270,6 +226,38 @@ export class RpcBudgetTracker {
   }
 }
 
+// ── Event-Count Budget Tracker ───────────────────────────────────────────────
+
+export class EventBudgetTracker {
+  readonly limit: number;
+  private usedCount: number = 0;
+
+  constructor(limit: number) {
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new Error(`--max-events must be a positive integer, got ${limit}`);
+    }
+    this.limit = limit;
+  }
+
+  get used(): number {
+    return this.usedCount;
+  }
+
+  get remaining(): number {
+    return Math.max(0, this.limit - this.usedCount);
+  }
+
+  get exhausted(): boolean {
+    return this.usedCount >= this.limit;
+  }
+
+  consume(): boolean {
+    if (this.usedCount >= this.limit) return false;
+    this.usedCount += 1;
+    return true;
+  }
+}
+
 // ── Core replay function ──────────────────────────────────────────────────────
 
 export interface ReplayOptions {
@@ -302,6 +290,10 @@ export interface ReplayOptions {
   certificateFile?: string | undefined;
   /** Maximum RPC requests per minute. */
   rpm?: number | undefined;
+  /** Maximum events to process in this run across targets. */
+  maxEvents?: number | undefined;
+  /** Shared event-count budget tracker across targets. */
+  eventBudget?: EventBudgetTracker | undefined;
   /** Checkpoint state for this specific target, if resuming. */
   targetProgress?: ReplayProgressTarget | undefined;
   /** Called atomically after each page is processed. */
@@ -539,6 +531,40 @@ export function normalizeRangeTo(to?: number | null): number | null {
   return to !== undefined && to !== null ? to : null;
 }
 
+export interface ReplayFilterFingerprintInput {
+  from: string | number;
+  to?: number | null | undefined;
+  contracts: ContractSource[];
+  network: string;
+  config: Pick<StellarConfig, "marketContractId" | "squadContractId">;
+}
+
+/**
+ * Compute a deterministic, normalized SHA-256 fingerprint for the replay filter
+ * set (network, range, sorted unique contracts, and their resolved contract IDs).
+ *
+ * Used to guard `--progress-file` resumes against accidentally reusing a
+ * checkpoint created for a different filter set.
+ */
+export function computeReplayFilterFingerprint(input: ReplayFilterFingerprintInput): string {
+  const normalizedContracts = Array.from(new Set(input.contracts)).sort();
+  const contractIds: Record<string, string> = {};
+  for (const source of normalizedContracts) {
+    const id = source === "market" ? input.config.marketContractId : input.config.squadContractId;
+    contractIds[source] = id.trim();
+  }
+  const canonical = {
+    network: input.network.trim().toLowerCase(),
+    range: {
+      from: normalizeRangeFrom(input.from),
+      to: normalizeRangeTo(input.to),
+    },
+    contracts: normalizedContracts,
+    contractIds,
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
 export async function loadAndValidateProgressFile(
   filePath: string,
   opts: {
@@ -573,6 +599,44 @@ export async function loadAndValidateProgressFile(
   const p = parsed as Partial<ReplayProgressFile>;
   if (p.format !== "mimir-replay-progress-v1" || p.version !== 1) {
     throw new Error(`incompatible progress file format or version in "${filePath}" (expected mimir-replay-progress-v1 v1)`);
+  }
+
+  // Validate normalized filter fingerprint when present
+  const expectedFingerprint = computeReplayFilterFingerprint(opts);
+  if (p.filterFingerprint !== undefined) {
+    if (typeof p.filterFingerprint !== "string" || p.filterFingerprint.trim() === "") {
+      throw new Error(
+        `invalid filterFingerprint in progress file "${filePath}". ` +
+          `Remove the progress file or pass a new --progress-file path to start a fresh replay.`,
+      );
+    }
+    if (p.filterFingerprint !== expectedFingerprint) {
+      const diffs: string[] = [];
+      const expectedFrom = normalizeRangeFrom(opts.from);
+      const fileFrom = normalizeRangeFrom(p.range?.from ?? "");
+      if (expectedFrom !== fileFrom) {
+        diffs.push(`from (${fileFrom || "unset"} vs ${expectedFrom})`);
+      }
+      const expectedTo = normalizeRangeTo(opts.to);
+      const fileTo = normalizeRangeTo(p.range?.to);
+      if (expectedTo !== fileTo) {
+        diffs.push(`to (${fileTo ?? "tip"} vs ${expectedTo ?? "tip"})`);
+      }
+      if ((p.network ?? "").trim().toLowerCase() !== opts.network.trim().toLowerCase()) {
+        diffs.push(`network (${p.network ?? "unset"} vs ${opts.network})`);
+      }
+      const fileContracts = Array.from(new Set(p.contracts ?? [])).sort().join(",");
+      const expectedContracts = Array.from(new Set(opts.contracts)).sort().join(",");
+      if (fileContracts !== expectedContracts) {
+        diffs.push(`contracts (${fileContracts || "none"} vs ${expectedContracts || "none"})`);
+      }
+      const diffSummary = diffs.length > 0 ? ` (${diffs.join("; ")})` : "";
+      throw new Error(
+        `progress file "${filePath}" was created for a different filter set${diffSummary} ` +
+          `[fingerprint ${p.filterFingerprint.slice(0, 12)} != ${expectedFingerprint.slice(0, 12)}]. ` +
+          `Re-run with the original --from/--to/--contract/network settings, or use a new --progress-file path.`,
+      );
+    }
   }
 
   // Validate range
@@ -682,7 +746,42 @@ async function replayContract(
       resumedSkippedEvents: opts.targetProgress.eventsProcessed,
       lastProcessedEventId: opts.targetProgress.lastProcessedEventId,
       failedSends: opts.targetProgress.failedSends ?? 0,
-      certificate,
+      budgetExhausted: false,
+      completed: true,
+    };
+  }
+
+  const eventBudget =
+    opts.eventBudget ??
+    (opts.maxEvents !== undefined ? new EventBudgetTracker(opts.maxEvents) : undefined);
+
+  if (eventBudget?.exhausted) {
+    progress(
+      `[replay] ${target.source}: event budget (${eventBudget.limit}) already exhausted before starting target`,
+    );
+    return {
+      source: target.source,
+      contractId: target.contractId,
+      fromLedger: opts.targetProgress?.lastEventLedger ?? 0,
+      toLedger,
+      startLedger: null,
+      startClamped: false,
+      pages: opts.targetProgress?.pagesProcessed ?? 0,
+      events: opts.targetProgress?.eventsProcessed ?? 0,
+      sent: opts.targetProgress?.eventsSent ?? 0,
+      skipped: opts.targetProgress?.eventsSkipped ?? 0,
+      capped: opts.targetProgress?.eventsCapped ?? 0,
+      adminLogged: opts.targetProgress?.adminLogged ?? 0,
+      duplicates: opts.targetProgress?.duplicates ?? 0,
+      truncated: false,
+      lastEventLedger: opts.targetProgress?.lastEventLedger ?? null,
+      cursor: opts.targetProgress?.cursor ?? null,
+      eventLog: [],
+      resumedSkippedEvents: 0,
+      lastProcessedEventId: opts.targetProgress?.lastProcessedEventId ?? null,
+      failedSends: opts.targetProgress?.failedSends ?? 0,
+      budgetExhausted: true,
+      completed: false,
     };
   }
 
@@ -754,6 +853,8 @@ async function replayContract(
   let lastCursor: string | null = opts.targetProgress?.cursor ?? null;
   let truncated = false;
   let stoppedByToLedger = false;
+  let budgetExhausted = false;
+  let completed = false;
   let latestLedger = window.latestLedger;
   let cursor: string | undefined = startCursor;
   let usedStartLedger: number | null = null;
@@ -790,6 +891,7 @@ async function replayContract(
 
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     const pageDecoded: DecodedEvent[] = [];
+    const seenInPage = new Set<string>();
 
     for (const raw of rawEvents) {
       if (!raw || typeof raw !== "object") continue;
@@ -807,10 +909,11 @@ async function replayContract(
         continue;
       }
 
-      if (dedup.add(key)) {
-        pageDecoded.push(decodeEvent(target.source, raw));
-      } else {
+      if (key !== null && (dedup.has(key) || seenInPage.has(key))) {
         duplicates += 1;
+      } else {
+        if (key !== null) seenInPage.add(key);
+        pageDecoded.push(decodeEvent(target.source, raw));
       }
     }
 
@@ -831,10 +934,21 @@ async function replayContract(
       ),
     );
 
-    totalProcessedEvents += filteredPage.length;
+    let stoppedMidPage = false;
 
     // Notify / log each event in this page
     for (const event of filteredPage) {
+      if (eventBudget && !eventBudget.consume()) {
+        stoppedMidPage = true;
+        budgetExhausted = true;
+        break;
+      }
+
+      const evKey = event.eventId || eventKey(event);
+      if (evKey) {
+        dedup.add(evKey);
+      }
+      totalProcessedEvents += 1;
       const entry: ReplayEventSummary = {
         ledger: event.ledger,
         txHash: event.txHash,
@@ -942,7 +1056,6 @@ async function replayContract(
         if (showLog) eventLog.push(entry);
       }
 
-      const evKey = event.eventId || eventKey(event);
       if (evKey) {
         lastProcessedEventId = evKey;
       }
@@ -954,7 +1067,18 @@ async function replayContract(
     const nextCursor = typeof response?.cursor === "string" ? response.cursor : "";
     let isFinalPage = false;
 
-    if (!nextCursor || nextCursor === previousCursor) {
+    if (stoppedMidPage) {
+      // Stopped mid-page due to --max-events: rewind/anchor cursor at the last
+      // processed event (if cursor-shaped) or keep previousCursor so remaining
+      // events on this page are re-fetched on resume without loss.
+      if (lastProcessedEventId && /^\d+-\d+$/.test(lastProcessedEventId)) {
+        lastCursor = lastProcessedEventId;
+      } else {
+        lastCursor = previousCursor || lastCursor;
+      }
+      isFinalPage = false;
+      stoppedByToLedger = false;
+    } else if (!nextCursor || nextCursor === previousCursor) {
       isFinalPage = true;
     } else {
       lastCursor = nextCursor;
@@ -969,6 +1093,12 @@ async function replayContract(
       previousCursor = nextCursor;
       cursor = nextCursor;
     }
+
+    if (!stoppedMidPage && eventBudget?.exhausted && !isFinalPage) {
+      budgetExhausted = true;
+    }
+
+    completed = isFinalPage && !truncated && !budgetExhausted;
 
     // Persist checkpoint after each completed page
     if (opts.onPageComplete) {
@@ -995,7 +1125,8 @@ async function replayContract(
         eventsCapped: capped,
         adminLogged,
         duplicates,
-        completed: isFinalPage && !truncated,
+        completed,
+        budgetExhausted,
         failedSends,
         observedFromLedger: pageObservedFrom,
         observedToLedger: pageObservedTo,
@@ -1005,7 +1136,7 @@ async function replayContract(
       });
     }
 
-    if (isFinalPage || stoppedByToLedger) {
+    if (isFinalPage || stoppedByToLedger || budgetExhausted) {
       break;
     }
   }
@@ -1039,7 +1170,7 @@ async function replayContract(
   progress(
     `[replay] ${target.source}: pages=${finalPages} events=${totalProcessedEvents} sent=${sent} ` +
       `skipped=${skipped} capped=${capped} admin=${adminLogged} duplicates=${duplicates} ` +
-      `truncated=${truncated || stoppedByToLedger}` +
+      `truncated=${truncated || stoppedByToLedger} budgetExhausted=${budgetExhausted}` +
       (resumedSkippedEvents > 0 ? ` resumedSkipped=${resumedSkippedEvents}` : ""),
   );
 
@@ -1064,7 +1195,8 @@ async function replayContract(
     resumedSkippedEvents,
     lastProcessedEventId,
     failedSends,
-    certificate,
+    budgetExhausted,
+    completed,
   };
 }
 
@@ -1106,12 +1238,13 @@ export async function runReplayCli(opts: {
   const progressFile = flag("progress-file");
   const certificateFile = flag("certificate-file");
   const rpmRaw = flag("rpm");
+  const maxEventsRaw = flag("max-events");
   const progress = overrideDeps.progress ?? (asJson ? console.error.bind(console) : console.log.bind(console));
   const safeErr = (err: unknown): string => safeErrorMessage(err, []);
 
   if (!fromRaw) {
     console.error("[replay] error: --from <ledger|cursor> is required");
-    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--certificate-file <path>] [--rpm N]");
+    console.error("Usage: npm run replay -- --from <ledger> [--to <ledger>] [--send] [--dry-run] [--contract market|squad] [--pages N] [--cap N] [--show N] [--json] [--mock] [--progress-file <path>] [--rpm N] [--max-events N]");
     return { report: null, exitCode: 2 };
   }
 
@@ -1141,6 +1274,21 @@ export async function runReplayCli(opts: {
       return { report: null, exitCode: 2 };
     }
     rpm = n;
+  }
+
+  // Validate --max-events
+  let maxEvents: number | undefined;
+  if (boolFlag("max-events") && maxEventsRaw === undefined) {
+    console.error("[replay] error: --max-events requires a positive integer value");
+    return { report: null, exitCode: 2 };
+  }
+  if (maxEventsRaw !== undefined) {
+    const n = Number(maxEventsRaw);
+    if (!Number.isInteger(n) || n < 1) {
+      console.error(`[replay] error: --max-events must be a positive integer, got "${maxEventsRaw}"`);
+      return { report: null, exitCode: 2 };
+    }
+    maxEvents = n;
   }
 
   // Validate --from vs --to for ledger numbers (cursors are opaque).
@@ -1205,12 +1353,13 @@ export async function runReplayCli(opts: {
     if (progressFile) progress(`[replay] progress  ${progressFile}`);
     if (certificateFile) progress(`[replay] cert      ${certificateFile}`);
     if (rpm !== undefined) progress(`[replay] rpm       ${rpm}`);
+    if (maxEvents !== undefined) progress(`[replay] maxEvents ${maxEvents}`);
   } else {
     progress(
       `replay ${network} from=${fromRaw} to=${toLedger ?? "tip"} mode=${dryRun ? "dry-run" : "send"}` +
         (progressFile ? ` progress=${progressFile}` : "") +
-        (certificateFile ? ` certificate=${certificateFile}` : "") +
-        (rpm !== undefined ? ` rpm=${rpm}` : ""),
+        (rpm !== undefined ? ` rpm=${rpm}` : "") +
+        (maxEvents !== undefined ? ` maxEvents=${maxEvents}` : ""),
     );
   }
 
@@ -1233,11 +1382,19 @@ export async function runReplayCli(opts: {
   const sleep = overrideDeps.sleep ?? defaultSleep;
   const now = overrideDeps.now ?? Date.now;
   const budget = rpm !== undefined ? new RpcBudgetTracker(rpm, sleep, now) : undefined;
+  const eventBudget = maxEvents !== undefined ? new EventBudgetTracker(maxEvents) : undefined;
 
   // ── Load or initialize progress file ──────────────────────────────────────
 
   let progressData: ReplayProgressFile | null = null;
   if (progressFile) {
+    const filterFingerprint = computeReplayFilterFingerprint({
+      from: fromRaw,
+      to: toLedger,
+      contracts: requestedContracts,
+      network,
+      config,
+    });
     try {
       progressData = await loadAndValidateProgressFile(progressFile, {
         from: fromRaw,
@@ -1247,6 +1404,9 @@ export async function runReplayCli(opts: {
         config,
       });
       if (progressData) {
+        if (!progressData.filterFingerprint) {
+          progressData.filterFingerprint = filterFingerprint;
+        }
         progress(`[replay] loaded progress file "${progressFile}"`);
       } else {
         progressData = {
@@ -1261,6 +1421,7 @@ export async function runReplayCli(opts: {
             to: normalizeRangeTo(toLedger),
           },
           contracts: requestedContracts,
+          filterFingerprint,
           targets: {},
         };
       }
@@ -1301,6 +1462,8 @@ export async function runReplayCli(opts: {
           progressFile,
           certificateFile,
           rpm,
+          maxEvents,
+          eventBudget,
           targetProgress,
           onPageComplete,
           budget,
@@ -1332,20 +1495,8 @@ export async function runReplayCli(opts: {
         lastEventLedger: null,
         cursor: null,
         eventLog: [],
-        certificate: buildTargetCertificate({
-          source: target.source,
-          contractId: target.contractId,
-          requestedFrom: fromRaw,
-          requestedTo: toLedger ?? null,
-          observedFromLedger: null,
-          observedToLedger: null,
-          retainedFloorLedger: null,
-          chainTipLedger: null,
-          startClamped: false,
-          truncated: false,
-          pages: 0,
-          scanError: msg,
-        }),
+        budgetExhausted: false,
+        completed: false,
       });
     }
   }
@@ -1375,40 +1526,12 @@ export async function runReplayCli(opts: {
     },
   );
 
-  const certificate = buildCompletenessCertificate({
-    network,
-    rpcUrl: config.rpcUrl,
-    dryRun,
-    requestedFrom: fromRaw,
-    requestedTo: toLedger ?? null,
-    targets: targetResults.map(
-      (r) =>
-        r.certificate ??
-        buildTargetCertificate({
-          source: r.source,
-          contractId: r.contractId,
-          requestedFrom: fromRaw,
-          requestedTo: toLedger ?? null,
-          observedFromLedger: r.startLedger,
-          observedToLedger: r.toLedger,
-          retainedFloorLedger: null,
-          chainTipLedger: null,
-          startClamped: r.startClamped,
-          truncated: r.truncated,
-          pages: r.pages,
-        }),
-    ),
-  });
-
-  if (certificateFile) {
-    try {
-      await writeCertificateFileAtomic(certificateFile, certificate);
-    } catch (err) {
-      const msg = safeErr(err);
-      progress(`[replay] error: failed to write certificate file "${certificateFile}": ${msg}`);
-      fatalError = fatalError ?? msg;
-    }
-  }
+  const anyBudgetExhausted = targetResults.some((r) => r.budgetExhausted === true);
+  const allCompleted =
+    !fatalError &&
+    !anyBudgetExhausted &&
+    targetResults.length > 0 &&
+    targetResults.every((r) => r.completed !== false);
 
   const report: ReplayReport = {
     format: "mimir-replay-v1",
@@ -1417,6 +1540,9 @@ export async function runReplayCli(opts: {
     fromLedger: fromLedger ?? 0,
     toLedger: toLedger ?? null,
     dryRun,
+    ...(maxEvents !== undefined ? { maxEvents } : {}),
+    budgetExhausted: anyBudgetExhausted,
+    completed: allCompleted,
     targets: targetResults,
     totals,
     certificate,
@@ -1428,6 +1554,7 @@ export async function runReplayCli(opts: {
     progress(
       `[replay] done  events=${totals.events} sent=${totals.sent} skipped=${totals.skipped} ` +
         `capped=${totals.capped} admin=${totals.adminLogged} duplicates=${totals.duplicates}` +
+        ` completed=${allCompleted} budgetExhausted=${anyBudgetExhausted}` +
         ((totals.resumedSkippedEvents ?? 0) > 0 ? ` resumedSkipped=${totals.resumedSkippedEvents}` : ""),
     );
     progress(
