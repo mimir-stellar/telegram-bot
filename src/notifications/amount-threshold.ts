@@ -4,6 +4,10 @@
  * Lets operators hide small deposits and challenges in busy chats.
  * Amounts are parsed as 7-decimal atomic USDC units (Stellar Asset Contract)
  * using integer arithmetic only (no floating point).
+ *
+ * `meetsThreshold` keeps its boolean allow-or-deny contract; dry runs use
+ * `evaluateThresholdDiagnostic` to tell a missing amount field apart from an
+ * amount that is present but below the configured minimum.
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
@@ -85,6 +89,89 @@ export function parseUsdcThreshold(text: string): bigint {
   return whole * 10_000_000n + frac;
 }
 
+/** Why a threshold evaluation passed or failed, for dry-run diagnostics. */
+export type ThresholdDiagnosticReason =
+  | "not-configured"
+  | "passed"
+  | "below-threshold"
+  | "missing-field";
+
+/** Diagnostic result of evaluating amount thresholds against one event. */
+export interface ThresholdDiagnostic {
+  passed: boolean;
+  reason: ThresholdDiagnosticReason;
+  /** Payload field the threshold applied to, when one was configured. */
+  field?: "stake" | "amount";
+  /** The configured minimum, in atomic 7-decimal units. */
+  threshold?: bigint;
+}
+
+/**
+ * Evaluates amount thresholds and explains the outcome.
+ *
+ * Unlike {@link meetsThreshold}, a configured threshold on an event whose
+ * amount field is absent reports `"missing-field"` rather than collapsing
+ * into the same deny result as a genuinely low amount (`"below-threshold"`).
+ * Both still deny, so live allow-or-deny behavior is unchanged.
+ */
+export function evaluateThresholdDiagnostic(
+  event: DecodedEvent,
+  thresholds?: AmountThresholds,
+): ThresholdDiagnostic {
+  if (!thresholds) {
+    return { passed: true, reason: "not-configured" };
+  }
+
+  if (event.payload.name === "claim_challenged") {
+    const minStake = thresholds.marketChallenge;
+    if (minStake === undefined || minStake <= 0n) {
+      return { passed: true, reason: "not-configured" };
+    }
+    const stake = (event.payload as Record<string, unknown>).stake;
+    if (typeof stake !== "bigint") {
+      return { passed: false, reason: "missing-field", field: "stake", threshold: minStake };
+    }
+    if (stake < minStake) {
+      return { passed: false, reason: "below-threshold", field: "stake", threshold: minStake };
+    }
+    return { passed: true, reason: "passed", field: "stake", threshold: minStake };
+  }
+
+  if (event.payload.name === "deposited") {
+    const minAmount = thresholds.squadDeposit;
+    if (minAmount === undefined || minAmount <= 0n) {
+      return { passed: true, reason: "not-configured" };
+    }
+    const amount = (event.payload as Record<string, unknown>).amount;
+    if (typeof amount !== "bigint") {
+      return { passed: false, reason: "missing-field", field: "amount", threshold: minAmount };
+    }
+    if (amount < minAmount) {
+      return { passed: false, reason: "below-threshold", field: "amount", threshold: minAmount };
+    }
+    return { passed: true, reason: "passed", field: "amount", threshold: minAmount };
+  }
+
+  return { passed: true, reason: "not-configured" };
+}
+
+/**
+ * Normalizes a valid decimal USDC threshold string to its canonical 7-decimal representation.
+ *
+ * Canonical equivalent decimal strings produce identical output:
+ * - "1", "01", "1.0", "1.00", "1.0000000" -> "1.0000000"
+ * - "0.5", "00.50", "0.5000000" -> "0.5000000"
+ *
+ * Rejects negative numbers, malformed input, or values exceeding 7 fractional digits
+ * with an {@link InvalidThresholdError}.
+ */
+export function normalizeUsdcThreshold(text: string): string {
+  const atomic = parseUsdcThreshold(text);
+  const whole = atomic / 10_000_000n;
+  const frac = (atomic % 10_000_000n).toString().padStart(7, "0");
+  return `${whole}.${frac}`;
+}
+
 /**
  * Evaluates whether an event meets the configured amount thresholds.
  *
@@ -92,30 +179,14 @@ export function parseUsdcThreshold(text: string): bigint {
  * - market `claim_challenged`: passes if stake >= threshold (or threshold <= 0 / unset)
  * - squad `deposited`: passes if amount >= threshold (or threshold <= 0 / unset)
  * - other events: always pass
+ *
+ * A missing amount field on a filtered event denies, exactly as before; use
+ * {@link evaluateThresholdDiagnostic} in dry runs to tell it apart from an
+ * amount that is present but too small.
  */
 export function meetsThreshold(
   event: DecodedEvent,
   thresholds?: AmountThresholds,
 ): boolean {
-  if (!thresholds) {
-    return true;
-  }
-
-  if (event.payload.name === "claim_challenged") {
-    const minStake = thresholds.marketChallenge;
-    if (minStake === undefined || minStake <= 0n) {
-      return true;
-    }
-    return event.payload.stake >= minStake;
-  }
-
-  if (event.payload.name === "deposited") {
-    const minAmount = thresholds.squadDeposit;
-    if (minAmount === undefined || minAmount <= 0n) {
-      return true;
-    }
-    return event.payload.amount >= minAmount;
-  }
-
-  return true;
+  return evaluateThresholdDiagnostic(event, thresholds).passed;
 }

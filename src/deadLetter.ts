@@ -40,6 +40,8 @@ export interface DeadLetterEntry {
   text: string;
   attempts: number;
   lastError: string | null;
+  /** Stellar network passphrase where the failure originated, if recorded. */
+  networkPassphrase?: string;
 }
 
 export interface DeadLetterFile {
@@ -73,12 +75,41 @@ export interface DeadLetterQueueOptions {
    * a URL, so the value itself is what makes that case safe.
    */
   secrets?: readonly string[];
+  /** Active Stellar network passphrase; replay rejects entries from another network. */
+  networkPassphrase?: string;
   /** Optional clock for deterministic tests. */
   now?: () => number;
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
+
+export class DeadLetterMalformedError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "DeadLetterMalformedError";
+  }
+}
+
+export class DeadLetterAccessError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, code?: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "DeadLetterAccessError";
+    this.code = code;
+  }
+}
+
+export interface DeadLetterLoadOptions {
+  /**
+   * When true, surface malformed files and non-ENOENT access errors instead of
+   * falling back to an empty queue. Used by the offline inspection CLI.
+   */
+  strict?: boolean;
+  /** Suppress informational `loaded ...` stdout logging (keeps CLI stdout machine-readable). */
+  quiet?: boolean;
+}
 
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
@@ -128,7 +159,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     stats.depth = entries.length;
   }
 
-  async function load(): Promise<void> {
+  async function load(loadOptions: DeadLetterLoadOptions = {}): Promise<void> {
+    const strict = loadOptions.strict === true;
+    const quiet = loadOptions.quiet === true;
     if (filePath === null) {
       entries = [];
       syncDepth();
@@ -138,7 +171,15 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     let raw: string;
     try {
       raw = await readFile(filePath, "utf8");
-    } catch {
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (strict && code !== "ENOENT") {
+        throw new DeadLetterAccessError(
+          `cannot read dead-letter file ${filePath}: ${safeError(err)}`,
+          code,
+          { cause: err },
+        );
+      }
       // No file yet is the normal first-run case, not a problem to report.
       entries = [];
       syncDepth();
@@ -146,21 +187,41 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     }
 
     try {
-      const parsed = JSON.parse(raw) as DeadLetterFile;
-      if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
+      const parsed = JSON.parse(raw) as unknown;
+      if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        (parsed as DeadLetterFile).version !== 1 ||
+        !Array.isArray((parsed as DeadLetterFile).entries)
+      ) {
+        if (strict) {
+          throw new DeadLetterMalformedError(
+            `malformed dead-letter file at ${filePath}: expected version 1 with entries array`,
+          );
+        }
         console.warn(
           `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
         );
         entries = [];
       } else {
-        entries = parsed.entries
-          .filter(
-            (e) =>
-              e &&
-              typeof e.id === "string" &&
-              typeof e.text === "string" &&
-              typeof e.ledger === "number",
-          )
+        const rawEntries = (parsed as DeadLetterFile).entries;
+        const validEntry = (e: unknown): e is DeadLetterEntry =>
+          Boolean(
+            e &&
+              typeof e === "object" &&
+              !Array.isArray(e) &&
+              typeof (e as DeadLetterEntry).id === "string" &&
+              typeof (e as DeadLetterEntry).text === "string" &&
+              typeof (e as DeadLetterEntry).ledger === "number",
+          );
+        if (strict && rawEntries.some((e) => !validEntry(e))) {
+          throw new DeadLetterMalformedError(
+            `malformed dead-letter entry in ${filePath}: expected id, text, and ledger`,
+          );
+        }
+        entries = rawEntries
+          .filter(validEntry)
           .map((e) => ({
             id: e.id,
             enqueuedAt:
@@ -171,6 +232,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
             text: truncate(e.text, TEXT_TRUNCATE),
             attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
             lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
+            ...(typeof e.networkPassphrase === "string" && e.networkPassphrase.trim() !== ""
+              ? { networkPassphrase: e.networkPassphrase }
+              : {}),
           }));
         // Bound on load too: the file may have been edited by hand.
         while (entries.length > options.maxEntries) {
@@ -179,13 +243,20 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         }
       }
     } catch (err) {
+      if (strict) {
+        if (err instanceof DeadLetterMalformedError) throw err;
+        throw new DeadLetterMalformedError(
+          `malformed dead-letter file at ${filePath}: ${safeError(err)}`,
+          { cause: err },
+        );
+      }
       console.warn(
         `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
       );
       entries = [];
     }
     syncDepth();
-    if (entries.length > 0) {
+    if (!quiet && entries.length > 0) {
       console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
   }
@@ -251,6 +322,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       text: truncate(input.text, TEXT_TRUNCATE),
       attempts: 1,
       lastError: safeError(input.error),
+      ...(typeof options.networkPassphrase === "string" && options.networkPassphrase.trim() !== ""
+        ? { networkPassphrase: options.networkPassphrase }
+        : {}),
     };
     entries.push(entry);
     stats.enqueued += 1;
@@ -272,17 +346,38 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   async function flush(
     send: (text: string, entry: DeadLetterEntry) => Promise<void>,
     budget: number,
-  ): Promise<{ sent: number; remaining: number }> {
+  ): Promise<{ sent: number; remaining: number; rejectedNetworkMismatch: number }> {
     if (budget <= 0 || entries.length === 0) {
-      return { sent: 0, remaining: entries.length };
+      return { sent: 0, remaining: entries.length, rejectedNetworkMismatch: 0 };
     }
 
+    const configuredNetwork =
+      typeof options.networkPassphrase === "string" && options.networkPassphrase.trim() !== ""
+        ? options.networkPassphrase
+        : null;
+
     let sent = 0;
+    let rejectedNetworkMismatch = 0;
     const kept: DeadLetterEntry[] = [];
 
     for (const entry of entries) {
       if (sent >= budget) {
         kept.push(entry);
+        continue;
+      }
+
+      if (
+        configuredNetwork !== null &&
+        typeof entry.networkPassphrase === "string" &&
+        entry.networkPassphrase.trim() !== "" &&
+        entry.networkPassphrase !== configuredNetwork
+      ) {
+        rejectedNetworkMismatch += 1;
+        kept.push(entry);
+        console.warn(
+          `[dead-letter] rejected replay for ${entry.source} ${entry.eventName} ` +
+            `@ ledger ${entry.ledger}: entry network does not match current configuration`,
+        );
         continue;
       }
 
@@ -316,7 +411,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     entries = kept;
     syncDepth();
     await persist();
-    return { sent, remaining: entries.length };
+    return { sent, remaining: entries.length, rejectedNetworkMismatch };
   }
 
   return {

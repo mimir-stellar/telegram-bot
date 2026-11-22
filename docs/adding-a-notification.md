@@ -254,9 +254,13 @@ Open `src/notifications/format.ts` and wire the new payload into both `headline`
 
    `formatEvent(config, event)`, `formatPlainTextEvent(config, event)`, `formatLastEvent(config, event)`, and `formatDigest(events, options)` all delegate to `headline` and `plainHeadline`, so updating those two functions automatically enables single-event notifications, `/last` previews, plain-text fallback, and digest summaries.
 
-3. **Check digest grouping (`src/notifications/digest-grouping.ts`)**:
+3. **Check digest grouping and period completeness (`src/notifications/digest-grouping.ts` & `src/notifications/schedule.ts`)**:
 
-   `groupDigestEvents(events)` groups market events that have a numeric `claimId` property under `market:<claimId>` and squad events that have a numeric `marketId` property under `squad:<marketId>`. Because `claim_escalated` includes `claimId: number` on its payload, `groupDigestEvents` groups it automatically. If your new event uses a different identifier, update `groupKeyForEvent` in `src/notifications/digest-grouping.ts`.
+   `groupDigestEvents(events)` groups market events that have a numeric `claimId` property under `market:<claimId>` and squad events that have a numeric `marketId` property under `squad:<marketId>`. Because `claim_escalated` includes `claimId: number` on its payload, `groupDigestEvents` groups it automatically. If your new event uses a different identifier, update `groupKeyFor` in `src/notifications/digest-grouping.ts`.
+
+   When a digest period is affected by an RPC gap or restart, pass `completeness: { complete: false, reasons: ["rpc_gap" | "restart"] }` (or build the period with `buildDigestPeriod(events, completeness)` and forward `ScheduledRunContext.completeness` from `createScheduler` in `src/notifications/schedule.ts`) to `formatDigest(events, { grouped, completeness })`. Incomplete periods are explicitly labeled and report observed counts as partial so a partial count is never presented as a complete ledger summary.
+
+   For operator-only previews of the current pending digest window without consuming events, use `previewPendingDigest(window, options)` in `src/notifications/digest-preview.ts` or the hidden operator command `/digestpreview [grouped|flat]` (`src/commands/digest-preview.ts`), which delegates directly to `formatDigest` via `PendingDigestWindow.peek()`.
 
 ---
 
@@ -442,10 +446,12 @@ Use this checklist when opening a pull request that adds a new contract notifica
 - [ ] **Strings (`src/i18n.ts`)**
   - [ ] Added MarkdownV2 template function to `NOTIFICATION_MD` with all static reserved characters escaped (`\\`).
   - [ ] Added matching plain-text template function to `NOTIFICATION_PLAIN` with no Markdown syntax or backslash escapes.
-- [ ] **Formatter (`src/notifications/format.ts` & `src/notifications/digest-grouping.ts`)**
+- [ ] **Formatter (`src/notifications/format.ts`, `src/notifications/html.ts`, `src/notifications/parity.ts` & `src/notifications/digest-grouping.ts`)**
   - [ ] Added `case` in `headline(event)` using `NOTIFICATION_MD`, `escapeMd`, `clip`, `usdc`, and `who`.
   - [ ] Added `case` in `plainHeadline(event)` using `NOTIFICATION_PLAIN`, `clip`, `plainUsdc`, and `plainWho`.
-  - [ ] Verified `formatEvent`, `formatPlainTextEvent`, `formatLastEvent`, and `groupDigestEvents` (`src/notifications/digest-grouping.ts`) handle the new payload.
+  - [ ] Added `case` in `headlineHtml(event)` (`src/notifications/html.ts`) using `escapeHtml`, `usdcHtml`, and `whoHtml`.
+  - [ ] Added `case` in `extractSemanticFacts(event)` (`src/notifications/parity.ts`) so `checkEventSemanticParity` verifies identity, amount, and verdict parity across MarkdownV2, plaintext, and HTML.
+  - [ ] Verified `formatEvent`, `formatPlainTextEvent`, `formatEventHtml`, `formatLastEvent`, and `groupDigestEvents` (`src/notifications/digest-grouping.ts`) handle the new payload.
 - [ ] **Filters & Feature Flags (`src/notifications/format.ts` & `src/notifications/featureFlags.ts`)**
   - [ ] Updated `eventAllowedByCategory(config, event)` in `src/notifications/format.ts` if the new event has a filterable `category` field.
   - [ ] Updated `NotificationFeatureFlags`, `DEFAULT_FEATURE_FLAGS`, `parseNotificationFeatureFlags`, `isNotificationAllowed`, and `formatFeatureFlags` in `src/notifications/featureFlags.ts` if the event requires a dedicated feature flag.
