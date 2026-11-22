@@ -23,6 +23,8 @@ import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
 import type { BroadcastStore } from "./broadcast.js";
+import type { FollowStore } from "../subscriptions/store.js";
+import type { PendingDigestWindow } from "../notifications/digest-preview.js";
 
 /** Everything a command handler may need, supplied once by `createBot`. */
 export interface CommandDeps {
@@ -45,6 +47,18 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /**
+   * Follow store for subscription data. When provided, the operator can use
+   * `/matchpreview` to count how many chats follow a given event reference.
+   * Absent means that command reports zero matches.
+   */
+  follows?: FollowStore | undefined;
+  /**
+   * Optional read-only view of the current pending digest window backing
+   * `/digestpreview`. Absent means `/digestpreview` reports that no pending
+   * digest window is configured.
+   */
+  digestWindow?: PendingDigestWindow | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */
@@ -87,6 +101,38 @@ export interface CommandMetadata {
   readonly command: string;
   readonly description: string;
   readonly operatorOnly: boolean;
+}
+
+/** One consistency mismatch between the command catalogue, menu, and `/help`. */
+export interface CommandConsistencyIssue {
+  readonly command: string;
+  readonly source: "catalogue" | "menu" | "help";
+  readonly message: string;
+}
+
+/** Inputs for {@link findCommandConsistencyIssues} and {@link validateCommandConsistency}. */
+export interface CommandConsistencyOptions {
+  /** Registered command modules (defaults to the live registry). */
+  readonly modules?: readonly CommandModule[];
+  /** Menu/autocomplete descriptions (defaults to `COMMAND_DESCRIPTIONS`). */
+  readonly menuDescriptions?: Readonly<Record<string, string>>;
+  /** Detailed `/help <command>` entries (pass `COMMAND_DETAILS` to check help parity). */
+  readonly helpDetails?: Readonly<Record<string, { readonly operatorOnly?: boolean }>>;
+}
+
+/**
+ * Thrown at startup when an advertised command has no live registered handler
+ * or when the catalogue, menu descriptions, and `/help` details disagree.
+ */
+export class CommandConsistencyError extends Error {
+  readonly issues: readonly CommandConsistencyIssue[];
+
+  constructor(issues: readonly CommandConsistencyIssue[]) {
+    const summary = issues.map((issue) => `/${issue.command}: ${issue.message}`).join("; ");
+    super(`command consistency check failed: ${summary}`);
+    this.name = "CommandConsistencyError";
+    this.issues = issues;
+  }
 }
 
 const registered = new Map<string, CommandModule>();

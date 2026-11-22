@@ -9,7 +9,7 @@ This guide explains the example Prometheus alerting rules shipped in [`deploy/pr
 The bot exposes Prometheus text-format (`0.0.4`) metrics from two built-in endpoints:
 
 1. **Health & Readiness Server (`GET /metrics` on `HEALTH_PORT`, default `8787`)** — rendered by `buildMetricsReport` in [`src/health.ts`](../src/health.ts). Every metric is labeled with `network` (and per-target ledger metrics include `source` and `contract`).
-2. **Optional Standalone Metrics Server (`GET /metrics` on `METRICS_PORT`)** — rendered by `createMetrics` in [`src/metrics.ts`](../src/metrics.ts) with the `mimir_bot_` prefix when `METRICS_PORT` is explicitly configured.
+2. **Optional Standalone Metrics Server (`GET /metrics` and `GET /service-level` on `METRICS_PORT`)** — rendered by `createMetrics` in [`src/metrics.ts`](../src/metrics.ts) with the `mimir_bot_` prefix when `METRICS_PORT` is explicitly configured. `GET /service-level` returns a machine-readable JSON service-level window report (`schema: "mimir.service-level-window"`, `schemaVersion: 1`) computed from a bounded rolling window of local samples, covering delivery success (`delivery`), end-to-end lag (`lag`), data-gap indicators (`dataGap`), and explicit window completeness (`complete`, `incomplete`, `completeness.reasons`).
 
 The alert rules in [`deploy/prometheus/alerts.yml`](../deploy/prometheus/alerts.yml) target the default health server's `mimir_telegram_*` metrics so operators only need a single scrape job against `HEALTH_PORT`.
 

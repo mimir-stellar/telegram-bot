@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   InvalidThresholdError,
   meetsThreshold,
+  normalizeUsdcThreshold,
   parseUsdcThreshold,
 } from "../dist/notifications/amount-threshold.js";
 
@@ -71,6 +72,35 @@ test("parseUsdcThreshold: rejects precision beyond 7 decimals (negative)", () =>
   );
   assert.throws(
     () => parseUsdcThreshold("1.12345678"),
+    (err) => err instanceof InvalidThresholdError && /precision/.test(err.message),
+  );
+  assert.throws(
+    () => parseUsdcThreshold("1.00000000"),
+    (err) => err instanceof InvalidThresholdError && /precision/.test(err.message),
+  );
+});
+
+test("normalizeUsdcThreshold & parseUsdcThreshold: treats canonical equivalent decimal strings identically", () => {
+  const equivalentOnes = ["1", "01", "001", "1.0", "1.00", "1.0000000", " 01.00 "];
+  for (const input of equivalentOnes) {
+    assert.equal(normalizeUsdcThreshold(input), "1.0000000", `normalize failed for "${input}"`);
+    assert.equal(parseUsdcThreshold(input), 10_000_000n, `parse failed for "${input}"`);
+  }
+
+  const equivalentZeros = ["0", "00", "0.0", "0.00", "0.0000000"];
+  for (const input of equivalentZeros) {
+    assert.equal(normalizeUsdcThreshold(input), "0.0000000", `normalize failed for "${input}"`);
+    assert.equal(parseUsdcThreshold(input), 0n, `parse failed for "${input}"`);
+  }
+
+  const equivalentFractions = ["10.5", "010.5", "10.50", "10.5000000", " 010.500 "];
+  for (const input of equivalentFractions) {
+    assert.equal(normalizeUsdcThreshold(input), "10.5000000", `normalize failed for "${input}"`);
+    assert.equal(parseUsdcThreshold(input), 105_000_000n, `parse failed for "${input}"`);
+  }
+
+  assert.throws(
+    () => normalizeUsdcThreshold("1.00000000"),
     (err) => err instanceof InvalidThresholdError && /precision/.test(err.message),
   );
 });

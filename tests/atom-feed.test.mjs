@@ -4,7 +4,8 @@
  * Coverage:
  *   - escapeXml: each of the five predefined entities
  *   - stripXmlIllegal: removes C0 control chars, keeps printable Unicode
- *   - xmlText: clips to max code points and escapes
+ *   - xmlText: clips to max code points *after* XML escaping, entity-safe
+ *   - clipEscapedXml: post-escape code-point clip, entity and surrogate safety
  *   - safeHttpsUrl: accepts https, rejects http and other schemes
  *   - buildAtomEntry: id, title, updated, content, link derivation
  *   - buildAtomFeed: well-formed XML, required Atom elements, entry count,
@@ -18,11 +19,13 @@ import {
   escapeXml,
   stripXmlIllegal,
   xmlText,
+  clipEscapedXml,
   safeHttpsUrl,
   buildAtomEntry,
   buildAtomFeed,
   FEED_CONTENT_MAX_CHARS,
   FEED_TITLE_MAX_CHARS,
+  UNKNOWN_EVENT_TIMESTAMP,
 } from "../dist/stellar/feed.js";
 
 // ---------------------------------------------------------------------------
@@ -161,6 +164,111 @@ test("xmlText: strips XML-illegal chars before escaping", () => {
   assert.ok(!result.includes("\x00"), "NUL should be stripped");
 });
 
+test("xmlText: output never exceeds max code points even when escaping expands chars", () => {
+  // "&&&&" → "&amp;&amp;&amp;&amp;" which is 20 code points.
+  // With max=10 the clip must stay ≤ 10 code points.
+  const result = xmlText("&&&&", 10);
+  assert.ok(Array.from(result).length <= 10, `output was ${Array.from(result).length} code points: "${result}"`);
+  assert.ok(result.includes("…"), "must include ellipsis when input is clipped");
+  // Must not contain a dangling & (every & must be part of &...;)
+  const danglingAmp = /&(?!amp;|lt;|gt;|quot;|apos;|#)/;
+  assert.ok(!danglingAmp.test(result), `dangling & in result: "${result}"`);
+});
+
+test("xmlText: entity reference at the clip boundary is not split", () => {
+  // "ab&cd" escapes to "ab&amp;cd" (9 code points).
+  // With max=6 the budget is 5. "ab&amp;" = 7 code points, so the entity
+  // doesn't fit: cut should land at "ab" (2 code points) + "…" = "ab…".
+  const result = xmlText("ab&cd", 6);
+  assert.equal(result, "ab…", `result was "${result}"`);
+  // No dangling &
+  assert.ok(!result.includes("&amp;".slice(0, -1).trimEnd()), "no half-entity");
+});
+
+// ---------------------------------------------------------------------------
+// clipEscapedXml
+// ---------------------------------------------------------------------------
+
+test("clipEscapedXml: short string returns unchanged", () => {
+  assert.equal(clipEscapedXml("hello", 10), "hello");
+});
+
+test("clipEscapedXml: clips plain ASCII and appends ellipsis", () => {
+  // "abcde" with max=4 → "abc…"
+  assert.equal(clipEscapedXml("abcde", 4), "abc…");
+});
+
+test("clipEscapedXml: empty string returns empty", () => {
+  assert.equal(clipEscapedXml("", 5), "");
+});
+
+test("clipEscapedXml: max=1 returns ellipsis for any multi-char input", () => {
+  assert.equal(clipEscapedXml("hello", 1), "…");
+});
+
+test("clipEscapedXml: does not split inside &amp; entity reference", () => {
+  // "&amp;abc" = 8 code points. With max=5, budget=4.
+  // "&amp;" is 5 code points which exceeds the budget of 4, so cut at 0 → "…"
+  assert.equal(clipEscapedXml("&amp;abc", 5), "…");
+});
+
+test("clipEscapedXml: includes entity reference when it fits in budget", () => {
+  // "&amp;xy" = 7 code points, exactly max=7, so no clipping.
+  assert.equal(clipEscapedXml("&amp;xy", 7), "&amp;xy");
+  // "&amp;xyz" = 8 code points. With max=7, budget=6.
+  // "&amp;" = 5 cp, then "x" = 1 cp → total 6 = budget. Next "y" pushes to 7 > budget.
+  // Safe cut after "x": "&amp;x" + "…" = "&amp;x…" (7 code points).
+  assert.equal(clipEscapedXml("&amp;xyz", 7), "&amp;x…");
+});
+
+test("clipEscapedXml: handles surrogate pair (emoji) without splitting", () => {
+  // "🚀" is 2 UTF-16 units but 1 code point.  "🚀🚀🚀" with max=2 → "🚀…"
+  assert.equal(clipEscapedXml("🚀🚀🚀", 2), "🚀…");
+});
+
+test("clipEscapedXml: before/after — entity-safe vs naive slice", () => {
+  // Before fix: a naive slice("&lt;tag&gt;", 0, 5) would give "&lt;t" which looks fine,
+  // but a naive byte-slice could land mid-entity. After fix: entity-aware clipping.
+  // "&lt;tag&gt;" = 10 code points. max=5, budget=4.
+  //   "&lt;" = 4 code points → fills budget exactly. Next char "t" would be cp 5 > budget.
+  //   Result: "&lt;" + "…" = "&lt;…"
+  const result = clipEscapedXml("&lt;tag&gt;", 5);
+  assert.equal(Array.from(result).length, 5, `code points: "${result}"`);
+  // The result must start with the complete entity "&lt;"
+  assert.ok(result.startsWith("&lt;"), `should start with &lt;, got "${result}"`);
+  assert.ok(result.endsWith("…"), `should end with ellipsis, got "${result}"`);
+  // Must not contain a partial &gt; (the closing entity shouldn't appear split)
+  assert.ok(!result.includes("&gt"), `no split &gt; entity, got "${result}"`);
+});
+
+test("clipEscapedXml: all five entity types are kept whole or excluded entirely", () => {
+  const entities = ["&amp;", "&lt;", "&gt;", "&quot;", "&apos;"];
+  for (const ent of entities) {
+    // max = entity.length (exactly fits content, no room for ellipsis = no clip)
+    assert.equal(clipEscapedXml(ent, ent.length), ent, `full entity should pass: ${ent}`);
+    // max = entity.length - 1 (entity does not fit, output is just ellipsis)
+    assert.equal(clipEscapedXml(ent, ent.length - 1), "…", `entity should not be split: ${ent}`);
+  }
+});
+
+test("clipEscapedXml: output code-point count is always <= max", () => {
+  const inputs = [
+    "&amp;&amp;&amp;", // all entities
+    "hello &lt;world&gt;", // mixed
+    "🚀 &amp; 🌍", // emoji + entity
+    "normal text here", // plain
+    "&apos;&quot;&apos;", // apos/quot
+  ];
+  const maxValues = [1, 3, 5, 10, 20, 50];
+  for (const input of inputs) {
+    for (const max of maxValues) {
+      const result = clipEscapedXml(input, max);
+      const len = Array.from(result).length;
+      assert.ok(len <= max, `"${input}" max=${max}: got ${len} code points in "${result}"`);
+    }
+  }
+});
+
 // ---------------------------------------------------------------------------
 // safeHttpsUrl
 // ---------------------------------------------------------------------------
@@ -184,6 +292,12 @@ test("safeHttpsUrl: rejects non-URL garbage", () => {
 
 test("safeHttpsUrl: rejects empty string", () => {
   assert.equal(safeHttpsUrl(""), null);
+});
+
+test("safeHttpsUrl: rejects credential-bearing URLs (userinfo)", () => {
+  assert.equal(safeHttpsUrl("https://user:pass@example.com/feed"), null);
+  assert.equal(safeHttpsUrl("https://user@example.com/feed"), null);
+  assert.equal(safeHttpsUrl("https://:pass@example.com/feed"), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -250,6 +364,13 @@ test("buildAtomEntry: updated is an ISO 8601 string derived from event.at", () =
   const parsed = new Date(entry.updated);
   assert.ok(!Number.isNaN(parsed.getTime()), "updated should parse as a valid date");
   assert.equal(parsed.getTime(), 1_700_000_000 * 1000);
+});
+
+test("buildAtomEntry: unknown or invalid event.at uses UNKNOWN_EVENT_TIMESTAMP", () => {
+  for (const at of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+    const entry = buildAtomEntry(makeEvent({ at }), BASE_CONFIG);
+    assert.equal(entry.updated, UNKNOWN_EVENT_TIMESTAMP);
+  }
 });
 
 test("buildAtomEntry: content is a non-empty string for a notifiable event", () => {
@@ -330,6 +451,14 @@ test("buildAtomFeed: <link rel='self'> is present for a valid https selfUrl", ()
   assert.ok(feed.includes("https://example.com/feed.atom"), "selfUrl not in self link");
 });
 
+test("buildAtomFeed: rejects credential-bearing selfUrl without serializing it", () => {
+  const selfUrl = "https://private:secret@example.com/feed.atom";
+  assert.throws(
+    () => buildAtomFeed([], { ...FEED_OPTS, selfUrl }),
+    /valid HTTPS URL without credentials/,
+  );
+});
+
 test("buildAtomFeed: empty events array produces no <entry> elements", () => {
   const feed = buildAtomFeed([], FEED_OPTS);
   assert.ok(!feed.includes("<entry>"), "empty feed should have no entries");
@@ -352,6 +481,38 @@ test("buildAtomFeed: <updated> reflects the most recent event.at", () => {
   // The feed's <updated> should be the ISO string of the max at (1_700_000_200)
   const expected = new Date(1_700_000_200 * 1000).toISOString();
   assert.ok(feed.includes(expected), `feed <updated> should be ${expected}`);
+});
+
+test("buildAtomFeed: <updated> uses UNKNOWN_EVENT_TIMESTAMP when events have no valid ledger time", () => {
+  const events = [
+    makeEvent({ at: 0 }),
+    makeEvent({ at: -5 }),
+    makeEvent({ at: Number.NaN }),
+  ];
+  const feed = buildAtomFeed(events, FEED_OPTS);
+  assert.ok(
+    feed.includes(`<updated>${UNKNOWN_EVENT_TIMESTAMP}</updated>`),
+    `feed <updated> should be ${UNKNOWN_EVENT_TIMESTAMP}, not wall-clock time`,
+  );
+});
+
+test("buildAtomFeed: <updated> uses UNKNOWN_EVENT_TIMESTAMP for empty events without updatedAt", () => {
+  const feed = buildAtomFeed([], FEED_OPTS);
+  assert.ok(
+    feed.includes(`<updated>${UNKNOWN_EVENT_TIMESTAMP}</updated>`),
+    `empty feed <updated> should be ${UNKNOWN_EVENT_TIMESTAMP}`,
+  );
+});
+
+test("buildAtomFeed: <updated> ignores invalid event.at when another event has a valid ledger time", () => {
+  const events = [
+    makeEvent({ at: Number.POSITIVE_INFINITY }),
+    makeEvent({ at: 1_700_000_123 }),
+    makeEvent({ at: 0 }),
+  ];
+  const feed = buildAtomFeed(events, FEED_OPTS);
+  const expected = new Date(1_700_000_123 * 1000).toISOString();
+  assert.ok(feed.includes(`<updated>${expected}</updated>`), `feed <updated> should be ${expected}`);
 });
 
 test("buildAtomFeed: updatedAt option overrides event timestamps", () => {

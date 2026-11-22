@@ -219,8 +219,8 @@ test("AUDIT_CLI_HINT is a non-empty string mentioning npm run audit", () => {
 
 // ── COMMAND_DESCRIPTIONS ─────────────────────────────────────────────────────
 
-test("COMMAND_DESCRIPTIONS has all nine commands with non-empty descriptions", () => {
-  const required = ["start", "help", "status", "audit", "contracts", "health", "preview", "pause", "resume"];
+test("COMMAND_DESCRIPTIONS has all ten commands with non-empty descriptions", () => {
+  const required = ["start", "help", "status", "audit", "contracts", "health", "preview", "categories", "pause", "resume"];
   for (const cmd of required) {
     assert.ok(cmd in COMMAND_DESCRIPTIONS, `missing command: ${cmd}`);
     assert.ok(COMMAND_DESCRIPTIONS[cmd].length > 0, `empty description for: ${cmd}`);
@@ -656,7 +656,7 @@ test("claim_challenged MarkdownV2 snapshot matches i18n template exactly", () =>
   });
   const result = formatEvent(config, event);
   assert.match(result, /⚔️ \*Claim \\#7 challenged\*/);
-  assert.match(result, /Stake: \*2\\\.0000000 USDC\*/);
+  assert.match(result, /Stake: \*\u20682\\\.0000000 USDC\u2069\*/);
   assert.match(result, /Challenger: `GABCD`/);
 });
 
