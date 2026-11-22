@@ -327,3 +327,50 @@ test("Authorization header at the fixed byte limit is accepted", async () => {
     await server.close();
   }
 });
+
+test("operational HTTP responses set Cache-Control: no-store for success, degraded, and unauthorized", async () => {
+  let healthy = true;
+  const config = baseConfig({
+    healthPort: 18797,
+    healthAuthToken: HEALTH_TOKEN,
+  });
+  const server = startHealthServer({
+    config,
+    status: () => baseStatus({ running: healthy }),
+    now: () => 5_500,
+  });
+  assert.ok(server.url);
+
+  try {
+    const authHeaders = { Authorization: `Bearer ${HEALTH_TOKEN}` };
+
+    for (const path of ["/health", "/healthz", "/health/live", "/livez", "/metrics", "/"]) {
+      const unauth = await fetch(`${server.url}${path}`);
+      assert.equal(unauth.status, 401, `expected 401 for unauthenticated ${path}`);
+      assert.equal(
+        unauth.headers.get("cache-control"),
+        "no-store",
+        `expected Cache-Control: no-store for 401 on ${path}`,
+      );
+
+      const ok = await fetch(`${server.url}${path}`, { headers: authHeaders });
+      assert.equal(ok.status, 200, `expected 200 for authenticated ${path}`);
+      assert.equal(
+        ok.headers.get("cache-control"),
+        "no-store",
+        `expected Cache-Control: no-store for 200 on ${path}`,
+      );
+    }
+
+    healthy = false;
+    const degraded = await fetch(`${server.url}/health`, { headers: authHeaders });
+    assert.equal(degraded.status, 503);
+    assert.equal(degraded.headers.get("cache-control"), "no-store");
+
+    const notFound = await fetch(`${server.url}/does-not-exist`, { headers: authHeaders });
+    assert.equal(notFound.status, 404);
+    assert.equal(notFound.headers.get("cache-control"), "no-store");
+  } finally {
+    await server.close();
+  }
+});
