@@ -23,6 +23,7 @@ import {
 } from "./config.js";
 import { EXIT_ERROR, EXIT_OK } from "./exitCodes.js";
 import { REDACTED, redactText, redactUrl, registerSecrets } from "./redact.js";
+import { DEFAULT_MAX_RESPONSE_BYTES } from "./stellar/rpc-guard.js";
 
 export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "MIMIR_PROFILE",
@@ -32,6 +33,7 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "SQUAD_CONTRACT_VERSION",
   "STELLAR_NETWORK",
   "STELLAR_RPC_URL",
+  "STELLAR_RPC_MAX_RESPONSE_BYTES",
   "STELLAR_HORIZON_URL",
   "STELLAR_NETWORK_PASSPHRASE",
   "STELLAR_EXPLORER_BASE_URL",
@@ -180,6 +182,8 @@ function resolveSettingValue(
       return config.squadContractId;
     case "STELLAR_RPC_URL":
       return redactUrl(config.rpcUrl);
+    case "STELLAR_RPC_MAX_RESPONSE_BYTES":
+      return String(config.rpcMaxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES);
     case "STELLAR_HORIZON_URL":
       return redactUrl(config.horizonUrl);
     case "STELLAR_NETWORK_PASSPHRASE":

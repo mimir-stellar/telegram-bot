@@ -294,6 +294,70 @@ test("parseUsdcStringToUnits: atomic unit conversion utility", () => {
   assert.equal(parseUsdcStringToUnits("100"), 1_000_000_000n);
   assert.equal(parseUsdcStringToUnits("0.0000001"), 1n);
   assert.equal(parseUsdcStringToUnits("2.5"), 25_000_000n);
+
+  // Canonical equivalent decimal strings normalize identically
+  for (const equivalent of ["10.5", "010.5", "10.50", "10.5000000", " 010.50 "]) {
+    assert.equal(parseUsdcStringToUnits(equivalent), 105_000_000n);
+  }
+
+  // Values exceeding 7 fractional digits (including trailing zeros) are rejected
+  assert.throws(
+    () => parseUsdcStringToUnits("1.00000000"),
+    (err) => err instanceof FilterParseError && /exceeds maximum precision of 7 decimals/.test(err.message),
+  );
+});
+
+test("evaluateFilterRule: normalizes equivalent decimal USDC thresholds before comparison", () => {
+  const equivalentExpressions = [
+    "claim_challenged where stake >= 10.5",
+    "claim_challenged where stake >= 10.50",
+    "claim_challenged where stake >= 010.5000000",
+    "claim_challenged where stake >= 10.5 USDC",
+    "claim_challenged where stake >= $10.50",
+  ];
+
+  const belowEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    stake: 104_999_999n, // 10.4999999 USDC
+  });
+  const exactEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    stake: 105_000_000n, // 10.5000000 USDC
+  });
+  const aboveEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    stake: 105_000_001n, // 10.5000001 USDC
+  });
+
+  for (const expr of equivalentExpressions) {
+    const rule = parseFilterExpression(expr);
+    assert.equal(evaluateFilterRule(rule, belowEvent), false, `belowEvent failed for: ${expr}`);
+    assert.equal(evaluateFilterRule(rule, exactEvent), true, `exactEvent failed for: ${expr}`);
+    assert.equal(evaluateFilterRule(rule, aboveEvent), true, `aboveEvent failed for: ${expr}`);
+  }
+});
+
+test("parseFilterExpression: rejects bare and explicit decimal USDC thresholds exceeding 7 fractional digits", () => {
+  const invalidExpressions = [
+    "claim_challenged where stake >= 1.12345678",
+    "deposited where amount >= 1.00000000",
+    "claim_challenged where stake >= $1.00000000",
+    "deposited where amount == 0.00000001 USDC",
+  ];
+
+  for (const expr of invalidExpressions) {
+    assert.throws(
+      () => parseFilterExpression(expr),
+      (err) => err instanceof FilterParseError && /exceeds maximum precision of 7 decimals/.test(err.message),
+      `Expected FilterParseError for: ${expr}`,
+    );
+  }
 });
 
 // ----------------------------------------------------

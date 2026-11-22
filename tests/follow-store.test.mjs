@@ -204,3 +204,109 @@ test('preserves unreadable follow file and redacts credentials when read and qua
     assert.strictEqual(Buffer.compare(await fs.promises.readFile(filePath), raw), 0);
   });
 });
+
+test('deduplicates duplicate references on load without consuming extra quota slots', async () => {
+  await withTempDir(async (dir) => {
+    const { createFollowStore } = await importStore();
+    const filePath = pathJoin(dir, 'follows.json');
+    await fs.promises.writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        follows: {
+          'chat:1': ['market:a1', 'market:a1', 'squad:s1', 'market:a1'],
+          'chat:2': ['market:b1', 'market:b1'],
+        },
+      }),
+      'utf8',
+    );
+
+    const store = createFollowStore({
+      filePath,
+      maxPerChat: 3,
+      maxTotal: 4,
+    });
+
+    assert.deepStrictEqual(store.list('chat:1'), ['market:a1', 'squad:s1']);
+    assert.deepStrictEqual(store.list('chat:2'), ['market:b1']);
+
+    // Only 3 unique entries exist (2 in chat:1, 1 in chat:2), so 1 more fits under both caps.
+    assert.strictEqual(store.follow('chat:1', 'market:a2'), true);
+    assert.deepStrictEqual(store.list('chat:1'), ['market:a1', 'squad:s1', 'market:a2']);
+    assert.throws(() => store.follow('chat:1', 'market:a3'), /per-chat follow limit reached \(3\)/);
+    assert.throws(() => store.follow('chat:2', 'market:b2'), /total follow limit reached \(4\)/);
+  });
+});
+
+test('import deduplicates within payload and against existing follows before enforcing limits', async () => {
+  await withTempDir(async (dir) => {
+    const { createFollowStore } = await importStore();
+    const store = createFollowStore({
+      filePath: pathJoin(dir, 'follows.json'),
+      maxPerChat: 2,
+      maxTotal: 3,
+    });
+
+    store.follow('chat:1', 'market:a1');
+
+    // 3 entries in payload, but market:a1 is already followed and market:a2 is duplicated -> 1 net new.
+    const res1 = store.import({
+      'chat:1': ['market:a1', 'market:a2', 'market:a2'],
+    });
+    assert.deepStrictEqual(res1, { added: 1, skipped: 2 });
+    assert.deepStrictEqual(store.list('chat:1'), ['market:a1', 'market:a2']);
+
+    // StoreFile payload format also supported and deduplicated before total cap check.
+    const res2 = store.import({
+      version: 1,
+      follows: {
+        'chat:2': ['squad:s1', 'squad:s1'],
+      },
+    });
+    assert.deepStrictEqual(res2, { added: 1, skipped: 1 });
+    assert.deepStrictEqual(store.list('chat:2'), ['squad:s1']);
+  });
+});
+
+test('import rejects limit violations and malformed inputs atomically without partial writes', async () => {
+  await withTempDir(async (dir) => {
+    const { createFollowStore } = await importStore();
+    const store = createFollowStore({
+      filePath: pathJoin(dir, 'follows.json'),
+      maxPerChat: 2,
+      maxTotal: 3,
+    });
+
+    store.follow('chat:1', 'market:a1');
+
+    // Per-chat cap exceeded even after deduplication.
+    assert.throws(
+      () => store.import({ 'chat:1': ['market:a2', 'market:a2', 'market:a3'] }),
+      /per-chat follow limit reached \(2\)/,
+    );
+    assert.deepStrictEqual(store.list('chat:1'), ['market:a1']);
+
+    // Total cap exceeded across multiple chats; chat:2 must not be partially persisted.
+    assert.throws(
+      () =>
+        store.import({
+          'chat:2': ['market:b1', 'market:b2'],
+          'chat:3': ['market:c1'],
+        }),
+      /total follow limit reached \(3\)/,
+    );
+    assert.deepStrictEqual(store.list('chat:2'), []);
+    assert.deepStrictEqual(store.list('chat:3'), []);
+
+    // Malformed ref in a later chat aborts the entire import.
+    assert.throws(
+      () =>
+        store.import({
+          'chat:2': ['market:b1'],
+          'chat:3': ['badref'],
+        }),
+      { name: 'FollowStoreError' },
+    );
+    assert.deepStrictEqual(store.list('chat:2'), []);
+  });
+});

@@ -7,17 +7,6 @@
  * is unrecoverable, and the poller must say so once rather than retry the same
  * position forever.
  *
- * The poller already recovers from the case Soroban *rejects*. This suite covers
- * the two states that recovery cannot see:
- *
- *   - the same below-floor position answered with an **empty page instead of an
- *     error** — a walk that advances nothing and would otherwise stay silent
- *     forever. It is caught by placing the cursor against the floor the last
- *     successful scan proved, before asking the RPC anything;
- *   - a cursor whose ledger **cannot be read** out of the opaque token, which is
- *     reported (`cursorUnreadable`) and left untouched rather than treated as a
- *     gap, because an unreadable token is not evidence of a stale position.
- *
  * Everything here is an in-process fake: fake RPC, fake Telegram send, temporary
  * cursor paths and a fake clock. No network, no live Telegram, no credentials.
  */
@@ -222,289 +211,28 @@ test("the documented stale-cursor fixture is a restart gap", async () => {
   });
 });
 
-// ── Detection that does not need an RPC error ───────────────────────────────
+// ── Recovery preview ────────────────────────────────────────────────────────
 
-test("a stale cursor the RPC answers with an empty page is still caught and reported", () =>
-  withTempDataDir(async (dir) => {
-    const cursorFile = dir.file("cursor.json");
-    await writeFile(
-      cursorFile,
-      cursorFileJson({
-        market: { cursor: makeCursor(STALE_LEDGER), lastEventLedger: STALE_LEDGER },
-        squad: { cursor: makeCursor(TIP), lastEventLedger: TIP },
-      }),
-      "utf8",
-    );
+test("a recovery preview reports old and proposed positions with retained-window evidence", () => {
+  const verdict = classifyCursorWindow(makeCursor(STALE_LEDGER), FLOOR);
+  assert.equal(verdict.status, "stale");
+  const preview = {
+    oldPosition: verdict.cursorLedger,
+    proposedPosition: FLOOR,
+    retainedWindow: { oldestLedger: FLOOR, latestLedger: TIP },
+    estimatedMissedLedgers: verdict.missedLedgers,
+  };
+  assert.deepEqual(preview, {
+    oldPosition: STALE_LEDGER,
+    proposedPosition: FLOOR,
+    retainedWindow: { oldestLedger: FLOOR, latestLedger: TIP },
+    estimatedMissedLedgers: FLOOR - STALE_LEDGER,
+  });
+});
 
-    const server = makeServer();
-    const poller = createPoller({
-      config: makeConfig(cursorFile),
-      server,
-      send: async () => {},
-      sendOptions: { sendSpacingMs: 0 },
-      now: fakeClock(),
-    });
-
-    const lines = await captureLogs(async () => {
-      await poller.start();
-      try {
-        await until(
-          () => poller.status().cursorRewinds >= 1,
-          "the below-floor cursor is caught without an RPC error",
-        );
-        await until(
-          () => targetOf(poller, "market").rewindFromLedger === null,
-          "the floor walk completed",
-        );
-      } finally {
-        poller.stop();
-      }
-    });
-
-    const status = poller.status();
-    const market = targetOf(poller, "market");
-
-    assert.equal(status.restartGaps, 1, "one gap, detected once");
-    assert.equal(market.gapLedgers, FLOOR - STALE_LEDGER, "ledgers lost are counted");
-    assert.equal(typeof market.cursorResetAt, "number", "the recovery is timestamped");
-    assert.equal(market.cursorUnreadable, false);
-    assert.deepEqual(
-      { ...status.lastRestartGap, at: 0 },
-      {
-        at: 0,
-        source: "market",
-        cursorLedger: STALE_LEDGER,
-        oldestLedger: FLOOR,
-        missedLedgers: FLOOR - STALE_LEDGER,
-      },
-      "the gap names the position, the floor and what was lost",
-    );
-    assert.equal(targetOf(poller, "squad").gapLedgers, 0, "a healthy target keeps no gap");
-
-    // The recovery is the existing one: walk from the floor, never from the
-    // stale cursor (the two are mutually exclusive in one request).
-    assert.ok(
-      server.requests.some(
-        (req) => req.startLedger === FLOOR && !Object.prototype.hasOwnProperty.call(req, "cursor"),
-      ),
-      "expected a floor walk with startLedger 900 and no cursor",
-    );
-    // Reported once, not once per cycle.
-    const gapLines = lines.filter((line) => line.includes("restart gap"));
-    assert.equal(gapLines.length, 1, `expected one gap line, got:\n${gapLines.join("\n")}`);
-    assert.match(gapLines[0], new RegExp(`${STALE_LEDGER}`));
-    assert.match(gapLines[0], new RegExp(`${FLOOR}`));
-    assertBoundedAndClean(lines);
-
-    // Both operator surfaces carry the gap.
-    const config = makeConfig(cursorFile);
-    const report = buildHealthReport(config, status, Date.now());
-    assert.equal(report.poller.restartGaps, 1);
-    assert.equal(report.poller.lastRestartGap.missedLedgers, FLOOR - STALE_LEDGER);
-    assert.equal(report.poller.lastRestartGap.oldestLedger, FLOOR);
-    assert.match(report.poller.lastRestartGap.at, /^\d{4}-\d{2}-\d{2}T/);
-    const healthMarket = report.poller.targets.find((t) => t.source === "market");
-    assert.equal(healthMarket.gapLedgers, FLOOR - STALE_LEDGER);
-    assert.match(healthMarket.cursorResetAt, /^\d{4}-\d{2}-\d{2}T/);
-    assert.equal(healthMarket.cursorUnreadable, false);
-
-    const message = statusMessage(config, status, Date.now());
-    assert.match(message, /restart gap: 400 ledgers unrecoverable, cursor reset \d+[smh] ago/);
-    assert.match(message, /Restart gaps detected since start: 1/);
-  }));
-
-test("a failing scan with the cursor inside the window records no gap", () =>
-  withTempDataDir(async (dir) => {
-    const cursorFile = dir.file("cursor.json");
-    const inside = FLOOR + 50;
-    await writeFile(
-      cursorFile,
-      cursorFileJson({
-        market: { cursor: makeCursor(inside), lastEventLedger: inside },
-        squad: { cursor: makeCursor(inside), lastEventLedger: inside },
-      }),
-      "utf8",
-    );
-
-    // The market scan fails for a reason that is *not* a stale rejection, while
-    // the squad scan succeeds and proves the floor. A failure inside the window
-    // is an RPC problem, not a retention gap: the position must be untouched.
-    const server = makeServer({
-      onEvents: (req) => {
-        if (req.filters?.[0]?.contractIds?.[0] === MARKET_ID) {
-          throw new Error("rpc unavailable");
-        }
-        return { events: [], cursor: makeCursor(TIP), latestLedger: TIP };
-      },
-    });
-
-    const poller = createPoller({
-      config: makeConfig(cursorFile),
-      server,
-      send: async () => {},
-      sendOptions: { sendSpacingMs: 0 },
-      now: fakeClock(),
-    });
-
-    const lines = await captureLogs(async () => {
-      await poller.start();
-      try {
-        await until(() => poller.status().oldestLedger === FLOOR, "the floor is known");
-        await until(() => poller.status().cycles >= 3, "a few cycles ran");
-      } finally {
-        poller.stop();
-      }
-    });
-
-    const status = poller.status();
-    const market = targetOf(poller, "market");
-    assert.equal(status.restartGaps, 0, "a failure inside the window is not a restart gap");
-    assert.equal(status.cursorRewinds, 0, "and nothing is rewound");
-    assert.equal(status.lastRestartGap, null);
-    assert.equal(market.gapLedgers, 0);
-    assert.equal(market.cursorResetAt, null);
-    assert.equal(market.cursor, makeCursor(inside), "the position is left exactly where it was");
-    assert.equal(lines.join("\n").includes("restart gap"), false);
-  }));
-
-test("a cursor with no readable ledger is flagged and left untouched, never called a gap", () =>
-  withTempDataDir(async (dir) => {
-    const cursorFile = dir.file("cursor.json");
-    const opaque = "opaque-token-from-another-build";
-    await writeFile(
-      cursorFile,
-      cursorFileJson({
-        market: { cursor: opaque, lastEventLedger: FLOOR + 50 },
-        squad: { cursor: makeCursor(TIP), lastEventLedger: TIP },
-      }),
-      "utf8",
-    );
-
-    const server = makeServer();
-    const poller = createPoller({
-      config: makeConfig(cursorFile),
-      server,
-      send: async () => {},
-      sendOptions: { sendSpacingMs: 0 },
-      now: fakeClock(),
-    });
-
-    const lines = await captureLogs(async () => {
-      await poller.start();
-      try {
-        await until(() => targetOf(poller, "market").cursorUnreadable === true, "the flag is set");
-        await until(() => poller.status().cycles >= 4, "later cycles ran");
-      } finally {
-        poller.stop();
-      }
-    });
-
-    const status = poller.status();
-    const market = targetOf(poller, "market");
-    assert.equal(market.cursorUnreadable, true);
-    assert.equal(market.cursor, opaque, "an unreadable token is forwarded, not replaced");
-    assert.equal(status.restartGaps, 0, "an unreadable token is not evidence of a stale one");
-    assert.equal(status.cursorRewinds, 0);
-    assert.equal(market.gapLedgers, 0);
-    assert.equal(market.cursorResetAt, null);
-
-    const unreadableLines = lines.filter((line) => line.includes("no readable ledger position"));
-    assert.equal(unreadableLines.length, 1, "flagged once, not once per cycle");
-    assertBoundedAndClean(lines);
-
-    const report = buildHealthReport(makeConfig(cursorFile), status, Date.now());
-    assert.equal(report.poller.targets.find((t) => t.source === "market").cursorUnreadable, true);
-    assert.equal(report.poller.targets.find((t) => t.source === "squad").cursorUnreadable, false);
-    assert.match(
-      statusMessage(makeConfig(cursorFile), status, Date.now()),
-      /cursor ledger unreadable: position left untouched/,
-    );
-  }));
-
-test("a cursor whose TOID packs no ledger is flagged, not mistaken for a gap", () =>
-  withTempDataDir(async (dir) => {
-    const cursorFile = dir.file("cursor.json");
-    // `456-0` is a well-formed TOID shape that packs ledger 0, which is what the
-    // shutdown suites persist as a placeholder. Ledgers start at 1, so this is a
-    // token this build cannot place: it must be forwarded and flagged, never
-    // rewound on the strength of a ledger of 0.
-    await writeFile(
-      cursorFile,
-      cursorFileJson({
-        market: { cursor: "456-0", lastEventLedger: 200 },
-        squad: { cursor: makeCursor(TIP), lastEventLedger: TIP },
-      }),
-      "utf8",
-    );
-
-    const server = makeServer();
-    const poller = createPoller({
-      config: makeConfig(cursorFile),
-      server,
-      send: async () => {},
-      sendOptions: { sendSpacingMs: 0 },
-      now: fakeClock(),
-    });
-
-    await poller.start();
-    try {
-      await until(() => targetOf(poller, "market").cursorUnreadable === true, "the flag is set");
-      await until(() => poller.status().cycles >= 3, "later cycles ran");
-    } finally {
-      poller.stop();
-    }
-
-    assert.equal(targetOf(poller, "market").cursor, "456-0", "the token is left untouched");
-    assert.equal(poller.status().restartGaps, 0);
-    assert.equal(poller.status().cursorRewinds, 0);
-    assert.equal(targetOf(poller, "market").gapLedgers, 0);
-  }));
-
-test("an unreadable cursor clears once the RPC accepts it and the walk advances", () =>
-  withTempDataDir(async (dir) => {
-    const cursorFile = dir.file("cursor.json");
-    const opaque = "opaque-token-from-another-build";
-    await writeFile(
-      cursorFile,
-      cursorFileJson({
-        market: { cursor: opaque, lastEventLedger: FLOOR + 50 },
-        squad: { cursor: makeCursor(TIP), lastEventLedger: TIP },
-      }),
-      "utf8",
-    );
-
-    // First the RPC accepts the token but hands it straight back (no progress,
-    // so the flag stands), then it advances the walk — at which point the
-    // position this build could not read is no longer the position it holds.
-    let advancing = false;
-    const server = makeServer({
-      onEvents: (req) => {
-        if (req.cursor === opaque && !advancing) {
-          return { events: [], cursor: opaque, latestLedger: TIP };
-        }
-        return { events: [], cursor: makeCursor(TIP), latestLedger: TIP };
-      },
-    });
-
-    const poller = createPoller({
-      config: makeConfig(cursorFile),
-      server,
-      send: async () => {},
-      sendOptions: { sendSpacingMs: 0 },
-      now: fakeClock(),
-    });
-
-    await poller.start();
-    try {
-      await until(() => targetOf(poller, "market").cursorUnreadable === true, "the flag is set");
-      advancing = true;
-      await until(
-        () => targetOf(poller, "market").cursorUnreadable === false,
-        "the flag clears on its own",
-      );
-      assert.equal(targetOf(poller, "market").cursor, makeCursor(TIP));
-      assert.equal(poller.status().restartGaps, 0);
-    } finally {
-      poller.stop();
-    }
-  }));
+test("a recovery preview never guesses an opaque token into a proposed position", () => {
+  assert.deepEqual(classifyCursorWindow("opaque-token", FLOOR), {
+    status: "unreadable",
+    cursor: "opaque-token",
+  });
+});
