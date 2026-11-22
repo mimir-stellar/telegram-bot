@@ -4,8 +4,30 @@ import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
 import { validateLedgerRange, type LedgerRange } from "./ledger-range.js";
+import { compareLedgerCoverage } from "./scan-jsonl.js";
+import type {
+  ArchiveCoverageInput,
+  ArchiveCoverageOptions,
+  ArchiveCoverageReport,
+} from "./scan-jsonl.js";
 
 export { validateLedgerRange, type LedgerRange };
+export {
+  compareLedgerCoverage,
+  compareScanJsonlCoverage,
+  formatArchiveCoverageReport,
+  renderArchiveCoverageReport,
+  formatCoverageReport,
+  renderCoverageReport,
+  type ArchiveCoverageInput,
+  type ArchiveCoverageOptions,
+  type ArchiveCoverageReport,
+  type ArchiveCoverageTotals,
+  type CoverageCaptureSummary,
+  type CoverageCountMismatch,
+  type CoverageFinding,
+  type CoverageSpan,
+} from "./scan-jsonl.js";
 
 export interface EventArchiveOptions {
   dir: string;
@@ -542,4 +564,42 @@ export async function verifyArchiveManifest(dir: string): Promise<VerifyArchiveM
     }
   }
   return { ok: true, recordCount: records.length };
+}
+
+function looksLikeArchivePath(input: ArchiveCoverageInput): input is string {
+  if (typeof input !== "string") return false;
+  const trimmed = input.trim();
+  return trimmed.length > 0 && !trimmed.startsWith("{") && !trimmed.startsWith("[");
+}
+
+async function readCoverageCapture(dir: string): Promise<DecodedEvent[]> {
+  const events: DecodedEvent[] = [];
+  for await (const event of readArchive(dir)) events.push(event);
+  return events;
+}
+
+export async function compareArchiveDirCoverage(
+  firstDir: string,
+  secondDir: string,
+  options: ArchiveCoverageOptions | LedgerRange = {},
+): Promise<ArchiveCoverageReport> {
+  const [first, second] = await Promise.all([
+    readCoverageCapture(firstDir),
+    readCoverageCapture(secondDir),
+  ]);
+  return compareLedgerCoverage(first, second, options);
+}
+
+export function compareArchiveCoverage(
+  first: ArchiveCoverageInput,
+  second: ArchiveCoverageInput,
+  options: ArchiveCoverageOptions | LedgerRange = {},
+): ArchiveCoverageReport | Promise<ArchiveCoverageReport> {
+  if (looksLikeArchivePath(first) || looksLikeArchivePath(second)) {
+    if (typeof first !== "string" || typeof second !== "string") {
+      throw new TypeError("Both archive paths must be strings");
+    }
+    return compareArchiveDirCoverage(first, second, options);
+  }
+  return compareLedgerCoverage(first, second, options);
 }
