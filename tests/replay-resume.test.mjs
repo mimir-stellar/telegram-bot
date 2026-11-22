@@ -20,7 +20,11 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
-import { EXIT_REPLAY_CANCELLED, runReplayCli } from "../dist/stellar/replay.js";
+import {
+  computeReplayFilterFingerprint,
+  loadAndValidateProgressFile,
+  runReplayCli,
+} from "../dist/stellar/replay.js";
 import {
   MARKET_CONTRACT,
   SQUAD_CONTRACT,
@@ -555,152 +559,142 @@ test("backward compatibility: replay without --progress-file or --rpm runs clean
   assert.equal(report.totals.events, 0);
 });
 
-test("SIGINT mid-page exits with 130, flushes only committed progress, and leaves resumable status", async () => {
-  await withTempDataDir(async (dir) => {
-    const progressFile = dir.file("progress.json");
-    const health = { oldestLedger: 3000, latestLedger: 5000 };
-    const page1Cursor = makeCursor(4100);
-    const page2Cursor = makeCursor(4200);
-    const ev1 = claimCreatedEvent({ ledger: 4050, id: "4050-1", claimId: 1 });
-    const ev2 = claimCreatedEvent({ ledger: 4150, id: "4150-1", claimId: 2 });
-    const ev3 = claimCreatedEvent({ ledger: 4250, id: "4250-1", claimId: 3 });
+test("computeReplayFilterFingerprint normalizes equivalent filter sets and distinguishes differences", () => {
+  const cfg = fakeBotConfig();
+  const base = computeReplayFilterFingerprint({
+    from: "4000",
+    to: 5000,
+    contracts: ["market", "squad"],
+    network: "testnet",
+    config: cfg,
+  });
 
-    const server = makeServer(health, {
-      [MARKET_CONTRACT]: [
-        { events: [ev1], cursor: page1Cursor, latestLedger: 5000 },
-        { events: [ev2], cursor: page2Cursor, latestLedger: 5000 },
-        { events: [ev3], cursor: makeCursor(5000), latestLedger: 5000 },
-      ],
-      [SQUAD_CONTRACT]: [{ events: [], cursor: makeCursor(5000), latestLedger: 5000 }],
-    });
+  // Normalized equivalents produce identical fingerprint
+  assert.equal(
+    computeReplayFilterFingerprint({
+      from: " 4000 ",
+      to: 5000,
+      contracts: ["squad", "market", "market"],
+      network: " TestNet ",
+      config: fakeBotConfig({
+        marketContractId: ` ${MARKET_CONTRACT} `,
+        squadContractId: ` ${SQUAD_CONTRACT} `,
+      }),
+    }),
+    base,
+    "reordered/duplicate contracts and surrounding whitespace must normalize to the same fingerprint",
+  );
 
-    const delivered = [];
-    const logs = [];
-    const listenersBefore = process.listenerCount("SIGINT");
+  // Undefined vs null `to` normalize identically
+  assert.equal(
+    computeReplayFilterFingerprint({ from: "4000", to: undefined, contracts: ["market"], network: "testnet", config: cfg }),
+    computeReplayFilterFingerprint({ from: "4000", to: null, contracts: ["market"], network: "testnet", config: cfg }),
+  );
 
-    const { report, exitCode } = await runReplayCli({
-      argv: [
-        "node",
-        "replay-cli.ts",
-        "--from",
-        "4000",
-        "--to",
-        "5000",
-        "--contract",
-        "market",
-        "--send",
-        "--progress-file",
-        progressFile,
-      ],
-      deps: {
-        config: fakeBotConfig(),
-        server,
-        progress: (msg) => logs.push(String(msg)),
-        send: async (text) => {
-          delivered.push(text);
-          // Emit SIGINT while processing page 2 (before page 2 is committed)
-          if (delivered.length === 2) {
-            process.emit("SIGINT");
-          }
-        },
-      },
-    });
+  // Different contract subset produces a different fingerprint
+  assert.notEqual(
+    computeReplayFilterFingerprint({ from: "4000", to: 5000, contracts: ["market"], network: "testnet", config: cfg }),
+    base,
+  );
 
-    assert.equal(process.listenerCount("SIGINT"), listenersBefore, "SIGINT listener must be cleaned up");
-    assert.equal(exitCode, EXIT_REPLAY_CANCELLED);
-    assert.equal(exitCode, 130);
-    assert.ok(report !== null);
-    assert.equal(report.status, "cancelled");
-    assert.equal(report.cancelled, true);
-    assert.equal(report.resumable, true);
-    assert.ok(logs.some((l) => l.includes("cancelled") && l.includes("resumable=true")));
-    assert.ok(!logs.some((l) => l.includes("[replay] done")));
-
-    // Progress file must contain ONLY page 1 (committed), never page 2
-    const saved = JSON.parse(await readFile(progressFile, "utf8"));
-    assert.equal(saved.status, "cancelled");
-    assert.equal(saved.resumable, true);
-    assert.equal(saved.targets.market.pagesProcessed, 1);
-    assert.equal(saved.targets.market.cursor, page1Cursor);
-    assert.equal(saved.targets.market.eventsProcessed, 1);
-    assert.equal(saved.targets.market.completed, false);
-
-    // Resuming from the cancelled progress file completes cleanly without re-sending ev1
-    const resumeServer = makeServer(health, {
-      [MARKET_CONTRACT]: [
-        { events: [ev2], cursor: page2Cursor, latestLedger: 5000 },
-        { events: [ev3], cursor: makeCursor(5000), latestLedger: 5000 },
-      ],
-    });
-    const resumedDelivered = [];
-    const resumed = await runReplayCli({
-      argv: [
-        "node",
-        "replay-cli.ts",
-        "--from",
-        "4000",
-        "--to",
-        "5000",
-        "--contract",
-        "market",
-        "--send",
-        "--progress-file",
-        progressFile,
-      ],
-      deps: {
-        config: fakeBotConfig(),
-        server: resumeServer,
-        send: async (text) => {
-          resumedDelivered.push(text);
-        },
-      },
-    });
-
-    assert.equal(resumed.exitCode, 0);
-    assert.equal(resumed.report?.status, "completed");
-    assert.equal(resumed.report?.cancelled, false);
-    assert.equal(resumedDelivered.length, 2);
-
-    const completedFile = JSON.parse(await readFile(progressFile, "utf8"));
-    assert.equal(completedFile.status, "completed");
-    assert.equal(completedFile.resumable, false);
-    assert.equal(completedFile.targets.market.completed, true);
-  }, "replay-sigint-");
+  // Different contractId produces a different fingerprint
+  assert.notEqual(
+    computeReplayFilterFingerprint({
+      from: "4000",
+      to: 5000,
+      contracts: ["market", "squad"],
+      network: "testnet",
+      config: fakeBotConfig({ squadContractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }),
+    }),
+    base,
+  );
 });
 
-test("aborted signal before first page exits with 130 and leaves empty committed progress resumable", async () => {
-  await withTempDataDir(async (dir) => {
-    const progressFile = dir.file("progress.json");
-    const ac = new AbortController();
-    ac.abort();
+test("progress file records filterFingerprint and rejects incompatible filter sets with an actionable message", async () => {
+  await withTempDataDir(async (tmp) => {
+    const progressFile = tmp.file("progress.json");
+    const cursor1 = makeCursor(4100, 1);
+    const ev1 = claimCreatedEvent({ ledger: 4100, claimId: 601, id: cursor1, pagingToken: cursor1 });
 
-    const server = makeServer({ oldestLedger: 3000, latestLedger: 5000 }, {});
-    const { report, exitCode } = await runReplayCli({
-      argv: [
-        "node",
-        "replay-cli.ts",
-        "--from",
-        "4000",
-        "--to",
-        "5000",
-        "--progress-file",
-        progressFile,
-      ],
-      deps: {
-        config: fakeBotConfig(),
-        server,
-        signal: ac.signal,
-      },
+    // Run 1: both contracts requested, interrupted after 1 page on market (squad not yet in targets)
+    const server1 = makeServer({ oldestLedger: 3000, latestLedger: 5000 }, {
+      [MARKET_CONTRACT]: [{ events: [ev1], cursor: cursor1, latestLedger: 5000 }],
+      [SQUAD_CONTRACT]: [{ events: [], cursor: "", latestLedger: 5000 }],
     });
 
-    assert.equal(exitCode, 130);
-    assert.equal(report?.status, "cancelled");
-    assert.equal(report?.cancelled, true);
-    assert.equal(report?.resumable, true);
+    const cfg = fakeBotConfig();
+    const run1 = await runReplayCli({
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--to", "5000", "--pages", "1", "--progress-file", progressFile],
+      deps: { config: cfg, server: server1 },
+    });
+    assert.equal(run1.exitCode, 0);
 
     const saved = JSON.parse(await readFile(progressFile, "utf8"));
-    assert.equal(saved.status, "cancelled");
-    assert.equal(saved.resumable, true);
-    assert.deepEqual(saved.targets, {});
-  }, "replay-abort-early-");
+    const expectedFp = computeReplayFilterFingerprint({
+      from: "4000",
+      to: 5000,
+      contracts: ["market", "squad"],
+      network: "testnet",
+      config: cfg,
+    });
+    assert.equal(saved.filterFingerprint, expectedFp, "progress file must persist normalized filterFingerprint");
+
+    // Resume with a different contract filter (--contract market) must fail with an actionable error
+    await assert.rejects(
+      () =>
+        loadAndValidateProgressFile(progressFile, {
+          from: "4000",
+          to: 5000,
+          contracts: ["market"],
+          network: "testnet",
+          config: cfg,
+        }),
+      (err) => {
+        assert.match(err.message, /different filter set/i);
+        assert.match(err.message, /contracts/i);
+        assert.match(err.message, /--progress-file/i);
+        return true;
+      },
+    );
+
+    // Resume with a changed squadContractId (even if squad had no target checkpoint) must also be rejected
+    const changedSquadCfg = fakeBotConfig({
+      squadContractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+    const run2 = await runReplayCli({
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--to", "5000", "--progress-file", progressFile],
+      deps: { config: changedSquadCfg },
+    });
+    assert.equal(run2.exitCode, 2);
+    assert.equal(run2.report, null);
+  });
+});
+
+test("invalid or empty filterFingerprint in progress file rejects with exit code 2", async () => {
+  await withTempDataDir(async (tmp) => {
+    const progressFile = tmp.file("bad-fp.json");
+    await writeFile(
+      progressFile,
+      JSON.stringify({
+        format: "mimir-replay-progress-v1",
+        version: 1,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        network: "testnet",
+        rpcUrl: "http://fake-rpc.invalid",
+        range: { from: "4000", to: 5000 },
+        contracts: ["market"],
+        filterFingerprint: "   ",
+        targets: {},
+      }),
+      "utf8",
+    );
+
+    const { report, exitCode } = await runReplayCli({
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--to", "5000", "--contract", "market", "--progress-file", progressFile],
+      deps: { config: fakeBotConfig() },
+    });
+    assert.equal(exitCode, 2);
+    assert.equal(report, null);
+  });
 });

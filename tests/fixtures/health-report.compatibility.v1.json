@@ -10,7 +10,10 @@
     { "path": ["config", "futureField"], "value": true },
     { "path": ["config", "envFile", "futureField"], "value": true },
     { "path": ["config", "entries", 0, "futureField"], "value": true },
-    { "path": ["config", "counts", "future-source"], "value": 0 }
+    { "path": ["config", "counts", "future-source"], "value": 0 },
+    { "path": ["dependencies", "futureField"], "value": true },
+    { "path": ["dependencies", "rpc", "futureField"], "value": true },
+    { "path": ["dependencies", "delivery", "futureField"], "value": 2 }
   ],
   "breakingChanges": [
     {
@@ -40,6 +43,23 @@
       "path": ["status"],
       "value": "warning",
       "errors": ["$.status: \"warning\" is not one of \"ok\", \"degraded\", \"stopped\""]
+    },
+    {
+      "operation": "remove",
+      "path": ["dependencies"],
+      "errors": ["$: missing required property \"dependencies\""]
+    },
+    {
+      "operation": "replace",
+      "path": ["dependencies", "rpc", "ready"],
+      "value": "yes",
+      "errors": ["$.dependencies.rpc.ready: expected boolean, got string"]
+    },
+    {
+      "operation": "replace",
+      "path": ["dependencies", "route", "reason"],
+      "value": 7,
+      "errors": ["$.dependencies.route.reason: expected string or null, got number"]
     }
   ]
 }
