@@ -182,9 +182,12 @@ rarely conflicts with another in-flight branch):
 3. If the command is advertised, add its description to `COMMAND_DESCRIPTIONS`
    (both locales) in `src/i18n.ts` and its entry to `COMMAND_DETAILS` in
    `src/commands/help-detail.ts`. `/help`, the Telegram menu and the detail pages
-   are generated from those tables.
+   are generated from those tables, and startup validation
+   (`validateCommandCatalogue`) rejects any advertised command that lacks a live
+   registered handler (or any catalogue/menu/help mismatch) before the bot boots.
 4. Cover the handler in `tests/` like any other command; `tests/command-modules.test.mjs`
-   checks the registry invariants (unique names, menu parity, central authorization).
+   checks the registry invariants (unique names, menu parity, central authorization,
+   and startup consistency validation).
 
 ## Where things live
 

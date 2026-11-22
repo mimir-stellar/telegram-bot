@@ -8,13 +8,81 @@
 
 import type { rpc } from "@stellar/stellar-sdk";
 
-import { eventKey, type DedupableEvent } from "../dedup.js";
-import { validateScanWindow, type ScanLedgerWindow } from "./client.js";
+import { resolveMaxBackoffMs } from "./client.js";
 
 /** Default ceiling on the number of events permitted in a single RPC response. */
 export const DEFAULT_MAX_EVENTS_PER_RESPONSE = 1_000;
 
+export type RpcNetworkIdentityProblem =
+  | "not-an-object"
+  | "malformed-passphrase"
+  | "passphrase-mismatch";
+
+/**
+ * Error thrown when an RPC endpoint's `getNetwork` response fails network
+ * identity validation.
+ *
+ * Messages are strictly bounded and never echo configured or reported
+ * passphrases.
+ */
+export class RpcNetworkIdentityError extends Error {
+  readonly problem: RpcNetworkIdentityProblem;
+
+  constructor(problem: RpcNetworkIdentityProblem, message: string) {
+    super(message);
+    this.name = "RpcNetworkIdentityError";
+    this.problem = problem;
+  }
+}
+
+export interface VerifiedNetworkIdentity {
+  passphrase: string;
+}
+
+/**
+ * Validate a `getNetwork` RPC response against the configured network passphrase.
+ *
+ * Rejects non-object payloads, missing or non-string passphrases, and endpoints
+ * reporting a different network passphrase than configured. Error messages are
+ * bounded and never echo the raw passphrases.
+ *
+ * @param value The raw `getNetwork` response value to validate.
+ * @param expectedPassphrase The configured Stellar network passphrase.
+ * @returns The verified network identity.
+ * @throws {RpcNetworkIdentityError} When the response is malformed or serves another network.
+ */
+export function assertNetworkIdentity(
+  value: unknown,
+  expectedPassphrase: string,
+): VerifiedNetworkIdentity {
+  if (!isRecord(value)) {
+    throw new RpcNetworkIdentityError(
+      "not-an-object",
+      `RPC getNetwork response must be an object; got ${value === null ? "null" : typeof value}`,
+    );
+  }
+
+  const rpcPassphrase = value.passphrase;
+  if (typeof rpcPassphrase !== "string") {
+    throw new RpcNetworkIdentityError(
+      "malformed-passphrase",
+      `RPC getNetwork returned a malformed passphrase (expected a string; got ${typeof rpcPassphrase})`,
+    );
+  }
+
+  if (rpcPassphrase !== expectedPassphrase) {
+    throw new RpcNetworkIdentityError(
+      "passphrase-mismatch",
+      `RPC network passphrase does not match the configured value ` +
+        `(configured=${expectedPassphrase.length} chars, received=${rpcPassphrase.length} chars)`,
+    );
+  }
+
+  return { passphrase: rpcPassphrase };
+}
+
 export type RpcGuardProblem =
+  | "response-oversized"
   | "not-an-object"
   | "events-not-an-array"
   | "events-oversized"
@@ -143,201 +211,63 @@ export function assertEventsResponse(
   return value as unknown as rpc.Api.GetEventsResponse;
 }
 
-// ── Multi-provider disagreement tracking ─────────────────────────────────────
-
-/** Default maximum number of window comparisons retained by {@link ProviderDisagreementTracker}. */
-export const DEFAULT_MAX_DISAGREEMENT_HISTORY = 100;
-
-/** Events returned by one RPC provider for a shared ledger window. */
-export interface ProviderEventBatch {
-  /** Optional provider label for diagnostics (never used to pick a winner). */
-  provider?: string;
-  /** Events returned by this provider for the window. */
-  events: readonly DedupableEvent[];
-}
+// ── Untrusted RPC retry-delay clamping ───────────────────────────────────────
 
 /**
- * Symmetric comparison of canonical event identities from two providers on the
- * same ledger window. Exposes any disagreement without choosing an unverified
- * winner.
- */
-export interface ProviderComparisonResult {
-  window: ScanLedgerWindow;
-  providerA: string;
-  providerB: string;
-  /** True only when both providers returned the exact same canonical identities and zero unidentifiable events. */
-  agrees: boolean;
-  /** Negation of `agrees` for direct filtering. */
-  disagrees: boolean;
-  /** Number of canonical event identities present in both providers' responses. */
-  sharedCount: number;
-  /** Canonical event identities present only in provider A (sorted). */
-  onlyInA: string[];
-  /** Canonical event identities present only in provider B (sorted). */
-  onlyInB: string[];
-  /** Count of events in provider A whose canonical identity could not be derived. */
-  unidentifiableA: number;
-  /** Count of events in provider B whose canonical identity could not be derived. */
-  unidentifiableB: number;
-}
-
-/** Aggregated disagreement metrics across tracked ledger windows. */
-export interface ProviderDisagreementSummary {
-  totalWindows: number;
-  agreedWindows: number;
-  disagreedWindows: number;
-  disagreementRate: number;
-  recentDisagreements: ProviderComparisonResult[];
-}
-
-function collectCanonicalKeys(
-  events: readonly DedupableEvent[],
-  label: string,
-): { keys: Set<string>; unidentifiable: number } {
-  if (!Array.isArray(events)) {
-    throw new RpcResponseShapeError(
-      "events-not-an-array",
-      `Provider "${label}" events must be an array; got ${events === null ? "null" : typeof events}`,
-    );
-  }
-  const keys = new Set<string>();
-  let unidentifiable = 0;
-  for (const ev of events) {
-    const key = eventKey(ev);
-    if (key === null) {
-      unidentifiable += 1;
-    } else {
-      keys.add(key);
-    }
-  }
-  return { keys, unidentifiable };
-}
-
-/**
- * Compare canonical event identities returned by two RPC providers for the
- * same ledger window.
+ * Clamp a numeric retry delay (in milliseconds) against the configured
+ * authoritative maximum backoff.
  *
- * Uses {@link eventKey} to derive canonical identities and reports missing/extra
- * identities symmetrically without selecting an unverified winner.
+ * Rejects negative, non-finite (`NaN`, `Infinity`, `-Infinity`), and
+ * non-numeric values by returning `null`, and clamps oversized finite values to
+ * `resolveMaxBackoffMs(maxBackoffMs)`.
  */
-export function compareProviderEvents(
-  window: { startLedger?: unknown; endLedger?: unknown },
-  batchA: ProviderEventBatch,
-  batchB: ProviderEventBatch,
-): ProviderComparisonResult {
-  const validWindow = validateScanWindow(window);
-  const providerA = batchA.provider?.trim() || "provider-a";
-  const providerB = batchB.provider?.trim() || "provider-b";
-
-  const collectedA = collectCanonicalKeys(batchA.events, providerA);
-  const collectedB = collectCanonicalKeys(batchB.events, providerB);
-
-  let sharedCount = 0;
-  const onlyInA: string[] = [];
-  const onlyInB: string[] = [];
-
-  for (const key of collectedA.keys) {
-    if (collectedB.keys.has(key)) {
-      sharedCount += 1;
-    } else {
-      onlyInA.push(key);
-    }
+export function clampRetryDelayMs(
+  delayMs: unknown,
+  maxBackoffMs?: number,
+): number | null {
+  const authoritativeMax = resolveMaxBackoffMs(maxBackoffMs);
+  if (typeof delayMs !== "number" || !Number.isFinite(delayMs) || delayMs < 0) {
+    return null;
   }
-  for (const key of collectedB.keys) {
-    if (!collectedA.keys.has(key)) {
-      onlyInB.push(key);
-    }
-  }
-
-  onlyInA.sort();
-  onlyInB.sort();
-
-  const agrees =
-    onlyInA.length === 0 &&
-    onlyInB.length === 0 &&
-    collectedA.unidentifiable === 0 &&
-    collectedB.unidentifiable === 0;
-
-  return {
-    window: validWindow,
-    providerA,
-    providerB,
-    agrees,
-    disagrees: !agrees,
-    sharedCount,
-    onlyInA,
-    onlyInB,
-    unidentifiableA: collectedA.unidentifiable,
-    unidentifiableB: collectedB.unidentifiable,
-  };
+  return Math.min(delayMs, authoritativeMax);
 }
 
 /**
- * Bounded tracker for provider disagreement across ledger windows.
+ * Parse and clamp a `Retry-After` header value (in seconds) from an untrusted
+ * RPC response against the configured maximum backoff.
  *
- * Retains aggregated counts across all recorded windows and a bounded ring of
- * recent disagreements for inspection, without ever promoting an unverified
- * provider as authoritative.
+ * Rejects negative, non-finite, empty, or trailing-garbage values (e.g.
+ * `"-5"`, `"NaN"`, `"Infinity"`, `"10abc"`), rejects overflow to `Infinity`
+ * when converting seconds to milliseconds, and clamps oversized delays to
+ * `resolveMaxBackoffMs(maxBackoffMs)`.
  */
-export class ProviderDisagreementTracker {
-  readonly maxHistory: number;
-  private totalWindows = 0;
-  private agreedWindows = 0;
-  private disagreedWindows = 0;
-  private readonly recentDisagreements: ProviderComparisonResult[] = [];
+export function parseRetryAfterHeaderMs(
+  headerValue: unknown,
+  maxBackoffMs?: number,
+): number | null {
+  const authoritativeMax = resolveMaxBackoffMs(maxBackoffMs);
 
-  constructor(maxHistory: number = DEFAULT_MAX_DISAGREEMENT_HISTORY) {
-    this.maxHistory = Number.isFinite(maxHistory) && maxHistory >= 0 ? Math.floor(maxHistory) : 0;
-  }
-
-  /** Compare two providers on `window` and record the outcome. */
-  compareAndTrack(
-    window: { startLedger?: unknown; endLedger?: unknown },
-    batchA: ProviderEventBatch,
-    batchB: ProviderEventBatch,
-  ): ProviderComparisonResult {
-    const result = compareProviderEvents(window, batchA, batchB);
-    return this.record(result);
-  }
-
-  /** Record a pre-computed {@link ProviderComparisonResult}. */
-  record(result: ProviderComparisonResult): ProviderComparisonResult {
-    this.totalWindows += 1;
-    if (result.agrees) {
-      this.agreedWindows += 1;
-    } else {
-      this.disagreedWindows += 1;
-      if (this.maxHistory > 0) {
-        if (this.recentDisagreements.length >= this.maxHistory) {
-          this.recentDisagreements.shift();
-        }
-        this.recentDisagreements.push(result);
-      }
+  let seconds: number;
+  if (typeof headerValue === "number") {
+    seconds = headerValue;
+  } else if (typeof headerValue === "string") {
+    const trimmed = headerValue.trim();
+    if (!/^\d+(?:\.\d+)?$/.test(trimmed)) {
+      return null;
     }
-    return result;
+    seconds = Number(trimmed);
+  } else {
+    return null;
   }
 
-  /** True if at least one recorded window had a disagreement. */
-  hasDisagreement(): boolean {
-    return this.disagreedWindows > 0;
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return null;
   }
 
-  /** Return bounded summary metrics and recent disagreements. */
-  summary(): ProviderDisagreementSummary {
-    return {
-      totalWindows: this.totalWindows,
-      agreedWindows: this.agreedWindows,
-      disagreedWindows: this.disagreedWindows,
-      disagreementRate: this.totalWindows === 0 ? 0 : this.disagreedWindows / this.totalWindows,
-      recentDisagreements: [...this.recentDisagreements],
-    };
+  const delayMs = seconds * 1000;
+  if (!Number.isFinite(delayMs)) {
+    return null;
   }
 
-  /** Reset all tracked counts and history. */
-  clear(): void {
-    this.totalWindows = 0;
-    this.agreedWindows = 0;
-    this.disagreedWindows = 0;
-    this.recentDisagreements.length = 0;
-  }
+  return Math.min(delayMs, authoritativeMax);
 }
