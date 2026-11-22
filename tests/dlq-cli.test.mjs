@@ -18,6 +18,7 @@ import { promisify } from "node:util";
 
 import { createDeadLetterQueue } from "../dist/deadLetter.js";
 import {
+  DLQ_EXIT_CODES,
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
@@ -382,108 +383,107 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
 });
 
-test("list displays dead-letter age from oldest retained failure rather than file mtime", async () => {
-  const oldestAt = Date.parse("2026-10-18T10:00:00.000Z");
-  const newerAt = Date.parse("2026-10-18T12:00:00.000Z");
-  const nowAt = Date.parse("2026-10-18T12:15:00.000Z");
+// ── Stable exit codes & machine-readable stdout ───────────────────────────────
 
-  await withTempDlq(
-    async ({ filePath }) => {
-      // Touch file mtime to `nowAt` so mtime-based age would be 0s, not 2h 15m.
-      const touchTime = new Date(nowAt);
-      await utimes(filePath, touchTime, touchTime);
-
-      const textIo = captureIo();
-      const textRes = await runDlqCli({
-        argv: ["list", "--file", filePath],
-        now: () => nowAt,
-        stdout: textIo.out,
-        stderr: textIo.err,
-      });
-      assert.equal(textRes.exitCode, 0);
-      assert.match(textIo.stdout.join("\n"), /age=2h 15m/);
-
-      const jsonIo = captureIo();
-      const jsonRes = await runDlqCli({
+test("malformed JSON and invalid schema exit with code 3 and keep stdout empty", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    for (const badBody of ["{not-json", JSON.stringify({ version: 2, entries: [] }), JSON.stringify({ version: 1, entries: [{}] })]) {
+      await writeFile(filePath, badBody, "utf8");
+      const io = captureIo();
+      const { exitCode } = await runDlqCli({
         argv: ["list", "--file", filePath, "--json"],
-        now: () => nowAt,
-        stdout: jsonIo.out,
-        stderr: jsonIo.err,
+        stdout: io.out,
+        stderr: io.err,
       });
-      assert.equal(jsonRes.exitCode, 0);
-      const parsed = JSON.parse(jsonIo.stdout.join("\n"));
-      assert.equal(parsed.oldestEnqueuedAt, "2026-10-18T10:00:00.000Z");
-      assert.equal(parsed.oldestAgeMs, 2 * 3_600_000 + 15 * 60_000);
-      assert.equal(parsed.oldestAge, "2h 15m");
-      assert.equal(parsed.missingTimestamps, 0);
-    },
-    [
-      { ledger: 201, at: newerAt, text: "newer failure" },
-      { ledger: 202, at: oldestAt, text: "oldest failure" },
-    ],
-  );
+
+      assert.equal(exitCode, DLQ_EXIT_CODES.MALFORMED_FILE);
+      assert.equal(io.stdout.length, 0, "stdout must remain empty on error");
+      assert.match(io.stderr.join("\n"), /malformed/);
+    }
+  });
 });
 
-test("list and show handle missing legacy timestamps explicitly", async () => {
-  const nowAt = Date.parse("2026-10-18T12:00:00.000Z");
+test("access failure (e.g. EISDIR) exits with code 4 and keeps stdout empty", async () => {
+  await withTempDlq(async ({ directory }) => {
+    const io = captureIo();
+    const { exitCode } = await runDlqCli({
+      argv: ["list", "--file", directory, "--json"],
+      stdout: io.out,
+      stderr: io.err,
+    });
 
+    assert.equal(exitCode, DLQ_EXIT_CODES.ACCESS_ERROR);
+    assert.equal(io.stdout.length, 0, "stdout must remain empty on access failure");
+    assert.match(io.stderr.join("\n"), /cannot read dead-letter file/);
+  });
+});
+
+test("subprocess --json stdout is pure JSON without load logs, and exits 3/4 on failures", async () => {
+  await withTempDlq(
+    async ({ directory, filePath }) => {
+      const { stdout, stderr } = await execFileAsync(process.execPath, [
+        CLI_PATH,
+        "list",
+        "--file",
+        filePath,
+        "--json",
+      ]);
+      assert.equal(stderr.includes("[dlq]"), false);
+      const parsed = JSON.parse(stdout);
+      assert.equal(parsed.depth, 1);
+
+      await writeFile(filePath, "{broken", "utf8");
+      await assert.rejects(
+        () => execFileAsync(process.execPath, [CLI_PATH, "list", "--file", filePath, "--json"]),
+        (err) => err.code === 3 && err.stdout === "" && /malformed/.test(err.stderr),
+      );
+
+      await assert.rejects(
+        () => execFileAsync(process.execPath, [CLI_PATH, "list", "--file", directory, "--json"]),
+        (err) => err.code === 4 && err.stdout === "" && /cannot read/.test(err.stderr),
+      );
+    },
+    [{ ledger: 88 }],
+  );
+});
+test("list and show surface stored networkPassphrase and purge --yes can still remove entries", async () => {
   await withTempDlq(async ({ filePath }) => {
-    await writeFile(
+    const queue = createDeadLetterQueue({
       filePath,
-      JSON.stringify({
-        version: 1,
-        updatedAt: "2026-10-18T11:59:00.000Z",
-        entries: [
-          {
-            id: "market:301:claim_created:00000001",
-            source: "market",
-            ledger: 301,
-            eventName: "claim_created",
-            text: "legacy entry without timestamp",
-            attempts: 1,
-            lastError: "429",
-          },
-        ],
-      }),
-      "utf8",
-    );
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      now: () => 1_700_000_000_000,
+    });
+    await queue.load();
+    const entry = await queue.enqueue({
+      source: "market",
+      ledger: 90,
+      eventName: "claim_created",
+      text: "cross-network entry",
+      error: "Telegram 429",
+    });
 
     const listIo = captureIo();
     const listRes = await runDlqCli({
       argv: ["list", "--file", filePath],
-      now: () => nowAt,
       stdout: listIo.out,
       stderr: listIo.err,
     });
     assert.equal(listRes.exitCode, 0);
-    const listOut = listIo.stdout.join("\n");
-    assert.match(listOut, /age=unknown \(missing legacy timestamp\)/);
-    assert.match(listOut, /enqueued=unknown/);
-
-    const listJsonIo = captureIo();
-    await runDlqCli({
-      argv: ["list", "--file", filePath, "--json"],
-      now: () => nowAt,
-      stdout: listJsonIo.out,
-      stderr: listJsonIo.err,
-    });
-    const listParsed = JSON.parse(listJsonIo.stdout.join("\n"));
-    assert.equal(listParsed.oldestEnqueuedAt, null);
-    assert.equal(listParsed.oldestAgeMs, null);
-    assert.equal(listParsed.oldestAge, null);
-    assert.equal(listParsed.missingTimestamps, 1);
-    assert.equal(listParsed.entries[0].enqueuedAt, null);
+    assert.match(listIo.stdout.join("\n"), /network=Test SDF Network ; September 2015/);
 
     const showIo = captureIo();
     const showRes = await runDlqCli({
-      argv: ["show", "market:301:claim_created:00000001", "--file", filePath],
-      now: () => nowAt,
+      argv: ["show", entry.id, "--file", filePath],
       stdout: showIo.out,
       stderr: showIo.err,
     });
     assert.equal(showRes.exitCode, 0);
-    const showOut = showIo.stdout.join("\n");
-    assert.match(showOut, /enqueuedAt: unknown \(missing legacy timestamp\)/);
-    assert.match(showOut, /age:\s+unknown \(missing legacy timestamp\)/);
+    assert.match(showIo.stdout.join("\n"), /network:\s+Test SDF Network ; September 2015/);
+
+    const purgeRes = await purgeDeadLetters({ filePath, yes: true });
+    assert.equal(purgeRes.purged, 1);
+    assert.equal(purgeRes.remaining, 0);
   });
 });

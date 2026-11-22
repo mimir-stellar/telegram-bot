@@ -411,74 +411,82 @@ test("makeEntryId is stable for identical payloads and differs on content", () =
   assert.notEqual(a, d);
 });
 
-test("legacy entries missing or invalid enqueuedAt load as null and summarizeDeadLetterAge uses oldest failure", async () => {
-  await withQueue(async ({ queue, filePath }) => {
-    await writeFile(
+test("flush rejects replay of an entry from another network and leaves it unchanged", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-dlq-net-"));
+  const filePath = path.join(directory, "dead-letter.json");
+  try {
+    const testnetQueue = createDeadLetterQueue({
       filePath,
-      JSON.stringify({
-        version: 1,
-        updatedAt: "2026-10-18T12:00:00.000Z",
-        entries: [
-          {
-            id: "market:10:claim_created:00000001",
-            source: "market",
-            ledger: 10,
-            eventName: "claim_created",
-            text: "legacy missing timestamp",
-            attempts: 1,
-            lastError: "429",
-          },
-          {
-            id: "market:11:claim_created:00000002",
-            enqueuedAt: "2026-10-18T10:00:00.000Z",
-            source: "market",
-            ledger: 11,
-            eventName: "claim_created",
-            text: "newer failure",
-            attempts: 1,
-            lastError: "429",
-          },
-          {
-            id: "market:12:claim_created:00000003",
-            enqueuedAt: "2026-10-18T08:00:00.000Z",
-            source: "market",
-            ledger: 12,
-            eventName: "claim_created",
-            text: "oldest failure",
-            attempts: 2,
-            lastError: "429",
-          },
-          {
-            id: "market:13:claim_created:00000004",
-            enqueuedAt: "not-a-timestamp",
-            source: "market",
-            ledger: 13,
-            eventName: "claim_created",
-            text: "legacy invalid timestamp",
-            attempts: 1,
-            lastError: "429",
-          },
-        ],
-      }),
-      "utf8",
-    );
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      now: () => 1_700_000_000_000,
+    });
+    await testnetQueue.load();
+    await testnetQueue.enqueue({
+      source: "market",
+      ledger: 42,
+      eventName: "claim_created",
+      text: "testnet notification",
+      error: new Error("Telegram 429"),
+    });
 
-    await queue.load();
-    const loaded = queue.snapshot();
-    assert.equal(loaded.length, 3); // maxEntries is 3; drops index 0 (ledger 10)
-    assert.equal(loaded[0].enqueuedAt, "2026-10-18T10:00:00.000Z");
-    assert.equal(loaded[1].enqueuedAt, "2026-10-18T08:00:00.000Z");
-    assert.equal(loaded[2].enqueuedAt, null);
+    // Switch active configuration to mainnet and also add a legacy entry without networkPassphrase
+    // plus a mainnet entry to verify budget & compatibility.
+    const rawOnDisk = JSON.parse(await readFile(filePath, "utf8"));
+    rawOnDisk.entries.push({
+      id: "market:43:claim_created:11111111",
+      enqueuedAt: "2026-10-18T10:00:00.000Z",
+      source: "market",
+      ledger: 43,
+      eventName: "claim_created",
+      text: "legacy entry",
+      attempts: 1,
+      lastError: "Telegram 429",
+    });
+    await writeFile(filePath, JSON.stringify(rawOnDisk, null, 2), "utf8");
 
-    const nowMs = Date.parse("2026-10-18T11:30:00.000Z");
-    const summary = summarizeDeadLetterAge(loaded, nowMs);
-    assert.equal(summary.oldestEnqueuedAt, "2026-10-18T08:00:00.000Z");
-    assert.equal(summary.ageMs, 3.5 * 3_600_000);
-    assert.equal(summary.missingTimestamps, 1);
+    const mainnetQueue = createDeadLetterQueue({
+      filePath,
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Public Global Stellar Network ; September 2015",
+      now: () => 1_700_000_005_000,
+    });
+    await mainnetQueue.load();
+    await mainnetQueue.enqueue({
+      source: "market",
+      ledger: 44,
+      eventName: "claim_created",
+      text: "mainnet notification",
+      error: new Error("Telegram 503"),
+    });
 
-    const onlyMissing = summarizeDeadLetterAge([{ enqueuedAt: null }], nowMs);
-    assert.equal(onlyMissing.oldestEnqueuedAt, null);
-    assert.equal(onlyMissing.ageMs, null);
-    assert.equal(onlyMissing.missingTimestamps, 1);
-  });
+    const sentLedgers = [];
+    const result = await mainnetQueue.flush(async (_text, entry) => {
+      sentLedgers.push(entry.ledger);
+    }, 2);
+
+    // Legacy (43) and matching mainnet (44) replayed; testnet (42) rejected and left untouched.
+    assert.deepEqual(sentLedgers, [43, 44]);
+    assert.equal(result.sent, 2);
+    assert.equal(result.remaining, 1);
+    assert.equal(result.rejectedNetworkMismatch, 1);
+
+    const persisted = JSON.parse(await readFile(filePath, "utf8"));
+    assert.equal(persisted.entries.length, 1);
+    assert.deepEqual(persisted.entries[0], {
+      id: rawOnDisk.entries[0].id,
+      enqueuedAt: rawOnDisk.entries[0].enqueuedAt,
+      source: "market",
+      ledger: 42,
+      eventName: "claim_created",
+      text: "testnet notification",
+      attempts: 1,
+      lastError: "Telegram 429",
+      networkPassphrase: "Test SDF Network ; September 2015",
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
 });

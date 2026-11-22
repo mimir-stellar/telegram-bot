@@ -65,12 +65,22 @@ function mockedBot(deps) {
   const handlers = new Map();
   const bot = {
     command(name, handler) {
-      handlers.set(name, handler);
+      handlers.set(`cmd:${name}`, handler);
+    },
+    on(event, handler) {
+      handlers.set(`on:${event}`, handler);
     },
     // Stub for the pause confirmation inline-keyboard callback registrations.
     callbackQuery(_filter, _handler) {},
   };
   registerCommandHandlers(bot, deps);
+  // Legacy alias: expose command handlers under their bare name so existing
+  // tests that use handlers.get("resume") etc. still work.
+  for (const [key, fn] of handlers) {
+    if (key.startsWith("cmd:")) {
+      handlers.set(key.slice(4), fn);
+    }
+  }
   return { bot, handlers };
 }
 

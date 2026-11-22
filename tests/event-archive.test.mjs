@@ -7,6 +7,8 @@ import {
   createEventArchive,
   MalformedArchiveRecordError,
   readArchive,
+  writeArchiveManifest,
+  verifyArchiveManifest,
 } from "../dist/stellar/archive.js";
 import { withTempDataDir } from "./helpers/temp-data.mjs";
 
@@ -212,6 +214,64 @@ test("archive reports malformed record line without payload and retains valid pr
     assert.equal(retainedError.lineNumber, 3);
     assert.equal(retainedEvents.length, 1);
     assert.equal(retainedEvents[0].eventId, "event-1");
+  });
+});
+
+test("manifest verification accepts an intact hash-chained archive", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-archive");
+    const archive = createEventArchive({ dir: archiveDir });
+    await archive.append([makeDummyEvent(1), makeDummyEvent(2), makeDummyEvent(3)]);
+    await archive.close();
+
+    const manifest = await writeArchiveManifest(archiveDir, {
+      network: "testnet",
+      ledgerMin: 101,
+      ledgerMax: 103,
+    });
+    assert.equal(manifest.recordCount, 3);
+    assert.equal(manifest.network, "testnet");
+
+    const result = await verifyArchiveManifest(archiveDir);
+    assert.equal(result.ok, true);
+    assert.equal(result.recordCount, 3);
+  });
+});
+
+test("manifest verification rejects altered, reordered and missing records", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-archive");
+    const archive = createEventArchive({ dir: archiveDir });
+    await archive.append([makeDummyEvent(1), makeDummyEvent(2), makeDummyEvent(3)]);
+    await archive.close();
+    await writeArchiveManifest(archiveDir, {
+      network: "testnet",
+      ledgerMin: 101,
+      ledgerMax: 103,
+    });
+
+    const files = (await import("node:fs/promises"))
+      .readdir(archiveDir)
+      .then((names) => names.filter((n) => n.endsWith(".jsonl")));
+    const [fileName] = await files;
+    const filePath = path.join(archiveDir, fileName);
+    const original = (await import("node:fs/promises")).readFile(filePath, "utf8");
+    const lines = (await original).split("\n").filter(Boolean);
+
+    // Altered record
+    await writeFile(filePath, lines.map((l, i) => (i === 1 ? l.replace("event-2", "event-X") : l)).join("\n") + "\n", "utf8");
+    const altered = await verifyArchiveManifest(archiveDir);
+    assert.equal(altered.ok, false);
+
+    // Reordered records
+    await writeFile(filePath, [lines[1], lines[0], lines[2]].join("\n") + "\n", "utf8");
+    const reordered = await verifyArchiveManifest(archiveDir);
+    assert.equal(reordered.ok, false);
+
+    // Missing record
+    await writeFile(filePath, [lines[0], lines[2]].join("\n") + "\n", "utf8");
+    const missing = await verifyArchiveManifest(archiveDir);
+    assert.equal(missing.ok, false);
   });
 });
 

@@ -79,7 +79,7 @@ The bot reads only public chain data. It does not hold signing keys or any crede
 - **What it contains**: Ring buffer of recent console lines:
   - Bot log output (errors, warnings, info)
   - May include chat ids and Telegram user ids in error text
-- **Retention**: In-memory only; lost on process restart. Bounded size (default 500 lines, configurable via `LOG_BUFFER_LINES`; set to 0 to disable)
+- **Retention**: In-memory only; lost on process restart. Bounded size (default 500 lines, configurable via `LOG_BUFFER_LINES`; set to 0 to disable). Operator exports (`/export`, `GET /health/diag`) report retained vs. omitted line counts, truncation status, and retained ISO-8601 time bounds while staying within `MAX_EXPORT_CHARS` (32,000 characters, well within Telegram size limits)
 - **Redaction**: Before storage, log lines are redacted to remove:
   - Bot tokens
   - Chat ids

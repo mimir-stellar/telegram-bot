@@ -1,15 +1,18 @@
 /**
  * Text sanitization for user-generated strings in notifications.
  *
- * Removes bidirectional (bidi) override/embedding controls, zero-width joiners
- * outside emoji sequences, and C0/C1 control characters (except newline) to prevent
- * visual spoofing and formatting distortion in Telegram messages.
+ * Removes bidirectional (bidi) override/embedding/isolate controls and bidi
+ * marks, zero-width joiners outside emoji sequences, and C0/C1 control
+ * characters (except newline) to prevent visual spoofing and formatting
+ * distortion in Telegram messages.
  */
 
 import { Logger } from "../logger.js";
 
 /**
- * Unicode Bidirectional Control characters:
+ * Unicode Bidirectional Control characters plus the two bidi marks:
+ * - U+200E: LEFT-TO-RIGHT MARK (LRM)
+ * - U+200F: RIGHT-TO-LEFT MARK (RLM)
  * - U+202A: LEFT-TO-RIGHT EMBEDDING (LRE)
  * - U+202B: RIGHT-TO-LEFT EMBEDDING (RLE)
  * - U+202C: POP DIRECTIONAL FORMATTING (PDF)
@@ -20,7 +23,7 @@ import { Logger } from "../logger.js";
  * - U+2068: FIRST STRONG ISOLATE (FSI)
  * - U+2069: POP DIRECTIONAL ISOLATE (PDI)
  */
-const BIDI_CONTROLS = /[\u202A-\u202E\u2066-\u2069]/gu;
+const BIDI_CONTROLS = /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu;
 
 /**
  * C0 controls (\u0000-\u001F, \u007F) and C1 controls (\u0080-\u009F), except newline (\n, \u000A).
@@ -38,16 +41,23 @@ const CONTROLS_EXCEPT_NEWLINE = /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/gu;
 const EMOJI_ZWJ_SEQUENCE = /\p{Extended_Pictographic}(?:\uFE0F|\uFE0E|[\u{1F3FB}-\u{1F3FF}])?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F|\uFE0E|[\u{1F3FB}-\u{1F3FF}]?))+/gu;
 
 /**
- * Remove lone or non-emoji zero-width joiners (ZWJ, U+200D) while preserving valid
- * emoji sequences (such as family, professions, flags, etc.).
+ * Remove every bidirectional control or bidi mark from `text`.
+ *
+ * This is the contract for untrusted direction handling. It removes exactly
+ * `U+200E`, `U+200F`, `U+202A–U+202E`, and `U+2066–U+2069`, and nothing else:
+ * legitimate RTL scripts (Arabic, Hebrew) and every other codepoint pass
+ * through unchanged.
  */
+export function stripBidiControls(text: string): string {
+  if (!text) return text;
+  return text.replace(BIDI_CONTROLS, "");
+}
+
 function sanitizeZwj(text: string): { result: string; removed: number } {
   if (!text.includes("\u200D")) {
     return { result: text, removed: 0 };
   }
 
-  // Preserve emoji ZWJ sequences by replacing them with placeholders, removing
-  // all remaining ZWJ characters, and then restoring the preserved sequences.
   const preservedSequences: string[] = [];
   const placeholderPrefix = "\uE000__ZWJ_EMOJI_";
   const placeholderSuffix = "__\uE001";
@@ -79,7 +89,8 @@ function sanitizeZwj(text: string): { result: string; removed: number } {
  * Sanitize untrusted or user-supplied text before clipping and notification formatting.
  *
  * Removes:
- * - Bidirectional override/embedding/isolate controls: U+202A-U+202E, U+2066-U+2069
+ * - Bidirectional override/embedding/isolate controls and bidi marks:
+ *   U+200E, U+200F, U+202A–U+202E, U+2066–U+2069
  * - Zero-width joiners (U+200D) that do not belong to emoji sequences
  * - C0 and C1 control characters except newline (\n)
  *
@@ -97,7 +108,7 @@ export function sanitizeUserText(text: string): string {
 
   let strippedCount = 0;
 
-  // 1. Remove bidi controls
+  // 1. Remove bidi controls and bidi marks
   const withoutBidi = text.replace(BIDI_CONTROLS, () => {
     strippedCount++;
     return "";

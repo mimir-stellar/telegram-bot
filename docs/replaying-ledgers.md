@@ -70,16 +70,19 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--send` | Boolean flag | Actually dispatch messages to Telegram. Requires valid Telegram credentials in `.env` or process environment. | `false` (dry-run mode is active by default) |
 | `--dry-run` | Boolean flag | Explicit dry-run flag accepted by CLI parser. Dry-run is active whenever `--send` is omitted. | `true` |
 | `--pages` | `<number>` | Maximum RPC pages to walk per contract. Must be $\ge 1$. | `20` (`EVENT_MAX_PAGES`) |
+| `--max-events` | `<number>` | Maximum events to process in this run across targets. Must be a positive integer ($\ge 1$). Persists a resumable checkpoint when `--progress-file` is set and marks `budgetExhausted: true`, `completed: false`. | Unlimited |
 | `--cap` | `<number>` | Maximum notifications to send/count per contract. | `config.maxNotificationsPerCycle` in `--send` mode; `20` in dry-run mode |
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
+| `--progress-file` | `<path>` | Persist per-page checkpoint state (`mimir-replay-progress-v1`) for resumable replays. Includes a normalized `filterFingerprint` (network, range, contracts, and contract IDs); incompatible resume attempts are rejected with exit code `2` and an actionable message. | None |
+| `--rpm` | `<number>` | Maximum RPC requests per minute across health and event fetches. Must be $> 0$. | Unlimited |
 
 ### Exit Codes
 
 * **`0`:** Scan completed successfully (even if some events were skipped, deduplicated, or capped).
 * **`1`:** Fatal runtime error (RPC unreachable, invalid network passphrase, or missing config in `--send` mode).
-* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, or invalid `--contract`).
+* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, invalid `--contract`/`--rpm`, or an incompatible/corrupt `--progress-file`).
 
 ---
 
