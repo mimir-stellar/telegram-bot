@@ -201,6 +201,7 @@ A single poll cycle executes four distinct phases ([`src/poller.ts`](../src/poll
 | **20** | **Single-cycle burst exceeds `MAX_NOTIFICATIONS_PER_CYCLE` (default `20`)** | First `20` notifications for the target are sent; remaining events in that target's scan batch are skipped (`eventsSkipped++`, `notification_cap_reached`); cursor still advances to `scan.lastCursor`. | First `MAX_NOTIFICATIONS_PER_CYCLE` events: **delivered**.<br>Overflow events in the same scan batch: **missed (dropped)**. | [`src/poller.ts`](../src/poller.ts#L1725-L1760), [`src/poller.ts`](../src/poller.ts#L2214-L2233)<br>Test: `"Caps notifications per cycle and skips overflow without failing"` ([`tests/poller_resilience.test.mjs`](../tests/poller_resilience.test.mjs#L222-L260)) |
 | **21** | **Contract backlog spans more than `EVENT_MAX_PAGES` (`20` pages $\times$ `200` events = `4,000` raw events)** | `paginatedGetEvents` stops at 20 pages (`truncated = true`), returns `lastCursor` of page 20, notifies up to `MAX_NOTIFICATIONS_PER_CYCLE` for that slice, saves page 20's cursor, and continues from page 21 on the next poll cycle. | Events beyond page 20 are **delayed** to subsequent cycles (subject to per-cycle `MAX_NOTIFICATIONS_PER_CYCLE` cap on each cycle). | [`src/stellar/events.ts`](../src/stellar/events.ts#L45-L51), [`src/stellar/events.ts`](../src/stellar/events.ts#L275-L278), [`src/poller.ts`](../src/poller.ts#L2180-L2189)<br>Test: `"Walks multi-page event streams and resumes from the final cursor"` ([`tests/cursor-restart.test.mjs`](../tests/cursor-restart.test.mjs#L117-L154)) |
 | **22** | **Second bot instance started against the same `CURSOR_FILE`** | `acquireInstanceLock` checks `${CURSOR_FILE}.lock`. If locking PID is alive (`isProcessAlive`), startup throws `InstanceLockError` before reading or writing `CURSOR_FILE`. If locking PID died (`SIGKILL`), stale lock is stolen cleanly. | **Prevented (no concurrent double-delivery)**; stale lock after `SIGKILL` recovers automatically. | [`src/instanceLock.ts`](../src/instanceLock.ts#L103-L169), [`src/poller.ts`](../src/poller.ts#L2415-L2429)<br>Tests: `"blocks a second instance while the first holds the lock"`, `"steals a stale lock left behind by a dead PID"`, `"poller refuses to start when another instance holds the cursor lock"` ([`tests/instance-lock.test.mjs`](../tests/instance-lock.test.mjs#L33-L113)) |
+| **23** | **Process crashes mid-way through delivering a multi-page digest across destinations** | `FileDigestDeliveryStore` persists `intent` before sending each page and `confirmed` after. On restart, `recoverMultiPageDigest` skips confirmed pages (avoiding duplicates), reports unconfirmed intents as uncertain sends, and resumes delivering remaining unattempted pages. | **No duplicate delivery of confirmed pages**; uncertain sends surfaced and reported explicitly. | [`src/notifications/schedule.ts`](../src/notifications/schedule.ts#L330-L790), [`src/notifications/digest-grouping.ts`](../src/notifications/digest-grouping.ts#L80-L160)<br>Tests: `"recovery after restart: avoids resending confirmed pages while reporting uncertain sends"` ([`tests/digest-recovery.test.mjs`](../tests/digest-recovery.test.mjs)) |
 
 ---
 
@@ -213,12 +214,15 @@ A single poll cycle executes four distinct phases ([`src/poller.ts`](../src/poll
 - [`src/poller.ts`](../src/poller.ts) — `createPoller`, `cycle`, `notify`, `sendWithRetry`, `flushDeadLetter`, `loadCursors`, `saveCursors`, `quarantineCorruptCursorFile`, `enforceCursorWindow`, `rewindFromRetainedFloor`, `shutdown`
 - [`src/deadLetter.ts`](../src/deadLetter.ts) — `createDeadLetterQueue`, `makeEntryId`, `DEAD_LETTER_MAX_ENTRIES`, `DEAD_LETTER_MAX_ATTEMPTS`
 - [`src/instanceLock.ts`](../src/instanceLock.ts) — `acquireInstanceLock`, `InstanceLockError`, `isProcessAlive`
+- [`src/notifications/digest-grouping.ts`](../src/notifications/digest-grouping.ts) — `groupDigestEvents`, `paginateDigestGroups`, `createMultiPageDigest`
+- [`src/notifications/schedule.ts`](../src/notifications/schedule.ts) — `createScheduler`, `FileDigestDeliveryStore`, `deliverMultiPageDigest`, `recoverMultiPageDigest`
 - [`src/index.ts`](../src/index.ts) — `SIGINT` / `SIGTERM` graceful shutdown and force-exit handlers
 
 ### Verification Test Suites
 - [`tests/ordering.test.mjs`](../tests/ordering.test.mjs) — Deterministic comparator (`ledger`, `transactionIndex`, `operationIndex`, `eventId`, `txHash`, stability, TOID parsing)
 - [`tests/dedup.test.mjs`](../tests/dedup.test.mjs) — `eventKey` derivation hierarchy, `EventDedupWindow` FIFO eviction, capacity `0`, oversized keys, and `recentEventIds` persistence across restarts
 - [`tests/page-dedup.test.mjs`](../tests/page-dedup.test.mjs) — Cross-page and cross-cycle deduplication in `readContractEvents` / `paginatedGetEvents`
+- [`tests/digest-recovery.test.mjs`](../tests/digest-recovery.test.mjs) — Multi-page digest delivery recovery, skipping confirmed pages, uncertain send reporting, store compaction
 - [`tests/deadLetter.test.mjs`](../tests/deadLetter.test.mjs) — DLQ persistence, deterministic entry deduplication, `maxEntries` FIFO eviction, `maxAttempts` poison drop, corrupt file quarantine
 - [`tests/poller-dlq.test.mjs`](../tests/poller-dlq.test.mjs) — End-to-end poller DLQ enqueue on failed send, next-cycle replay, and `maxAttempts` drop
 - [`tests/poller_resilience.test.mjs`](../tests/poller_resilience.test.mjs) — RPC failure recovery, `sendWithRetry` transient retries, HTTP 429 `Retry-After`, partial delivery cursor advance, and `MAX_NOTIFICATIONS_PER_CYCLE` cap
@@ -229,3 +233,52 @@ A single poll cycle executes four distinct phases ([`src/poller.ts`](../src/poll
 - [`tests/cursor-backup.test.mjs`](../tests/cursor-backup.test.mjs) — Atomic `.tmp` write-then-rename and `.bak` backup preservation
 - [`tests/shutdown.test.mjs`](../tests/shutdown.test.mjs) — Graceful shutdown mid-RPC read, mid-`notify()` batch abort, and shutdown timeout dirty-cursor flush
 - [`tests/instance-lock.test.mjs`](../tests/instance-lock.test.mjs) — Single-instance lock enforcement and dead-PID stale lock recovery
+
+---
+
+## Offline Delivery Reconciliation Report
+
+`src/notifications/delivery-report.ts` provides a read-only reconciliation of the two
+delivery-tracking stores — the send journal and the message index — to surface delivery
+inconsistencies without contacting Telegram or mutating any file.
+
+### What it compares
+
+| Store | Contains |
+|---|---|
+| Send journal (`SEND_JOURNAL_FILE`) | Intent/done pairs. Pending intents (intent with no matching done) represent sends whose outcome is unknown. |
+| Message index (`MESSAGE_INDEX_FILE`) | `(chatId, ref) → messageId`. A record here means Telegram returned a message ID, confirming delivery. |
+
+### Inconsistency kinds
+
+**`UNRESOLVED_INTENT`** — The journal has a pending intent for `(source, ledger)` but the
+message index has no corresponding record.  The notification may or may not have reached
+Telegram; the process was killed between the `sendMessage` call and the `done` write.
+Operators should decide whether to re-send manually or let the bot's crash-recovery path
+handle it on the next restart.
+
+**`ORPHANED_INDEX`** — The message index has a record for `(ref)` but the journal has no
+pending intent for the same `(source, ledger)`.  This is the normal post-delivery state:
+the intent was settled by a `done` and compacted away.  It is surfaced so operators can
+confirm the population is expected.
+
+### Programmatic API
+
+```typescript
+import { buildDeliveryReport } from "./src/notifications/delivery-report.js";
+
+const report = await buildDeliveryReport({
+  journalFile: "./data/send-journal.jsonl",
+  indexFile:   "./data/message-index.json",
+});
+// report.readOnly === true — no mutations made
+// report.unresolvedIntents — count of UNRESOLVED_INTENT entries
+// report.orphanedIndexEntries — count of ORPHANED_INDEX entries
+// report.inconsistencies — full detail array
+```
+
+### Tests
+
+[`tests/delivery-report.test.mjs`](../tests/delivery-report.test.mjs) covers read-only
+guarantee, UNRESOLVED\_INTENT detection, settled-intent clean state, ORPHANED\_INDEX
+detection, mixed inconsistencies, and both-files-absent boundary.

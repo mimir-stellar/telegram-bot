@@ -5,7 +5,7 @@
   "description": "Version 1 baseline for GET /health and GET /healthz. Fields in this schema are required and typed; additional fields are compatible additions. Removing or changing a declared field's type is breaking and requires a new contract version.",
   "type": "object",
   "additionalProperties": true,
-  "required": ["ok", "status", "service", "version", "network", "uptimeMs", "checkedAt", "poller", "config"],
+  "required": ["ok", "status", "service", "version", "network", "uptimeMs", "checkedAt", "poller", "dependencies", "config"],
   "properties": {
     "ok": { "type": "boolean", "description": "True exactly when status is \"ok\"." },
     "status": {
@@ -195,6 +195,66 @@
         },
         "persistentVolumeAvailable": { "type": "boolean" },
         "persistentVolumeError": { "type": ["string", "null"] }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Per-dependency readiness, separating why the bot is not ready into the four dependencies it relies on. Additive detail; the overall ok/status are unchanged. Reasons are built from counts and public source names only — never a token, a chat id, or another private identifier.",
+      "required": ["rpc", "cursor", "route", "delivery"],
+      "properties": {
+        "rpc": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Stellar RPC reachability. Not ready when the circuit breaker is open, consecutive failures exceed the budget, or (after the first success) the last successful poll is stale.",
+          "required": ["ready", "reason"],
+          "properties": {
+            "ready": { "type": "boolean", "description": "True when this dependency is ready to serve." },
+            "reason": {
+              "type": ["string", "null"],
+              "description": "Value-free reason this dependency is not ready, or null when ready. Never a token, chat id, or other private identifier."
+            }
+          }
+        },
+        "cursor": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Cursor / resume-position usability. Not ready when any watched target's cursor is stale (RPC rejected) or stalled (not advancing while behind the tip).",
+          "required": ["ready", "reason"],
+          "properties": {
+            "ready": { "type": "boolean", "description": "True when this dependency is ready to serve." },
+            "reason": {
+              "type": ["string", "null"],
+              "description": "Value-free reason this dependency is not ready, or null when ready. Never a token, chat id, or other private identifier."
+            }
+          }
+        },
+        "route": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Telegram route configuration: a destination is configured for each watched contract. Reasons name the source (market/squad), never the chat id.",
+          "required": ["ready", "reason"],
+          "properties": {
+            "ready": { "type": "boolean", "description": "True when this dependency is ready to serve." },
+            "reason": {
+              "type": ["string", "null"],
+              "description": "Value-free reason this dependency is not ready, or null when ready. Never a token, chat id, or other private identifier."
+            }
+          }
+        },
+        "delivery": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Telegram delivery. Not ready when sends are parked in the dead-letter queue. Counts only; never message text or a destination.",
+          "required": ["ready", "reason"],
+          "properties": {
+            "ready": { "type": "boolean", "description": "True when this dependency is ready to serve." },
+            "reason": {
+              "type": ["string", "null"],
+              "description": "Value-free reason this dependency is not ready, or null when ready. Never a token, chat id, or other private identifier."
+            }
+          }
+        }
       }
     },
     "config": {

@@ -7,11 +7,14 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import {
+  defaultRedactionProbes,
   formatCheckLine,
   parseSemver,
   runDoctor,
+  runRedactionSelfCheck,
   satisfiesNodeEngine,
 } from "../dist/doctor-cli.js";
+import { Logger } from "../dist/logger.js";
 
 const execFileP = promisify(execFile);
 
@@ -327,6 +330,90 @@ test("CLI execution exits 0 on valid configuration", async () => {
     );
 
     assert.match(stdout, /\[OK\]/);
+    assert.match(stdout, /Redaction policy self-check passed/);
     assert.doesNotMatch(stdout, /\[FAIL\]/);
+  });
+});
+
+test("runRedactionSelfCheck passes across all configured log formats without leaking probes", () => {
+  const probes = defaultRedactionProbes();
+  const result = runRedactionSelfCheck({ probes });
+
+  assert.equal(result.name, "redaction-policy");
+  assert.equal(result.status, "OK");
+  assert.match(result.message, /text, json/);
+
+  const line = formatCheckLine(result);
+  for (const probe of probes) {
+    assert.equal(result.message.includes(probe.value), false);
+    assert.equal(line.includes(probe.value), false);
+    if (probe.canary) {
+      assert.equal(result.message.includes(probe.canary), false);
+      assert.equal(line.includes(probe.canary), false);
+    }
+  }
+});
+
+test("runRedactionSelfCheck fails with field names only when a probe leaks", () => {
+  const leakyValue = ["unredacted", "-synthetic-", "probe-value-99"].join("");
+  const result = runRedactionSelfCheck({
+    formats: ["text", "json"],
+    probes: [
+      ...defaultRedactionProbes(),
+      { field: "custom_unredacted_field", value: leakyValue, register: false },
+    ],
+  });
+
+  assert.equal(result.name, "redaction-policy");
+  assert.equal(result.status, "FAIL");
+  assert.match(result.message, /leaked fields: custom_unredacted_field/);
+  assert.equal(result.message.includes(leakyValue), false);
+
+  const line = formatCheckLine(result);
+  assert.equal(line.includes(leakyValue), false);
+});
+
+test("runRedactionSelfCheck restores previous Logger configuration", () => {
+  Logger.reset();
+  Logger.configure({ level: "warn", format: "json" });
+  try {
+    const result = runRedactionSelfCheck();
+    assert.equal(result.status, "OK");
+    assert.equal(Logger.getLevel(), "warn");
+    assert.equal(Logger.getFormat(), "json");
+  } finally {
+    Logger.reset();
+  }
+});
+
+test("runDoctor fails overall report when redaction self-check detects a leak", async () => {
+  await withTempDir(async (dir) => {
+    const leakyValue = ["doctor-leak-", "sentinel-value-42"].join("");
+    const envFile = path.join(dir, ".env");
+    await writeFile(
+      envFile,
+      [
+        `MARKET_CONTRACT_ID=${VALID_MARKET_ID}`,
+        `SQUAD_CONTRACT_ID=${VALID_SQUAD_ID}`,
+        `BOT_TOKEN=${validTestAuth}`,
+        `TELEGRAM_CHAT_ID=-1001234567890`,
+      ].join("\n"),
+    );
+
+    const report = await runDoctor({
+      cwd: dir,
+      nodeVersion: "v20.18.0",
+      packageJsonPath: path.resolve("package.json"),
+      redactionProbes: [
+        ...defaultRedactionProbes(),
+        { field: "leaked_probe_field", value: leakyValue, register: false },
+      ],
+    });
+
+    assert.equal(report.ok, false);
+    const redactionCheck = report.checks.find((c) => c.name === "redaction-policy");
+    assert.equal(redactionCheck.status, "FAIL");
+    assert.match(redactionCheck.message, /leaked_probe_field/);
+    assert.equal(redactionCheck.message.includes(leakyValue), false);
   });
 });
