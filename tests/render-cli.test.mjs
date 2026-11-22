@@ -114,7 +114,7 @@ test("snapshot: renderEvent renders expected MarkdownV2, plain-text and explorer
     bothOutput,
     [
       "=== MarkdownV2 ===",
-      "⚔️ *Claim \\#7 challenged*\nStake: *2\\.0000000 USDC*\nChallenger: `GABCD…TUVW`\n_ledger 4226692_ · [tx](https://stellar.expert/explorer/testnet/tx/aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899)",
+      "⚔️ *Claim \\#7 challenged*\nStake: *⁨2\\.0000000 USDC⁩*\nChallenger: `GABCD…TUVW`\n_ledger 4226692_ · [tx](https://stellar.expert/explorer/testnet/tx/aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899)",
       "",
       "=== Plain Text ===",
       "Claim #7 challenged\nStake: 2.0000000 USDC\nChallenger: GABCD…TUVW\nledger 4226692\ntx: https://stellar.expert/explorer/testnet/tx/aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",

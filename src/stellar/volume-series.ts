@@ -1,10 +1,30 @@
-import type { DecodedEvent } from "./decode.js";
+/**
+ * Time-bucketed volume series for challenge stakes and squad deposits.
+ *
+ * Derives hourly and daily volume aggregations from observed chain events.
+ *
+ * Invariants:
+ * - Avoids floating-point accumulation: amounts are strictly parsed and accumulated
+ *   as non-negative atomic integer USDC units (`bigint`).
+ * - Canonical 7-decimal USDC formatting (`formatUsdc`) is applied only at the
+ *   export boundary (`exportVolumeBucket`, `exportVolumeBuckets`, `exportVolumeSeries`,
+ *   `renderVolumeSeries`).
+ * - Zero-fills missing intermediate time buckets in UTC.
+ * - Deterministic ordering ascending by bucket timestamp.
+ */
+
+import { formatUsdc, type DecodedEvent } from "./decode.js";
 
 export type VolumeBucketUnit = "hour" | "day";
 
 export interface VolumeSeriesOptions {
   bucket: VolumeBucketUnit;
 }
+
+/**
+ * Summary of the volume series. Conflicting terminal events are not silently
+ * resolved; they are reported via `inconsistencies`.
+ */
 
 export interface VolumeBucket {
   /** UTC ISO string representing the start of the bucket (e.g. "2026-10-20T16:00:00.000Z" or "2026-10-20T00:00:00.000Z"). */
@@ -25,6 +45,10 @@ export interface VolumeBucket {
   depositCount: number;
   /** Total events aggregated into this bucket. */
   eventCount: number;
+  /** Formatted 7-decimal USDC challenge stake string (accessible at export boundary). */
+  challengeStakeUsdc?: string;
+  /** Formatted 7-decimal USDC squad deposit string (accessible at export boundary). */
+  squadDepositUsdc?: string;
 }
 
 export interface VolumeSeriesResult {
@@ -34,6 +58,42 @@ export interface VolumeSeriesResult {
   totalChallengeStake: string;
   /** Total squad deposit across all buckets as bigint string. */
   totalSquadDeposit: string;
+  /** Count of events skipped due to missing or invalid `at` timestamp. */
+  skippedWithoutAt: number;
+  /** Total valid events processed. */
+  processedEvents: number;
+  /** Total challenge stake across all buckets as bigint. */
+  totalChallengeStakeBigInt?: bigint;
+  /** Total squad deposit across all buckets as bigint. */
+  totalSquadDepositBigInt?: bigint;
+  /** Total challenge stake formatted as 7-decimal USDC string. */
+  totalChallengeStakeUsdc?: string;
+  /** Total squad deposit formatted as 7-decimal USDC string. */
+  totalSquadDepositUsdc?: string;
+}
+
+export interface ExportedVolumeBucket extends VolumeBucket {
+  /** Canonical 7-decimal USDC representation of challenge stake (e.g. "2.0000000"). */
+  challengeStakeUsdc: string;
+  /** Canonical 7-decimal USDC representation of squad deposit (e.g. "1.5000000"). */
+  squadDepositUsdc: string;
+}
+
+export interface ExportedVolumeSeriesResult {
+  /** Contiguous time buckets with decimal formatted USDC amounts. */
+  buckets: ExportedVolumeBucket[];
+  /** Total challenge stake across all buckets as bigint string. */
+  totalChallengeStake: string;
+  /** Total squad deposit across all buckets as bigint string. */
+  totalSquadDeposit: string;
+  /** Total challenge stake formatted as 7-decimal USDC string (e.g. "2.0000000"). */
+  totalChallengeStakeUsdc: string;
+  /** Total squad deposit formatted as 7-decimal USDC string (e.g. "2.0000000"). */
+  totalSquadDepositUsdc: string;
+  /** Total challenge stake as bigint. */
+  totalChallengeStakeBigInt: bigint;
+  /** Total squad deposit as bigint. */
+  totalSquadDepositBigInt: bigint;
   /** Count of events skipped due to missing or invalid `at` timestamp. */
   skippedWithoutAt: number;
   /** Total valid events processed. */
@@ -54,10 +114,42 @@ export function floorToBucketUtc(unixSeconds: number, bucket: VolumeBucketUnit):
 }
 
 /**
+ * Parse an event stake or deposit amount as a non-negative integer bigint.
+ *
+ * Avoids floating-point accumulation by discarding non-integers, floats, negative amounts,
+ * and unsafe integers exceeding Number.MAX_SAFE_INTEGER.
+ */
+export function toIntegerAmount(val: unknown): bigint {
+  if (typeof val === "bigint") {
+    return val >= 0n ? val : 0n;
+  }
+  if (typeof val === "number") {
+    if (Number.isSafeInteger(val) && val >= 0) {
+      return BigInt(val);
+    }
+    return 0n;
+  }
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (/^\d+$/.test(trimmed)) {
+      try {
+        const parsed = BigInt(trimmed);
+        return parsed >= 0n ? parsed : 0n;
+      } catch {
+        return 0n;
+      }
+    }
+    return 0n;
+  }
+  return 0n;
+}
+
+/**
  * Produce time-bucketed volume series for stakes and deposits.
  *
  * Empty buckets between earliest and latest events are filled with zero values.
  * Events without a valid `at` timestamp are skipped and counted in `skippedWithoutAt`.
+ * Accumulates volume strictly using integer atomic USDC amounts (bigint).
  */
 export function volumeSeries(
   events: readonly DecodedEvent[] | null | undefined,
@@ -74,13 +166,15 @@ export function volumeSeries(
   let processedEvents = 0;
 
   if (!events || !Array.isArray(events)) {
-    return {
+    const emptyResult: VolumeSeriesResult = {
       buckets: [],
       totalChallengeStake: "0",
       totalSquadDeposit: "0",
       skippedWithoutAt: 0,
       processedEvents: 0,
     };
+    attachSeriesMetadata(emptyResult, 0n, 0n);
+    return emptyResult;
   }
 
   interface IntermediateBucket {
@@ -125,27 +219,11 @@ export function volumeSeries(
 
     if (payloadName === "claim_challenged") {
       const stake = (payload as { stake?: unknown }).stake;
-      if (typeof stake === "bigint") {
-        challengeStakeDelta = stake;
-      } else if (typeof stake === "string" || typeof stake === "number") {
-        try {
-          challengeStakeDelta = BigInt(stake);
-        } catch {
-          challengeStakeDelta = 0n;
-        }
-      }
+      challengeStakeDelta = toIntegerAmount(stake);
       isChallenge = true;
     } else if (payloadName === "deposited") {
       const amount = (payload as { amount?: unknown }).amount;
-      if (typeof amount === "bigint") {
-        squadDepositDelta = amount;
-      } else if (typeof amount === "string" || typeof amount === "number") {
-        try {
-          squadDepositDelta = BigInt(amount);
-        } catch {
-          squadDepositDelta = 0n;
-        }
-      }
+      squadDepositDelta = toIntegerAmount(amount);
       isDeposit = true;
     }
 
@@ -184,13 +262,15 @@ export function volumeSeries(
   }
 
   if (minBucketStart === null || maxBucketStart === null) {
-    return {
+    const emptyResult: VolumeSeriesResult = {
       buckets: [],
       totalChallengeStake: "0",
       totalSquadDeposit: "0",
       skippedWithoutAt,
       processedEvents,
     };
+    attachSeriesMetadata(emptyResult, 0n, 0n);
+    return emptyResult;
   }
 
   // Generate contiguous buckets from minBucketStart to maxBucketStart (zero-filled)
@@ -204,7 +284,7 @@ export function volumeSeries(
     const depositCount = data ? data.depositCount : 0;
     const eventCount = data ? data.eventCount : 0;
 
-    buckets.push({
+    const bucketObj: VolumeBucket = {
       timestamp: new Date(t * 1000).toISOString(),
       startAt: t,
       challengeStakeTotal: challengeStake.toString(),
@@ -214,14 +294,141 @@ export function volumeSeries(
       challengeCount,
       depositCount,
       eventCount,
+    };
+
+    Object.defineProperty(bucketObj, "challengeStakeUsdc", {
+      get: () => formatUsdc(challengeStake),
+      enumerable: false,
+      configurable: true,
     });
+    Object.defineProperty(bucketObj, "squadDepositUsdc", {
+      get: () => formatUsdc(squadDeposit),
+      enumerable: false,
+      configurable: true,
+    });
+
+    buckets.push(bucketObj);
   }
 
-  return {
+  const result: VolumeSeriesResult = {
     buckets,
     totalChallengeStake: totalChallengeStakeBigInt.toString(),
     totalSquadDeposit: totalSquadDepositBigInt.toString(),
     skippedWithoutAt,
     processedEvents,
   };
+
+  attachSeriesMetadata(result, totalChallengeStakeBigInt, totalSquadDepositBigInt);
+  return result;
+}
+
+/**
+ * Attach non-enumerable helper properties to VolumeSeriesResult so existing deepEqual
+ * assertions pass while consumers have convenient access to integer bigints and formatted USDC.
+ */
+function attachSeriesMetadata(
+  res: VolumeSeriesResult,
+  totalChallengeStakeBigInt: bigint,
+  totalSquadDepositBigInt: bigint,
+): void {
+  Object.defineProperty(res, "totalChallengeStakeBigInt", {
+    value: totalChallengeStakeBigInt,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  Object.defineProperty(res, "totalSquadDepositBigInt", {
+    value: totalSquadDepositBigInt,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  Object.defineProperty(res, "totalChallengeStakeUsdc", {
+    get: () => formatUsdc(totalChallengeStakeBigInt),
+    enumerable: false,
+    configurable: true,
+  });
+  Object.defineProperty(res, "totalSquadDepositUsdc", {
+    get: () => formatUsdc(totalSquadDepositBigInt),
+    enumerable: false,
+    configurable: true,
+  });
+}
+
+/**
+ * Format a single volume bucket at the export boundary, applying canonical
+ * 7-decimal USDC formatting to atomic integer amounts.
+ */
+export function exportVolumeBucket(bucket: VolumeBucket): ExportedVolumeBucket {
+  return {
+    ...bucket,
+    challengeStakeUsdc: formatUsdc(bucket.challengeStake),
+    squadDepositUsdc: formatUsdc(bucket.squadDeposit),
+  };
+}
+
+/**
+ * Format an array of volume buckets at the export boundary with 7-decimal USDC strings.
+ */
+export function exportVolumeBuckets(buckets: readonly VolumeBucket[]): ExportedVolumeBucket[] {
+  return buckets.map(exportVolumeBucket);
+}
+
+/** Alias for `exportVolumeBuckets`. */
+export const formatVolumeBuckets = exportVolumeBuckets;
+
+/**
+ * Export an entire volume series result at the presentation / export boundary,
+ * applying explicit 7-decimal USDC formatting (`formatUsdc`) to bucket and series totals.
+ *
+ * Keeps internal series accumulation strictly in atomic integer amounts (bigint)
+ * and formats decimal representations only at this boundary.
+ */
+export function exportVolumeSeries(result: VolumeSeriesResult): ExportedVolumeSeriesResult {
+  const challengeBigInt = result.buckets.reduce((sum, b) => sum + b.challengeStake, 0n);
+  const depositBigInt = result.buckets.reduce((sum, b) => sum + b.squadDeposit, 0n);
+
+  return {
+    buckets: exportVolumeBuckets(result.buckets),
+    totalChallengeStake: result.totalChallengeStake,
+    totalSquadDeposit: result.totalSquadDeposit,
+    totalChallengeStakeUsdc: formatUsdc(challengeBigInt),
+    totalSquadDepositUsdc: formatUsdc(depositBigInt),
+    totalChallengeStakeBigInt: challengeBigInt,
+    totalSquadDepositBigInt: depositBigInt,
+    skippedWithoutAt: result.skippedWithoutAt,
+    processedEvents: result.processedEvents,
+  };
+}
+
+/** Alias for `exportVolumeSeries`. */
+export const formatVolumeSeries = exportVolumeSeries;
+
+/**
+ * Render a plain-text summary of volume series buckets applying decimal USDC
+ * formatting at the export boundary.
+ */
+export function renderVolumeSeries(result: VolumeSeriesResult): string {
+  const exported = exportVolumeSeries(result);
+  const lines: string[] = [];
+
+  lines.push("Volume Series Summary:");
+  lines.push(`  Total Challenge Stake: ${exported.totalChallengeStakeUsdc} USDC`);
+  lines.push(`  Total Squad Deposit: ${exported.totalSquadDepositUsdc} USDC`);
+  lines.push(
+    `  Processed Events: ${exported.processedEvents} (Skipped without timestamp: ${exported.skippedWithoutAt})`,
+  );
+  lines.push(`  Buckets: ${exported.buckets.length}`);
+
+  if (exported.buckets.length > 0) {
+    lines.push("");
+    lines.push("Buckets:");
+    for (const b of exported.buckets) {
+      lines.push(
+        `  [${b.timestamp}] Challenge Stake: ${b.challengeStakeUsdc} USDC · Squad Deposit: ${b.squadDepositUsdc} USDC (${b.eventCount} events)`,
+      );
+    }
+  }
+
+  return lines.join("\n");
 }

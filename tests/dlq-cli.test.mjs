@@ -18,6 +18,7 @@ import { promisify } from "node:util";
 
 import { createDeadLetterQueue } from "../dist/deadLetter.js";
 import {
+  DLQ_EXIT_CODES,
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
@@ -380,4 +381,109 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.equal(parseDurationMs("1h30m"), 5_400_000);
   assert.throws(() => parseDurationMs(""), /requires a duration/);
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
+});
+
+// ── Stable exit codes & machine-readable stdout ───────────────────────────────
+
+test("malformed JSON and invalid schema exit with code 3 and keep stdout empty", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    for (const badBody of ["{not-json", JSON.stringify({ version: 2, entries: [] }), JSON.stringify({ version: 1, entries: [{}] })]) {
+      await writeFile(filePath, badBody, "utf8");
+      const io = captureIo();
+      const { exitCode } = await runDlqCli({
+        argv: ["list", "--file", filePath, "--json"],
+        stdout: io.out,
+        stderr: io.err,
+      });
+
+      assert.equal(exitCode, DLQ_EXIT_CODES.MALFORMED_FILE);
+      assert.equal(io.stdout.length, 0, "stdout must remain empty on error");
+      assert.match(io.stderr.join("\n"), /malformed/);
+    }
+  });
+});
+
+test("access failure (e.g. EISDIR) exits with code 4 and keeps stdout empty", async () => {
+  await withTempDlq(async ({ directory }) => {
+    const io = captureIo();
+    const { exitCode } = await runDlqCli({
+      argv: ["list", "--file", directory, "--json"],
+      stdout: io.out,
+      stderr: io.err,
+    });
+
+    assert.equal(exitCode, DLQ_EXIT_CODES.ACCESS_ERROR);
+    assert.equal(io.stdout.length, 0, "stdout must remain empty on access failure");
+    assert.match(io.stderr.join("\n"), /cannot read dead-letter file/);
+  });
+});
+
+test("subprocess --json stdout is pure JSON without load logs, and exits 3/4 on failures", async () => {
+  await withTempDlq(
+    async ({ directory, filePath }) => {
+      const { stdout, stderr } = await execFileAsync(process.execPath, [
+        CLI_PATH,
+        "list",
+        "--file",
+        filePath,
+        "--json",
+      ]);
+      assert.equal(stderr.includes("[dlq]"), false);
+      const parsed = JSON.parse(stdout);
+      assert.equal(parsed.depth, 1);
+
+      await writeFile(filePath, "{broken", "utf8");
+      await assert.rejects(
+        () => execFileAsync(process.execPath, [CLI_PATH, "list", "--file", filePath, "--json"]),
+        (err) => err.code === 3 && err.stdout === "" && /malformed/.test(err.stderr),
+      );
+
+      await assert.rejects(
+        () => execFileAsync(process.execPath, [CLI_PATH, "list", "--file", directory, "--json"]),
+        (err) => err.code === 4 && err.stdout === "" && /cannot read/.test(err.stderr),
+      );
+    },
+    [{ ledger: 88 }],
+  );
+});
+test("list and show surface stored networkPassphrase and purge --yes can still remove entries", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    const queue = createDeadLetterQueue({
+      filePath,
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      now: () => 1_700_000_000_000,
+    });
+    await queue.load();
+    const entry = await queue.enqueue({
+      source: "market",
+      ledger: 90,
+      eventName: "claim_created",
+      text: "cross-network entry",
+      error: "Telegram 429",
+    });
+
+    const listIo = captureIo();
+    const listRes = await runDlqCli({
+      argv: ["list", "--file", filePath],
+      stdout: listIo.out,
+      stderr: listIo.err,
+    });
+    assert.equal(listRes.exitCode, 0);
+    assert.match(listIo.stdout.join("\n"), /network=Test SDF Network ; September 2015/);
+
+    const showIo = captureIo();
+    const showRes = await runDlqCli({
+      argv: ["show", entry.id, "--file", filePath],
+      stdout: showIo.out,
+      stderr: showIo.err,
+    });
+    assert.equal(showRes.exitCode, 0);
+    assert.match(showIo.stdout.join("\n"), /network:\s+Test SDF Network ; September 2015/);
+
+    const purgeRes = await purgeDeadLetters({ filePath, yes: true });
+    assert.equal(purgeRes.purged, 1);
+    assert.equal(purgeRes.remaining, 0);
+  });
 });
