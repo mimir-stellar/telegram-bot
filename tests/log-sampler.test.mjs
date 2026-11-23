@@ -34,9 +34,9 @@ test("boundary: exactly maxPerWindow logs and the next repeat is the first suppr
   const time = clock();
   const sampler = new LogSampler({ maxPerWindow: 2, windowMs: 1_000, now: time.now });
 
-  assert.deepEqual(sampler.record("k"), { log: true, suppressed: 0 });
-  assert.deepEqual(sampler.record("k"), { log: true, suppressed: 0 });
-  assert.deepEqual(sampler.record("k"), { log: false, suppressed: 0 });
+  assert.deepEqual(sampler.record("k"), { log: true, suppressed: 0, kind: "repeat" });
+  assert.deepEqual(sampler.record("k"), { log: true, suppressed: 0, kind: "repeat" });
+  assert.deepEqual(sampler.record("k"), { log: false, suppressed: 0, kind: "repeat" });
   assert.equal(sampler.pending("k"), 1);
   assert.equal(sampler.suppressedTotal(), 1);
 });
@@ -45,13 +45,13 @@ test("a window roll reports the suppressed repeats once, then resets", () => {
   const time = clock();
   const sampler = new LogSampler({ maxPerWindow: 1, windowMs: 1_000, now: time.now });
 
-  assert.deepEqual(sampler.record("scan:squad"), { log: true, suppressed: 0 });
+  assert.deepEqual(sampler.record("scan:squad"), { log: true, suppressed: 0, kind: "repeat" });
   for (let i = 0; i < 4; i += 1) assert.equal(sampler.record("scan:squad").log, false);
   assert.equal(sampler.pending("scan:squad"), 4);
 
   time.advance(1_000);
   // The line that opens the new window is the one that accounts for the old.
-  assert.deepEqual(sampler.record("scan:squad"), { log: true, suppressed: 4 });
+  assert.deepEqual(sampler.record("scan:squad"), { log: true, suppressed: 4, kind: "repeat" });
   assert.equal(sampler.pending("scan:squad"), 0);
 
   // The fresh window allows its own first line before suppressing again.

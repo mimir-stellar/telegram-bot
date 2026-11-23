@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -92,5 +92,55 @@ test("restore normalizes supported legacy cursor files to version 1", async () =
     assert.equal(restored.version, 1);
     assert.equal(restored.targets.market.cursor, "legacy-cursor");
     assert.equal(restored.targets.market.lastEventLedger, null);
+  });
+});
+
+test("rejects backup and restore when symbolic-link aliases resolve to the same file", async () => {
+  await withTempDir(async (directory) => {
+    const realDir = path.join(directory, "real");
+    const linkDir = path.join(directory, "alias");
+    await mkdir(realDir);
+    await symlink(realDir, linkDir);
+
+    const cursorFile = path.join(realDir, "cursor.json");
+    const lockFile = path.join(realDir, "poller.lock");
+    const raw = `${JSON.stringify({
+      version: 1,
+      updatedAt: "2026-09-29T00:00:00.000Z",
+      targets: { market: { cursor: "live-cursor", lastEventLedger: 99 } },
+    }, null, 2)}\n`;
+    await writeFile(cursorFile, raw);
+
+    // 1. Direct file symlink alias
+    const fileAlias = path.join(directory, "cursor-link.json");
+    await symlink(cursorFile, fileAlias);
+    await assert.rejects(
+      restoreCursor({ cursorFile, backupFile: fileAlias, lockFile, force: true }),
+      /must be different/,
+    );
+    await assert.rejects(
+      backupCursor({ cursorFile, backupFile: fileAlias, force: true }),
+      /must be different/,
+    );
+    // Live cursor must remain untouched and lock must not be left behind
+    assert.equal(await readFile(cursorFile, "utf8"), raw);
+    assert.equal(await exists(lockFile), false);
+
+    // 2. Directory symlink alias (differently spelled path to same file)
+    const dirAliasCursor = path.join(linkDir, "cursor.json");
+    await assert.rejects(
+      restoreCursor({ cursorFile, backupFile: dirAliasCursor, lockFile, force: true }),
+      /must be different/,
+    );
+    assert.equal(await readFile(cursorFile, "utf8"), raw);
+
+    // 3. Directory symlink alias when destination file does not exist yet
+    const newInReal = path.join(realDir, "new-backup.json");
+    const newInLink = path.join(linkDir, "new-backup.json");
+    await writeFile(newInReal, raw);
+    await assert.rejects(
+      restoreCursor({ cursorFile: newInLink, backupFile: newInReal, lockFile, force: true }),
+      /must be different/,
+    );
   });
 });

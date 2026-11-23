@@ -30,6 +30,7 @@
     "audit": "tsx src/audit-cli.ts",
     "audit:report": "tsx src/audit-cli.ts",
     "audit:check": "tsx src/audit-check-cli.ts",
+    "analytics:export": "tsx src/analytics-export-cli.ts",
     "seed:cursor": "tsx src/dev/seedCursor.ts",
     "cursor": "node dist/cursor-cli.js",
     "replay": "tsx src/replay-cli.ts",
@@ -56,12 +57,12 @@
     "branches": 80
   },
   "dependencies": {
-    "@stellar/stellar-sdk": "^17.2.1",
-    "dotenv": "^18.0.8",
+    "@stellar/stellar-sdk": "^17.4.0",
+    "dotenv": "^18.0.10",
     "grammy": "^1.46.0"
   },
   "devDependencies": {
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "c8": "^12.0.0",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"

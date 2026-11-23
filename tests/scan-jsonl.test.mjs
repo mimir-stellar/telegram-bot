@@ -60,6 +60,7 @@ test("formatScanJsonl emits one valid JSON line per decoded event and a final su
 
   const output = formatScanJsonl(scan.events);
   assert.equal(output.endsWith("\n"), true);
+  assert.equal(output.includes("\r\n"), false, "canonical JSONL export must use LF, not CRLF");
 
   const rawLines = output.trimEnd().split("\n");
   assert.equal(rawLines.length, scan.events.length + 1);

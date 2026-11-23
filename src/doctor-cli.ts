@@ -14,6 +14,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse as parseDotenv } from "dotenv";
 
 import { EXIT_ERROR, EXIT_OK } from "./exitCodes.js";
+import { LOG_FORMATS, Logger, type LogFormat } from "./logger.js";
 import { redactText, registerSecret } from "./redact.js";
 import { MOCK_BOT_TOKEN } from "./stellar/mock-constants.js";
 import { validateContractId } from "./stellar/client.js";
@@ -29,6 +30,22 @@ export interface CheckResult {
 export interface DoctorReport {
   ok: boolean;
   checks: CheckResult[];
+}
+
+export interface RedactionProbe {
+  /** Logical field name reported if this probe leaks (value is never reported). */
+  field: string;
+  /** Synthetic secret payload passed through the logger. */
+  value: string;
+  /** Substring that must not appear in emitted log lines. Defaults to `value`. */
+  canary?: string;
+  /** Whether to register `value` as a runtime secret in the logger. */
+  register?: boolean;
+}
+
+export interface RedactionSelfCheckOptions {
+  formats?: readonly LogFormat[];
+  probes?: readonly RedactionProbe[];
 }
 
 export interface DoctorOptions {

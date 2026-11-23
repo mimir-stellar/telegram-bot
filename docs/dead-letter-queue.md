@@ -53,6 +53,7 @@ Each entry in `entries` mirrors the `DeadLetterEntry` TypeScript interface defin
 * `text` (`string`): The formatted Telegram `MarkdownV2` message body. Bounded and truncated to at most 4,000 characters (`TEXT_TRUNCATE`).
 * `attempts` (`number`): The number of delivery attempts made so far (starts at `1` upon initial enqueue and increments on each failed replay).
 * `lastError` (`string | null`): Scrubbed, redacted error message from the most recent send failure, truncated to at most 200 characters (`ERROR_TRUNCATE`). Sensitive secrets like `BOT_TOKEN` are scrubbed via `safeErrorMessage`.
+* `networkPassphrase` (`string`, optional): Stellar network passphrase where the failure originated. When configured on the queue, `flush` compares each entry's `networkPassphrase` against the active network and rejects replay of entries from another network, leaving them unchanged on disk.
 
 ---
 
@@ -93,6 +94,30 @@ The queue is strictly bounded across every dimension:
 3. **Payload Truncation**:
    * Message text is truncated to 4,000 characters.
    * Error messages are scrubbed of secrets and truncated to 200 characters.
+
+---
+
+## Offline Inspection CLI (`src/dlq-cli.ts`)
+
+Operators can inspect and purge `DEAD_LETTER_FILE` offline without contacting Stellar or Telegram:
+
+```bash
+node dist/dlq-cli.js list [--file PATH] [--json]
+node dist/dlq-cli.js show <id> [--file PATH] [--json]
+node dist/dlq-cli.js purge [--older-than <dur>] [--yes] [--file PATH] [--json]
+```
+
+Diagnostics and errors are written to `stderr`, keeping `stdout` clean and machine-readable (for example, valid JSON when `--json` is passed).
+
+### Exit Codes
+
+| Exit Code | Meaning |
+|---|---|
+| `0` | Success (including `list` when `DEAD_LETTER_FILE` does not exist yet) |
+| `1` | Unknown entry (`show <id>` did not match any entry) |
+| `2` | Invalid CLI arguments or usage |
+| `3` | Malformed dead-letter file (invalid JSON, unsupported version, or invalid entry schema) |
+| `4` | Dead-letter file access or I/O failure (e.g. permission denied or directory path) |
 
 ---
 

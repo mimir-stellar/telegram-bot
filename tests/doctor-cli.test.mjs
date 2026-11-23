@@ -11,8 +11,10 @@ import {
   formatCheckLine,
   parseSemver,
   runDoctor,
+  runRedactionSelfCheck,
   satisfiesNodeEngine,
 } from "../dist/doctor-cli.js";
+import { Logger } from "../dist/logger.js";
 
 const execFileP = promisify(execFile);
 
@@ -328,6 +330,7 @@ test("CLI execution exits 0 on valid configuration", async () => {
     );
 
     assert.match(stdout, /\[OK\]/);
+    assert.match(stdout, /Redaction policy self-check passed/);
     assert.doesNotMatch(stdout, /\[FAIL\]/);
   });
 });

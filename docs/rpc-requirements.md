@@ -12,7 +12,7 @@ The bot is a read-only event listener and does not submit transactions. It inter
 | :--- | :--- | :--- |
 | `getHealth` | Validates endpoint health, chain tip, and retention boundaries | Called during startup health checks, periodically at each polling cycle, and before event queries (`src/stellar/client.ts`, `src/stellar/events.ts`, `src/poller.ts`) |
 | `getEvents` | Reads contract event logs using pagination filters | Sequentially queried by cursor or start ledger in `paginatedGetEvents` (`src/stellar/events.ts`) |
-| `getNetwork` | Validates network identity and passphrase alignment | Invoked at startup via `validateNetworkPassphrase` (`src/stellar/client.ts`, `src/index.ts`) to prevent running against the wrong network |
+| `getNetwork` | Validates network identity and passphrase alignment | Invoked before admitting an RPC provider via `assertNetworkIdentity` (`src/stellar/rpc-guard.ts`), `validateNetworkPassphrase`, and `admitRpcProvider` (`src/stellar/client.ts`, `src/index.ts`) to prevent running against the wrong network |
 
 ### Method Payloads & Expectations
 
@@ -34,6 +34,7 @@ Called with JSON-RPC parameters matching Soroban RPC specs:
 - **Filters**: Topic/contract filters (e.g. `[{ type: "contract", contractIds: [...] }]`).
 - **Paging bounds**: Accepts either `startLedger` or `cursor` (mutually exclusive).
 - **Responses**: Returns `events` array along with `latestLedger` and a pagination `cursor`.
+- **Response-size guard**: `createRpcServer` enforces a byte-length ceiling on HTTP responses (`STELLAR_RPC_MAX_RESPONSE_BYTES`, default `4194304` / 4 MiB). Oversized responses are aborted before JSON parsing with `RpcResponseShapeError("response-oversized")`, leaving the target cursor unchanged.
 - **Note on pagination**: In Soroban RPC, an empty `events` list does not necessarily indicate the end of events—it indicates no events were found in the inspected slice of ledgers. The bot continues walking via `cursor` until the cursor reaches the tip.
 
 #### `getNetwork`
@@ -44,7 +45,7 @@ Used at boot to verify the network passphrase (e.g. `Test SDF Network ; Septembe
   "protocolVersion": 22
 }
 ```
-If the passphrase does not match configuration, the bot refuses to boot with `NetworkPassphraseMismatchError`.
+If the reported passphrase does not match `STELLAR_NETWORK_PASSPHRASE`, `assertNetworkIdentity` (`src/stellar/rpc-guard.ts`) and `admitRpcProvider` / `validateNetworkPassphrase` (`src/stellar/client.ts`) reject the provider with `NetworkPassphraseMismatchError` even if `getHealth` reports `"healthy"`. Error messages are bounded and never echo the raw passphrases.
 
 ---
 
@@ -78,7 +79,7 @@ An endpoint with insufficient retention, rate limits, lagging synchronization, o
 | **Stale Cursor (`cursor-before-floor`)** | The bot was down or paused longer than the endpoint's retention window, or the endpoint pruned history aggressively. | The RPC rejects queries with an error matching stale cursor patterns. The bot confirms the condition via `getHealth()`, records a `stale_cursor` event in audit logs, and flags `cursorStale = true`. |
 | **Restart Gaps (`restartGaps`, `gapLedgers`)** | When a stale cursor is detected and verified against `oldestLedger`, the bot is forced to rewind its cursor to `oldestLedger`. | The bot logs: `[poller] <source>: restart gap - cursor at ledger X is Y ledger(s) below the retained floor; skipping Y missed ledger(s) to resume from Z`. The missing ledgers in that gap are permanently skipped and will not trigger notifications. |
 | **Malformed Ledger Window Errors** | The endpoint omits `oldestLedger`/`latestLedger` or reports inverted values (`oldest > latest`). | Poller raises `LedgerWindowError` (`malformed-window`), aborting the cycle. |
-| **Inverted or Stalled Ledgers** | The RPC endpoint serves requests from an out-of-sync backend node or a pool of load-balanced nodes with drifting ledger tips. | `latestLedger` oscillates backwards or fails to advance, resulting in duplicate query retries, cursor stalls, or `cursor-after-tip` errors. |
+| **Inverted or Stalled Ledgers** | The RPC endpoint serves requests from an out-of-sync backend node or a pool of load-balanced nodes with drifting ledger tips. | `latestLedger` oscillates backwards or fails to advance, resulting in duplicate query retries, cursor stalls, or `cursor-after-tip` errors. `LedgerProgressTracker` (`src/stellar/rpc-guard.ts`) compares `latestLedger` progress over a bounded interval (`DEFAULT_MAX_LEDGER_STALL_MS = 60_000` ms) to classify a stalled provider as `stale-provider` without flagging an up-to-date provider that simply has an `idle` (zero-event) stream. |
 | **Frequent Timeouts / Rate Limits (HTTP 429 / 504)** | Public shared endpoints often enforce strict rate limits or experience high load during peak testnet activity. | Poller enters exponential backoff, health status degrades, and notification latency increases. |
 
 ---
@@ -139,3 +140,12 @@ STELLAR_NETWORK=testnet
 STELLAR_RPC_URL=http://localhost:8000/rpc
 STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 ```
+
+---
+
+## 5. Untrusted `Retry-After` Delay Clamping
+
+Untrusted `Retry-After` headers from RPC responses are validated and clamped at the ingestion boundary by `parseRetryAfterHeaderMs` and `clampRetryDelayMs` (`src/stellar/rpc-guard.ts`), with `resolveMaxBackoffMs` (`src/stellar/client.ts`) keeping the configured maximum backoff (`DEFAULT_RPC_MAX_BACKOFF_MS = 60_000` ms by default) authoritative:
+
+- **Rejected values**: Negative delays, non-finite numbers (`NaN`, `Infinity`, `-Infinity`), non-numeric strings (including trailing garbage like `"10abc"`), and values that overflow to `Infinity` when converted to milliseconds return `null` so the poller falls back to its own bounded backoff.
+- **Authoritative cap**: Finite oversized delays are clamped to the configured `maxBackoffMs` (e.g. `targetMaxBackoff` in `src/poller.ts`).

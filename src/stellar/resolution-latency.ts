@@ -25,10 +25,24 @@ export interface LatencyGroup {
   summary: LatencySummary | null;
 }
 
+/**
+ * An explicit inconsistency: the same claim identity has terminal events that
+ * contradict each other (e.g. both a resolution and a cancellation, or more than
+ * one distinct resolution outcome). Such claims are never silently resolved to
+ * the last or earliest event; they are reported here and excluded from groups.
+ */
+export interface ConflictingTerminalEvents {
+  claimId: number;
+  resolutionLedgers: number[];
+  cancellationLedgers: number[];
+  reason: "resolved_and_cancelled" | "multiple_resolutions" | "multiple_cancellations";
+}
+
 export interface ResolutionLatencyReport {
   resolved: LatencyGroup;
   cancelled: LatencyGroup;
   excludedCount: number;
+  conflicts: ConflictingTerminalEvents[];
 }
 
 /**
@@ -69,19 +83,33 @@ function computeSummary(claims: ClaimLatency[]): LatencySummary | null {
   };
 }
 
+interface Marker {
+  at: number;
+  ledger: number;
+}
+
+function earlier(a: Marker, b: Marker): boolean {
+  return a.ledger < b.ledger || (a.ledger === b.ledger && a.at < b.at);
+}
+
 /**
  * Computes durations from creation to resolution/cancellation per claim.
  *
  * Excludes claims missing either creation or resolution/cancellation event.
- * If multiple creation or resolution events exist for the same claimId, deterministic
- * earliest creation and earliest resolution/cancellation are used.
+ * If multiple creation events exist for the same claimId, deterministic
+ * earliest creation is used.
+ *
+ * Contradictory terminal events for the same claimId (a resolution together with
+ * a cancellation, or multiple resolutions / multiple cancellations) are reported
+ * explicitly in `conflicts` and the claim is excluded from both groups, rather
+ * than silently selecting one of the events.
  *
  * Uses integer math only.
  */
 export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLatencyReport {
-  const creations = new Map<number, { at: number; ledger: number }>();
-  const resolutions = new Map<number, { at: number; ledger: number }>();
-  const cancellations = new Map<number, { at: number; ledger: number }>();
+  const creations = new Map<number, Marker>();
+  const resolutions = new Map<number, Marker[]>();
+  const cancellations = new Map<number, Marker[]>();
 
   for (const event of events) {
     const payload = event.payload;
@@ -94,21 +122,21 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
       continue;
     }
 
+    const marker: Marker = { at: Math.trunc(event.at), ledger: Math.trunc(event.ledger) };
+
     if (payload.name === "claim_created") {
       const existing = creations.get(claimId);
-      if (!existing || event.ledger < existing.ledger || (event.ledger === existing.ledger && event.at < existing.at)) {
-        creations.set(claimId, { at: Math.trunc(event.at), ledger: Math.trunc(event.ledger) });
+      if (!existing || earlier(marker, existing)) {
+        creations.set(claimId, marker);
       }
     } else if (payload.name === "claim_resolved") {
-      const existing = resolutions.get(claimId);
-      if (!existing || event.ledger < existing.ledger || (event.ledger === existing.ledger && event.at < existing.at)) {
-        resolutions.set(claimId, { at: Math.trunc(event.at), ledger: Math.trunc(event.ledger) });
-      }
+      const list = resolutions.get(claimId) ?? [];
+      list.push(marker);
+      resolutions.set(claimId, list);
     } else if (payload.name === "claim_cancelled") {
-      const existing = cancellations.get(claimId);
-      if (!existing || event.ledger < existing.ledger || (event.ledger === existing.ledger && event.at < existing.at)) {
-        cancellations.set(claimId, { at: Math.trunc(event.at), ledger: Math.trunc(event.ledger) });
-      }
+      const list = cancellations.get(claimId) ?? [];
+      list.push(marker);
+      cancellations.set(claimId, list);
     }
   }
 
@@ -121,12 +149,34 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
 
   const resolvedClaims: ClaimLatency[] = [];
   const cancelledClaims: ClaimLatency[] = [];
+  const conflicts: ConflictingTerminalEvents[] = [];
   let excludedCount = 0;
 
   for (const claimId of allClaimIds) {
     const creation = creations.get(claimId);
-    const resolution = resolutions.get(claimId);
-    const cancellation = cancellations.get(claimId);
+    const resolutionList = resolutions.get(claimId) ?? [];
+    const cancellationList = cancellations.get(claimId) ?? [];
+
+    // Contradictory terminal events: surface explicitly, never pick silently.
+    let conflictReason: ConflictingTerminalEvents["reason"] | null = null;
+    if (resolutionList.length > 0 && cancellationList.length > 0) {
+      conflictReason = "resolved_and_cancelled";
+    } else if (resolutionList.length > 1) {
+      conflictReason = "multiple_resolutions";
+    } else if (cancellationList.length > 1) {
+      conflictReason = "multiple_cancellations";
+    }
+
+    if (conflictReason) {
+      conflicts.push({
+        claimId,
+        resolutionLedgers: resolutionList.map((m) => m.ledger).sort((a, b) => a - b),
+        cancellationLedgers: cancellationList.map((m) => m.ledger).sort((a, b) => a - b),
+        reason: conflictReason,
+      });
+      excludedCount++;
+      continue;
+    }
 
     // If missing creation, it cannot form a duration
     if (!creation) {
@@ -134,23 +184,13 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
       continue;
     }
 
-    // A claim may have resolution or cancellation or neither
-    // If both exist (rare/edge case), pick the one with earlier ledger/at
-    let endEvent: { at: number; ledger: number } | null = null;
+    const resolution = resolutionList[0];
+    const cancellation = cancellationList[0];
+
+    let endEvent: Marker | null = null;
     let endType: "resolved" | "cancelled" | null = null;
 
-    if (resolution && cancellation) {
-      if (
-        resolution.ledger < cancellation.ledger ||
-        (resolution.ledger === cancellation.ledger && resolution.at <= cancellation.at)
-      ) {
-        endEvent = resolution;
-        endType = "resolved";
-      } else {
-        endEvent = cancellation;
-        endType = "cancelled";
-      }
-    } else if (resolution) {
+    if (resolution) {
       endEvent = resolution;
       endType = "resolved";
     } else if (cancellation) {
@@ -189,6 +229,7 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
   // Ensure deterministic ordering by claimId ascending
   resolvedClaims.sort((a, b) => a.claimId - b.claimId);
   cancelledClaims.sort((a, b) => a.claimId - b.claimId);
+  conflicts.sort((a, b) => a.claimId - b.claimId);
 
   return {
     resolved: {
@@ -200,5 +241,6 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
       summary: computeSummary(cancelledClaims),
     },
     excludedCount,
+    conflicts,
   };
 }

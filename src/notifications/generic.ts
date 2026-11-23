@@ -11,6 +11,7 @@
 
 import type { StellarConfig } from "../config.js";
 import { txExplorerUrl } from "../stellar/client.js";
+import { safeLinkUrl } from "./link-safety.js";
 import { shortAddress } from "../stellar/decode.js";
 import type { GenericDecodedEvent } from "../stellar/generic-decode.js";
 
@@ -38,10 +39,7 @@ function resolveExplorerUrl(config: StellarConfig | undefined, txHash: string | 
   const trimmed = txHash.trim();
   if (!/^[0-9a-fA-F]{64}$/.test(trimmed)) return null;
   try {
-    const url = txExplorerUrl(config, trimmed);
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:") return null;
-    return url;
+    return safeLinkUrl(txExplorerUrl(config, trimmed));
   } catch {
     return null;
   }
