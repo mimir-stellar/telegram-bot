@@ -13,18 +13,39 @@
  *   - {@link routeStatus}      — actionable status when zero routes are active
  */
 
+import { createHash } from "node:crypto";
 import type { Bot } from "grammy";
 
 import { applyChatMigration, type BotConfig } from "../config.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
+  isTimeoutError,
   safeErrorMessage,
   splitTelegramMessage,
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+import type { SendJournal } from "./send-journal.js";
+
+// Re-export isTimeoutError so callers that only import from notifier.ts
+// can classify timeout errors without also depending on format.ts directly.
+export { isTimeoutError } from "./format.js";
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
+
+/** A Telegram destination: a chat id plus an optional forum topic (thread) id. */
+export interface NotificationDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
+
+/** Optional dependencies for {@link createNotifier}. */
+export interface NotifierOptions {
+  /** Optional send journal for persisting per-destination delivery outcomes. */
+  sendJournal?: SendJournal | undefined;
+  /** Clock override for journal timestamps (defaults to `Date.now`). */
+  now?: (() => number) | undefined;
+}
 
 /** Extra Telegram send options the poller may attach to a notification. */
 export interface SendExtra {
@@ -48,6 +69,8 @@ export interface SendExtra {
   replyToMessageId?: number | undefined;
   /** Decoded contract event name used to apply silent-notification policy. */
   eventName?: string | undefined;
+  /** Optional claim/event category used to resolve forum topic overrides. */
+  category?: string | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -176,10 +199,11 @@ export function routeStatus(activeRoutes: number): RouteStatus {
 // ── notifierSkips ────────────────────────────────────────────────────────────
 
 /**
- * Sends suppressed by the empty-message guard, counted so callers (and the
- * empty-text tests) can prove a blank render never reached the Telegram API.
+ * Sends suppressed by notifier guards (empty render or route permission
+ * cooldown), counted so callers can prove a skipped send never reached the
+ * Telegram API.
  */
-export const notifierSkips = { emptyText: 0 };
+export const notifierSkips = { emptyText: 0, routeCooldown: 0 };
 
 // ── previewRouting ───────────────────────────────────────────────────────────
 
@@ -322,22 +346,25 @@ export function createNotifier(
     const parts = splitTelegramMessage(text);
     if (parts.length > 1) {
       for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
+        await sendToRoute(chatId, part, {
           ...notificationOptions,
-          ...(index === parts.length - 1 && extra?.reply_markup
-            ? { reply_markup: extra.reply_markup }
+          ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+          ...(extra?.replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
             : {}),
           ...(index === 0 && replyToMessageId !== undefined
             ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
             : {}),
         });
+        cooldowns.clearCooldown(chatId);
       }
       return;
     }
 
     try {
-      await bot.api.sendMessage(chatId, text, {
+      await sendToRoute(chatId, text, {
         ...notificationOptions,
+        ...threadOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
@@ -345,11 +372,15 @@ export function createNotifier(
       });
       return;
     } catch (err) {
-      // A blank fallback is no fallback: sending whitespace-only text would
-      // just draw the same 400, so the original parse error propagates.
-      const fallback = extra?.plainText;
-      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
-        throw err;
+      if (isPermissionFailure(err)) {
+        const reason = safeErrorMessage(err, secrets);
+        const state = cooldowns.recordPermissionFailure(chatId, reason);
+        if (state) {
+          console.warn(
+            `[notifier] route entered permission cooldown for ${cooldownMs}ms` +
+              `${eventRefLabel(extra?.eventRef)}: ${reason}`,
+          );
+        }
       }
       // Only bounded metadata is logged: the fallback outcome, the safe error
       // category, and the caller-supplied event reference — never message
@@ -359,9 +390,11 @@ export function createNotifier(
           `retrying as plain text: ${safeErrorMessage(err, secrets)}`,
       );
       // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
+      await sendToRoute(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
+        ...threadOption,
         ...silentOption,
+        ...topicOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }

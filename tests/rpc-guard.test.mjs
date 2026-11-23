@@ -3,6 +3,7 @@ import http from "node:http";
 import test from "node:test";
 
 import {
+  assertAllowedRpcUrl,
   assertEventsResponse,
   clampRetryDelayMs,
   DEFAULT_MAX_EVENTS_PER_RESPONSE,

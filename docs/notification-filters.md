@@ -166,56 +166,20 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
 
----
-
-## 4. Decimal USDC Threshold Normalization
-
-Both [`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts) and [`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts) normalize equivalent decimal USDC thresholds to 7-decimal atomic units (`bigint`) before comparison:
-
-- **Canonical equivalence**: Equivalent decimal strings (for example `"1"`, `"01"`, `"1.0"`, `"1.00"`, and `"1.0000000"`) normalize identically via `parseUsdcThreshold` / `normalizeUsdcThreshold` and in filter expression comparisons (both explicit `USDC` / `$` literals and bare decimal literals such as `stake >= 10.50`).
-- **Precision limit**: Values exceeding seven fractional digits (for example `"1.00000000"` or `"0.00000001"`) are rejected with `InvalidThresholdError` or `FilterParseError`.
 
 ---
 
-## 5. Filter Explanation Tree (Operator Diagnostics)
+## 4. Filter Dry-Run Report Over Local Archive
 
-[`explainFilterRule(rule, event, options?)`](../src/notifications/filter-expr.ts) explains *why* a parsed filter expression (and, optionally, the amount thresholds) allowed or denied one event. It is a dry-run diagnostic only: the live path still uses `evaluateFilterRule` and `meetsThreshold`, whose exports and semantics are unchanged.
+Operators can simulate and preview the effect of proposed filter expressions and USDC amount thresholds against locally recorded historical events before altering live bot deployments.
 
-The tree mirrors the rule and its expression AST:
+The filter dry-run report (`runFilterDryRunReport` in [`src/notifications/filter-dry-run.ts`](../src/notifications/filter-dry-run.ts)) reads events from a local event archive (`events-*.jsonl`), parses expressions using the production parser (`parseFilterExpression`), and aggregates match vs. rejection statistics grouped by reason without modifying live state or sending notifications:
 
-| Node `kind` | When present | Meaning |
-| :--- | :--- | :--- |
-| `rule` | Always (root) | Final decision. `matched` and the top-level `reason` always equal `evaluateFilterRule` / `evaluateFilterDryRun`. |
-| `event-name` | The rule names an event | Whether the event is the named one. |
-| `and` / `or` | Logical operators in the condition | Children are the left and right operands, in source order. |
-| `comparison` | Each predicate in the condition | `matched`, `predicate-false`, or `missing-field`. |
-| `threshold` | `options.thresholds` is given | Amount threshold check, evaluated after the expression as in the live path. |
-
-Each node carries `matched`, an `outcome` (`matched`, `event-name-mismatch`, `missing-field`, `predicate-false`, `below-threshold`, `not-configured`, `not-evaluated`) and a short `reason`. Branches the live evaluator short-circuits (the right side of a failed `and` or a matched `or`, the condition after an event-name mismatch, the threshold after a failed expression) are reported as `not-evaluated`, so the tree shows exactly what the live path looked at. Output is deterministic and JSON-serializable (no `bigint` values).
-
-`renderFilterExplanation(explanation)` renders the tree as indented plain text, one line per node. For the rule `claim_challenged where (stake >= 100 USDC and challenger != "G…") or claimId == 42` with a 10 USDC challenge threshold, against a synthetic 25 USDC challenge on claim 7:
-
-```text
-✗ [rule] rule failed (predicate-false): event denied
-  ✓ [event-name] event is claim_challenged
-  ✗ [or] or: neither side matched
-    ✗ [and] and: left side failed; right side not evaluated
-      ✗ [comparison] stake >= 100 USDC: false
-      - [comparison] challenger != <redacted>: not evaluated
-    ✗ [comparison] claimId == 42: false
-  - [threshold] amount threshold: not evaluated
-```
-
-### 5.1 Privacy
-
-Reasons never contain payload values: no addresses, claim titles, summaries, questions, categories, or amounts from the event. String literals written in the rule (which may hold an address, a chat or route identity, or message text) are shown as `<redacted>`. Only schema field names, operators, numeric literals, USDC amounts written in the rule, configured threshold minimums, and the rule's own (schema-validated) event name appear. On an event-name mismatch the event's actual name is not echoed.
-
-### 5.2 Bounds
-
-| Option | Default | Minimum | Effect |
-| :--- | :--- | :--- | :--- |
-| `maxNodes` | `MAX_EXPLANATION_NODES` (64) | 1 | Nodes kept, in pre-order. |
-| `maxDepth` | `MAX_EXPLANATION_DEPTH` (32) | 0 | Levels kept below the root. |
-| `maxReasonLength` | `MAX_EXPLANATION_REASON_LENGTH` (96) | 8 | Characters per `reason`; longer reasons end in `…`. |
-
-Dropped subtrees are counted in the parent's `omitted` field and `truncated` is set to `true`; truncation never changes `matched` or `reason`. Invalid values (`NaN`, `Infinity`) fall back to the default and values below the minimum are raised to it. The defaults fit the largest expression the parser accepts (`MAX_FILTER_TOKENS`, a left-deep chain of 24 comparisons) without truncation.
+- **Matching counts**: Events satisfying all configured filter rules and amount thresholds.
+- **Rejection counts by reason**:
+  - `name_mismatch`: Event payload name does not match the rule's target event name.
+  - `condition_unmet`: Event matched the target name but failed the condition (e.g. `stake < 100 USDC`).
+  - `threshold_unmet`: Event failed integer USDC amount thresholds (`marketChallenge` or `squadDeposit`).
+  - `unknown_payload`: Payload is unknown, admin, or untyped.
+  - `malformed`: Event payload is corrupt or unparseable.
+- **Breakdown by event name**: Per-event-name counts of total, matched, and rejected events.

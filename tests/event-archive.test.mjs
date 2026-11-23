@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  ArchiveMetadataConflictError,
   createEventArchive,
   MalformedArchiveRecordError,
   readArchive,
