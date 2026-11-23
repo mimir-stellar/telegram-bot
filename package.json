@@ -10,9 +10,9 @@
   },
   "main": "dist/index.js",
   "scripts": {
-    "dev": "node init && tsx watch src/index.ts",
-    "start": "node init && node dist/index.js",
-    "build": "node init && tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lockfile:check": "node scripts/check-lockfile.mjs",
     "lockfile:reproduce": "node scripts/check-lockfile.mjs --reproduce",
