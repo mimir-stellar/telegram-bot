@@ -1,25 +1,69 @@
 /*
- * Offline cursor backup and restore command. It never contacts Stellar or
- * Telegram; restore uses the normal instance lock to exclude a running poller.
+ * Offline cursor backup, restore, history, recovery-preview and consistency-check
+ * command. It never contacts Stellar or Telegram; restore uses the normal
+ * instance lock to exclude a running poller. `history`, `preview` and `check`
+ * are read-only.
  */
 
 import { randomUUID } from "node:crypto";
-import { access, link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
+import {
+  checkCursorConsistency,
+  formatCursorConsistencyReport,
+  type CursorConsistencyReport,
+} from "./cursor-consistency.js";
 import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import { DuplicateCursorTargetError, parseAndMigrateCursorFile } from "./poller.js";
 
 export interface BackupCursorOptions {
   cursorFile: string;
   backupFile: string;
   force?: boolean;
+  /** Optional CAS digest of the live cursor file from an earlier inspection. */
+  expectedDigest?: string;
+}
+
+export interface BackupCursorResult {
+  status: "backed_up";
+  version: number;
+  targets: number;
+  digest: string;
 }
 
 export interface RestoreCursorOptions extends BackupCursorOptions {
   lockFile: string;
+  now?: () => Date;
+}
+
+export interface RecoveryPreviewOptions {
+  cursorFile: string;
+  /** Optional target name; when omitted every target in the cursor file is previewed. */
+  target?: string;
+  /** Proposed ledger to rewind to. Must not be newer than the current position. */
+  proposedLedger: number;
+  /** Inclusive lowest ledger still retained by the RPC/history window, if known. */
+  retainedWindowStart?: number;
+  /** Inclusive highest ledger currently retained, if known. */
+  retainedWindowEnd?: number;
+}
+
+export interface RecoveryPreviewEntry {
+  target: string;
+  currentLedger: number | null;
+  proposedLedger: number;
+  missedLedgerRange: { from: number; to: number } | null;
+  retainedWindow: { start: number; end: number } | null;
+  withinRetainedWindow: boolean | null;
+  warnings: string[];
+}
+
+export interface RecoveryPreview {
+  schemaVersion: number;
+  entries: RecoveryPreviewEntry[];
 }
 
 async function exists(filePath: string): Promise<boolean> {
@@ -27,21 +71,73 @@ async function exists(filePath: string): Promise<boolean> {
     await access(filePath);
     return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw err;
+    const classified = classifyCursorFsError(err);
+    if (classified.kind === "not_found") return false;
+    throw toCursorFsDiagnostic(err, filePath, "checking");
+  }
+}
+
+async function canonicalizePath(filePath: string): Promise<string> {
+  const resolved = path.resolve(filePath);
+  const normalizeCase = (value: string) =>
+    process.platform === "win32" ? value.toLowerCase() : value;
+
+  try {
+    return normalizeCase(await realpath(resolved));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw err;
+    }
+  }
+
+  // If the leaf does not exist yet, resolve symlinks on the nearest existing ancestor.
+  const segments: string[] = [];
+  let current = resolved;
+  for (;;) {
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return normalizeCase(resolved);
+    }
+    segments.unshift(path.basename(current));
+    current = parent;
+    try {
+      const realParent = await realpath(current);
+      return normalizeCase(path.join(realParent, ...segments));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw err;
+      }
+    }
+  }
+}
+
+export async function assertDifferentPaths(left: string, right: string): Promise<void> {
+  const [canonicalLeft, canonicalRight] = await Promise.all([
+    canonicalizePath(left),
+    canonicalizePath(right),
+  ]);
+  if (canonicalLeft === canonicalRight) {
+    throw new Error("backup and live cursor paths must be different");
   }
 }
 
 function validateCursor(raw: string): ReturnType<typeof parseAndMigrateCursorFile> {
   try {
     return parseAndMigrateCursorFile(raw);
-  } catch {
+  } catch (err) {
+    if (err instanceof DuplicateCursorTargetError) {
+      throw err;
+    }
     throw new Error("cursor file is malformed or uses an unsupported schema");
   }
 }
 
 async function writeAtomic(filePath: string, contents: string, replace: boolean): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
+  try {
+    await mkdir(path.dirname(filePath), { recursive: true });
+  } catch (err) {
+    throw toCursorFsDiagnostic(err, path.dirname(filePath), "preparing directory for");
+  }
   const temporaryPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
 
   try {
@@ -55,121 +151,551 @@ async function writeAtomic(filePath: string, contents: string, replace: boolean)
         if ((err as NodeJS.ErrnoException).code === "EEXIST") {
           throw new Error(`destination already exists at ${filePath}; pass --force to overwrite`);
         }
-        throw err;
+        throw toCursorFsDiagnostic(err, filePath, "writing");
       }
     }
+  } catch (err) {
+    if (err instanceof CursorDiagnosticError) throw err;
+    if (err instanceof Error && err.message.includes("destination already exists")) throw err;
+    throw toCursorFsDiagnostic(err, filePath, "writing");
   } finally {
     await unlink(temporaryPath).catch(() => undefined);
   }
 }
 
+async function readOptionalFile(filePath: string): Promise<string | null> {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/** Inspect a cursor file and return its schema metadata and CAS digest without exposing cursor values. */
+export async function inspectCursor(options: InspectCursorOptions): Promise<InspectCursorResult> {
+  const raw = await readOptionalFile(options.cursorFile);
+  if (raw === null) {
+    return { exists: false, digest: null, version: null, targets: 0 };
+  }
+  const parsed = validateCursor(raw);
+  return {
+    exists: true,
+    digest: cursorDigest(raw),
+    version: parsed.file.version,
+    targets: Object.keys(parsed.file.targets).length,
+  };
+}
+
 /** Copy a validated supported cursor snapshot without exposing cursor values. */
 export async function backupCursor(options: BackupCursorOptions): Promise<void> {
+  await assertDifferentPaths(options.cursorFile, options.backupFile);
   const raw = await readFile(options.cursorFile, "utf8");
+  const cas = checkCursorCas(raw, options.expectedDigest);
+  if (!cas.ok) {
+    throw new CursorConflictError("live", cas.expected, cas.actual, cas.reason);
+  }
   const parsed = validateCursor(raw);
   if (!options.force && (await exists(options.backupFile))) {
     throw new Error(`backup already exists at ${options.backupFile}; pass --force to overwrite`);
   }
   await writeAtomic(options.backupFile, raw, options.force === true);
+  const digest = cursorDigest(raw);
+  const version = parsed.file.version;
+  const targets = Object.keys(parsed.file.targets).length;
   console.log(
-    `[cursor] backed up schema=v` + `${parsed.file.version} targets=${Object.keys(parsed.file.targets).length} ` +
+    `[cursor] backed up schema=v${version} targets=${targets} digest=${digest.slice(0, 12)} ` +
       `from ${options.cursorFile} to ${options.backupFile}`,
   );
+  return { status: "backed_up", version, targets, digest };
+}
+
+function validateBackupOwnership(
+  backup: ReturnType<typeof parseAndMigrateCursorFile>["file"],
+  liveRaw: string | null,
+  options: Pick<RestoreCursorOptions, "expectedTargets" | "expectedNetwork" | "expectedContractIds">,
+): void {
+  const backupSources = Object.keys(backup.targets);
+  if (backupSources.length === 0) {
+    throw new Error("backup cursor has no targets; refusing to overwrite live cursor");
+  }
+
+  if (options.expectedNetwork && backup.network && backup.network !== options.expectedNetwork) {
+    throw new Error(
+      `backup network (${backup.network}) does not match expected network (${options.expectedNetwork})`,
+    );
+  }
+
+  if (options.expectedTargets && options.expectedTargets.length > 0) {
+    const allowed = new Set(options.expectedTargets);
+    for (const source of backupSources) {
+      if (!allowed.has(source)) {
+        throw new Error(`backup target "${source}" is not owned by this configuration`);
+      }
+    }
+  }
+
+  if (options.expectedContractIds) {
+    for (const [source, target] of Object.entries(backup.targets)) {
+      const expectedCid = options.expectedContractIds[source];
+      if (expectedCid && target.contractId && target.contractId !== expectedCid) {
+        throw new Error(
+          `backup contractId for "${source}" (${target.contractId}) does not match expected (${expectedCid})`,
+        );
+      }
+    }
+  }
+
+  if (liveRaw === null) return;
+
+  let live: ReturnType<typeof parseAndMigrateCursorFile>["file"];
+  try {
+    live = parseAndMigrateCursorFile(liveRaw).file;
+  } catch {
+    // Live cursor is corrupt/unparseable: allow restoring a valid backup with --force.
+    return;
+  }
+
+  if (live.network && backup.network && live.network !== backup.network) {
+    throw new Error(
+      `backup network (${backup.network}) does not match live cursor network (${live.network})`,
+    );
+  }
+
+  const liveSources = new Set(Object.keys(live.targets));
+  if (liveSources.size > 0) {
+    for (const source of backupSources) {
+      if (!liveSources.has(source)) {
+        throw new Error(
+          `backup target "${source}" does not match live cursor targets (${[...liveSources].join(", ")})`,
+        );
+      }
+      const liveCid = live.targets[source]?.contractId;
+      const backupCid = backup.targets[source]?.contractId;
+      if (liveCid && backupCid && liveCid !== backupCid) {
+        throw new Error(
+          `backup contractId for "${source}" (${backupCid}) does not match live cursor (${liveCid})`,
+        );
+      }
+    }
+  }
+}
+
+function expectedFingerprints(
+  config: TargetFingerprintConfig,
+): Record<string, string> {
+  return {
+    market: computeCursorTargetFingerprint(config.networkPassphrase, config.marketContractId),
+    squad: computeCursorTargetFingerprint(config.networkPassphrase, config.squadContractId),
+  };
 }
 
 /** Restore a compatible cursor while holding the poller's exclusive lock. */
 export async function restoreCursor(options: RestoreCursorOptions): Promise<void> {
+  await assertDifferentPaths(options.cursorFile, options.backupFile);
   const lock = await acquireInstanceLock(options.lockFile);
   try {
     const raw = await readFile(options.backupFile, "utf8");
     const parsed = validateCursor(raw);
-    if (!options.force && (await exists(options.cursorFile))) {
+    const liveExists = await exists(options.cursorFile);
+    if (!options.force && liveExists) {
       throw new Error(`cursor already exists at ${options.cursorFile}; pass --force to replace it`);
     }
-    const normalized = `${JSON.stringify(parsed.file, null, 2)}\n`;
+
+    let before: Record<string, CursorRecoveryPosition> = {};
+    let priorHistory: CursorRecoveryRecord[] = parsed.file.recoveryHistory ?? [];
+    if (liveExists) {
+      try {
+        const liveRaw = await readFile(options.cursorFile, "utf8");
+        const liveParsed = parseAndMigrateCursorFile(liveRaw);
+        before = snapshotCursorPositions(liveParsed.file.targets);
+        priorHistory = liveParsed.file.recoveryHistory ?? [];
+      } catch {
+        // Unreadable or corrupt live cursor: record empty before-positions
+        // without copying raw bytes or secrets into recovery history.
+        before = {};
+        priorHistory = [];
+      }
+    }
+
+    const after = snapshotCursorPositions(parsed.file.targets);
+    const recoveryHistory = appendCursorRecoveryHistory(priorHistory, {
+      at: (options.now ?? (() => new Date()))().toISOString(),
+      reason: "restore",
+      before,
+      after,
+    });
+    const nextFile = {
+      ...parsed.file,
+      recoveryHistory,
+    };
+
+    const normalized = `${JSON.stringify(nextFile, null, 2)}\n`;
     await writeAtomic(options.cursorFile, normalized, options.force === true);
+    const digest = cursorDigest(normalized);
+    const version = parsed.file.version;
+    const targets = Object.keys(parsed.file.targets).length;
     console.log(
-      `[cursor] restored schema=v${parsed.file.version} targets=${Object.keys(parsed.file.targets).length} ` +
+      `[cursor] restored schema=v${nextFile.version} targets=${Object.keys(nextFile.targets).length} ` +
         `from ${options.backupFile} to ${options.cursorFile}`,
     );
+    return {
+      status: "restored",
+      version,
+      targets,
+      digest,
+      previousDigest: liveDigestBefore,
+    };
   } finally {
     await lock.release();
   }
+}
+
+/**
+ * Read-only recovery preview. Shows the current and proposed cursor positions for each
+ * target along with the estimated missed ledger range and retained-window evidence.
+ * It never writes the cursor file, never guesses opaque tokens and never contacts the chain.
+ */
+export async function previewRecovery(options: RecoveryPreviewOptions): Promise<RecoveryPreview> {
+  if (!Number.isSafeInteger(options.proposedLedger) || options.proposedLedger < 0) {
+    throw new Error("proposed ledger must be a non-negative integer");
+  }
+  const hasStart = options.retainedWindowStart !== undefined;
+  const hasEnd = options.retainedWindowEnd !== undefined;
+  if (hasStart !== hasEnd) {
+    throw new Error("retained window requires both start and end");
+  }
+  if (hasStart && hasEnd && options.retainedWindowStart! > options.retainedWindowEnd!) {
+    throw new Error("retained window start must not exceed end");
+  }
+
+  const raw = await readFile(options.cursorFile, "utf8");
+  const parsed = validateCursor(raw);
+  const targetNames = options.target !== undefined ? [options.target] : Object.keys(parsed.file.targets);
+  if (options.target !== undefined && !(options.target in parsed.file.targets)) {
+    throw new Error(`target not found in cursor file: ${options.target}`);
+  }
+
+  const retained = hasStart && hasEnd
+    ? { start: options.retainedWindowStart!, end: options.retainedWindowEnd! }
+    : null;
+
+  const entries: RecoveryPreviewEntry[] = targetNames.map((target) => {
+    const state = parsed.file.targets[target] as { ledger?: number } | undefined;
+    const currentLedger = typeof state?.ledger === "number" ? state.ledger : null;
+    const warnings: string[] = [];
+
+    if (currentLedger !== null && options.proposedLedger > currentLedger) {
+      warnings.push("proposed ledger is ahead of the current position; no rewind would occur");
+    }
+
+    let missedLedgerRange: { from: number; to: number } | null = null;
+    if (currentLedger !== null && options.proposedLedger < currentLedger) {
+      missedLedgerRange = { from: options.proposedLedger + 1, to: currentLedger };
+    }
+
+    let withinRetainedWindow: boolean | null = null;
+    if (retained) {
+      withinRetainedWindow = options.proposedLedger >= retained.start && options.proposedLedger <= retained.end;
+      if (!withinRetainedWindow) {
+        warnings.push("proposed ledger is outside the retained window; events may be unrecoverable");
+      }
+      if (missedLedgerRange && missedLedgerRange.from < retained.start) {
+        warnings.push("part of the missed range predates the retained window");
+      }
+    } else {
+      warnings.push("no retained-window evidence supplied; availability is unverified");
+    }
+
+    return {
+      target,
+      currentLedger,
+      proposedLedger: options.proposedLedger,
+      missedLedgerRange,
+      retainedWindow: retained,
+      withinRetainedWindow,
+      warnings,
+    };
+  });
+
+  return { schemaVersion: parsed.file.version, entries };
+}
+
+export function formatRecoveryPreview(preview: RecoveryPreview): string {
+  const lines = [`[cursor] recovery preview schema=v${preview.schemaVersion} targets=${preview.entries.length}`];
+  for (const entry of preview.entries) {
+    const current = entry.currentLedger === null ? "unknown" : String(entry.currentLedger);
+    const range = entry.missedLedgerRange
+      ? `${entry.missedLedgerRange.from}..${entry.missedLedgerRange.to}`
+      : "none";
+    const window = entry.retainedWindow
+      ? `${entry.retainedWindow.start}..${entry.retainedWindow.end}`
+      : "unknown";
+    const retained = entry.withinRetainedWindow === null ? "unknown" : String(entry.withinRetainedWindow);
+    lines.push(
+      `  target=${entry.target} old=${current} proposed=${entry.proposedLedger} ` +
+        `missed=${range} retainedWindow=${window} proposedRetained=${retained}`,
+    );
+    for (const warning of entry.warnings) {
+      lines.push(`    warning: ${warning}`);
+    }
+  }
+  lines.push("[cursor] preview is read-only; no cursor or chain state was modified");
+  return lines.join("\n");
+}
+
+export function summarizePositions(positions: Record<string, CursorRecoveryPosition>): string {
+  const entries = Object.entries(positions);
+  if (entries.length === 0) return "none";
+  return entries
+    .map(([source, pos]) => {
+      const ledger =
+        typeof pos.rewindFromLedger === "number"
+          ? `rewind@${pos.rewindFromLedger}`
+          : pos.lastEventLedger !== null
+            ? `ledger=${pos.lastEventLedger}`
+            : pos.cursor !== null
+              ? "cursor=set"
+              : "none";
+      return `${source}:${ledger}`;
+    })
+    .join(",");
+}
+
+/** Read and print the bounded recovery history from a validated cursor file. */
+export async function readCursorRecoveryHistory(cursorFile: string): Promise<CursorRecoveryRecord[]> {
+  const raw = await readFile(cursorFile, "utf8");
+  const parsed = validateCursor(raw);
+  return parsed.file.recoveryHistory ?? [];
+}
+
+/**
+ * Load scan-archive records without modifying them. A directory is read as an
+ * event archive (`events-*.jsonl`, see `createEventArchive`); a file is read as
+ * a `npm run scan -- --jsonl` export, skipping its `{ "type": "summary" }` line.
+ */
+export async function readScanArchiveRecords(archivePath: string): Promise<unknown[]> {
+  let info;
+  try {
+    info = await stat(archivePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`archive not found at ${archivePath}`);
+    }
+    throw err;
+  }
+
+  const records: unknown[] = [];
+  if (info.isDirectory()) {
+    for await (const event of readArchive(archivePath)) records.push(event);
+    return records;
+  }
+
+  const raw = await readFile(archivePath, "utf8");
+  const lines = raw.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = lines[index]!.trim();
+    if (!trimmed) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      throw new Error(`malformed archive record at line ${index + 1}`);
+    }
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const { type, ...rest } = parsed as Record<string, unknown>;
+      if (type === "summary") continue;
+      records.push(type === undefined || type === "event" ? rest : parsed);
+      continue;
+    }
+    records.push(parsed);
+  }
+  return records;
+}
+
+export interface CheckCursorOptions {
+  cursorFile: string;
+  archivePath: string;
+  /** Contract id each source is expected to belong to (e.g. `{ market: MARKET_CONTRACT_ID }`). */
+  expectedContracts?: Record<string, string | undefined>;
+}
+
+/**
+ * Read-only consistency check of a cursor file against a scan archive. Takes
+ * no instance lock and writes nothing: neither the cursor nor the archive is
+ * modified, whatever the result.
+ */
+export async function checkCursor(options: CheckCursorOptions): Promise<CursorConsistencyReport> {
+  const raw = await readFile(options.cursorFile, "utf8");
+  const parsed = validateCursor(raw);
+  const records = await readScanArchiveRecords(options.archivePath);
+  return checkCursorConsistency(parsed.file, records, {
+    expectedContracts: options.expectedContracts,
+  });
 }
 
 interface CliOptions {
   file?: string;
   out?: string;
   from?: string;
+  target?: string;
+  to?: string;
+  retainedStart?: string;
+  retainedEnd?: string;
+  archive?: string;
+  marketContract?: string;
+  squadContract?: string;
   force: boolean;
+  json: boolean;
 }
 
 function parseOptions(args: string[]): CliOptions {
-  const options: CliOptions = { force: false };
+  const options: CliOptions = { force: false, json: false };
   const seen = new Set<string>();
+  const valued = new Set([
+    "--file", "--out", "--from", "--target", "--to", "--retained-start", "--retained-end",
+    "--archive", "--market-contract", "--squad-contract",
+  ]);
 
   for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    if (arg === "--force") {
-      if (seen.has(arg)) throw new Error("duplicate --force option");
+    const arg = args[index] ?? "";
+    if (arg === "--force" || arg === "--json") {
+      if (seen.has(arg)) throw new Error(`duplicate ${arg} option`);
       seen.add(arg);
-      options.force = true;
+      options[arg.slice(2) as "force" | "json"] = true;
       continue;
     }
-    if (arg !== "--file" && arg !== "--out" && arg !== "--from") {
+    if (!valued.has(arg)) {
       throw new Error(`unknown option: ${arg}`);
     }
     if (seen.has(arg)) throw new Error(`duplicate ${arg} option`);
     seen.add(arg);
     const value = args[index + 1];
-    if (value === undefined || value.startsWith("--")) throw new Error(`${arg} requires a path`);
-    options[arg.slice(2) as "file" | "out" | "from"] = value;
+    if (value === undefined || value.startsWith("--")) {
+      throw new Error(`${arg} requires ${arg.endsWith("-contract") ? "a contract id" : "a value"}`);
+    }
+    const key = arg.slice(2).replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
+    (options as unknown as Record<string, string>)[key] = value;
     index += 1;
   }
 
   return options;
 }
 
+function parseLedger(value: string, label: string): number {
+  if (!/^\d+$/.test(value)) throw new Error(`${label} must be a non-negative integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${label} is out of range`);
+  return parsed;
+}
+
 function resolvePath(value: string): string {
   return path.resolve(process.cwd(), value);
 }
 
-function assertDifferentPaths(left: string, right: string): void {
-  const normalize = (value: string) =>
-    process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
-  if (normalize(left) === normalize(right)) {
-    throw new Error("backup and live cursor paths must be different");
-  }
+function resolveTargetConfigFromEnv(): TargetFingerprintConfig | undefined {
+  const marketContractId = process.env.MARKET_CONTRACT_ID?.trim();
+  const squadContractId = process.env.SQUAD_CONTRACT_ID?.trim();
+  if (!marketContractId || !squadContractId) return undefined;
+
+  const network = process.env.STELLAR_NETWORK?.trim().toLowerCase();
+  const defaultPassphrase =
+    network === "mainnet" || network === "futurenet" || network === "testnet"
+      ? NETWORK_PASSPHRASES[network]
+      : NETWORK_PASSPHRASES.testnet;
+  const networkPassphrase =
+    process.env.STELLAR_NETWORK_PASSPHRASE?.trim() || defaultPassphrase;
+
+  return { networkPassphrase, marketContractId, squadContractId };
 }
 
 async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
-  if (action !== "backup" && action !== "restore") {
-    throw new Error("usage: npm run cursor -- <backup|restore> [--file PATH] [--out PATH|--from PATH] [--force]");
+  if (action !== "backup" && action !== "restore" && action !== "history" && action !== "preview" && action !== "check") {
+    throw new Error(
+      "usage: npm run cursor -- <backup|restore|history|preview|check> [--file PATH] [--out PATH|--from PATH] " +
+        "[--to LEDGER] [--target NAME] [--retained-start LEDGER --retained-end LEDGER] [--force] " +
+        "[--archive PATH [--json] [--market-contract ID] [--squad-contract ID]]",
+    );
   }
 
   const options = parseOptions(args);
   const cursorFile = resolvePath(options.file ?? process.env.CURSOR_FILE ?? "./data/cursor.json");
+  if (action === "check") {
+    if (!options.archive) throw new Error("check requires --archive PATH");
+    const report = await checkCursor({
+      cursorFile,
+      archivePath: resolvePath(options.archive),
+      expectedContracts: {
+        market: options.marketContract ?? (process.env.MARKET_CONTRACT_ID || undefined),
+        squad: options.squadContract ?? (process.env.SQUAD_CONTRACT_ID || undefined),
+      },
+    });
+    process.stdout.write(
+      options.json ? `${JSON.stringify(report, null, 2)}\n` : formatCursorConsistencyReport(report),
+    );
+    // Non-zero on any error finding so scripts can gate on it; nothing was written.
+    if (!report.consistent) process.exitCode = 1;
+    return;
+  }
+  if (action === "history") {
+    const history = await readCursorRecoveryHistory(cursorFile);
+    console.log(`[cursor] recovery history (${history.length}) for ${cursorFile}`);
+    for (const record of history) {
+      const targetPart = record.source ? ` source=${record.source}` : "";
+      console.log(
+        `  ${record.at} reason=${record.reason}${targetPart} ` +
+          `before=[${summarizePositions(record.before)}] after=[${summarizePositions(record.after)}]`,
+      );
+    }
+    return;
+  }
+
+  if (action === "preview") {
+    if (!options.to) throw new Error("preview requires --to LEDGER");
+    const preview = await previewRecovery({
+      cursorFile,
+      proposedLedger: parseLedger(options.to, "--to"),
+      ...(options.target !== undefined ? { target: options.target } : {}),
+      ...(options.retainedStart !== undefined
+        ? { retainedWindowStart: parseLedger(options.retainedStart, "--retained-start") }
+        : {}),
+      ...(options.retainedEnd !== undefined
+        ? { retainedWindowEnd: parseLedger(options.retainedEnd, "--retained-end") }
+        : {}),
+    });
+    console.log(formatRecoveryPreview(preview));
+    return;
+  }
+
   if (action === "backup") {
     const backupFile = resolvePath(
       options.out ?? `${cursorFile}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`,
     );
-    assertDifferentPaths(cursorFile, backupFile);
     await backupCursor({ cursorFile, backupFile, force: options.force });
+    return;
+  }
+
+  const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
+  if (action === "migrate") {
+    const targets = resolveTargetConfigFromEnv();
+    if (!targets) {
+      throw new Error("migrate requires MARKET_CONTRACT_ID and SQUAD_CONTRACT_ID");
+    }
+    await migrateCursor({
+      cursorFile,
+      lockFile,
+      force: options.force,
+      ...targets,
+    });
     return;
   }
 
   if (!options.from) throw new Error("restore requires --from PATH");
   const backupFile = resolvePath(options.from);
-  assertDifferentPaths(cursorFile, backupFile);
   const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
-  await restoreCursor({
-    cursorFile,
-    backupFile,
-    lockFile,
-    force: options.force,
-  });
+  await restoreCursor({ cursorFile, backupFile, lockFile, force: options.force });
 }
 
 const invokedPath = process.argv[1];

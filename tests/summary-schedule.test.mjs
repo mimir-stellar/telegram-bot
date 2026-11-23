@@ -6,6 +6,8 @@ import { join } from "node:path";
 import {
   parseSchedule,
   nextRun,
+  nextAllowedWindowStart,
+  nextAllowedRun,
   createScheduler,
   FileLastRunStore,
   ScheduleParseError,
@@ -139,6 +141,39 @@ test("scheduler fires missed run once on restart", async () => {
     await clock.advanceTo(Date.UTC(2024, 0, 4, 10));
     assert.strictEqual(runs.length, 2);
     await scheduler.stop();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scheduler reports complete context on normal tick and restart-incomplete context on catch-up", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "test-schedule-completeness-"));
+  try {
+    const store = new FileLastRunStore(join(dir, "last-run"));
+    await store.write(Date.UTC(2024, 0, 1, 9, 0, 0));
+    const clock = fakeClock(Date.UTC(2024, 0, 3, 10, 0, 0));
+    const contexts = [];
+    const scheduler = createScheduler({
+      schedule: "daily@09:00",
+      clock,
+      lastRunStore: store,
+      run: (_at, context) => {
+        contexts.push(context);
+      },
+    });
+    await scheduler.start();
+    await clock.advanceTo(Date.UTC(2024, 0, 4, 10, 0, 0));
+    await scheduler.stop();
+
+    assert.strictEqual(contexts.length, 2);
+    assert.deepStrictEqual(contexts[0], {
+      afterRestart: true,
+      completeness: { complete: false, reasons: ["restart"] },
+    });
+    assert.deepStrictEqual(contexts[1], {
+      afterRestart: false,
+      completeness: { complete: true, reasons: [] },
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

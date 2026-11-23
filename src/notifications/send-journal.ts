@@ -6,20 +6,40 @@
  * an `intent` but no `done` identify notifications that may or may not have
  * been delivered -- instead of guessing from the cursor.
  *
+ * A `timeout` line is written when the HTTP call to Telegram timed out before
+ * a response was received. A pending intent that also has a matching `timeout`
+ * line is a **confirmed-unknown outcome**: Telegram may have received the
+ * message even though the client did not. This is distinct from a plain pending
+ * intent (crashed before or during the send, no timeout observed). Both cases
+ * leave the notification potentially sent, but the timeout case gives recovery
+ * tooling a stronger signal for de-duplication decisions.
+ *
  * Every append is fsynced before it returns, so a journal entry survives an
  * abrupt termination. The file is JSONL and is kept bounded by compaction:
  * resolved (`intent` + `done`) pairs are dropped, leaving only unresolved
- * intents.
+ * intents and any associated `timeout` lines.
  *
  * The journal is best-effort: a write failure is logged and the poller carries
  * on, falling back to guessing from the cursor exactly as it does today.
+ *
+ * Routing preview: `previewRoutingDecision` is not part of this module; the
+ * journal only records send intents and outcomes.
  */
 
 import { mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
+import { sanitizeTelegramError } from "./notifier.js";
+
 export const DEFAULT_SEND_JOURNAL_MAX_ENTRIES = 1_000;
 export const DEFAULT_SEND_JOURNAL_MAX_BYTES = 1_000_000;
+
+export type DeliveryOutcome = "sent" | "failed" | "skipped";
+
+export interface JournalDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
 
 export interface JournalEntry {
   kind: "intent" | "retry" | "done";
@@ -27,8 +47,18 @@ export interface JournalEntry {
   source: string;
   ledger: number;
   eventName: string;
+  /** Target Telegram chat id when tracked per-destination. */
+  chatId?: string;
+  /** Target Telegram forum topic / thread id when tracked per-destination. */
+  topicId?: number;
+  /** Persisted delivery outcome on `done` entries. */
+  outcome?: DeliveryOutcome;
   /** Bounded hash of the message body; the body itself is never persisted. */
   textHash?: string;
+  /** Stable error code for operator triage (e.g. Telegram error_code 400, 429). */
+  errorCode?: number | string;
+  /** Sanitized, redacted, and length-bounded error description. */
+  errorDescription?: string;
   at: number;
   /**
    * Epoch milliseconds when the next retry attempt is eligible.
@@ -45,6 +75,8 @@ export interface SendJournalOptions {
   maxEntries?: number;
   maxBytes?: number;
   now?: () => number;
+  /** Known secrets (e.g. botToken) to redact from persisted error descriptions. */
+  secrets?: readonly string[];
 }
 
 export interface SendJournalStats {
@@ -58,7 +90,11 @@ export interface SendJournal {
     source: string;
     ledger: number;
     eventName: string;
+    chatId?: string;
+    topicId?: number;
     textHash?: string;
+    chatId?: string;
+    networkPassphrase?: string;
     at: number;
     nextAttemptAt?: number;
     attempts?: number;
@@ -69,6 +105,13 @@ export interface SendJournal {
    */
   recordRetry(id: string, nextAttemptAt: number, attempts?: number): Promise<void>;
   recordDone(id: string): Promise<void>;
+  /**
+   * Record that a send attempt for `id` timed out before Telegram responded.
+   * The notification may or may not have been delivered. This is distinct from
+   * a confirmed rejection (4xx error) or a crash before the send was attempted.
+   * `timeoutReason` is a bounded, pre-scrubbed description; never persisted raw.
+   */
+  recordTimeout(id: string, timeoutReason?: string): Promise<void>;
   /** Intents with no matching done: notifications that may have been sent. */
   loadPending(): Promise<JournalEntry[]>;
   /**
@@ -182,7 +225,11 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     source: string;
     ledger: number;
     eventName: string;
+    chatId?: string;
+    topicId?: number;
     textHash?: string;
+    chatId?: string;
+    networkPassphrase?: string;
     at: number;
     nextAttemptAt?: number;
     attempts?: number;
@@ -226,8 +273,23 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     });
   }
 
-  async function recordDone(id: string): Promise<void> {
-    await append({ kind: "done", id, source: "", ledger: 0, eventName: "", at: now() });
+  async function recordDone(
+    id: string,
+    destination?: JournalDestination,
+    outcome?: DeliveryOutcome,
+  ): Promise<void> {
+    const doneEntry: JournalEntry = {
+      kind: "done",
+      id,
+      source: "",
+      ledger: 0,
+      eventName: "",
+      ...(destination ? { chatId: destination.chatId } : {}),
+      ...(destination?.topicId !== undefined ? { topicId: destination.topicId } : {}),
+      ...(outcome !== undefined ? { outcome } : destination ? { outcome: "sent" as const } : {}),
+      at: now(),
+    };
+    await append(doneEntry);
     // Once a send is accounted for, compact resolved pairs away when the file
     // has grown past its budget so the journal stays bounded.
     const stats = await journalStats();
@@ -238,8 +300,10 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
 
   function resolvePending(entries: JournalEntry[]): JournalEntry[] {
     const done = new Set<string>();
+    const timedOut = new Set<string>();
     for (const entry of entries) {
       if (entry.kind === "done") done.add(entry.id);
+      if (entry.kind === "timeout") timedOut.add(entry.id);
     }
     const pending = new Map<string, JournalEntry>();
     for (const entry of entries) {
