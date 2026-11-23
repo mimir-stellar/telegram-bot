@@ -1,5 +1,17 @@
 # Notification Filters
 
+## Previewing Routing Decisions
+
+Operators can preview how a notification would be routed without calling Telegram `sendMessage`. The preview uses the same decision path as live notification delivery (feature flags, category allowlist, and destination configuration), and returns three buckets for each candidate destination:
+
+- **matched**: destinations that would receive the notification.
+- **filtered**: destinations skipped by a feature flag or category filter, with the reason.
+- **unavailable**: destinations that are not configured or cannot currently receive messages.
+
+No network call to Telegram is made during a preview, and no state is mutated.
+
+---
+
 The Mimir Telegram bot reads eight environment variables that gate or filter outbound Telegram notifications. Because several of their names look similar, this document specifies what each variable filters, its default value, how multiple variables interact, and how to configure common scenarios.
 
 ---

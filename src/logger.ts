@@ -30,6 +30,7 @@
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import { redactText } from "./redact.js";
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -47,6 +48,19 @@ export interface LogLine {
   text: string;
 }
 
+export interface LogCaptureStats {
+  /** Number of lines currently retained in the ring buffer. */
+  retained: number;
+  /** Number of older lines evicted from the ring buffer due to capacity. */
+  omitted: number;
+  /** Configured ring buffer capacity (0 = capture disabled). */
+  capacity: number;
+  /** Timestamp (`ms` since epoch) of the oldest retained line, or `null` if empty. */
+  oldestAt: number | null;
+  /** Timestamp (`ms` since epoch) of the newest retained line, or `null` if empty. */
+  newestAt: number | null;
+}
+
 export interface LogCapture {
   /** Redact and append one line. Drops the oldest when the ring is full. */
   add(level: LogLine["level"], text: string): void;
@@ -56,6 +70,8 @@ export interface LogCapture {
   size(): number;
   /** Configured capacity (0 = capture disabled). */
   capacity(): number;
+  /** Capture retention/truncation counts and time bounds. */
+  stats?(): LogCaptureStats;
 }
 
 /**
@@ -88,16 +104,20 @@ export function secretsFor(config: BotConfig): string[] {
  * Create the ring buffer. Capacity 0 means capture is disabled: `add` is a
  * no-op and `lines()` is always empty, so callers need no special casing.
  */
-export function createLogCapture(capacity: number): LogCapture {
+export function createLogCapture(capacity: number, now: () => number = Date.now): LogCapture {
   const cap = Math.max(0, Math.floor(capacity));
   const ring: LogLine[] = [];
   let nextSeq = 0;
+  let omitted = 0;
 
   return {
     add(level, text) {
       if (cap === 0) return;
-      const line: LogLine = { seq: nextSeq++, at: Date.now(), level, text };
-      if (ring.length >= cap) ring.shift();
+      const line: LogLine = { seq: nextSeq++, at: now(), level, text };
+      if (ring.length >= cap) {
+        ring.shift();
+        omitted += 1;
+      }
       ring.push(line);
     },
     lines() {
@@ -108,6 +128,15 @@ export function createLogCapture(capacity: number): LogCapture {
     },
     capacity() {
       return cap;
+    },
+    stats() {
+      return {
+        retained: ring.length,
+        omitted,
+        capacity: cap,
+        oldestAt: ring[0]?.at ?? null,
+        newestAt: ring[ring.length - 1]?.at ?? null,
+      };
     },
   };
 }
@@ -186,10 +215,25 @@ export function renderLogExport(
   if (status.lastError) {
     lines.push(`last error (${agoShort(status.lastError.at, now)} ago): ${status.lastError.message}`);
   }
+  const logs = capture.lines();
+  const stats: LogCaptureStats = capture.stats?.() ?? {
+    retained: logs.length,
+    omitted: 0,
+    capacity: capture.capacity(),
+    oldestAt: logs[0]?.at ?? null,
+    newestAt: logs[logs.length - 1]?.at ?? null,
+  };
+  const timeBounds =
+    stats.oldestAt !== null && stats.newestAt !== null
+      ? `${new Date(stats.oldestAt).toISOString()}..${new Date(stats.newestAt).toISOString()}`
+      : "none";
+  lines.push(
+    `log capture: retained ${stats.retained} · omitted ${stats.omitted} · ` +
+      `truncated: ${stats.omitted > 0 ? "yes" : "no"} · window: ${timeBounds}`,
+  );
   lines.push("");
   lines.push(`recent logs (${capture.size()} lines, redacted):`);
 
-  const logs = capture.lines();
   if (logs.length === 0) {
     lines.push("(no log lines captured)");
   }
@@ -296,10 +340,10 @@ function defaultState(): LoggerState {
 let state = defaultState();
 
 function redactLogText(text: string): string {
-  let out = text;
-  for (const secret of state.secrets) {
-    if (secret.length > 0) out = out.split(secret).join(LOG_REDACTED);
-  }
+  const out = redactText(text, {
+    secrets: state.secrets,
+    maxLen: Number.MAX_SAFE_INTEGER,
+  });
   return out.replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED);
 }
 
@@ -358,6 +402,15 @@ export const Logger = {
   },
   reset(): void {
     state = defaultState();
+  },
+  runWithConfig<T>(options: Partial<LoggerState>, fn: () => T): T {
+    const previous = { ...state, secrets: [...state.secrets] };
+    state = { ...state, ...options };
+    try {
+      return fn();
+    } finally {
+      state = previous;
+    }
   },
   getLevel(): LogLevel {
     return state.level;
