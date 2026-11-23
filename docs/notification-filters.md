@@ -1,5 +1,17 @@
 # Notification Filters
 
+## Previewing Routing Decisions
+
+Operators can preview how a notification would be routed without calling Telegram `sendMessage`. The preview uses the same decision path as live notification delivery (feature flags, category allowlist, and destination configuration), and returns three buckets for each candidate destination:
+
+- **matched**: destinations that would receive the notification.
+- **filtered**: destinations skipped by a feature flag or category filter, with the reason.
+- **unavailable**: destinations that are not configured or cannot currently receive messages.
+
+No network call to Telegram is made during a preview, and no state is mutated.
+
+---
+
 The Mimir Telegram bot reads eight environment variables that gate or filter outbound Telegram notifications. Because several of their names look similar, this document specifies what each variable filters, its default value, how multiple variables interact, and how to configure common scenarios.
 
 ---
@@ -153,3 +165,21 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_created` events**: Muted by `eventAllowedByCategory` because `config.notificationCategories` is non-empty (`["__none__"]`) and no real on-chain claim category matches `"__none__"`.
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
+
+
+---
+
+## 4. Filter Dry-Run Report Over Local Archive
+
+Operators can simulate and preview the effect of proposed filter expressions and USDC amount thresholds against locally recorded historical events before altering live bot deployments.
+
+The filter dry-run report (`runFilterDryRunReport` in [`src/notifications/filter-dry-run.ts`](../src/notifications/filter-dry-run.ts)) reads events from a local event archive (`events-*.jsonl`), parses expressions using the production parser (`parseFilterExpression`), and aggregates match vs. rejection statistics grouped by reason without modifying live state or sending notifications:
+
+- **Matching counts**: Events satisfying all configured filter rules and amount thresholds.
+- **Rejection counts by reason**:
+  - `name_mismatch`: Event payload name does not match the rule's target event name.
+  - `condition_unmet`: Event matched the target name but failed the condition (e.g. `stake < 100 USDC`).
+  - `threshold_unmet`: Event failed integer USDC amount thresholds (`marketChallenge` or `squadDeposit`).
+  - `unknown_payload`: Payload is unknown, admin, or untyped.
+  - `malformed`: Event payload is corrupt or unparseable.
+- **Breakdown by event name**: Per-event-name counts of total, matched, and rejected events.
