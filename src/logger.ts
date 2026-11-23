@@ -30,7 +30,7 @@
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
-import { redactText } from "./redact.js";
+import { redactInlineUrls, registeredSecrets } from "./redact.js";
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -88,6 +88,14 @@ export function redactLine(text: string, secrets: string[]): string {
   for (const secret of secrets) {
     if (secret) out = out.split(secret).join(REDACTED);
   }
+  out = redactInlineUrls(out, {
+    secrets,
+    placeholder: REDACTED,
+    includeRegisteredSecrets: false,
+  });
+  out = out
+    .replace(/\b(?:bot)?\d{5,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, REDACTED)
+    .replace(/\bS[A-Z2-7]{55}\b/g, REDACTED);
   // Full-precision Stellar strkeys (G…/C…, 56 chars) -> first 4 + … + last 4.
   // Shortened display forms like `CDV6…LPKZI` are left alone; the ellipsis
   // means there is nothing more to hide.
@@ -288,7 +296,8 @@ export const MAX_LOG_FIELD_CHARS = 1_000;
 const LOG_REDACTED = "[REDACTED]";
 const MAX_FIELD_DEPTH = 4;
 const LEVEL_RANK: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40, fatal: 50 };
-const TELEGRAM_TOKEN_SHAPE = /\b\d{5,}:[A-Za-z0-9_-]{20,}/g;
+const TELEGRAM_TOKEN_SHAPE = /\b(?:bot)?\d{5,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g;
+const STELLAR_SECRET_SEED_SHAPE = /\bS[A-Z2-7]{55}\b/g;
 
 export function parseLogLevel(value: unknown): LogLevel {
   if (typeof value !== "string") return DEFAULT_LOG_LEVEL;
@@ -340,11 +349,21 @@ function defaultState(): LoggerState {
 let state = defaultState();
 
 function redactLogText(text: string): string {
-  const out = redactText(text, {
-    secrets: state.secrets,
-    maxLen: Number.MAX_SAFE_INTEGER,
+  let out = text;
+  const secrets = [...state.secrets, ...registeredSecrets()]
+    .filter((secret) => secret.length > 0)
+    .sort((a, b) => b.length - a.length);
+  for (const secret of secrets) {
+    if (out.includes(secret)) out = out.split(secret).join(LOG_REDACTED);
+  }
+  out = redactInlineUrls(out, {
+    secrets,
+    placeholder: LOG_REDACTED,
+    includeRegisteredSecrets: false,
   });
-  return out.replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED);
+  return out
+    .replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED)
+    .replace(STELLAR_SECRET_SEED_SHAPE, LOG_REDACTED);
 }
 
 function boundField(text: string): string {

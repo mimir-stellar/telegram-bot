@@ -24,7 +24,7 @@
  * metadata. It never holds signing keys or bot tokens.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { safeErrorMessage } from "./notifications/format.js";
@@ -32,7 +32,8 @@ import { safeErrorMessage } from "./notifications/format.js";
 export interface DeadLetterEntry {
   /** Stable id within the queue (source + ledger + event + short text hash). */
   id: string;
-  enqueuedAt: string;
+  /** ISO 8601 timestamp of the original failure, or `null` for legacy entries missing one. */
+  enqueuedAt: string | null;
   source: string;
   ledger: number;
   eventName: string;
@@ -42,6 +43,12 @@ export interface DeadLetterEntry {
   lastError: string | null;
   /** Stellar network passphrase where the failure originated, if recorded. */
   networkPassphrase?: string;
+}
+
+export interface DeadLetterAgeSummary {
+  oldestEnqueuedAt: string | null;
+  ageMs: number | null;
+  missingTimestamps: number;
 }
 
 export interface DeadLetterFile {
@@ -55,6 +62,13 @@ export interface DeadLetterStats {
   enqueued: number;
   replayed: number;
   dropped: number;
+}
+
+export interface DeadLetterAckResult {
+  acknowledged: DeadLetterEntry[];
+  acknowledgedIds: string[];
+  unmatchedIds: string[];
+  remaining: number;
 }
 
 export interface DeadLetterQueueOptions {
@@ -79,37 +93,56 @@ export interface DeadLetterQueueOptions {
   networkPassphrase?: string;
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /**
+   * When `true`, validation errors during `load()` (such as duplicate entry
+   * IDs) throw instead of logging a warning and starting empty. The source
+   * file is always preserved untouched in either mode.
+   */
+  strict?: boolean;
+}
+
+export class DeadLetterDuplicateIdError extends Error {
+  readonly filePath: string | null;
+  readonly duplicateIds: string[];
+
+  constructor(filePath: string | null, duplicateIds: readonly string[]) {
+    const location = filePath ? ` in ${filePath}` : "";
+    super(
+      `duplicate dead-letter entry id(s)${location}: ${duplicateIds.join(", ")}; ` +
+        `source file preserved for inspection`,
+    );
+    this.name = "DeadLetterDuplicateIdError";
+    this.filePath = filePath;
+    this.duplicateIds = [...duplicateIds];
+  }
+}
+
+/**
+ * Return any duplicate entry IDs in first-seen conflict order.
+ * An empty array means all entry IDs are unique.
+ */
+export function findDuplicateEntryIds(
+  entries: readonly Pick<DeadLetterEntry, "id">[],
+): string[] {
+  const seen = new Set<string>();
+  const recorded = new Set<string>();
+  const duplicates: string[] = [];
+  for (const entry of entries) {
+    if (seen.has(entry.id)) {
+      if (!recorded.has(entry.id)) {
+        recorded.add(entry.id);
+        duplicates.push(entry.id);
+      }
+    } else {
+      seen.add(entry.id);
+    }
+  }
+  return duplicates;
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
-
-export class DeadLetterMalformedError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(message, options);
-    this.name = "DeadLetterMalformedError";
-  }
-}
-
-export class DeadLetterAccessError extends Error {
-  readonly code?: string;
-
-  constructor(message: string, code?: string, options?: { cause?: unknown }) {
-    super(message, options);
-    this.name = "DeadLetterAccessError";
-    this.code = code;
-  }
-}
-
-export interface DeadLetterLoadOptions {
-  /**
-   * When true, surface malformed files and non-ENOENT access errors instead of
-   * falling back to an empty queue. Used by the offline inspection CLI.
-   */
-  strict?: boolean;
-  /** Suppress informational `loaded ...` stdout logging (keeps CLI stdout machine-readable). */
-  quiet?: boolean;
-}
+export const DEAD_LETTER_MAX_ACK_IDS = 100;
 
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
@@ -139,10 +172,54 @@ export function makeEntryId(
   return `${source}:${ledger}:${eventName}:${shortHash(text)}`;
 }
 
+/**
+ * Parse an entry's original failed-at timestamp (`enqueuedAt`), returning `null`
+ * for missing or invalid legacy timestamps instead of falling back to `now` or file mtime.
+ */
+export function parseEntryTimestampMs(enqueuedAt: unknown): number | null {
+  if (typeof enqueuedAt !== "string" || enqueuedAt.trim() === "") {
+    return null;
+  }
+  const ms = Date.parse(enqueuedAt);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Compute the dead-letter queue age from the oldest retained failure's original
+ * `enqueuedAt` timestamp, counting entries whose legacy timestamp is missing or invalid.
+ */
+export function summarizeDeadLetterAge(
+  entries: readonly Pick<DeadLetterEntry, "enqueuedAt">[],
+  nowMs: number = Date.now(),
+): DeadLetterAgeSummary {
+  let oldestMs: number | null = null;
+  let oldestEnqueuedAt: string | null = null;
+  let missingTimestamps = 0;
+
+  for (const entry of entries) {
+    const ms = parseEntryTimestampMs(entry.enqueuedAt);
+    if (ms === null) {
+      missingTimestamps += 1;
+      continue;
+    }
+    if (oldestMs === null || ms < oldestMs) {
+      oldestMs = ms;
+      oldestEnqueuedAt = entry.enqueuedAt;
+    }
+  }
+
+  return {
+    oldestEnqueuedAt,
+    ageMs: oldestMs === null ? null : Math.max(0, nowMs - oldestMs),
+    missingTimestamps,
+  };
+}
+
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
   let entries: DeadLetterEntry[] = [];
+  let sourcePreserved = false;
   const stats: DeadLetterStats = {
     depth: 0,
     enqueued: 0,
@@ -159,9 +236,8 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     stats.depth = entries.length;
   }
 
-  async function load(loadOptions: DeadLetterLoadOptions = {}): Promise<void> {
-    const strict = loadOptions.strict === true;
-    const quiet = loadOptions.quiet === true;
+  async function load(): Promise<void> {
+    sourcePreserved = false;
     if (filePath === null) {
       entries = [];
       syncDepth();
@@ -205,27 +281,18 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         );
         entries = [];
       } else {
-        const rawEntries = (parsed as DeadLetterFile).entries;
-        const validEntry = (e: unknown): e is DeadLetterEntry =>
-          Boolean(
-            e &&
-              typeof e === "object" &&
-              !Array.isArray(e) &&
-              typeof (e as DeadLetterEntry).id === "string" &&
-              typeof (e as DeadLetterEntry).text === "string" &&
-              typeof (e as DeadLetterEntry).ledger === "number",
-          );
-        if (strict && rawEntries.some((e) => !validEntry(e))) {
-          throw new DeadLetterMalformedError(
-            `malformed dead-letter entry in ${filePath}: expected id, text, and ledger`,
-          );
-        }
-        entries = rawEntries
-          .filter(validEntry)
+        const candidateEntries = parsed.entries
+          .filter(
+            (e) =>
+              e &&
+              typeof e.id === "string" &&
+              typeof e.text === "string" &&
+              typeof e.ledger === "number",
+          )
           .map((e) => ({
             id: e.id,
             enqueuedAt:
-              typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
+              parseEntryTimestampMs(e.enqueuedAt) !== null ? (e.enqueuedAt as string) : null,
             source: typeof e.source === "string" ? e.source : "unknown",
             ledger: e.ledger,
             eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
@@ -236,6 +303,24 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
               ? { networkPassphrase: e.networkPassphrase }
               : {}),
           }));
+
+        // Reject conflicting duplicate IDs before trimming to maxEntries so an
+        // older duplicate is never silently discarded, and preserve the source
+        // file for inspection rather than overwriting it.
+        const duplicateIds = findDuplicateEntryIds(candidateEntries);
+        if (duplicateIds.length > 0) {
+          entries = [];
+          sourcePreserved = true;
+          syncDepth();
+          const err = new DeadLetterDuplicateIdError(filePath, duplicateIds);
+          if (options.strict) {
+            throw err;
+          }
+          console.warn(`[dead-letter] ${safeError(err)}; starting empty`);
+          return;
+        }
+
+        entries = candidateEntries;
         // Bound on load too: the file may have been edited by hand.
         while (entries.length > options.maxEntries) {
           entries.shift();
@@ -243,12 +328,8 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         }
       }
     } catch (err) {
-      if (strict) {
-        if (err instanceof DeadLetterMalformedError) throw err;
-        throw new DeadLetterMalformedError(
-          `malformed dead-letter file at ${filePath}: ${safeError(err)}`,
-          { cause: err },
-        );
+      if (err instanceof DeadLetterDuplicateIdError) {
+        throw err;
       }
       console.warn(
         `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
@@ -263,6 +344,13 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
 
   async function persist(): Promise<void> {
     if (filePath === null) {
+      syncDepth();
+      return;
+    }
+    if (sourcePreserved) {
+      console.warn(
+        `[dead-letter] refusing to overwrite ${filePath} while duplicate-id conflict is unresolved`,
+      );
       syncDepth();
       return;
     }
@@ -414,12 +502,188 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     return { sent, remaining: entries.length, rejectedNetworkMismatch };
   }
 
+  /**
+   * Interruptible, resumable recovery over a filtered selection of entries.
+   * Persists a bounded checkpoint of acknowledged IDs so a resumed run skips
+   * entries that were already acknowledged before interruption.
+   */
+  async function recoverSelection(
+    send: (text: string, entry: DeadLetterEntry) => Promise<void>,
+    recoverOptions: RecoverSelectionOptions = {},
+  ): Promise<RecoverSelectionResult> {
+    const maxAckIds = recoverOptions.maxAcknowledgedIds ?? DEAD_LETTER_CHECKPOINT_MAX_IDS;
+    const checkpointFile = recoverOptions.checkpointFile;
+
+    if (checkpointFile && recoverOptions.resetCheckpoint) {
+      await clearRecoveryCheckpoint(checkpointFile);
+    }
+
+    const existingCheckpoint = checkpointFile
+      ? await loadRecoveryCheckpoint(checkpointFile, maxAckIds)
+      : null;
+    const acknowledgedIds = existingCheckpoint ? [...existingCheckpoint.acknowledgedIds] : [];
+    const acknowledgedSet = new Set(acknowledgedIds);
+
+    const budget = recoverOptions.budget ?? entries.length;
+    let sent = 0;
+    let skippedAcknowledged = 0;
+    let interrupted = false;
+    const kept: DeadLetterEntry[] = [];
+
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index]!;
+      if (acknowledgedSet.has(entry.id)) {
+        skippedAcknowledged += 1;
+        continue;
+      }
+      if (recoverOptions.source && entry.source !== recoverOptions.source) {
+        kept.push(entry);
+        continue;
+      }
+      if (recoverOptions.signal?.aborted || sent >= budget) {
+        interrupted = true;
+        kept.push(...entries.slice(index));
+        break;
+      }
+
+      try {
+        await send(entry.text, entry);
+        sent += 1;
+        stats.replayed += 1;
+        if (!acknowledgedSet.has(entry.id)) {
+          acknowledgedSet.add(entry.id);
+          acknowledgedIds.push(entry.id);
+        }
+        if (checkpointFile) {
+          await saveRecoveryCheckpoint(
+            checkpointFile,
+            {
+              version: 1,
+              updatedAt: new Date(now()).toISOString(),
+              acknowledgedIds,
+              source: recoverOptions.source,
+              completed: false,
+            },
+            maxAckIds,
+          );
+        }
+      } catch (err) {
+        entry.attempts += 1;
+        entry.lastError = safeError(err);
+        if (entry.attempts >= options.maxAttempts) {
+          stats.dropped += 1;
+        } else {
+          kept.push(entry);
+        }
+      }
+    }
+
+    entries = kept;
+    syncDepth();
+    await persist();
+
+    const remainingSelected = entries.filter(
+      (e) =>
+        !acknowledgedSet.has(e.id) &&
+        (!recoverOptions.source || e.source === recoverOptions.source),
+    ).length;
+    const completed = !interrupted && remainingSelected === 0;
+
+    if (checkpointFile) {
+      await saveRecoveryCheckpoint(
+        checkpointFile,
+        {
+          version: 1,
+          updatedAt: new Date(now()).toISOString(),
+          acknowledgedIds,
+          source: recoverOptions.source,
+          completed,
+        },
+        maxAckIds,
+      );
+    }
+
+    return {
+      sent,
+      skippedAcknowledged,
+      remaining: entries.length,
+      interrupted,
+      completed,
+      acknowledgedCount: boundAcknowledgedIds(acknowledgedIds, maxAckIds).length,
+    };
+  }
+
+  /**
+   * Atomically acknowledge (remove) an explicit, bounded list of inspected
+   * dead-letter entry IDs. Unmatched IDs are reported and all non-matching
+   * queued entries are preserved untouched in their original order.
+   */
+  async function acknowledge(ids: readonly string[]): Promise<DeadLetterAckResult> {
+    if (!Array.isArray(ids) || ids.length === 0) {
+      throw new RangeError("acknowledge requires at least one entry id");
+    }
+    if (ids.length > DEAD_LETTER_MAX_ACK_IDS) {
+      throw new RangeError(
+        `acknowledge accepts at most ${DEAD_LETTER_MAX_ACK_IDS} entry ids (received ${ids.length})`,
+      );
+    }
+
+    const normalizedIds: string[] = [];
+    const requestedSet = new Set<string>();
+    for (const rawId of ids) {
+      if (typeof rawId !== "string" || rawId.trim() === "") {
+        throw new RangeError("acknowledge entry ids must be non-empty strings");
+      }
+      const id = rawId.trim();
+      if (!requestedSet.has(id)) {
+        requestedSet.add(id);
+        normalizedIds.push(id);
+      }
+    }
+
+    const acknowledged: DeadLetterEntry[] = [];
+    const kept: DeadLetterEntry[] = [];
+    const matchedSet = new Set<string>();
+
+    for (const entry of entries) {
+      if (requestedSet.has(entry.id)) {
+        acknowledged.push(entry);
+        matchedSet.add(entry.id);
+      } else {
+        kept.push(entry);
+      }
+    }
+
+    const unmatchedIds = normalizedIds.filter((id) => !matchedSet.has(id));
+
+    if (acknowledged.length > 0) {
+      entries = kept;
+      syncDepth();
+      await persist();
+      console.log(
+        `[dead-letter] acknowledged ${acknowledged.length} entry(s) ` +
+          `(${unmatchedIds.length} unmatched, ${entries.length} remaining)`,
+      );
+    }
+
+    return {
+      acknowledged: acknowledged.map((e) => ({ ...e })),
+      acknowledgedIds: acknowledged.map((e) => e.id),
+      unmatchedIds,
+      remaining: entries.length,
+    };
+  }
+
   return {
     load,
     enqueue,
     flush,
+    acknowledge,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
+    },
+    summary(): DeadLetterStatusSummary {
+      return summarizeDeadLetters(entries);
     },
     /** Test helper — snapshot of current entries. */
     snapshot(): DeadLetterEntry[] {

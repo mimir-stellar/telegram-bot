@@ -113,6 +113,20 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+/**
+ * Normalize an event's chain close timestamp (`at`, unix seconds) into a
+ * strictly comparable rank for deterministic digest sorting. Positive finite
+ * timestamps sort chronologically; missing/zero/non-finite timestamps sort
+ * deterministically after known timestamps so tie-breaking falls through to
+ * canonical chain identity without violating transitivity.
+ */
+export function normalizeDigestEventTimestamp(at: unknown): number {
+  if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return Math.trunc(at);
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;
@@ -184,15 +198,18 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       ? parseSchedule(options.schedule)
       : options.schedule;
   const clock = options.clock ?? systemClock;
-  const { run, lastRunStore } = options;
+  const { run, lastRunStore, quietHours } = options;
 
   let timer: unknown = null;
   let stopped = true;
   let chain = Promise.resolve();
 
-  const scheduleNext = () => {
+  const scheduleNext = (deferredAtMs?: number) => {
     const now = clock.now();
-    const next = nextRun(schedule, now);
+    const next =
+      deferredAtMs !== undefined && quietHours
+        ? nextAllowedWindowStart(quietHours, deferredAtMs)
+        : nextAllowedRun(schedule, now, quietHours);
     const delay = Math.max(0, next - now);
     timer = clock.setTimeout(() => {
       void tick(true);
@@ -204,6 +221,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
   const tick = async (atBoundary: boolean) => {
     if (stopped) return;
     timer = null;
+    let deferredAtMs: number | undefined;
     try {
       const now = clock.now();
       const last = await lastRunStore.read();
@@ -226,7 +244,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       console.error("[scheduler] run failed:", err);
     } finally {
       if (!stopped) {
-        scheduleNext();
+        scheduleNext(deferredAtMs);
       }
     }
   };

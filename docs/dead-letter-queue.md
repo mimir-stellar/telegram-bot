@@ -46,7 +46,7 @@ The dead-letter file is written atomically (via a write-to-temporary-file and re
 Each entry in `entries` mirrors the `DeadLetterEntry` TypeScript interface defined in [`src/deadLetter.ts`](file:///c:/Users/HP/drips/work/telegram-bot/src/deadLetter.ts):
 
 * `id` (`string`): Stable unique identifier within the queue (see [Entry ID Generation](#entry-id-generation-makeentryid)).
-* `enqueuedAt` (`string`): ISO 8601 timestamp recording when the failure was first enqueued.
+* `enqueuedAt` (`string | null`): ISO 8601 timestamp recording when the failure was first enqueued (`null` for legacy entries loaded without a valid timestamp).
 * `source` (`string`): Originating contract source name (e.g. `market` or `squad`).
 * `ledger` (`number`): Stellar ledger sequence number where the event occurred.
 * `eventName` (`string`): Contract event topic/name (e.g. `MarketCreated`, `BetPlaced`, `Resolved`).
@@ -70,6 +70,7 @@ Format:
 
 * `shortHash(text)`: A 32-bit non-cryptographic polynomial hash (`h * 31 + charCode`) formatted as an 8-character zero-padded hexadecimal string.
 * **Deduplication**: If an identical event failure is enqueued again while an entry with the same ID is already present in the queue, a duplicate entry is not added. Instead, the existing entry's `attempts` counter increments and `lastError` updates with the latest failure.
+* **Duplicate ID Validation on Load**: Every entry in `dead-letter.json` must have a unique `id`. If a hand-edited or corrupted file contains conflicting entries with the same `id`, validation rejects the file before applying `maxEntries` trimming and preserves the source file untouched on disk for operator inspection rather than silently overwriting it. The offline `dlq` CLI (`list`, `show`, `purge`) exits with status `1` and reports the conflicting IDs.
 
 ---
 
@@ -123,7 +124,12 @@ Diagnostics and errors are written to `stderr`, keeping `stdout` clean and machi
 
 ## Operator Inspection with `jq`
 
-Because the file contains standard JSON, operators can safely inspect queue status and contents on host or container storage using `jq`.
+Operators can inspect and purge the queue offline with `npm run dlq -- <list|show <id>|purge>`.
+
+* `npm run dlq -- list` computes the queue's age (`age=...`, and `oldestEnqueuedAt` / `oldestAgeMs` / `oldestAge` / `missingTimestamps` under `--json`) from the **oldest retained failure's original `enqueuedAt` timestamp**, not the file's modification time (`mtime`).
+* Legacy entries missing a valid `enqueuedAt` timestamp are preserved with `enqueuedAt: null` and reported explicitly as `unknown` / `missing legacy timestamp` rather than being backfilled with the current time.
+
+Because the file contains standard JSON, operators can also safely inspect queue status and contents on host or container storage using `jq`.
 
 ### 1. Check queue depth and last updated time
 ```bash
@@ -181,3 +187,86 @@ However, manual deletion or clearing of `DEAD_LETTER_FILE` is appropriate in the
    ```bash
    echo '{"version":1,"updatedAt":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'","entries":[]}' > data/dead-letter.json
    ```
+
+---
+
+## CLI Inspection and Management (`npm run dlq`)
+
+The `dlq` CLI gives operators an offline way to inspect, purge, and plan replays without
+touching Telegram or mutating chain state.
+
+```
+npm run dlq -- <subcommand> [--file PATH] [--json]
+```
+
+All subcommands redact raw chat IDs and scrub secrets from their output.
+
+### `list` — Show all parked entries
+
+```bash
+npm run dlq -- list
+npm run dlq -- list --chat-id "-1001234567890"
+npm run dlq -- list --json
+```
+
+Prints every entry in the queue with its ID, source, ledger, event name, attempt count, and
+redacted last error. `--json` emits machine-readable JSON.
+
+### `show <id>` — Inspect a single entry
+
+```bash
+npm run dlq -- show market:123456:MarketCreated:a1b2c3d4
+```
+
+Prints the full entry including the formatted message body.
+
+### `purge` — Remove entries (dry-run by default)
+
+```bash
+# Dry-run: see what would be removed without changing anything
+npm run dlq -- purge
+
+# Commit: atomically remove all entries
+npm run dlq -- purge --yes
+
+# Remove only entries older than 2 days
+npm run dlq -- purge --older-than 2d --yes
+```
+
+Without `--yes` the command prints what it would do and exits without touching the file.
+
+### `replay` — Dry-run replay plan grouped by destination
+
+```bash
+npm run dlq -- replay
+npm run dlq -- replay --chat-id "-1001234567890"
+npm run dlq -- replay --json
+```
+
+Reads the queue and produces a plan showing which entries would be sent on the next replay
+cycle, grouped by destination (redacted chat ID). No Telegram requests are made and the
+queue file is not modified.
+
+Each entry is classified as:
+
+- **eligible** — `attempts < maxAttempts`; would be replayed.
+- **ineligible** — `attempts >= maxAttempts`; already exhausted and would be dropped on the
+  next flush rather than sent.
+
+Example output:
+
+```
+[dlq] replay plan (dry-run): 3 eligible, 1 ineligible, 4 total — no Telegram requests made
+
+  destination: ***4567890
+    eligible (3):
+      market:101:claim_created:a1b2c3d4  source=market  ledger=101  event=claim_created  attempts=1  reason=attempt 1/9 remaining
+      market:102:claim_created:b2c3d4e5  source=market  ledger=102  event=claim_created  attempts=2  reason=attempt 2/9 remaining
+      squad:200:claim_cancelled:c3d4e5f6  source=squad   ledger=200  event=claim_cancelled attempts=1  reason=attempt 1/9 remaining
+    ineligible (1):
+      market:50:claim_created:00000001   source=market  ledger=50   event=claim_created  attempts=10 reason=exhausted after 10 attempt(s) (max 10)
+```
+
+The `replay` subcommand does not accept `--yes` or `--older-than`; it is always a read-only
+plan. To actually flush the queue, the bot must be running (flushes happen automatically at
+the start of each poll cycle).

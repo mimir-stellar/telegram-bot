@@ -125,7 +125,7 @@ The bot applies the following redaction rules to all operator-facing text (logs,
 - Secret/seed strkeys (`S[A-Z2-7]{55}`) → `[redacted:secret key]`
 - URLs → `[redacted:url]`
 - Any ≥40-character opaque token (except public G…/C… strkeys) → `[redacted:long token]`
-- Credential-bearing query strings (`token=…`, `authorization: …`) → redacted
+- Credential-bearing query strings (`token=…`, repeated `?token=…&token=…`, array-style `?token[]=…`, and `authorization: …`), URL userinfo (`user:pass@` or `token@`), secret-shaped URL path segments, and non-empty URL `#fragment`s → redacted while preserving safe host and path diagnostics
 - Chat ids in status file → coarse shape only (`…1234` or `@x…`)
 - Full Stellar strkeys in logs → shortened form (`GDV6…PKZI`)
 

@@ -28,12 +28,7 @@ import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
 import { escapeMdLinkUrl, safeLinkUrl } from "./link-safety.js";
 import { iconForCategory } from "./category-icons.js";
-import {
-  formatCompletenessLabel,
-  groupDigestEvents,
-  normalizeDigestCompleteness,
-  type DigestPeriodCompleteness,
-} from "./digest-grouping.js";
+import { groupDigestEvents, sortDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
@@ -391,7 +386,7 @@ export function formatLastEvent(
   const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
   return (
     `*Last observed event* — \`${escapeMd(clip(name, 120))}\`\n` +
-    `This event has no notification summary\.\n${footer(config, event)}`
+    `This event has no notification summary\\.\n${footer(config, event)}`
   );
 }
 
@@ -402,8 +397,12 @@ export interface FormatDigestOptions {
    * Multi-event groups get an escaped Group_Key header and indented sub-lines;
    * singletons are rendered exactly like the flat layout.
    *
-   * Defaults to `false` — the existing flat layout is unchanged when this
-   * option is omitted or set to `false`.
+   * Defaults to `false` — the existing one-bullet-per-event flat layout is
+   * unchanged when this option is omitted or set to `false`.
+   *
+   * Both layouts order events via {@link sortDigestEvents}: chain close time,
+   * then canonical chain identity when timestamps are equal. This makes replay
+   * and live processing emit byte-identical digests for the same event set.
    */
   grouped?: boolean;
   /**
@@ -473,23 +472,17 @@ function renderGroupedDigest(
  * `"restart"`) to label an incomplete period explicitly so partial counts are
  * never presented as complete ledger summaries.
  * The default (`{}` or no second argument) produces the unchanged flat layout.
+ * Both layouts use deterministic chain-time + canonical-identity ordering, so
+ * equal timestamps never make replay output depend on arrival order.
  */
 export function formatDigest(
   events: readonly DecodedEvent[],
   options: FormatDigestOptions = {},
 ): string | null {
-  const completeness = normalizeDigestCompleteness(options.completeness);
-  if (events.length === 0) {
-    if (completeness.complete) return null;
-    return [
-      digestHeader(0, completeness),
-      "",
-      "_No events observed; ledger coverage for this period is incomplete\\._",
-    ].join("\n");
-  }
-  if (options.grouped) return renderGroupedDigest(events, completeness);
-  const lines = events.map(flatLine);
-  return [digestHeader(events.length, completeness), "", ...lines].join("\n");
+  if (events.length === 0) return null;
+  if (options.grouped) return renderGroupedDigest(events);
+  const lines = sortDigestEvents(events).map(flatLine);
+  return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
 }
 
 /**

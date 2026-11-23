@@ -8,36 +8,36 @@
  * Subcommands:
  *   list [--file PATH] [--json]
  *   show <id> [--file PATH] [--json]
+ *   ack <id...> [--yes] [--file PATH] [--json]
  *   purge [--older-than <dur>] [--yes] [--file PATH] [--json]
+ *   replay [--file PATH] [--json]
  *
  * Safety rules:
  *   - Chat ids from the environment or embedded in entries/errors are redacted
  *     via `redactChatId` from `src/status.ts`.
  *   - Secrets are scrubbed via `safeErrorMessage` / `redactText`.
- *   - `purge` without `--yes` performs a dry run and never modifies disk.
- *   - `purge --yes` writes atomically via the queue's persistence functions.
- *   - Stdout stays machine-readable: errors and diagnostics go to stderr.
- *
- * Exit codes:
- *   - 0: success
- *   - 1: unknown dead-letter entry (`show <id>` not found)
- *   - 2: invalid CLI arguments or usage
- *   - 3: malformed dead-letter file (invalid JSON or schema)
- *   - 4: dead-letter file access or I/O failure
+ *   - `ack` and `purge` without `--yes` perform a dry run and never modify disk.
+ *   - `ack --yes` and `purge --yes` write atomically via the queue's persistence functions.
+ *   - Unknown subcommands or bad arguments print usage and exit 2.
  */
 
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import {
+  clearRecoveryCheckpoint,
   createDeadLetterQueue,
+  DEAD_LETTER_MAX_ACK_IDS,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
   DeadLetterAccessError,
   DeadLetterMalformedError,
   type DeadLetterEntry,
+  type DeadLetterStatusSummary,
 } from "./deadLetter.js";
+import { formatDuration } from "./notifications/time.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
@@ -50,7 +50,7 @@ export const DLQ_EXIT_CODES = {
 } as const;
 
 export const USAGE =
-  "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
+  "usage: npm run dlq -- <list|show <id>|ack <id...> [--yes]|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
   readonly exitCode = DLQ_EXIT_CODES.USAGE;
@@ -93,11 +93,30 @@ export interface PurgeDlqOptions extends ListDlqOptions {
   yes?: boolean;
 }
 
+export interface ExportBundleOptions extends ListDlqOptions {
+  outFile?: string;
+}
+
 export interface PurgeDlqResult {
   dryRun: boolean;
   purged: number;
   remaining: number;
   purgedIds: string[];
+  entries: DlqEntryView[];
+  chatId: string;
+}
+
+export interface AckDlqOptions extends ListDlqOptions {
+  ids: readonly string[];
+  yes?: boolean;
+}
+
+export interface AckDlqResult {
+  dryRun: boolean;
+  acknowledged: number;
+  remaining: number;
+  acknowledgedIds: string[];
+  unmatchedIds: string[];
   entries: DlqEntryView[];
   chatId: string;
 }
@@ -295,7 +314,17 @@ function openQueue(options: ListDlqOptions) {
     maxAttempts,
     secrets: configuredSecrets(options.secrets),
     now: options.now,
+    strict: true,
   });
+}
+
+/** Load and return a destination-safe dead-letter summary (counts and reason categories only). */
+export async function getDeadLetterStatus(
+  options: ListDlqOptions,
+): Promise<DeadLetterStatusSummary> {
+  const queue = openQueue(options);
+  await queue.load();
+  return queue.summary();
 }
 
 /** Load and return all dead-letter entries with redacted chat ids. */
@@ -320,13 +349,80 @@ export async function showDeadLetter(options: ShowDlqOptions): Promise<DlqEntryV
   return toEntryView(match, options);
 }
 
+function normalizeAckIds(ids: readonly string[]): string[] {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new DlqUsageError(`ack requires at least one entry <id>\n${USAGE}`);
+  }
+  if (ids.length > DEAD_LETTER_MAX_ACK_IDS) {
+    throw new DlqUsageError(
+      `ack accepts at most ${DEAD_LETTER_MAX_ACK_IDS} entry ids (received ${ids.length})\n${USAGE}`,
+    );
+  }
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const rawId of ids) {
+    if (typeof rawId !== "string" || rawId.trim() === "") {
+      throw new DlqUsageError(`ack entry ids must be non-empty\n${USAGE}`);
+    }
+    const id = rawId.trim();
+    if (!seen.has(id)) {
+      seen.add(id);
+      normalized.push(id);
+    }
+  }
+  return normalized;
+}
+
+/**
+ * Bulk-acknowledge an explicit, bounded list of inspected dead-letter entry IDs.
+ *
+ * Without `yes: true`, performs a dry run and leaves the file untouched.
+ * With `yes: true`, atomically removes all matched entries in a single write
+ * via `queue.acknowledge` and preserves all unmatched entries intact.
+ */
+export async function acknowledgeDeadLetters(options: AckDlqOptions): Promise<AckDlqResult> {
+  const normalizedIds = normalizeAckIds(options.ids);
+  const dryRun = options.yes !== true;
+
+  const queue = openQueue(options);
+  await queue.load();
+
+  if (dryRun) {
+    const before = queue.snapshot();
+    const requestedSet = new Set(normalizedIds);
+    const matched = before.filter((entry) => requestedSet.has(entry.id));
+    const matchedSet = new Set(matched.map((entry) => entry.id));
+    const unmatchedIds = normalizedIds.filter((id) => !matchedSet.has(id));
+    return {
+      dryRun: true,
+      acknowledged: matched.length,
+      remaining: before.length - matched.length,
+      acknowledgedIds: matched.map((entry) => entry.id),
+      unmatchedIds,
+      entries: matched.map((entry) => toEntryView(entry, options)),
+      chatId: resolveChatIdForSource("default", options.chatId),
+    };
+  }
+
+  const res = await queue.acknowledge(normalizedIds);
+  return {
+    dryRun: false,
+    acknowledged: res.acknowledged.length,
+    remaining: res.remaining,
+    acknowledgedIds: res.acknowledgedIds,
+    unmatchedIds: res.unmatchedIds,
+    entries: res.acknowledged.map((entry) => toEntryView(entry, options)),
+    chatId: resolveChatIdForSource("default", options.chatId),
+  };
+}
+
 function shouldPurgeEntry(
   entry: DeadLetterEntry,
   cutoffMs: number | null,
 ): boolean {
   if (cutoffMs === null) return true;
-  const enqueuedMs = Date.parse(entry.enqueuedAt);
-  if (!Number.isFinite(enqueuedMs)) return false;
+  const enqueuedMs = parseEntryTimestampMs(entry.enqueuedAt);
+  if (enqueuedMs === null) return false;
   return enqueuedMs < cutoffMs;
 }
 
@@ -379,6 +475,67 @@ export async function purgeDeadLetters(options: PurgeDlqOptions): Promise<PurgeD
 }
 
 /**
+ * Build a dry-run replay plan grouped by destination.
+ *
+ * Reads the queue from disk, classifies every entry as eligible (attempts <
+ * maxAttempts) or ineligible (exhausted), and groups the results by redacted
+ * destination chat id. Makes no Telegram requests and does not mutate the queue.
+ */
+export async function planReplay(options: ReplayPlanOptions): Promise<ReplayPlanResult> {
+  const maxAttempts =
+    options.maxAttempts ??
+    (Number.isInteger(Number(process.env.DEAD_LETTER_MAX_ATTEMPTS)) &&
+    Number(process.env.DEAD_LETTER_MAX_ATTEMPTS) >= 1
+      ? Number(process.env.DEAD_LETTER_MAX_ATTEMPTS)
+      : DEAD_LETTER_MAX_ATTEMPTS);
+
+  const queue = openQueue(options);
+  await queue.load();
+  const entries = queue.snapshot();
+
+  // Group by destination (resolved from source + explicit chatId).
+  const groups = new Map<string, { eligible: ReplayPlanEntry[]; ineligible: ReplayPlanEntry[] }>();
+
+  for (const entry of entries) {
+    const view = toEntryView(entry, options);
+    const dest = view.chatId;
+
+    if (!groups.has(dest)) {
+      groups.set(dest, { eligible: [], ineligible: [] });
+    }
+    const group = groups.get(dest)!;
+
+    const eligible = entry.attempts < maxAttempts;
+    const reason = eligible
+      ? `attempt ${entry.attempts}/${maxAttempts - 1} remaining`
+      : `exhausted after ${entry.attempts} attempt(s) (max ${maxAttempts})`;
+
+    const planEntry: ReplayPlanEntry = { ...view, eligible, reason };
+    if (eligible) {
+      group.eligible.push(planEntry);
+    } else {
+      group.ineligible.push(planEntry);
+    }
+  }
+
+  // Sort destination groups by chatId for deterministic output.
+  const destinations: ReplayPlanDestination[] = Array.from(groups.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([chatId, group]) => ({ chatId, ...group }));
+
+  const eligibleCount = destinations.reduce((s, d) => s + d.eligible.length, 0);
+  const ineligibleCount = destinations.reduce((s, d) => s + d.ineligible.length, 0);
+
+  return {
+    dryRun: true,
+    total: entries.length,
+    eligibleCount,
+    ineligibleCount,
+    destinations,
+  };
+}
+
+/**
  * Atomically persist the post-purge entry set using `createDeadLetterQueue`'s
  * built-in persistence functions (`load` / `flush` / `enqueue`).
  */
@@ -420,11 +577,90 @@ async function persistPurgedQueue(
   }, budget);
 }
 
+/**
+ * Interruptible, resumable dead-letter recovery.
+ *
+ * Without `yes: true`, performs a dry run inspecting the queue and checkpoint
+ * without modifying disk. With `yes: true`, processes unacknowledged entries
+ * up to `limit` (or until interrupted) and persists a bounded checkpoint so a
+ * resumed run never reprocesses already-acknowledged entries.
+ */
+export async function recoverDeadLetters(
+  options: RecoverDlqOptions,
+): Promise<RecoverDlqResult> {
+  const checkpointFile = options.checkpointFile ?? `${options.filePath}.recovery.json`;
+  const maxAcknowledgedIds = options.maxAcknowledgedIds ?? DEAD_LETTER_CHECKPOINT_MAX_IDS;
+  const dryRun = options.yes !== true;
+
+  if (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 1)) {
+    throw new DlqUsageError(`--limit must be a positive integer`);
+  }
+
+  const queue = openQueue(options);
+  await queue.load();
+  const snapshot = queue.snapshot();
+
+  if (dryRun) {
+    const checkpoint = options.resetCheckpoint
+      ? null
+      : await loadRecoveryCheckpoint(checkpointFile, maxAcknowledgedIds);
+    const ackSet = new Set(checkpoint?.acknowledgedIds ?? []);
+    const skippedAcknowledged = snapshot.filter((e) => ackSet.has(e.id)).length;
+    const eligible = snapshot.filter(
+      (e) => !ackSet.has(e.id) && (!options.source || e.source === options.source),
+    );
+    const wouldProcess =
+      options.limit !== undefined ? Math.min(eligible.length, options.limit) : eligible.length;
+    return {
+      dryRun: true,
+      checkpointFile,
+      recovered: wouldProcess,
+      skippedAcknowledged,
+      remaining: snapshot.length - skippedAcknowledged - wouldProcess,
+      interrupted: options.limit !== undefined && eligible.length > options.limit,
+      completed: eligible.length <= (options.limit ?? eligible.length),
+      acknowledgedCount: ackSet.size,
+      chatId: resolveChatIdForSource(options.source ?? "default", options.chatId),
+    };
+  }
+
+  if (options.resetCheckpoint) {
+    await clearRecoveryCheckpoint(checkpointFile);
+  }
+
+  const send = options.send ?? (async () => undefined);
+  const res = await queue.recoverSelection(send, {
+    checkpointFile,
+    source: options.source,
+    budget: options.limit,
+    maxAcknowledgedIds,
+    signal: options.signal,
+  });
+
+  return {
+    dryRun: false,
+    checkpointFile,
+    recovered: res.sent,
+    skippedAcknowledged: res.skippedAcknowledged,
+    remaining: res.remaining,
+    interrupted: res.interrupted,
+    completed: res.completed,
+    acknowledgedCount: res.acknowledgedCount,
+    chatId: resolveChatIdForSource(options.source ?? "default", options.chatId),
+  };
+}
+
 interface ParsedCliArgs {
-  subcommand: "list" | "show" | "purge";
+  subcommand: "list" | "show" | "ack" | "purge";
   file?: string;
+  out?: string;
   id?: string;
+  ids?: string[];
   olderThan?: string;
+  checkpoint?: string;
+  source?: string;
+  limit?: number;
+  resetCheckpoint: boolean;
   yes: boolean;
   json: boolean;
   chatId?: string;
@@ -432,14 +668,21 @@ interface ParsedCliArgs {
 
 export function parseDlqArgs(argv: string[]): ParsedCliArgs {
   const [subcommand, ...rest] = argv;
-  if (subcommand !== "list" && subcommand !== "show" && subcommand !== "purge") {
+  if (
+    subcommand !== "list" &&
+    subcommand !== "show" &&
+    subcommand !== "ack" &&
+    subcommand !== "purge"
+  ) {
     throw new DlqUsageError(USAGE);
   }
 
   const parsed: ParsedCliArgs = {
     subcommand,
+    resetCheckpoint: false,
     yes: false,
     json: false,
+    ...(subcommand === "ack" ? { ids: [] } : {}),
   };
   const seen = new Set<string>();
 
@@ -447,12 +690,22 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
     const arg = rest[i]!;
 
     if (arg === "--yes") {
-      if (subcommand !== "purge") {
-        throw new DlqUsageError(`--yes is only valid with purge\n${USAGE}`);
+      if (subcommand !== "purge" && subcommand !== "ack") {
+        throw new DlqUsageError(`--yes is only valid with ack or purge\n${USAGE}`);
       }
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
       parsed.yes = true;
+      continue;
+    }
+
+    if (arg === "--reset-checkpoint") {
+      if (subcommand !== "recover") {
+        throw new DlqUsageError(`--reset-checkpoint is only valid with recover\n${USAGE}`);
+      }
+      if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
+      seen.add(arg);
+      parsed.resetCheckpoint = true;
       continue;
     }
 
@@ -463,9 +716,22 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
-    if (arg === "--file" || arg === "--older-than" || arg === "--chat-id") {
+    if (
+      arg === "--file" ||
+      arg === "--older-than" ||
+      arg === "--chat-id" ||
+      arg === "--checkpoint" ||
+      arg === "--source" ||
+      arg === "--limit"
+    ) {
       if (arg === "--older-than" && subcommand !== "purge") {
         throw new DlqUsageError(`--older-than is only valid with purge\n${USAGE}`);
+      }
+      if (
+        (arg === "--checkpoint" || arg === "--source" || arg === "--limit") &&
+        subcommand !== "recover"
+      ) {
+        throw new DlqUsageError(`${arg} is only valid with recover\n${USAGE}`);
       }
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
@@ -476,6 +742,15 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       if (arg === "--file") parsed.file = value;
       else if (arg === "--older-than") parsed.olderThan = value;
       else if (arg === "--chat-id") parsed.chatId = value;
+      else if (arg === "--checkpoint") parsed.checkpoint = value;
+      else if (arg === "--source") parsed.source = value;
+      else if (arg === "--limit") {
+        const limit = Number(value);
+        if (!Number.isInteger(limit) || limit < 1) {
+          throw new DlqUsageError(`--limit must be a positive integer\n${USAGE}`);
+        }
+        parsed.limit = limit;
+      }
       i += 1;
       continue;
     }
@@ -489,11 +764,20 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
+    if (subcommand === "ack") {
+      parsed.ids!.push(arg);
+      continue;
+    }
+
     throw new DlqUsageError(`unexpected argument: ${arg}\n${USAGE}`);
   }
 
   if (subcommand === "show" && (!parsed.id || parsed.id.trim() === "")) {
     throw new DlqUsageError(`show requires an entry <id>\n${USAGE}`);
+  }
+
+  if (subcommand === "ack") {
+    normalizeAckIds(parsed.ids ?? []);
   }
 
   if (parsed.olderThan !== undefined) {
@@ -507,23 +791,54 @@ function resolvePath(value: string): string {
   return path.resolve(process.cwd(), value);
 }
 
+function formatAgeLabel(ageMs: number | null): string | null {
+  if (ageMs === null) return null;
+  return formatDuration(Math.floor(ageMs / 1_000));
+}
+
 function formatListOutput(
   entries: DlqEntryView[],
   filePath: string,
   chatId: string,
   asJson: boolean,
+  nowMs: number,
 ): string {
+  const ageSummary = summarizeDeadLetterAge(entries, nowMs);
+  const oldestAge = formatAgeLabel(ageSummary.ageMs);
+
   if (asJson) {
-    return `${JSON.stringify({ file: filePath, chatId, depth: entries.length, entries }, null, 2)}\n`;
+    return `${JSON.stringify(
+      {
+        file: filePath,
+        chatId,
+        depth: entries.length,
+        oldestEnqueuedAt: ageSummary.oldestEnqueuedAt,
+        oldestAgeMs: ageSummary.ageMs,
+        oldestAge,
+        missingTimestamps: ageSummary.missingTimestamps,
+        entries,
+      },
+      null,
+      2,
+    )}\n`;
   }
   if (entries.length === 0) {
     return `[dlq] 0 entries (chat=${chatId}) in ${filePath}`;
   }
+  const missingSuffix =
+    ageSummary.missingTimestamps > 0
+      ? `, ${ageSummary.missingTimestamps} missing timestamp(s)`
+      : "";
+  const agePart =
+    oldestAge !== null
+      ? `age=${oldestAge}${missingSuffix}`
+      : `age=unknown (missing legacy timestamp${ageSummary.missingTimestamps > 1 ? "s" : ""})`;
+
   const lines = [
-    `[dlq] ${entries.length} entry(s) (chat=${chatId}) in ${filePath}`,
+    `[dlq] ${entries.length} entry(s) (chat=${chatId}, ${agePart}) in ${filePath}`,
     ...entries.map(
       (e) =>
-        `  ${e.id}  enqueued=${e.enqueuedAt}  source=${e.source}  ledger=${e.ledger}  ` +
+        `  ${e.id}  enqueued=${e.enqueuedAt ?? "unknown"}  source=${e.source}  ledger=${e.ledger}  ` +
         `event=${e.eventName}  attempts=${e.attempts}  chat=${e.chatId}  ` +
         (e.networkPassphrase ? `network=${boundText(e.networkPassphrase, 64)}  ` : "") +
         `lastError=${boundText(e.lastError ?? "none", 120)}`,
@@ -532,13 +847,18 @@ function formatListOutput(
   return lines.join("\n");
 }
 
-function formatShowOutput(entry: DlqEntryView, asJson: boolean): string {
+function formatShowOutput(entry: DlqEntryView, asJson: boolean, nowMs: number): string {
+  const enqueuedMs = parseEntryTimestampMs(entry.enqueuedAt);
+  const ageMs = enqueuedMs === null ? null : Math.max(0, nowMs - enqueuedMs);
+  const age = formatAgeLabel(ageMs);
+
   if (asJson) {
-    return `${JSON.stringify(entry, null, 2)}\n`;
+    return `${JSON.stringify({ ...entry, ageMs, age }, null, 2)}\n`;
   }
   return [
     `id:         ${entry.id}`,
-    `enqueuedAt: ${entry.enqueuedAt}`,
+    `enqueuedAt: ${entry.enqueuedAt ?? "unknown (missing legacy timestamp)"}`,
+    `age:        ${age ?? "unknown (missing legacy timestamp)"}`,
     `source:     ${entry.source}`,
     `ledger:     ${entry.ledger}`,
     `eventName:  ${entry.eventName}`,
@@ -548,6 +868,28 @@ function formatShowOutput(entry: DlqEntryView, asJson: boolean): string {
     `lastError:  ${entry.lastError ?? "none"}`,
     `text:\n${entry.text}`,
   ].join("\n");
+}
+
+function formatAckOutput(
+  result: AckDlqResult,
+  filePath: string,
+  asJson: boolean,
+): string {
+  if (asJson) {
+    return `${JSON.stringify({ file: filePath, ...result }, null, 2)}\n`;
+  }
+  if (result.dryRun) {
+    return (
+      `[dlq] dry-run: would acknowledge ${result.acknowledged} entry(s), ` +
+      `${result.unmatchedIds.length} unmatched, ${result.remaining} remaining ` +
+      `(chat=${result.chatId}) in ${filePath}; pass --yes to write`
+    );
+  }
+  return (
+    `[dlq] acknowledged ${result.acknowledged} entry(s), ` +
+    `${result.unmatchedIds.length} unmatched, ${result.remaining} remaining ` +
+    `(chat=${result.chatId}) in ${filePath}`
+  );
 }
 
 function formatPurgeOutput(
@@ -568,6 +910,45 @@ function formatPurgeOutput(
     `[dlq] purged ${result.purged} entry(s), ${result.remaining} remaining ` +
     `(chat=${result.chatId}) in ${filePath}`
   );
+}
+
+function formatReplayPlanOutput(
+  plan: ReplayPlanResult,
+  filePath: string,
+  asJson: boolean,
+): string {
+  if (asJson) {
+    return `${JSON.stringify({ file: filePath, ...plan }, null, 2)}\n`;
+  }
+  if (plan.total === 0) {
+    return `[dlq] replay plan (dry-run): 0 entries in ${filePath}`;
+  }
+  const lines: string[] = [
+    `[dlq] replay plan (dry-run): ${plan.eligibleCount} eligible, ` +
+      `${plan.ineligibleCount} ineligible, ${plan.total} total — no Telegram requests made`,
+  ];
+  for (const dest of plan.destinations) {
+    lines.push(`\n  destination: ${dest.chatId}`);
+    if (dest.eligible.length > 0) {
+      lines.push(`    eligible (${dest.eligible.length}):`);
+      for (const e of dest.eligible) {
+        lines.push(
+          `      ${e.id}  source=${e.source}  ledger=${e.ledger}  event=${e.eventName}  ` +
+            `attempts=${e.attempts}  reason=${e.reason}`,
+        );
+      }
+    }
+    if (dest.ineligible.length > 0) {
+      lines.push(`    ineligible (${dest.ineligible.length}):`);
+      for (const e of dest.ineligible) {
+        lines.push(
+          `      ${e.id}  source=${e.source}  ledger=${e.ledger}  event=${e.eventName}  ` +
+            `attempts=${e.attempts}  reason=${e.reason}`,
+        );
+      }
+    }
+  }
+  return lines.join("\n");
 }
 
 export interface RunDlqCliOptions {
@@ -602,26 +983,53 @@ export async function runDlqCli(
     now: options.now,
   };
 
+  const nowMs = (options.now ?? Date.now)();
+
   try {
+    if (parsed.subcommand === "status") {
+      const summary = await getDeadLetterStatus(commonOptions);
+      out(formatStatusOutput(summary, filePath, parsed.json).trimEnd());
+      return { exitCode: 0 };
+    }
+
     if (parsed.subcommand === "list") {
       const entries = await listDeadLetters(commonOptions);
       const chatId = resolveChatIdForSource("default", parsed.chatId);
-      out(formatListOutput(entries, filePath, chatId, parsed.json).trimEnd());
+      out(formatListOutput(entries, filePath, chatId, parsed.json, nowMs).trimEnd());
       return { exitCode: 0 };
     }
 
     if (parsed.subcommand === "show") {
       const entry = await showDeadLetter({ ...commonOptions, id: parsed.id! });
-      out(formatShowOutput(entry, parsed.json).trimEnd());
+      out(formatShowOutput(entry, parsed.json, nowMs).trimEnd());
+      return { exitCode: 0 };
+    }
+
+    if (parsed.subcommand === "replay") {
+      const plan = await planReplay(commonOptions);
+      out(formatReplayPlanOutput(plan, filePath, parsed.json).trimEnd());
+      return { exitCode: 0 };
+    }
+
+    if (parsed.subcommand === "ack") {
+      const result = await acknowledgeDeadLetters({
+        ...commonOptions,
+        ids: parsed.ids!,
+        yes: parsed.yes,
+      });
+      out(formatAckOutput(result, filePath, parsed.json).trimEnd());
       return { exitCode: 0 };
     }
 
     const result = await purgeDeadLetters({
       ...commonOptions,
-      olderThan: parsed.olderThan,
+      checkpointFile: parsed.checkpoint ? resolvePath(parsed.checkpoint) : undefined,
+      source: parsed.source,
+      limit: parsed.limit,
+      resetCheckpoint: parsed.resetCheckpoint,
       yes: parsed.yes,
     });
-    out(formatPurgeOutput(result, filePath, parsed.json).trimEnd());
+    out(formatRecoverOutput(result, filePath, parsed.json).trimEnd());
     return { exitCode: 0 };
   } catch (err) {
     if (err instanceof DlqUsageError) {
@@ -640,7 +1048,12 @@ export async function runDlqCli(
       errOut(`[dlq] ${boundText(err.message, 300)}`);
       return { exitCode: DLQ_EXIT_CODES.ACCESS_ERROR };
     }
-    const message = err instanceof Error ? err.message : "dlq command failed";
+    const rawMessage = err instanceof Error ? err.message : "dlq command failed";
+    const message = sanitizeDlqText(
+      rawMessage,
+      configuredChatIds(parsed.chatId),
+      configuredSecrets(),
+    );
     errOut(`[dlq] ${boundText(message, 300)}`);
     return { exitCode: DLQ_EXIT_CODES.ACCESS_ERROR };
   }

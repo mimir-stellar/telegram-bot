@@ -17,7 +17,7 @@
  */
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
-import type { DecoderCapabilityReport } from "./decode.js";
+import type { EventQuarantine } from "./quarantine.js";
 
 // ── Bounded Limits ───────────────────────────────────────────────────────────
 
@@ -39,16 +39,6 @@ export const MAX_GENERIC_BYTES_CHARS = 64;
 /** Hard ceiling on total rendered string representation. */
 export const MAX_GENERIC_TOTAL_CHARS = 2048;
 
-/** Hard ceiling on generic unknown-event diagnostic reasons. */
-export const MAX_GENERIC_DIAGNOSTIC_LENGTH = 200;
-
-export interface DuplicateMapKeyCollision {
-  /** Bounded representation of the colliding key. */
-  key: string;
-  /** Bounded diagnostic message describing the collision. */
-  reason: string;
-}
-
 /** Maximum number of topics allowed on a single Soroban event (protocol max is 4). */
 export const MAX_GENERIC_TOPICS = 4;
 
@@ -58,7 +48,12 @@ export interface GenericRenderOptions {
   maxVecItems?: number;
   maxStringChars?: number;
   maxBytesChars?: number;
-  maxTopics?: number;
+  /**
+   * Optional quarantine instance to preserve undecodable event envelopes.
+   * When provided and an event cannot be decoded cleanly (e.g. malformed XDR or unknown payload),
+   * the raw envelope and source identity are preserved to the quarantine.
+   */
+  quarantine?: EventQuarantine;
 }
 
 export interface GenericEventPayload {
@@ -910,55 +905,25 @@ export function decodeGenericEvent(
   }
 
   const eventName = extractEventName(rawTopics[0]);
-
-  const maxDepth = options?.maxDepth ?? MAX_GENERIC_DEPTH;
-  let duplicateCollision: DuplicateMapKeyCollision | null = null;
-  for (const t of rawTopics) {
-    duplicateCollision = findDuplicateMapKey(t, maxDepth);
-    if (duplicateCollision) break;
-  }
-  if (!duplicateCollision) {
-    duplicateCollision = findDuplicateMapKey(event.value, maxDepth);
-  }
-
-  if (duplicateCollision) {
-    const reason = boundDiagnostic(duplicateCollision.reason);
-    const topics = renderTopics(rawTopics, options);
-    const value = `malformed:${reason}`;
-    const topicSummary = topics.length > 0 ? topics.join(" | ") : "(none)";
-    const valueSummary = value;
-    const summary = `[${eventName}] ${topicSummary} => ${valueSummary}`;
-
-    return {
-      source,
-      contractId,
-      ledger,
-      txHash,
-      at,
-      eventId,
-      eventType,
-      transactionIndex,
-      operationIndex,
-      inSuccessfulContractCall,
-      eventName,
-      topics,
-      value,
-      topicSummary,
-      valueSummary,
-      summary,
-      payload: {
-        name: "unknown",
-        eventName,
-        topics,
-        value,
-        summary,
-        reason,
-      },
-    };
-  }
-
   const topics = renderTopics(rawTopics, options);
   const value = renderGenericScVal(event.value, 0, options);
+
+  if (options?.quarantine) {
+    const isUndecodable =
+      eventName === "unknown" ||
+      rawTopics.length === 0 ||
+      topics.some((t) => t === "malformed") ||
+      value === "malformed";
+    if (isUndecodable) {
+      const reason =
+        eventName === "unknown"
+          ? "unrecognized event name"
+          : value === "malformed"
+            ? "malformed value"
+            : "malformed topics";
+      void options.quarantine.quarantine(event, source, reason).catch(() => {});
+    }
+  }
 
   const topicSummary = topics.length > 0 ? topics.join(" | ") : "(none)";
   const valueSummary = value;

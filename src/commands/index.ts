@@ -5,7 +5,7 @@
  * here is the order Telegram's menu and `/help` list them in. Adding a command:
  *
  *   1. create `src/commands/<name>.ts` and export a module from
- *      `defineCommand({ command, operatorOnly?, chatAllowlist?, hidden?, handler })`
+ *      `defineCommand({ command, operatorOnly?, chatAllowlist?, hidden?, availability?, handler })`
  *   2. add one import line here — in menu order — and re-export anything
  *      `src/bot.ts` or the tests need
  *   3. if the command is advertised, add its description to
@@ -50,16 +50,18 @@ export function validateCommandCatalogue(options?: CommandConsistencyOptions): v
 }
 
 export {
-  CommandConsistencyError,
+  commandAvailabilityReport,
   commandMetadata,
   commandModule,
   defineCommand,
-  findCommandConsistencyIssues,
+  formatCommandAvailabilityReport,
   registeredCommands,
   validateCommandConsistency,
   visibleCommandMetadata,
-  type CommandConsistencyIssue,
-  type CommandConsistencyOptions,
+  type CommandAvailabilityCheck,
+  type CommandAvailabilityCheckResult,
+  type CommandAvailabilityEntry,
+  type CommandAvailabilityReport,
   type CommandDeps,
   type CommandHandler,
   type CommandMetadata,
@@ -74,6 +76,7 @@ export {
   commandArgumentAllowed,
   commandArgumentTooLongMessage,
   isChatAllowed,
+  isCommandForAnotherBot,
   isOperator,
   operatorAllowed,
   replyMarkdown,

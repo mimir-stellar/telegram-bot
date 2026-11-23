@@ -18,6 +18,22 @@
  * that clamping happened without any unbounded label cardinality.
  */
 
+import {
+  MetricLabelError,
+  escapeMetricLabelValue,
+  formatMetricLabels,
+  validateMetricLabelKey,
+  validateMetricName,
+} from "../metrics.js";
+
+export {
+  MetricLabelError,
+  escapeMetricLabelValue,
+  formatMetricLabels,
+  validateMetricLabelKey,
+  validateMetricName,
+};
+
 export type RpcOperation = "health" | "events";
 
 /** Bounded set of reasons a sample's duration was dropped/clamped. */
@@ -724,4 +740,53 @@ export function formatServiceLevelWindow(report: ServiceLevelWindowReport): stri
     `delivery_success=${succ} attempts=${report.delivery.attempts} ` +
     `avg_lag=${avgLag} max_lag=${maxLag} gaps=${report.dataGap.totalGaps}`
   );
+}
+
+/**
+ * Render an {@link RpcTimingSummary} as Prometheus text exposition lines with
+ * validated label keys and escaped label values (rejecting control-character
+ * injection before exposition).
+ */
+export function renderRpcTimingMetrics(
+  summary: RpcTimingSummary,
+  extraLabels: Readonly<Record<string, string>> = {},
+): string {
+  for (const key of Object.keys(extraLabels)) {
+    validateMetricLabelKey(key);
+    if (key === "operation") {
+      throw new MetricLabelError(
+        "INVALID_LABEL_KEY",
+        'extraLabels must not override reserved RPC metric label "operation"',
+      );
+    }
+  }
+
+  const lines: string[] = [
+    `# HELP mimir_stellar_rpc_operation_requests_total Total Soroban RPC calls by operation`,
+    `# TYPE mimir_stellar_rpc_operation_requests_total counter`,
+  ];
+  for (const op of RPC_OPERATIONS) {
+    const labels = formatMetricLabels({ ...extraLabels, operation: op });
+    lines.push(`mimir_stellar_rpc_operation_requests_total${labels} ${summary.operations[op].requests}`);
+  }
+
+  lines.push(
+    `# HELP mimir_stellar_rpc_operation_failures_total Total failed Soroban RPC calls by operation`,
+    `# TYPE mimir_stellar_rpc_operation_failures_total counter`,
+  );
+  for (const op of RPC_OPERATIONS) {
+    const labels = formatMetricLabels({ ...extraLabels, operation: op });
+    lines.push(`mimir_stellar_rpc_operation_failures_total${labels} ${summary.operations[op].failures}`);
+  }
+
+  lines.push(
+    `# HELP mimir_stellar_rpc_operation_duration_ms_total Cumulative Soroban RPC call duration in ms by operation`,
+    `# TYPE mimir_stellar_rpc_operation_duration_ms_total counter`,
+  );
+  for (const op of RPC_OPERATIONS) {
+    const labels = formatMetricLabels({ ...extraLabels, operation: op });
+    lines.push(`mimir_stellar_rpc_operation_duration_ms_total${labels} ${summary.operations[op].totalMs}`);
+  }
+
+  return `${lines.join("\n")}\n`;
 }

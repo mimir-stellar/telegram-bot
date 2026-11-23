@@ -168,6 +168,8 @@ rarely conflicts with another in-flight branch):
      chatAllowlist: true, // optional: only chats in ALLOWED_CHAT_IDS
      operatorOnly: false, // optional: operator-only, silently ignored otherwise
      hidden: false,       // optional: registered but not advertised in the menu
+     availability: (deps) => // optional: omit from menu & explain why disabled when data source is absent
+       deps?.logs ? { available: true } : { available: false, reason: "Log buffer unavailable." },
      handler: async (ctx, deps) => {
        await ctx.reply(widgetMessage(deps.config), TELEGRAM_OPTIONS);
      },
@@ -177,7 +179,10 @@ rarely conflicts with another in-flight branch):
    The handler receives `(ctx, deps)`; `deps` is the same object `createBot` took
    (config, poller status, pause/resume, audit, logs). Authorization is applied by
    the registrar from `operatorOnly`/`chatAllowlist` — do not repeat it in the
-   handler.
+   handler. Use `commandAvailabilityReport(deps)` (and `formatCommandAvailabilityReport`)
+   to inspect which commands are enabled or disabled for a given runtime dependency set,
+   and pass `deps` to `visibleCommandMetadata(config, deps)` to keep unavailable
+   commands out of the public menu.
 2. Add one import line to `src/commands/index.ts`, in menu order.
 3. If the command is advertised, add its description to `COMMAND_DESCRIPTIONS`
    (both locales) in `src/i18n.ts` and its entry to `COMMAND_DETAILS` in

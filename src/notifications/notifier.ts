@@ -13,18 +13,35 @@
  *   - {@link routeStatus}      — actionable status when zero routes are active
  */
 
+import { createHash } from "node:crypto";
 import type { Bot } from "grammy";
 
 import { applyChatMigration, type BotConfig } from "../config.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
+  isTimeoutError,
   safeErrorMessage,
   splitTelegramMessage,
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+import { retryDelayMs, type SendJournal } from "./send-journal.js";
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
+
+/** A Telegram destination: a chat id plus an optional forum topic (thread) id. */
+export interface NotificationDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
+
+/** Optional dependencies for {@link createNotifier}. */
+export interface NotifierOptions {
+  /** Optional send journal for persisting per-destination delivery outcomes. */
+  sendJournal?: SendJournal | undefined;
+  /** Clock override for journal timestamps (defaults to `Date.now`). */
+  now?: (() => number) | undefined;
+}
 
 /** Extra Telegram send options the poller may attach to a notification. */
 export interface SendExtra {
@@ -48,6 +65,8 @@ export interface SendExtra {
   replyToMessageId?: number | undefined;
   /** Decoded contract event name used to apply silent-notification policy. */
   eventName?: string | undefined;
+  /** Optional claim/event category used to resolve forum topic overrides. */
+  category?: string | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -176,10 +195,11 @@ export function routeStatus(activeRoutes: number): RouteStatus {
 // ── notifierSkips ────────────────────────────────────────────────────────────
 
 /**
- * Sends suppressed by the empty-message guard, counted so callers (and the
- * empty-text tests) can prove a blank render never reached the Telegram API.
+ * Sends suppressed by notifier guards (empty render or route permission
+ * cooldown), counted so callers can prove a skipped send never reached the
+ * Telegram API.
  */
-export const notifierSkips = { emptyText: 0 };
+export const notifierSkips = { emptyText: 0, routeCooldown: 0 };
 
 // ── previewRouting ───────────────────────────────────────────────────────────
 
@@ -234,6 +254,49 @@ export function previewRouting(
   return preview;
 }
 
+// ── NotifierOptions ──────────────────────────────────────────────────────────
+
+const DEFAULT_NOTIFIER_INITIAL_BACKOFF_MS = 1_000;
+const DEFAULT_NOTIFIER_MAX_BACKOFF_MS = 60_000;
+
+/**
+ * Optional persistent retry scheduling for {@link createNotifier}.
+ *
+ * When configured, failed sends persist their next eligible attempt timestamp
+ * (`nextAttemptAt`) to the send journal, and a restarted notifier hydrates
+ * pending timestamps before sending so pending deliveries honour their
+ * remaining backoff instead of bursting immediately on restart.
+ */
+export interface NotifierRetryOptions {
+  journal: SendJournal;
+  /** Clock used to compute and evaluate `nextAttemptAt` (defaults to `Date.now`). */
+  now?: () => number;
+  /** Sleep function used to wait until a persisted `nextAttemptAt` (defaults to `setTimeout`). */
+  sleep?: (ms: number) => Promise<void>;
+  /** Initial backoff in ms when a failure has no `retry_after` hint (default: 1000). */
+  initialBackoffMs?: number;
+  /** Maximum backoff cap in ms (default: 60_000). */
+  maxBackoffMs?: number;
+}
+
+/** Optional extensions for {@link createNotifier}. */
+export interface NotifierOptions {
+  retry?: NotifierRetryOptions | undefined;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractRetryAfterMs(err: unknown): number | null {
+  if (!err || typeof err !== "object") return null;
+  const params = (err as { parameters?: { retry_after?: unknown } }).parameters;
+  if (params && typeof params.retry_after === "number" && Number.isFinite(params.retry_after) && params.retry_after > 0) {
+    return Math.ceil(params.retry_after * 1_000);
+  }
+  return null;
+}
+
 // ── createNotifier ───────────────────────────────────────────────────────────
 
 /**
@@ -266,111 +329,78 @@ export type Notifier = ((
 export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
-    Partial<
-      Pick<
-        BotConfig,
-        "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents" | "routes"
-      >
-    >,
+    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
   options?: NotifierOptions,
-): Notifier {
-  const migrations = new Map<string, string>();
-  const secrets = typeof config.botToken === "string" ? [config.botToken] : [];
+) {
+  const retry = options?.retry;
+  const retryNow = retry?.now ?? Date.now;
+  const retrySleep = retry?.sleep ?? defaultSleep;
+  const initialBackoffMs = Math.max(0, retry?.initialBackoffMs ?? DEFAULT_NOTIFIER_INITIAL_BACKOFF_MS);
+  const maxBackoffMs = Math.max(initialBackoffMs, retry?.maxBackoffMs ?? DEFAULT_NOTIFIER_MAX_BACKOFF_MS);
+  const scheduledRetries = new Map<string, { nextAttemptAt: number; attempts: number }>();
+  let retryStateLoaded = false;
 
-  function resolveMigratedChatId(chatId: string): string {
-    let current = chatId;
-    const seen = new Set<string>();
-    while (migrations.has(current) && !seen.has(current)) {
-      seen.add(current);
-      current = migrations.get(current)!;
-    }
-    return current;
-  }
-
-  function migrateRoute(fromChatId: string, toChatId: string): boolean {
-    const from = fromChatId.trim();
-    const to = toChatId.trim();
-    if (!from || !to || from === to) return false;
-    // Prevent cyclic migrations (e.g. to -> ... -> from).
-    if (resolveMigratedChatId(to) === from) return false;
-    if (migrations.get(from) === to) return false;
-
-    migrations.set(from, to);
-    applyChatMigration(config, from, to);
-    console.warn(`[notifier] route migrated to supergroup chat id`);
-    options?.onRouteMigrated?.(from, to);
-    return true;
-  }
-
-  async function sendToChat(
-    chatId: string,
-    text: string,
-    notificationOptions: {
-      parse_mode: "MarkdownV2";
-      link_preview_options: { is_disabled: boolean };
-      disable_notification?: boolean;
-    },
-    silentOption: { disable_notification?: boolean },
-    extra?: SendExtra,
-    omitReplyTo = false,
-  ): Promise<void> {
-    const replyToMessageId = omitReplyTo ? undefined : extra?.replyToMessageId;
-
-    // Oversized payloads go out as ordered chunks under Telegram's limit. The
-    // thread reply rides on the first chunk and the explorer button on the
-    // last, so the message reads exactly like the unsplit one.
-    const parts = splitTelegramMessage(text);
-    if (parts.length > 1) {
-      for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
-          ...notificationOptions,
-          ...(index === parts.length - 1 && extra?.reply_markup
-            ? { reply_markup: extra.reply_markup }
-            : {}),
-          ...(index === 0 && replyToMessageId !== undefined
-            ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
-            : {}),
-        });
-      }
-      return;
-    }
-
+  async function ensureRetryStateLoaded(): Promise<void> {
+    if (!retry || retryStateLoaded) return;
+    retryStateLoaded = true;
     try {
-      await bot.api.sendMessage(chatId, text, {
-        ...notificationOptions,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
-          : {}),
-      });
-      return;
-    } catch (err) {
-      // A blank fallback is no fallback: sending whitespace-only text would
-      // just draw the same 400, so the original parse error propagates.
-      const fallback = extra?.plainText;
-      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
-        throw err;
+      for (const entry of await retry.journal.loadPending()) {
+        if (typeof entry.nextAttemptAt === "number" && Number.isFinite(entry.nextAttemptAt)) {
+          scheduledRetries.set(entry.id, {
+            nextAttemptAt: entry.nextAttemptAt,
+            attempts: typeof entry.attempts === "number" && Number.isFinite(entry.attempts) ? entry.attempts : 1,
+          });
+        }
       }
-      // Only bounded metadata is logged: the fallback outcome, the safe error
-      // category, and the caller-supplied event reference — never message
-      // text, tokens, or remote payloads.
+    } catch (err) {
       console.warn(
-        `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
-          `retrying as plain text: ${safeErrorMessage(err, secrets)}`,
+        `[notifier] failed to load persisted retry schedule: ${safeErrorMessage(
+          err,
+          typeof config.botToken === "string" ? [config.botToken] : [],
+        )}`,
       );
-      // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
-        link_preview_options: notificationOptions.link_preview_options,
-        ...silentOption,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
-          : {}),
-      });
     }
   }
 
-  const notify = async (
+  async function recordRetryFailure(eventId: string | undefined, err: unknown): Promise<void> {
+    if (!retry || !eventId) return;
+    const prevAttempts = scheduledRetries.get(eventId)?.attempts ?? 0;
+    const retryAfterMs = extractRetryAfterMs(err);
+    const delayMs =
+      retryAfterMs !== null
+        ? retryAfterMs
+        : Math.min(initialBackoffMs * 2 ** prevAttempts, maxBackoffMs);
+    const nextAttemptAt = retryNow() + delayMs;
+    const attempts = prevAttempts + 1;
+    scheduledRetries.set(eventId, { nextAttemptAt, attempts });
+    try {
+      await retry.journal.recordRetry(eventId, nextAttemptAt, attempts);
+    } catch (journalErr) {
+      console.warn(
+        `[notifier] failed to persist retry schedule for ${eventId}: ${safeErrorMessage(
+          journalErr,
+          typeof config.botToken === "string" ? [config.botToken] : [],
+        )}`,
+      );
+    }
+  }
+
+  async function clearRetrySuccess(eventId: string | undefined): Promise<void> {
+    if (!retry || !eventId || !scheduledRetries.has(eventId)) return;
+    scheduledRetries.delete(eventId);
+    try {
+      await retry.journal.recordDone(eventId);
+    } catch (journalErr) {
+      console.warn(
+        `[notifier] failed to clear retry schedule for ${eventId}: ${safeErrorMessage(
+          journalErr,
+          typeof config.botToken === "string" ? [config.botToken] : [],
+        )}`,
+      );
+    }
+  }
+
+  return async (
     text: string | null,
     source?: ContractSource,
     extra?: SendExtra,
@@ -387,7 +417,28 @@ export function createNotifier(
       return;
     }
 
-    const chatId = resolveChatId(config, source);
+    const eventId =
+      typeof extra?.eventRef?.eventId === "string" && extra.eventRef.eventId.length > 0
+        ? extra.eventRef.eventId
+        : undefined;
+
+    if (retry && eventId) {
+      await ensureRetryStateLoaded();
+      const scheduled = scheduledRetries.get(eventId);
+      if (scheduled) {
+        const waitMs = retryDelayMs(scheduled.nextAttemptAt, retryNow());
+        if (waitMs > 0) {
+          await retrySleep(waitMs);
+        }
+      }
+    }
+
+    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
+    const chatId = source === "market"
+      ? config.marketChatId || defaultChat
+      : source === "squad"
+        ? config.squadChatId || defaultChat
+        : defaultChat;
 
     // Select link preview settings based on the contract source.
     // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
@@ -402,15 +453,74 @@ export function createNotifier(
       ...silentOption,
     };
 
-    try {
-      await sendToChat(chatId, text, notificationOptions, silentOption, extra);
-    } catch (err) {
-      const migratedTo = extractMigrateToChatId(err);
-      if (migratedTo && migrateRoute(chatId, migratedTo)) {
-        await sendToChat(migratedTo, text, notificationOptions, silentOption, extra, true);
+    // Oversized payloads go out as ordered chunks under Telegram's limit. The
+    // thread reply rides on the first chunk and the explorer button on the
+    // last, so the message reads exactly like the unsplit one.
+    const parts = splitTelegramMessage(text);
+    if (parts.length > 1) {
+      try {
+        for (const [index, part] of parts.entries()) {
+          await bot.api.sendMessage(chatId, part, {
+            ...notificationOptions,
+            ...(index === parts.length - 1 && extra?.reply_markup
+              ? { reply_markup: extra.reply_markup }
+              : {}),
+            ...(index === 0 && extra?.replyToMessageId !== undefined
+              ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+              : {}),
+          });
+        }
+        await clearRetrySuccess(eventId);
         return;
+      } catch (err) {
+        await recordRetryFailure(eventId, err);
+        throw err;
       }
-      throw err;
+    }
+
+    try {
+      await bot.api.sendMessage(chatId, text, {
+        ...notificationOptions,
+        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(extra?.replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+          : {}),
+      });
+      await clearRetrySuccess(eventId);
+      return;
+    } catch (err) {
+      // A blank fallback is no fallback: sending whitespace-only text would
+      // just draw the same 400, so the original parse error propagates.
+      const fallback = extra?.plainText;
+      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
+        await recordRetryFailure(eventId, err);
+        throw err;
+      }
+      // Only bounded metadata is logged: the fallback outcome, the safe error
+      // category, and the caller-supplied event reference — never message
+      // text, tokens, or remote payloads.
+      console.warn(
+        `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
+          `retrying as plain text: ${safeErrorMessage(
+            err,
+            typeof config.botToken === "string" ? [config.botToken] : [],
+          )}`,
+      );
+      // Plain text (no parse mode), same per-source link preview setting.
+      try {
+        await bot.api.sendMessage(chatId, fallback, {
+          link_preview_options: notificationOptions.link_preview_options,
+          ...silentOption,
+          ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+          ...(extra?.replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+            : {}),
+        });
+        await clearRetrySuccess(eventId);
+      } catch (fallbackErr) {
+        await recordRetryFailure(eventId, fallbackErr);
+        throw fallbackErr;
+      }
     }
   };
 
