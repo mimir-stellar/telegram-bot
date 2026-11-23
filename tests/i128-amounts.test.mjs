@@ -69,11 +69,11 @@ const BOUNDARIES = [
 
 /** Exact channel text for each boundary's `withdrawal` notification. */
 const EXPECTED_WITHDRAWALS = [
-  "📤 *Withdrawal* — 0\\.0000000 USDC to `GAQVF…ET46`" + EXPLORER_FOOTER,
-  "📤 *Withdrawal* — 0\\.0000001 USDC to `GAQVF…ET46`" + EXPLORER_FOOTER,
-  "📤 *Withdrawal* — 1\\.0000000 USDC to `GAQVF…ET46`" + EXPLORER_FOOTER,
-  "📤 *Withdrawal* — 922337203685\\.4775808 USDC to `GAQVF…ET46`" + EXPLORER_FOOTER,
-  "📤 *Withdrawal* — 17014118346046923173168730371588\\.4105727 USDC to `GAQVF…ET46`" +
+  "📤 *Withdrawal* — \u20680\\.0000000 USDC\u2069 to `GAQVF…ET46`" + EXPLORER_FOOTER,
+  "📤 *Withdrawal* — \u20680\\.0000001 USDC\u2069 to `GAQVF…ET46`" + EXPLORER_FOOTER,
+  "📤 *Withdrawal* — \u20681\\.0000000 USDC\u2069 to `GAQVF…ET46`" + EXPLORER_FOOTER,
+  "📤 *Withdrawal* — \u2068922337203685\\.4775808 USDC\u2069 to `GAQVF…ET46`" + EXPLORER_FOOTER,
+  "📤 *Withdrawal* — \u206817014118346046923173168730371588\\.4105727 USDC\u2069 to `GAQVF…ET46`" +
     EXPLORER_FOOTER,
 ];
 
@@ -208,7 +208,7 @@ test("a squad deposit at the i128 maximum keeps amount and shares exact", () => 
   assert.equal(decoded.payload.shares, max);
 
   const expected =
-    "➕ *Squad \\#1* — 17014118346046923173168730371588\\.4105727 USDC on *Side A*\n" +
+    "➕ *Squad \\#1* — \u206817014118346046923173168730371588\\.4105727 USDC\u2069 on *Side A*\n" +
     "Participant: `GAQVF…ET46`" +
     EXPLORER_FOOTER;
   assert.equal(formatEvent(config, decoded), expected);
@@ -233,7 +233,7 @@ test("market_settled at the i128 maximum keeps every amount field exact", () => 
 
   const expected =
     "💰 *Claim \\#7 settled*\n" +
-    "Paid out: *17014118346046923173168730371588\\.4105727 USDC* · fees 0\\.0000000 USDC\n" +
+    "Paid out: *\u206817014118346046923173168730371588\\.4105727 USDC\u2069* · fees \u20680\\.0000000 USDC\u2069\n" +
     // #639 lists every share of the gross with its percentage.
     "Owed to challengers: 1\\.0000000 USDC \\(0\\.00%\\)\n" +
     "Total fees: 0\\.0000000 USDC \\(0\\.00%\\)\n" +
