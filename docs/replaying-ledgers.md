@@ -70,15 +70,19 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--send` | Boolean flag | Actually dispatch messages to Telegram. Requires valid Telegram credentials in `.env` or process environment. | `false` (dry-run mode is active by default) |
 | `--dry-run` | Boolean flag | Explicit dry-run flag accepted by CLI parser. Dry-run is active whenever `--send` is omitted. | `true` |
 | `--pages` | `<number>` | Maximum RPC pages to walk per contract. Must be $\ge 1$. | `20` (`EVENT_MAX_PAGES`) |
+| `--max-events` | `<number>` | Maximum events to process in this run across targets. Must be a positive integer ($\ge 1$). Persists a resumable checkpoint when `--progress-file` is set and marks `budgetExhausted: true`, `completed: false`. | Unlimited |
 | `--cap` | `<number>` | Maximum notifications to send/count per contract. | `config.maxNotificationsPerCycle` in `--send` mode; `20` in dry-run mode |
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
+| `--certificate-file` | `<path>` | Write a deterministic replay completeness certificate (`mimir-replay-certificate-v1`) JSON file atomically. | None |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
+| `--progress-file` | `<path>` | Persist per-page checkpoint state (`mimir-replay-progress-v1`) for resumable replays. Includes a normalized `filterFingerprint` (network, range, contracts, and contract IDs); incompatible resume attempts are rejected with exit code `2` and an actionable message. | None |
+| `--rpm` | `<number>` | Maximum RPC requests per minute across health and event fetches. Must be $> 0$. | Unlimited |
 
 ### Exit Codes
 
 * **`0`:** Scan completed successfully (even if some events were skipped, deduplicated, or capped).
-* **`1`:** Fatal runtime error (RPC unreachable, invalid network passphrase, or missing config in `--send` mode).
+* **`1`:** Fatal runtime error (RPC unreachable, nonmonotonic RPC page ledger boundaries, invalid network passphrase, or missing config in `--send` mode).
 * **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, or invalid `--contract`).
 
 ---
@@ -173,6 +177,7 @@ The replay engine applies identical decoding and deduplication rules as the live
 3. **Deduplication:** An in-memory `EventDedupWindow` (capacity 256) tracks the canonical `eventKey` across overlapping pages. Duplicate event IDs returned across page boundaries are counted in `duplicates` and suppressed.
 4. **Cap Protection:** If the count of sent notifications reaches `--cap`, subsequent events are skipped with `skipReason = "cap"` to prevent Telegram rate-limiting (HTTP 429).
 5. **Send Errors:** An individual Telegram dispatch failure is logged and recorded as skipped (`skipReason = "send-error"`). It does not abort the remaining replay walk.
+6. **Nonmonotonic Ledger Boundaries:** Each RPC page is validated before decoding, sending, or committing progress. If a page reports a regressing `latestLedger`, a `cursor` ledger behind the prior cursor or committed event ledger, an event ledger behind the committed boundary or decreasing within the page, or a `cursor` ledger behind an event on the same page, replay aborts with a bounded `ReplayConsistencyError` (exit code `1`) and leaves the previously committed progress checkpoint unchanged.
 
 ---
 
@@ -186,7 +191,17 @@ Soroban RPC nodes maintain a rolling window of history (typically ~120,960 ledge
   If an outage lasted longer than the retention window:
   1. The replay CLI can only recover events from `oldestLedger` to the recovery point.
   2. Events prior to `oldestLedger` **cannot be recovered via Soroban RPC**.
-  3. For archival recovery prior to `oldestLedger`, operators must consult an external archival indexer or Stellar Expert block explorer; the Soroban RPC itself cannot serve pruned event history.
+  3. The generated completeness certificate (`report.certificate` or `--certificate-file`) records the `pruned-history` gap and sets `complete: false` so partial or pruned ranges are never marked complete.
+  4. For archival recovery prior to `oldestLedger`, operators must consult an external archival indexer or Stellar Expert block explorer; the Soroban RPC itself cannot serve pruned event history.
+
+### 6.1 Deterministic Completeness Certificate
+
+Every replay run produces a deterministic `mimir-replay-certificate-v1` completeness certificate on `report.certificate` (and optionally written to `--certificate-file <path>`):
+
+* **`requestedRange` & `observedRange`:** Records the requested `[from, to]` bounds alongside the actually observed `[fromLedger, toLedger]` range per contract and overall.
+* **`gaps`:** Lists any unresolved gaps (`pruned-history`, `truncated-pages`, `beyond-tip`, or `scan-error`) with their ledger bounds and reason.
+* **`complete`:** `true` only when every requested target observed its full requested range without pruning, truncation, or scan errors. Partial or pruned ranges are never marked complete.
+* **`digest`:** Deterministic SHA-256 hex digest over the canonical certificate payload (omitting wall-clock timestamps so identical inputs produce identical certificates).
 
 ---
 

@@ -193,9 +193,23 @@ export function redactError(err: unknown, options: RedactOptions = {}): string {
     raw = err;
   } else if (err === null || err === undefined) {
     raw = String(err);
+  } else if (typeof err === "symbol") {
+    raw = "[unsupported:symbol]";
+  } else if (typeof err === "function") {
+    raw = "[unsupported:function]";
   } else {
     try {
-      const json = JSON.stringify(err);
+      const seen = new WeakSet<object>();
+      const json = JSON.stringify(err, (_key, val) => {
+        if (typeof val === "bigint") return val.toString();
+        if (typeof val === "symbol") return "[unsupported:symbol]";
+        if (typeof val === "function") return "[unsupported:function]";
+        if (val !== null && typeof val === "object") {
+          if (seen.has(val)) return "[circular]";
+          seen.add(val);
+        }
+        return val;
+      });
       raw = typeof json === "string" ? json : String(err);
     } catch {
       raw = String(err);

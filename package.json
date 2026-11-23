@@ -30,6 +30,7 @@
     "audit": "tsx src/audit-cli.ts",
     "audit:report": "tsx src/audit-cli.ts",
     "audit:check": "tsx src/audit-check-cli.ts",
+    "analytics:export": "tsx src/analytics-export-cli.ts",
     "seed:cursor": "tsx src/dev/seedCursor.ts",
     "cursor": "node dist/cursor-cli.js",
     "replay": "tsx src/replay-cli.ts",

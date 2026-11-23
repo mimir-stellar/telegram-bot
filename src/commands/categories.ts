@@ -13,6 +13,8 @@
 import { escapeMd } from "../notifications/format.js";
 import type { BotConfig } from "../config.js";
 import type { DecodedEvent } from "../stellar/decode.js";
+import { defineCommand } from "./registry.js";
+import { replyMarkdown } from "./runtime.js";
 
 /** Default ceiling on tracked distinct categories in memory. */
 export const DEFAULT_MAX_CATEGORIES = 256;
@@ -338,3 +340,14 @@ export function categoriesMessage(
 
   return lines.join("\n");
 }
+
+export const categoriesCommand = defineCommand({
+  command: "categories",
+  chatAllowlist: true,
+  handler: async (ctx, deps) => {
+    await replyMarkdown(
+      ctx,
+      categoriesMessage(deps.status().categories ?? {}, deps.config),
+    );
+  },
+});

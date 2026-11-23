@@ -58,6 +58,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import { DEFAULT_MAX_RESPONSE_BYTES } from "./stellar/rpc-guard.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -183,11 +184,104 @@ export interface StellarConfig {
   networkPassphrase: string;
   /** Optional override for stellar.expert (or compatible) explorer origin. */
   explorerBaseUrl: string;
+  /**
+   * Maximum permitted byte length of a single Soroban RPC HTTP response
+   * (`STELLAR_RPC_MAX_RESPONSE_BYTES`). Optional on this chain-only type so
+   * hand-built configs keep working; defaults to {@link DEFAULT_MAX_RESPONSE_BYTES}.
+   */
+  rpcMaxResponseBytes?: number;
 }
 
 export interface TelegramRoute {
+  /** The contract source this route delivers; determines which events it carries. */
+  source: "market" | "squad" | "default";
   chatId: string;
   channelPreviewMode: boolean;
+  /** Previous group chat id recorded when Telegram migrated the chat to a supergroup. */
+  migratedFromChatId?: string;
+}
+
+/**
+ * Update configured chat routes in-place after Telegram reports a group-to-supergroup
+ * migration (`migrate_to_chat_id`). Returns `true` if any route changed.
+ */
+export function applyChatMigration(
+  config: Partial<
+    Pick<BotConfig, "chatId" | "chatIds" | "marketChatId" | "squadChatId" | "routes">
+  >,
+  fromChatId: string,
+  toChatId: string,
+): boolean {
+  const from = fromChatId.trim();
+  const to = toChatId.trim();
+  if (!from || !to || from === to) return false;
+
+  let changed = false;
+  if (config.chatId === from) {
+    config.chatId = to;
+    changed = true;
+  }
+  if (config.marketChatId === from) {
+    config.marketChatId = to;
+    changed = true;
+  }
+  if (config.squadChatId === from) {
+    config.squadChatId = to;
+    changed = true;
+  }
+  if (Array.isArray(config.chatIds)) {
+    const next: string[] = [];
+    for (const id of config.chatIds) {
+      const mapped = id === from ? to : id;
+      if (id === from) changed = true;
+      if (!next.includes(mapped)) next.push(mapped);
+    }
+    if (changed) config.chatIds = next;
+  }
+  if (Array.isArray(config.routes)) {
+    for (const route of config.routes) {
+      if (route.chatId === from) {
+        route.chatId = to;
+        route.migratedFromChatId = from;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+/**
+ * Result of resolving the configured Telegram routes for delivery.
+ *
+ * `zero-active-routes` means every configured route is disabled, so no
+ * notification can be delivered. It is reported distinctly from `healthy`
+ * and must never be presented as a successful delivery.
+ */
+export type RouteDeliveryStatus =
+  | { status: "healthy"; activeRouteCount: number }
+  | {
+      status: "zero-active-routes";
+      activeRouteCount: 0;
+      message: string;
+    };
+
+/**
+ * Derives the delivery status from the configured routes. A route counts as
+ * active unless it is explicitly disabled. Delivery is never claimed here.
+ */
+export function resolveRouteDeliveryStatus(
+  routes: ReadonlyArray<TelegramRoute & { enabled?: boolean }>,
+): RouteDeliveryStatus {
+  const activeRouteCount = routes.filter((route) => route.enabled !== false).length;
+  if (activeRouteCount === 0) {
+    return {
+      status: "zero-active-routes",
+      activeRouteCount: 0,
+      message:
+        "No active Telegram routes: every configured route is disabled. Notifications will not be delivered until at least one route is enabled.",
+    };
+  }
+  return { status: "healthy", activeRouteCount };
 }
 
 export interface BotConfig extends StellarConfig {
@@ -202,6 +296,16 @@ export interface BotConfig extends StellarConfig {
   /** Optional per-contract destinations; absent values use `chatId`. */
   marketChatId?: string;
   squadChatId?: string;
+  /**
+   * Optional Telegram message-thread id for market notifications (forum topics).
+   * Absent means the channel's main thread.
+   */
+  marketMessageThreadId?: number;
+  /**
+   * Optional Telegram message-thread id for squad notifications (forum topics).
+   * Absent means the channel's main thread.
+   */
+  squadMessageThreadId?: number;
   /** Chats allowed to use /status. Empty array means no restriction. */
   allowedChatIds: string[];
   /** Telegram user id allowed to run operator-only commands. Null disables them. */
@@ -259,6 +363,12 @@ export interface BotConfig extends StellarConfig {
    */
   healthStaleMs: number;
   /**
+   * How long operational HTTP servers (`/health`, `/metrics`) wait for active or
+   * stalled client sockets to close during shutdown before force-closing them.
+   * `0` force-closes sockets immediately.
+   */
+  healthShutdownGraceMs: number;
+  /**
    * Wall-clock budget for retrying the startup RPC `getHealth()` probe.
    * `0` means a single attempt with no retries.
    */
@@ -304,12 +414,15 @@ export interface BotConfig extends StellarConfig {
    * an https URL at load time.
    */
   mimirAppUrl: string | null;
-  /** Optional bearer token for health endpoint authentication. Null disables auth. */
+  /** Optional bearer token for health endpoint authentication. Null disables auth. The server rejects Authorization headers over 4096 UTF-8 bytes before comparison. */
   healthAuthToken: string | null;
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+
+/** Fallback grace period for closing stalled operational HTTP sockets during shutdown. */
+export const DEFAULT_HEALTH_SHUTDOWN_GRACE_MS = 2_000;
 
 /** Fallback per-send budget when a config object predates `TELEGRAM_SEND_TIMEOUT_MS`. */
 export const DEFAULT_TELEGRAM_SEND_TIMEOUT_MS = 10_000;
@@ -332,6 +445,7 @@ const DEFAULTS = {
   network: "testnet" as StellarNetwork,
   locale: DEFAULT_LOCALE,
   rpcUrl: NETWORK_RPC_URLS.testnet,
+  rpcMaxResponseBytes: DEFAULT_MAX_RESPONSE_BYTES,
   horizonUrl: NETWORK_HORIZON_URLS.testnet,
   networkPassphrase: NETWORK_PASSPHRASES.testnet,
   pollIntervalMs: 30_000,
@@ -352,8 +466,10 @@ const DEFAULTS = {
   sendJournalFile: "./data/send-journal.jsonl",
   healthHost: "127.0.0.1",
   healthPort: 8787,
-  // 3Ã— default poll interval â€” one missed cycle is fine; three is not.
+  // 3× default poll interval — one missed cycle is fine; three is not.
   healthStaleMs: 90_000,
+  // Short grace period so stalled health/metrics clients cannot hold shutdown open.
+  healthShutdownGraceMs: DEFAULT_HEALTH_SHUTDOWN_GRACE_MS,
   // Retry RPC getHealth at boot for up to 30s (Testnet blips / deploy races).
   startupHealthDeadlineMs: 30_000,
   startupHealthRetryMs: 1_000,
@@ -656,14 +772,14 @@ function collector(profile: Record<string, string>) {
     chatIds(name: string): string[] {
       const value = this.required(name);
       if (value === "") return [];
-      
+
       const ids = value.split(",").map(s => s.trim()).filter(s => s !== "");
       if (ids.length === 0) {
         problems.push(`${name} is required but not set`);
         return [];
       }
       for (const id of ids) {
-        if (!/^-?\d+$/.test(id) && !/^@[A-Za-z0-9_]{4,}$/.test(id)) {
+        if (!/^-?[1-9]\d*$/.test(id) && !/^-?0$/.test(id) && !/^@[A-Za-z0-9_]{4,}$/.test(id)) {
           problems.push(
             `${name} must contain numeric chat ids or @channelusernames; got "${id}"`,
           );
@@ -676,6 +792,17 @@ function collector(profile: Record<string, string>) {
      * Parse an optional TCP port number. Returns `null` when the env var is
      * absent/empty (server disabled). Validates 1–65535 when present.
      */
+    optionalPositiveInt(name: string): number | undefined {
+      const raw = read(name);
+      if (raw === undefined) return undefined;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+        problems.push(`${name} must be a positive integer; got "${raw}"`);
+        return undefined;
+      }
+      return parsed;
+    },
+
     optionalPort(name: string): number | null {
       const raw = read(name);
       if (raw === undefined) return null;
@@ -844,6 +971,11 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     marketContractVersion: c.contractVersion("MARKET_CONTRACT_VERSION", "v1"),
     squadContractVersion: c.contractVersion("SQUAD_CONTRACT_VERSION", "v1"),
     rpcUrl: c.url("STELLAR_RPC_URL", namedDefaults.rpcUrl),
+    rpcMaxResponseBytes: c.int(
+      "STELLAR_RPC_MAX_RESPONSE_BYTES",
+      DEFAULTS.rpcMaxResponseBytes,
+      1,
+    ),
     horizonUrl: c.url("STELLAR_HORIZON_URL", namedDefaults.horizonUrl),
     networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? namedDefaults.passphrase,
     explorerBaseUrl: c.url(
@@ -900,6 +1032,8 @@ export function loadConfig(): BotConfig {
     chatIds,
     marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
     squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
+    marketMessageThreadId: c.optionalPositiveInt("TELEGRAM_MARKET_MESSAGE_THREAD_ID"),
+    squadMessageThreadId: c.optionalPositiveInt("TELEGRAM_SQUAD_MESSAGE_THREAD_ID"),
     allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
@@ -942,6 +1076,11 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
+    healthShutdownGraceMs: c.int(
+      "HEALTH_SHUTDOWN_GRACE_MS",
+      DEFAULTS.healthShutdownGraceMs,
+      0,
+    ),
     // 0 = single attempt (no retries) for the startup RPC probe.
     startupHealthDeadlineMs: c.int(
       "STARTUP_HEALTH_DEADLINE_MS",
@@ -976,6 +1115,81 @@ export function loadConfig(): BotConfig {
     healthAuthToken: c.optionalSecret("HEALTH_AUTH_TOKEN"),
   };
 
+  // ── Build canonical routes and reject duplicates ───────────────────────────
+  //
+  // A route identity is (chatId, messageThreadId). Two different sources
+  // (market, squad) that share the exact same identity are a misconfiguration:
+  // they would deliver separate event streams to the same thread, making audit
+  // trails ambiguous and delivery behaviour surprising.
+  //
+  // Single-chat deployments are explicitly exempted: when neither
+  // TELEGRAM_MARKET_CHAT_ID nor TELEGRAM_SQUAD_CHAT_ID is set, all sources
+  // inherit the same chatId as the intended single-channel fallback, and no
+  // duplicate is reported. The check only fires when at least one per-contract
+  // destination was explicitly configured and both resolve to the same identity.
+  //
+  // The report names the conflicting sources and the shared identity, never
+  // the bot token.
+  const defaultChatId = config.chatId;
+  const marketExplicit = c.get("TELEGRAM_MARKET_CHAT_ID") !== undefined;
+  const squadExplicit = c.get("TELEGRAM_SQUAD_CHAT_ID") !== undefined;
+  const marketChatId = config.marketChatId ?? defaultChatId;
+  const squadChatId = config.squadChatId ?? defaultChatId;
+
+  const builtRoutes: TelegramRoute[] = [
+    {
+      source: "default",
+      chatId: defaultChatId,
+      channelPreviewMode: config.channelPreviewMode,
+    },
+    {
+      source: "market",
+      chatId: marketChatId,
+      channelPreviewMode: config.channelPreviewMode,
+      ...(config.marketMessageThreadId !== undefined
+        ? { messageThreadId: config.marketMessageThreadId }
+        : {}),
+    },
+    {
+      source: "squad",
+      chatId: squadChatId,
+      channelPreviewMode: config.channelPreviewMode,
+      ...(config.squadMessageThreadId !== undefined
+        ? { messageThreadId: config.squadMessageThreadId }
+        : {}),
+    },
+  ];
+
+  // Only check for duplicates when at least one per-contract destination was
+  // explicitly configured. If neither was set, the single-chat fallback is
+  // correct (all sources share one destination by design).
+  if (marketExplicit || squadExplicit) {
+    const seen = new Map<string, string>();
+    const explicitRoutes = builtRoutes.filter((r) => r.source !== "default");
+    for (const route of explicitRoutes) {
+      const identity = routeIdentity(route);
+      const prior = seen.get(identity);
+      if (prior !== undefined) {
+        // Report without the token: use the identity label (chat id + optional
+        // thread), which is a destination address, not a secret.
+        const label =
+          route.messageThreadId !== undefined
+            ? `chat ${route.chatId} topic ${route.messageThreadId}`
+            : `chat ${route.chatId}`;
+        c.problems.push(
+          `Duplicate notification route: ${prior} and ${route.source} both target ${label}. ` +
+            `Set TELEGRAM_MARKET_CHAT_ID / TELEGRAM_SQUAD_CHAT_ID to distinct destinations, ` +
+            `or use TELEGRAM_MARKET_MESSAGE_THREAD_ID / TELEGRAM_SQUAD_MESSAGE_THREAD_ID ` +
+            `to separate sources into different forum topics.`,
+        );
+      } else {
+        seen.set(identity, route.source);
+      }
+    }
+  }
+
+  config.routes = builtRoutes;
+
   if (c.problems.length > 0) throw new ConfigError(c.problems);
 
   // Warn if health endpoint is exposed beyond loopback without authentication.
@@ -988,6 +1202,55 @@ export function loadConfig(): BotConfig {
   }
 
   return config;
+}
+
+/** Result of previewing where a notification of a given contract would be routed. */
+export interface RoutingPreview {
+  /** Contract whose events were previewed. */
+  contract: "market" | "squad";
+  /** Destinations that would receive the notification. */
+  matched: string[];
+  /** Destinations dropped by a feature flag or the category allowlist. */
+  filtered: string[];
+  /** Destinations with no usable chat id (empty or unconfigured). */
+  unavailable: string[];
+}
+
+/**
+ * Preview routing for a contract's notifications without any network I/O.
+ * Uses the same chat-id resolution as configured destinations so the preview
+ * matches live delivery targets. Pure: safe to call from `/status` or tests.
+ */
+export function previewRouting(
+  config: BotConfig,
+  contract: "market" | "squad",
+): RoutingPreview {
+  const preview: RoutingPreview = { contract, matched: [], filtered: [], unavailable: [] };
+
+  const enabled =
+    contract === "market" ? config.featureFlags.market : config.featureFlags.squad;
+  const candidate =
+    contract === "market"
+      ? config.marketChatId ?? config.chatId
+      : config.squadChatId ?? config.chatId;
+
+  const destinations = [candidate, ...(config.routes ?? []).map((r) => r.chatId)];
+  const seen = new Set<string>();
+  for (const destination of destinations) {
+    if (destination === undefined || destination === "") {
+      preview.unavailable.push(String(destination ?? ""));
+      continue;
+    }
+    if (seen.has(destination)) continue;
+    seen.add(destination);
+    if (!enabled) {
+      preview.filtered.push(destination);
+    } else {
+      preview.matched.push(destination);
+    }
+  }
+
+  return preview;
 }
 
 /** Check if a host is a loopback address (127.0.0.1, [::1], localhost). */
@@ -1099,6 +1362,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "SQUAD_CONTRACT_VERSION", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_RPC_URL", secret: false, hasBuiltInDefault: true },
+  { key: "STELLAR_RPC_MAX_RESPONSE_BYTES", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_HORIZON_URL", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK_PASSPHRASE", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_EXPLORER_BASE_URL", secret: false, hasBuiltInDefault: true },
@@ -1108,6 +1372,8 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "TELEGRAM_CHAT_ID", secret: true },
   { key: "TELEGRAM_MARKET_CHAT_ID", secret: true, derivedFrom: { key: "TELEGRAM_CHAT_ID" } },
   { key: "TELEGRAM_SQUAD_CHAT_ID", secret: true, derivedFrom: { key: "TELEGRAM_CHAT_ID" } },
+  { key: "TELEGRAM_MARKET_MESSAGE_THREAD_ID", secret: false },
+  { key: "TELEGRAM_SQUAD_MESSAGE_THREAD_ID", secret: false },
   { key: "ALLOWED_CHAT_IDS", secret: true },
   { key: "OPERATOR_TELEGRAM_USER_ID", secret: true },
   { key: "POLL_INTERVAL_MS", secret: false, hasBuiltInDefault: true },
@@ -1144,6 +1410,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
     },
   },
   { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
+  { key: "HEALTH_SHUTDOWN_GRACE_MS", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_AUTH_TOKEN", secret: true },
   { key: "STARTUP_HEALTH_DEADLINE_MS", secret: false, hasBuiltInDefault: true },
   { key: "STARTUP_HEALTH_RETRY_MS", secret: false, hasBuiltInDefault: true },
