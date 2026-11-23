@@ -3,10 +3,12 @@ import test from "node:test";
 
 import {
   InvalidThresholdError,
+  compileAmountThresholdFilters,
   meetsThreshold,
   normalizeUsdcThreshold,
   parseUsdcThreshold,
 } from "../dist/notifications/amount-threshold.js";
+import { EVENT_PAYLOAD_SCHEMAS } from "../dist/notifications/filter-expr.js";
 
 test("parseUsdcThreshold: parses whole integer USDC amounts (positive)", () => {
   assert.equal(parseUsdcThreshold("0"), 0n);
@@ -305,4 +307,85 @@ test("meetsThreshold: other events always pass regardless of thresholds (boundar
       `Event "${event.payload.name}" should always pass threshold`,
     );
   }
+});
+
+// ----------------------------------------------------
+// Amount Threshold Compilation Tests
+// ----------------------------------------------------
+
+test("compileAmountThresholdFilters: compiles thresholds to versioned and fingerprinted filter rules", () => {
+  const thresholds = {
+    marketChallenge: 100_000_000n, // 10 USDC
+    squadDeposit: 55_000_000n,     // 5.5 USDC
+  };
+
+  const rules = compileAmountThresholdFilters(thresholds);
+  assert.equal(rules.length, 2);
+
+  const [marketRule, squadRule] = rules;
+
+  assert.equal(marketRule.eventName, "claim_challenged");
+  assert.equal(marketRule.schemaVersion, 1);
+  assert.match(marketRule.digest, /^[a-f0-9]{64}$/);
+  assert.equal(marketRule.rawExpression, "claim_challenged where stake >= 10 USDC");
+
+  assert.equal(squadRule.eventName, "deposited");
+  assert.equal(squadRule.schemaVersion, 1);
+  assert.match(squadRule.digest, /^[a-f0-9]{64}$/);
+  assert.equal(squadRule.rawExpression, "deposited where amount >= 5.5 USDC");
+
+  // Evaluation parity with meetsThreshold
+  const challengePass = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "G...",
+    stake: 100_000_000n,
+  });
+  const challengeFail = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "G...",
+    stake: 99_999_999n,
+  });
+  assert.equal(marketRule.evaluate(challengePass), true);
+  assert.equal(marketRule.evaluate(challengeFail), false);
+
+  const depositPass = mockEvent("squad", {
+    name: "deposited",
+    marketId: 1,
+    side: 1,
+    participant: "G...",
+    amount: 55_000_000n,
+  });
+  const depositFail = mockEvent("squad", {
+    name: "deposited",
+    marketId: 1,
+    side: 1,
+    participant: "G...",
+    amount: 54_999_999n,
+  });
+  assert.equal(squadRule.evaluate(depositPass), true);
+  assert.equal(squadRule.evaluate(depositFail), false);
+
+  // Fresh rules are not stale
+  assert.equal(marketRule.isStale(), false);
+  assert.equal(squadRule.isStale(), false);
+
+  // Detects staleness when schema changes
+  const modifiedSchemas = {
+    ...EVENT_PAYLOAD_SCHEMAS,
+    claim_challenged: {
+      ...EVENT_PAYLOAD_SCHEMAS.claim_challenged,
+      newProp: { type: "string" },
+    },
+  };
+  assert.equal(marketRule.isStale(modifiedSchemas), true);
+  // Unrelated squad rule is not stale
+  assert.equal(squadRule.isStale(modifiedSchemas), false);
+});
+
+test("compileAmountThresholdFilters: empty or undefined thresholds return empty array", () => {
+  assert.deepEqual(compileAmountThresholdFilters(undefined), []);
+  assert.deepEqual(compileAmountThresholdFilters({}), []);
+  assert.deepEqual(compileAmountThresholdFilters({ marketChallenge: 0n, squadDeposit: 0n }), []);
 });

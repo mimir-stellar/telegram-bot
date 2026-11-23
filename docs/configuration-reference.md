@@ -15,17 +15,15 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - `BOT_TOKEN`: The API token for the Telegram bot. Required.
 - `TELEGRAM_CHAT_ID`: The chat identifier where notifications are posted. Required. Accepts either an integer decimal string (positive or negative, arbitrarily large, e.g. `-1001234567890123456`), or a channel handle such as `@channelusername`. Fractional values (`-100.5`) and exponent notation (`-1e12`) are rejected at startup; identifiers are kept as strings and never converted through JavaScript numbers.
 - `MIMIR_LOCALE`: Language for bot replies and notifications. Supported: `en` (default) and `es`; region tags such as `es-MX` resolve to the base language. Any other value fails fast at startup. See [Translator Guide](translating.md).
-- `BROADCAST_CONFIRMATION_STORE_PATH`: Optional path to a JSON file where `/broadcast` confirmation identities (operator, chat, action, expiry, consumed state) are persisted. When set, confirmations that were already consumed or have expired are rejected after a process restart, so a replayed Confirm button cannot re-send a broadcast. Message bodies are never written to disk. Defaults to unset (in-memory only). Use a path on a persistent volume, e.g. `data/broadcast-confirmations.json`.
-- **Slash-command argument limit**: All registered slash commands enforce a shared 256-byte UTF-8 argument limit (`MAX_COMMAND_ARGUMENT_BYTES`) before individual handlers run. Arguments exceeding the limit are rejected with a bounded reply and logged with byte counts only, never full user input.
+- Per-route language preference (`TelegramRoute.locale`): Optional locale override on individual entries in `config.routes` (matched by destination `chatId`). Region tags such as `es-MX` resolve to the base language; omitted or unsupported route locales fall back deterministically to the global `config.locale` and then to `en`. Applies across MarkdownV2, plaintext, HTML, and inline keyboard renderers.
 
 ### Mimir Contract Settings
 - `MARKET_CONTRACT_ID`: The Mimir market Soroban contract address. Required. Must be a valid `C...` strkey.
 - `SQUAD_CONTRACT_ID`: The Mimir squad Soroban contract address. Required. Must be a valid `C...` strkey.
 
 ### Network Settings
-- `STELLAR_RPC_URL`: The Soroban RPC endpoint used to poll for events. (e.g., `https://soroban-testnet.stellar.org`).
-- `STELLAR_HORIZON_URL`: Used for generating transaction links.
-- `STELLAR_EXPLORER_BASE_URL`: Explorer origin for transaction links (default `https://stellar.expert/explorer`). Only `https:` origins become clickable links in notifications; see [notification-links.md](notification-links.md).
+- `STELLAR_RPC_URL`: The Soroban RPC endpoint used to poll for events. (e.g., `https://soroban-testnet.stellar.org`). Must be a valid `http(s)` URL without embedded credentials (`user:pass@host`); invalid URLs fail fast before startup and report only the affected configuration key.
+- `STELLAR_HORIZON_URL`: Used for generating transaction links. Must be a valid `http(s)` URL without embedded credentials.
 - `STELLAR_NETWORK_PASSPHRASE`: Must match the RPC network's passphrase.
 
 ### Poller Tuning & Safeguards
@@ -41,19 +39,15 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - For full details on defaults, evaluation precedence, and worked examples, see [Notification Filters](notification-filters.md).
 - **Zero active routes**: When every configured route is disabled (`NOTIFY_ENABLED=false`, or both `NOTIFY_MARKET` and `NOTIFY_SQUAD` set to `false`), the notifier reports an explicit `no-active-routes` status instead of a healthy delivery status. No notification is ever reported as delivered in this state; each would-be event is counted as suppressed and logged at warn level with the reason `no active routes`.
 
-### Routing Preview (Dry Run)
-Routing previews report which Telegram destinations an event would be delivered to, without calling Telegram `sendMessage`. The preview uses the same decision path as live notification delivery, so it returns:
-- **matched**: destinations that would receive the notification.
-- **filtered**: destinations excluded by `NOTIFY_ENABLED`, `NOTIFY_MARKET`, `NOTIFY_SQUAD`, `NOTIFY_CATEGORIES` (and aliases), or other notification filters.
-- **unavailable**: destinations that cannot currently receive messages (for example, a missing or unconfigured `TELEGRAM_CHAT_ID`).
+### Shareable Archive Privacy Review
+Shareable event archives (JSONL captures produced by the archive helpers) can be checked before they leave the operator's machine. The privacy review mode scans an archive file and produces a deterministic findings report. It is fully offline: it performs no network calls to Telegram, Stellar RPC, or Horizon, and it never modifies the archive.
 
-Previews are read-only: they perform no Telegram API calls, do not advance the cursor, and do not write to `CURSOR_FILE`. A preview does not guarantee delivery; the live path remains the authority for what is actually sent.
-
-### Operator Digest Preview
-Operators can inspect the current pending digest window via `/digestpreview [grouped|flat]` (backed by `previewPendingDigest` in `src/notifications/digest-preview.ts` and the optional `digestWindow` dependency on `CommandDeps`).
-- **Live builder, non-consuming**: renders pending events through `formatDigest` without draining or mutating the pending window (for example, `DeferredQueue.peek()`), so subsequent scheduled flushes still receive all pending events.
-- **Operator authorization**: protected by the existing `OPERATOR_TELEGRAM_USER_ID` gate (`operatorOnly: true`, `hidden: true`). Non-operators and deployments without `OPERATOR_TELEGRAM_USER_ID` are silently ignored without reading the pending window.
-- **Completeness & schedule**: preserves period completeness metadata (`rpc_gap`, `restart`) and displays the next scheduled digest timestamp when provided.
+- **Detected findings**:
+  - `private_chat_id`: Telegram private chat identifiers (numeric IDs that are positive, i.e. user-scoped rather than group/channel IDs, and `@username`-style handles found under chat-identifying keys).
+  - `secret_value`: secret-shaped values, such as Telegram bot tokens (`<digits>:<35 chars>`), `S...` Stellar secret seeds, and values under secret-named keys (`token`, `secret`, `password`, `api_key`, `private_key`, etc.).
+- **Output**: findings are sorted by line number, then kind, then column, so repeated runs over the same input produce byte-identical reports. Each finding records the line, JSON path, kind, and a redacted preview; raw secret or chat values are never printed in the report.
+- **Failure handling**: malformed JSONL lines are reported as `parse_error` findings rather than aborting the scan.
+- **Usage**: run the review on an archive path before sharing it. A non-empty findings list means the archive should be scrubbed before distribution.
 
 ### Health Reporting
 - `HEALTH_HOST` & `HEALTH_PORT`: Binds a local HTTP endpoint for health probes (e.g., Kubernetes liveness probes). Set port to 0 to disable.
@@ -75,6 +69,11 @@ Operators can inspect the current pending digest window via `/digestpreview [gro
 - **Behavior**: `/broadcast` confirmations are bound to the issuing operator, the chat in which they were issued, and the action (confirm or cancel). Each identity is consumed on first use.
 - **Pending List & Explicit Cancellation**: Operators in private chat can inspect their active pending confirmations with `/broadcast list` (or `/confirmations`) and explicitly cancel an action by ID (`/broadcast cancel <id>`, `/confirmations cancel <id>`, `/confirmations cancel all`, or via the inline cancel button). The pending confirmation store and listing are bounded to `MAX_PENDING_CONFIRMATIONS` (20 entries, oldest evicted at capacity). Listings show only the current operator's unexpired actions with remaining time and expiry timestamp, and report only destination counts so target chat IDs or other operators' actions are never exposed.
 - **Restarts**: When `BROADCAST_CONFIRMATION_STORE_PATH` is set, identities survive restarts. Replayed or expired confirmations are rejected after a restart. Without it, pending confirmations are lost on restart and are rejected as unknown.
+- **Expired Callbacks & Recovery Hints**: When an operator interacts with an expired broadcast confirmation or cancellation callback, the callback query is acknowledged exactly once with a localized alert dialog (`ctx.answerCallbackQuery`) and the prompt message is updated with a localized recovery hint directing the authorized operator to recreate the action via `/broadcast`.
+
+### Pause Confirmations
+- **Behavior**: Operator `/pause` commands require inline confirmation. The callback verifies operator authorization and enforces a TTL (`PAUSE_CONFIRM_TTL_MS`, 5 minutes).
+- **Expired Callbacks & Recovery Hints**: If the pause confirmation prompt expires before the operator confirms, the callback is acknowledged exactly once with a localized alert dialog and the prompt message is updated with a recovery hint directing the operator to run `/pause` again. Failed message edits (such as deleted prompt messages) do not trigger duplicate callback acknowledgments.
 
 ### Cursor Management and Restarts
 - **Behavior**: The cursor (the last ingested event's ledger sequence and ID) is persisted to `CURSOR_FILE` after events are dispatched.

@@ -262,6 +262,8 @@ Open `src/notifications/format.ts` and wire the new payload into both `headline`
 
    For operator-only previews of the current pending digest window without consuming events, use `previewPendingDigest(window, options)` in `src/notifications/digest-preview.ts` or the hidden operator command `/digestpreview [grouped|flat]` (`src/commands/digest-preview.ts`), which delegates directly to `formatDigest` via `PendingDigestWindow.peek()`.
 
+   For quiet-hours-aware digest deferral, `DigestDeferralBuffer` (and `partitionDigestEvents`) in `src/notifications/digest-grouping.ts` keep critical `alwaysSend` events immediate, cap accumulated deferred entries at `maxEntries` (default `1000`), and flush grouped digests via `flushIfAllowed(now)` once outside quiet hours. In `src/notifications/schedule.ts`, `nextAllowedWindowStart`, `nextAllowedRun`, and `SchedulerOptions.quietHours` defer scheduled digest runs that fall inside quiet hours until the allowed window opens.
+
 ---
 
 ### Step 5: Filters and Feature Flags (`src/notifications/format.ts` & `src/notifications/featureFlags.ts`)

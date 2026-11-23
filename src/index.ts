@@ -249,7 +249,9 @@ async function main(): Promise<void> {
   // The bot needs the poller's status and the poller needs the bot's send path,
   // so one edge of the cycle is late-bound. This one, because it is the only
   // one that is a single function reference.
-  let notify: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void> = async () => {
+  let notify: ((text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>) & {
+    shutdown?: (mode?: "drain" | "cancel") => Promise<void>;
+  } = async () => {
     throw new Error("telegram notifier not ready");
   };
 
@@ -379,8 +381,10 @@ async function main(): Promise<void> {
     watchdog.unref();
 
     void (async () => {
+      let pollerDrained = true;
       try {
         const result = await poller.shutdown();
+        pollerDrained = result.drained;
         Logger.info(
           "shutdown",
           `[shutdown] poller ${result.drained ? "drained" : "hit the drain deadline"}; ` +
@@ -392,10 +396,21 @@ async function main(): Promise<void> {
           },
         );
       } catch (err: unknown) {
+        pollerDrained = false;
         Logger.error(
           "shutdown",
           `[shutdown] poller drain failed: ${safeErrorMessage(err)}`,
           { action: "drain_failed" },
+        );
+      }
+
+      try {
+        await notify.shutdown?.(pollerDrained ? "drain" : "cancel");
+      } catch (err: unknown) {
+        Logger.error(
+          "shutdown",
+          `[shutdown] notifier limiter shutdown failed: ${safeErrorMessage(err)}`,
+          { action: "notifier_shutdown_failed" },
         );
       }
 

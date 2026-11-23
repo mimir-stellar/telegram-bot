@@ -244,6 +244,7 @@ test("poller: a crash mid-send leaves an intent without a done, recoverable on r
 
     // The intent must be durable before the send returns.
     await waitFor(async () => {
+      if (sendCalls < 1) return false;
       const raw = await readFile(journalFile, "utf8").catch(() => "");
       return raw.includes('"kind":"intent"');
     });

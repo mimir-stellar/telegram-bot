@@ -24,6 +24,7 @@ import {
   type ConfigProvenance,
 } from "./config.js";
 import type { LogCapture } from "./logger.js";
+import { formatMetricLabels } from "./metrics.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
@@ -440,30 +441,12 @@ function assessDependencies(
   return { rpc, cursor, route, delivery };
 }
 
-/**
- * Build a health report from poller status.
- *
- * - `ok` / HTTP 200 when the poller is running and has not exceeded the
- *   consecutive-failure budget (and, once it has succeeded at least once,
- *   a successful poll happened within `healthStaleMs`).
- * - `degraded` / HTTP 503 when running but stale or failing repeatedly.
- * - `stopped` / HTTP 503 when the poller is not running.
- */
-export function buildHealthReport(
+function evaluateHealthStatus(
   config: BotConfig,
   poller: PollerStatus,
-  nowMs: number = Date.now(),
-  provenance: ConfigProvenance = configProvenance(),
+  nowMs: number,
   options: HealthReportOptions = {},
-): HealthReport {
-  const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
-  // Tolerate a status snapshot that never learned about the chain clock (and
-  // any non-finite value): the report must stay JSON-serialisable, never NaN.
-  const chainClockAt =
-    typeof poller.chainClockAt === "number" && Number.isFinite(poller.chainClockAt)
-      ? poller.chainClockAt
-      : null;
-
+): { status: HealthReport["status"]; ready: boolean } {
   let status: HealthReport["status"];
   if (!poller.running) {
     status = "stopped";
@@ -492,6 +475,34 @@ export function buildHealthReport(
 
   const draining = options.draining === true || poller.stopping === true;
   const ready = status === "ok" && !draining;
+  return { status, ready };
+}
+
+/**
+ * Build a health report from poller status.
+ *
+ * - `ok` / HTTP 200 when the poller is running and has not exceeded the
+ *   consecutive-failure budget (and, once it has succeeded at least once,
+ *   a successful poll happened within `healthStaleMs`).
+ * - `degraded` / HTTP 503 when running but stale or failing repeatedly.
+ * - `stopped` / HTTP 503 when the poller is not running.
+ */
+export function buildHealthReport(
+  config: BotConfig,
+  poller: PollerStatus,
+  nowMs: number = Date.now(),
+  provenance: ConfigProvenance = configProvenance(),
+  options: HealthReportOptions = {},
+): HealthReport {
+  const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
+  // Tolerate a status snapshot that never learned about the chain clock (and
+  // any non-finite value): the report must stay JSON-serialisable, never NaN.
+  const chainClockAt =
+    typeof poller.chainClockAt === "number" && Number.isFinite(poller.chainClockAt)
+      ? poller.chainClockAt
+      : null;
+
+  const { status, ready } = evaluateHealthStatus(config, poller, nowMs, options);
 
   return {
     ok: status === "ok",
@@ -583,52 +594,53 @@ export function buildMetricsReport(
 ): string {
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
   const network = networkLabel(config);
+  const netLabels = formatMetricLabels({ network });
   const activity = poller.activityBaseline ?? emptyActivityBaseline();
 
   const lines: string[] = [
     `# HELP mimir_telegram_uptime_ms Uptime in milliseconds`,
     `# TYPE mimir_telegram_uptime_ms gauge`,
-    `mimir_telegram_uptime_ms{network="${network}"} ${uptimeMs}`,
+    `mimir_telegram_uptime_ms${netLabels} ${uptimeMs}`,
     ``,
     `# HELP mimir_telegram_poller_running Whether the poller is currently running (1) or stopped/paused (0)`,
     `# TYPE mimir_telegram_poller_running gauge`,
-    `mimir_telegram_poller_running{network="${network}"} ${poller.running && !poller.paused ? 1 : 0}`,
+    `mimir_telegram_poller_running${netLabels} ${poller.running && !poller.paused ? 1 : 0}`,
     ``,
     `# HELP mimir_telegram_poller_cycles_total Total number of completed poll cycles`,
     `# TYPE mimir_telegram_poller_cycles_total counter`,
-    `mimir_telegram_poller_cycles_total{network="${network}"} ${poller.cycles}`,
+    `mimir_telegram_poller_cycles_total${netLabels} ${poller.cycles}`,
     ``,
     `# HELP mimir_telegram_notifications_sent_total Total number of Telegram messages successfully sent`,
     `# TYPE mimir_telegram_notifications_sent_total counter`,
-    `mimir_telegram_notifications_sent_total{network="${network}"} ${poller.notificationsSent}`,
+    `mimir_telegram_notifications_sent_total${netLabels} ${poller.notificationsSent}`,
     ``,
     `# HELP mimir_telegram_notifications_failed_total Total number of Telegram messages that failed to send after retries`,
     `# TYPE mimir_telegram_notifications_failed_total counter`,
-    `mimir_telegram_notifications_failed_total{network="${network}"} ${poller.notificationsFailed}`,
+    `mimir_telegram_notifications_failed_total${netLabels} ${poller.notificationsFailed}`,
     ``,
     `# HELP mimir_telegram_events_skipped_total Total number of events skipped (unrecognized, unformatted, or rate-limited)`,
     `# TYPE mimir_telegram_events_skipped_total counter`,
-    `mimir_telegram_events_skipped_total{network="${network}"} ${poller.eventsSkipped}`,
+    `mimir_telegram_events_skipped_total${netLabels} ${poller.eventsSkipped}`,
     ``,
     `# HELP mimir_telegram_consecutive_failures Current number of consecutive failed poll cycles`,
     `# TYPE mimir_telegram_consecutive_failures gauge`,
-    `mimir_telegram_consecutive_failures{network="${network}"} ${poller.consecutiveFailures}`,
+    `mimir_telegram_consecutive_failures${netLabels} ${poller.consecutiveFailures}`,
     ``,
     `# HELP mimir_telegram_activity_last_cycle_events Events observed in the most recent complete poll cycle`,
     `# TYPE mimir_telegram_activity_last_cycle_events gauge`,
-    `mimir_telegram_activity_last_cycle_events{network="${network}"} ${activity.lastValue ?? 0}`,
+    `mimir_telegram_activity_last_cycle_events${netLabels} ${activity.lastValue ?? 0}`,
     ``,
     `# HELP mimir_telegram_activity_baseline_events Mean events per cycle in the rolling baseline (0 while warming up)`,
     `# TYPE mimir_telegram_activity_baseline_events gauge`,
-    `mimir_telegram_activity_baseline_events{network="${network}"} ${activity.baselineMean ?? 0}`,
+    `mimir_telegram_activity_baseline_events${netLabels} ${activity.baselineMean ?? 0}`,
     ``,
     `# HELP mimir_telegram_activity_deviation Z-score of the latest complete cycle against the rolling baseline (0 while warming up)`,
     `# TYPE mimir_telegram_activity_deviation gauge`,
-    `mimir_telegram_activity_deviation{network="${network}"} ${activity.zScore ?? 0}`,
+    `mimir_telegram_activity_deviation${netLabels} ${activity.zScore ?? 0}`,
     ``,
     `# HELP mimir_telegram_activity_anomalies_total Complete cycles classified as a spike or drop against the rolling baseline`,
     `# TYPE mimir_telegram_activity_anomalies_total counter`,
-    `mimir_telegram_activity_anomalies_total{network="${network}"} ${activity.anomalies}`,
+    `mimir_telegram_activity_anomalies_total${netLabels} ${activity.anomalies}`,
   ];
 
   if (poller.latestLedger !== null) {
@@ -636,7 +648,7 @@ export function buildMetricsReport(
       ``,
       `# HELP mimir_telegram_latest_ledger Highest ledger seen by the poller`,
       `# TYPE mimir_telegram_latest_ledger gauge`,
-      `mimir_telegram_latest_ledger{network="${network}"} ${poller.latestLedger}`
+      `mimir_telegram_latest_ledger${netLabels} ${poller.latestLedger}`
     );
   }
 
@@ -648,13 +660,32 @@ export function buildMetricsReport(
       `# TYPE mimir_telegram_target_last_event_ledger gauge`,
     );
     for (const target of targetsWithLedgers) {
+      const targetLabels = formatMetricLabels({
+        network,
+        source: String(target.source),
+        contract: String(target.contractId),
+      });
       lines.push(
-        `mimir_telegram_target_last_event_ledger{network="${network}",source="${target.source}",contract="${target.contractId}"} ${target.lastEventLedger}`
+        `mimir_telegram_target_last_event_ledger${targetLabels} ${target.lastEventLedger}`
       );
     }
   }
 
   return lines.join("\\n") + "\\n";
+}
+
+function sendHead(
+  res: http.ServerResponse,
+  statusCode: number,
+  contentType = "application/json; charset=utf-8",
+  closing = false,
+): void {
+  res.writeHead(statusCode, {
+    "content-type": contentType,
+    "cache-control": "no-store",
+    ...(closing ? { connection: "close" } : {}),
+  });
+  res.end();
 }
 
 function sendJson(
@@ -770,20 +801,29 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
-    if (HEALTH_GET_ROUTES.has(url.pathname) && method !== "GET") {
-      sendMethodNotAllowed(res, "GET");
+    if (HEALTH_GET_ROUTES.has(url.pathname) && method !== "GET" && method !== "HEAD") {
+      sendMethodNotAllowed(res, "GET, HEAD");
       return;
     }
 
-    if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
+    if ((method === "GET" || method === "HEAD") && (url.pathname === "/health" || url.pathname === "/healthz")) {
+      if (method === "HEAD") {
+        const { ready } = evaluateHealthStatus(config, status(), now(), { draining });
+        sendHead(res, ready ? 200 : 503, "application/json; charset=utf-8", closing);
+        return;
+      }
       const report = buildHealthReport(config, status(), now(), provenance(), { draining });
-      sendJson(res, report.ready ? 200 : 503, report);
+      sendJson(res, report.ready ? 200 : 503, report, closing);
       return;
     }
 
-    if (method === "GET" && (url.pathname === "/health/live" || url.pathname === "/livez")) {
+    if ((method === "GET" || method === "HEAD") && (url.pathname === "/health/live" || url.pathname === "/livez")) {
       // Liveness: the process is up and the HTTP server can answer. Do not
       // reflect poller degradation here — supervisors use /health for that.
+      if (method === "HEAD") {
+        sendHead(res, 200, "application/json; charset=utf-8", closing);
+        return;
+      }
       sendJson(
         res,
         200,
@@ -799,7 +839,11 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
-    if (method === "GET" && url.pathname === "/metrics") {
+    if ((method === "GET" || method === "HEAD") && url.pathname === "/metrics") {
+      if (method === "HEAD") {
+        sendHead(res, 200, "text/plain; version=0.0.4; charset=utf-8", closing);
+        return;
+      }
       const metrics = buildMetricsReport(config, status(), now());
       res.writeHead(200, {
         "content-type": "text/plain; version=0.0.4; charset=utf-8",
@@ -811,7 +855,11 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
-    if (method === "GET" && url.pathname === "/") {
+    if ((method === "GET" || method === "HEAD") && url.pathname === "/") {
+      if (method === "HEAD") {
+        sendHead(res, 200, "application/json; charset=utf-8", closing);
+        return;
+      }
       sendJson(
         res,
         200,
@@ -823,6 +871,11 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         },
         closing,
       );
+      return;
+    }
+
+    if (method === "HEAD") {
+      sendHead(res, 404, "application/json; charset=utf-8", closing);
       return;
     }
 

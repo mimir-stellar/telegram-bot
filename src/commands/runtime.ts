@@ -62,6 +62,29 @@ export function isOperator(ctx: Pick<Context, "from">, config: BotConfig): boole
 }
 
 /**
+ * Returns true when the incoming slash command explicitly targets a different
+ * bot (`/<cmd>@<otherbot>`). Commands without a `@mention` or addressed to
+ * `ctx.me.username` (case-insensitive) return false.
+ */
+export function isCommandForAnotherBot(ctx: Pick<Context, "message" | "me">): boolean {
+  const text = ctx.message?.text ?? "";
+  const entities = ctx.message?.entities ?? [];
+  const cmdEntity = entities.find((e) => e.type === "bot_command" && e.offset === 0);
+  const raw = cmdEntity
+    ? text.slice(1, cmdEntity.length)
+    : text.startsWith("/")
+      ? (text.slice(1).split(/\s/, 1)[0] ?? "")
+      : "";
+  const atIndex = raw.indexOf("@");
+  if (atIndex === -1) return false;
+  const mention = raw.slice(atIndex + 1);
+  if (mention.length === 0) return false;
+  const myUsername = ctx.me?.username;
+  if (!myUsername) return true;
+  return mention.toLowerCase() !== myUsername.toLowerCase();
+}
+
+/**
  * Gate for commands that expose deployment details. Requests from unapproved
  * chats are silently ignored: an error reply would leak the existence of the
  * restriction, and silence matches privacy-mode bots that never see most

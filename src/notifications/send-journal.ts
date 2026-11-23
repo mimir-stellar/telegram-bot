@@ -6,10 +6,18 @@
  * an `intent` but no `done` identify notifications that may or may not have
  * been delivered -- instead of guessing from the cursor.
  *
+ * A `timeout` line is written when the HTTP call to Telegram timed out before
+ * a response was received. A pending intent that also has a matching `timeout`
+ * line is a **confirmed-unknown outcome**: Telegram may have received the
+ * message even though the client did not. This is distinct from a plain pending
+ * intent (crashed before or during the send, no timeout observed). Both cases
+ * leave the notification potentially sent, but the timeout case gives recovery
+ * tooling a stronger signal for de-duplication decisions.
+ *
  * Every append is fsynced before it returns, so a journal entry survives an
  * abrupt termination. The file is JSONL and is kept bounded by compaction:
  * resolved (`intent` + `done`) pairs are dropped, leaving only unresolved
- * intents.
+ * intents and any associated `timeout` lines.
  *
  * The journal is best-effort: a write failure is logged and the poller carries
  * on, falling back to guessing from the cursor exactly as it does today.
@@ -21,9 +29,18 @@
 import { mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
+import { sanitizeTelegramError } from "./notifier.js";
+
 export const DEFAULT_SEND_JOURNAL_MAX_ENTRIES = 1_000;
 export const DEFAULT_SEND_JOURNAL_MAX_BYTES = 1_000_000;
 export const SEND_JOURNAL_DIAGNOSTIC_MAX_CHARS = 200;
+
+export type DeliveryOutcome = "sent" | "failed" | "skipped";
+
+export interface JournalDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
 
 export interface JournalEntry {
   kind: "intent" | "done" | "invalid_result";
@@ -31,11 +48,25 @@ export interface JournalEntry {
   source: string;
   ledger: number;
   eventName: string;
+  /** Target Telegram chat id when tracked per-destination. */
+  chatId?: string;
+  /** Target Telegram forum topic / thread id when tracked per-destination. */
+  topicId?: number;
+  /** Persisted delivery outcome on `done` entries. */
+  outcome?: DeliveryOutcome;
   /** Bounded hash of the message body; the body itself is never persisted. */
   textHash?: string;
   /** Bounded diagnostic retained when a delivery result is invalid (e.g. missing message_id). */
   diagnostic?: string;
   at: number;
+  /**
+   * Epoch milliseconds when the next retry attempt is eligible.
+   * Stored with pending deliveries so a restart honours remaining backoff
+   * instead of immediately bursting retries.
+   */
+  nextAttemptAt?: number;
+  /** Number of failed delivery attempts recorded for this pending delivery. */
+  attempts?: number;
 }
 
 export interface SendJournalOptions {
@@ -43,6 +74,8 @@ export interface SendJournalOptions {
   maxEntries?: number;
   maxBytes?: number;
   now?: () => number;
+  /** Known secrets (e.g. botToken) to redact from persisted error descriptions. */
+  secrets?: readonly string[];
 }
 
 export interface SendJournalStats {
@@ -56,9 +89,20 @@ export interface SendJournal {
     source: string;
     ledger: number;
     eventName: string;
+    chatId?: string;
+    topicId?: number;
     textHash?: string;
+    chatId?: string;
+    networkPassphrase?: string;
     at: number;
+    nextAttemptAt?: number;
+    attempts?: number;
   }): Promise<void>;
+  /**
+   * Persist the next eligible retry time for a pending delivery so a restart
+   * does not immediately burst retries.
+   */
+  recordRetry(id: string, nextAttemptAt: number, attempts?: number): Promise<void>;
   recordDone(id: string): Promise<void>;
   /**
    * Record a bounded diagnostic when a send returned an invalid delivery result
@@ -67,6 +111,12 @@ export interface SendJournal {
   recordInvalidResult(id: string, diagnostic: string): Promise<void>;
   /** Intents with no matching done: notifications that may have been sent. */
   loadPending(): Promise<JournalEntry[]>;
+  /**
+   * Pending deliveries whose `nextAttemptAt` is absent or `<= asOf`
+   * (defaults to the journal clock). Entries scheduled in the future are
+   * excluded until their retry time arrives.
+   */
+  loadDue(asOf?: number): Promise<JournalEntry[]>;
   compact(): Promise<void>;
   stats(): Promise<SendJournalStats>;
 }
@@ -160,14 +210,71 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     source: string;
     ledger: number;
     eventName: string;
+    chatId?: string;
+    topicId?: number;
     textHash?: string;
+    chatId?: string;
+    networkPassphrase?: string;
     at: number;
+    nextAttemptAt?: number;
+    attempts?: number;
   }): Promise<void> {
-    await append({ kind: "intent", ...entry });
+    const nextAttemptAt = normalizeNonNegativeInt(entry.nextAttemptAt);
+    const attempts = normalizeNonNegativeInt(entry.attempts);
+    await append({
+      kind: "intent",
+      id: entry.id,
+      source: entry.source,
+      ledger: entry.ledger,
+      eventName: entry.eventName,
+      ...(entry.textHash !== undefined ? { textHash: entry.textHash } : {}),
+      at: entry.at,
+      ...(nextAttemptAt !== undefined ? { nextAttemptAt } : {}),
+      ...(attempts !== undefined ? { attempts } : {}),
+    });
   }
 
-  async function recordDone(id: string): Promise<void> {
-    await append({ kind: "done", id, source: "", ledger: 0, eventName: "", at: now() });
+  async function recordRetry(
+    id: string,
+    nextAttemptAt: number,
+    attempts?: number,
+  ): Promise<void> {
+    const normalizedNext = normalizeNonNegativeInt(nextAttemptAt);
+    if (normalizedNext === undefined) {
+      throw new RangeError(
+        `nextAttemptAt must be a finite non-negative number, got ${String(nextAttemptAt)}`,
+      );
+    }
+    const normalizedAttempts = normalizeNonNegativeInt(attempts);
+    await append({
+      kind: "retry",
+      id,
+      source: "",
+      ledger: 0,
+      eventName: "",
+      at: now(),
+      nextAttemptAt: normalizedNext,
+      ...(normalizedAttempts !== undefined ? { attempts: normalizedAttempts } : {}),
+    });
+  }
+
+  async function recordDone(
+    id: string,
+    destination?: JournalDestination,
+    outcome?: DeliveryOutcome,
+  ): Promise<void> {
+    const doneEntry: JournalEntry = {
+      kind: "done",
+      id,
+      source: "",
+      ledger: 0,
+      eventName: "",
+      ...(destination ? { chatId: destination.chatId } : {}),
+      ...(destination?.topicId !== undefined ? { topicId: destination.topicId } : {}),
+      ...(outcome !== undefined ? { outcome } : destination ? { outcome: "sent" as const } : {}),
+      at: now(),
+    };
+    await append(doneEntry);
     // Once a send is accounted for, compact resolved pairs away when the file
     // has grown past its budget so the journal stays bounded.
     const stats = await journalStats();

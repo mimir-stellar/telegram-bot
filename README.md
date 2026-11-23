@@ -339,23 +339,31 @@ npm run replay -- --from 4226500 --to 4226800    # bounded range
 npm run replay -- --from 4226500 --send          # send to Telegram (needs BOT_TOKEN)
 npm run replay -- --from 4226500 --contract market  # one contract only
 npm run replay -- --from 4226500 --json          # machine-readable mimir-replay-v1
+npm run replay -- --from 4226500 --jsonl         # streaming mimir-replay-jsonl-v1
+npm run replay -- --merge-chunks c1.jsonl,c2.jsonl --out merged.jsonl  # merge chunks
 npm run replay -- --from 4226500 --pages 5       # walk at most 5 pages per contract
 npm run replay -- --from 4226500 --cap 10        # cap at 10 notifications per contract
 npm run replay:mock -- --from 4226500            # local mock profile, no credentials
+npm run replay -- --archive scan.json            # offline replay from mimir-scan-v1 archive
 ```
 
 **Flags:**
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--from <ledger\|cursor>` | (required) | Start of the range — a ledger number or an opaque RPC cursor |
+| `--from <ledger\|cursor>` | (required unless `--archive` is set) | Start of the range — a ledger number or an opaque RPC cursor |
 | `--to <ledger>` | chain tip | End of the range (inclusive). Clamped to the tip when above it |
+| `--archive <path>` | off | Replay offline from a validated `mimir-scan-v1` scanner archive without contacting RPC; enforces schema (`mimir-scan-v1`) and network identity before processing |
 | `--send` | off | Actually post to Telegram; requires `BOT_TOKEN` and `TELEGRAM_CHAT_ID` |
 | `--contract market\|squad` | both | Scan only the named contract |
 | `--pages <n>` | 20 | Page budget per contract |
 | `--cap <n>` | `MAX_NOTIFICATIONS_PER_CYCLE` | Maximum notifications per contract per run |
 | `--show <n>` | 0 | Include the last *n* decoded events per target in the report |
 | `--json` | off | Machine-readable `mimir-replay-v1` JSON on stdout; progress on stderr |
+| `--jsonl` | off | Streaming `mimir-replay-jsonl-v1` JSONL on stdout (or `--out`); bounded memory, progress on stderr |
+| `--merge-chunks <paths>` | — | Merge comma-separated or repeated replay chunk files (JSONL or `mimir-replay-v1` JSON) into a single canonical, deduplicated streaming JSONL report |
+| `--out <path>` | stdout | Write `--jsonl` or `--merge-chunks` output to a file instead of stdout |
+| `--dedup-window <n>` | 256 | Bounded deduplication window size for `--merge-chunks` (`0` disables dedup) |
 | `--mock` | off | `MIMIR_PROFILE=mock`: local RPC, fixture contracts, no credentials needed |
 
 **Default mode is dry-run.** Events are decoded and counted; nothing is posted to
@@ -493,7 +501,7 @@ end. `npm test` covers all of it (`tests/mock-*.test.mjs`); run just those with
 
 ## Decoded event payload caps
 
-Each Soroban event is size-checked **before** native decoding in
+Each Soroban event is size- and depth-checked **before** native decoding in
 `src/stellar/decode.ts`:
 
 | Cap | Default | Failure mode |
@@ -501,10 +509,34 @@ Each Soroban event is size-checked **before** native decoding in
 | Event `value` XDR | 16 KiB (`MAX_DECODED_EVENT_XDR_BYTES`) | Event becomes `unknown` with a short reason; cursor still advances |
 | Per-topic XDR | 1 KiB (`MAX_EVENT_TOPIC_XDR_BYTES`) | Same |
 | Decoded string field | 2048 chars (`MAX_DECODED_STRING_CHARS`) | Same |
+| Nested collection depth | 5 (`MAX_DECODED_COLLECTION_DEPTH`, shared with `MAX_GENERIC_DEPTH`) | Event becomes `unknown` with reason `collection depth limit exceeded`; cursor still advances |
+
+Depth is bounded independently of byte size: a small payload made of many
+nested vecs/maps is rejected before `scValToNative` recurses. The generic
+decoder (`src/stellar/generic-decode.ts`) keeps its bounded rendering and exposes
+the same `DEPTH_LIMIT_REASON` on `payload.reason`. Callers can override the typed
+bound per call with `DecodeOptions.maxDepth`.
 
 Oversized or malformed events never crash the poller and are never re-logged as
 raw remote bytes — only a truncated reason string is kept. No configuration
 change is required; existing cursors remain valid.
+
+### Event archive & JSONL streaming bounds
+
+Rotating event archives (`src/stellar/archive.ts`) and JSONL streams
+(`src/stellar/scan-jsonl.ts`) are read incrementally with a fixed-size chunk
+buffer and a bounded line buffer so memory usage stays independent of total
+archive size:
+
+| Constant / Option | Default | Failure mode |
+|---|---|---|
+| `DEFAULT_MAX_JSONL_LINE_BYTES` / `maxLineBytes` | 64 KiB (`65536`) | Throws `JsonlLineTooLongError` **before** UTF-8 decoding or `JSON.parse` (error message is bounded and never echoes raw record bytes) |
+| `DEFAULT_JSONL_CHUNK_BYTES` / `chunkBytes` | 64 KiB (`65536`) | Throws `RangeError` if not a positive finite integer |
+
+`readArchive(dir, options?)` remains backward-compatible when called without
+options; `readArchiveFile(filePath, options?)`, `parseJsonlStream(chunks, options?)`,
+and `streamBoundedJsonlLines(chunks, options?)` expose the same bounded
+streaming interface for single files and arbitrary async chunk streams.
 
 ## How the polling works
 
@@ -688,12 +720,12 @@ change and must be deployed together with a recorded fixture and an operational
 note. The chain remains authoritative if the bot version cannot decode an event.
 
 RPC configuration is read-only: `STELLAR_RPC_URL` must point to a Soroban RPC
-endpoint, and `STELLAR_NETWORK_PASSPHRASE` controls network labeling for
-explorer links. The client sends no signing material and creates no wallet.
-Explorer path components are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL`
-values are supported without changing cursor or decoder compatibility.
-Notifications only link `https:` URLs; any other explorer or app origin renders
-the `tx` label as inert text (see [docs/notification-links.md](docs/notification-links.md)).
+endpoint without embedded credentials (`user:pass@host` is rejected before
+startup, reporting only the affected configuration key), and
+`STELLAR_NETWORK_PASSPHRASE` controls network labeling for explorer links. The
+client sends no signing material and creates no wallet. Explorer path components
+are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL` values are supported without
+changing cursor or decoder compatibility.
 
 ## Cursor persistence
 
@@ -945,6 +977,20 @@ Two things it deliberately does not do:
 `DEAD_LETTER_FILE` disables the queue entirely, and the poller then behaves
 exactly as it did before the queue existed.
 
+Operators can inspect and manage parked entries offline (without contacting
+Stellar or Telegram) via the DLQ CLI:
+
+```bash
+npm run dlq -- list [--file PATH] [--json]
+npm run dlq -- show <id> [--file PATH] [--json]
+npm run dlq -- ack <id...> [--yes] [--file PATH] [--json]
+npm run dlq -- purge [--older-than <dur>] [--yes] [--file PATH] [--json]
+```
+
+`ack` accepts an explicit bounded list of up to 100 entry IDs (`DEAD_LETTER_MAX_ACK_IDS`),
+performs a dry run unless `--yes` is passed, atomically removes all matched entries in a
+single write-then-rename, and preserves unmatched entries untouched.
+
 ## Graceful shutdown
 
 `SIGINT`/`SIGTERM` starts a bounded drain rather than a hard stop:
@@ -1073,8 +1119,8 @@ proxy requirements, secret lifecycle, verification, and rollback steps.
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
-| `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
+| `GET` / `HEAD /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped, draining, or degraded (repeated RPC failures or a stale success window). `GET` returns the JSON report (including `poller.paused` and `poller.suppressedLogs`); `HEAD` returns the same status and headers without a response body or full report serialization. |
+| `GET` / `HEAD /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening (`HEAD` omits the response body). |
 | `GET /health/diag` | The same report `/export` produces in the chat, as plain text. `404` when log capture is off. For an operator with host access but no seat in the chat. |
 
 **Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:

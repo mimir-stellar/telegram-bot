@@ -15,10 +15,7 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
-import {
-  assertNetworkIdentity,
-  RpcNetworkIdentityError,
-} from "./rpc-guard.js";
+import { assertRpcEndpointUrl } from "./rpc-guard.js";
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -31,12 +28,31 @@ export class RpcPassphraseError extends Error {
 }
 
 /**
+ * Normalize a Soroban RPC URL into a bounded, secret-free endpoint key suitable
+ * for per-endpoint circuit-breaker state and logs. Strips credentials, query
+ * parameters, and fragments; falls back to `"default"` when empty or invalid.
+ */
+export function normalizeRpcEndpoint(rpcUrl: string): string {
+  const trimmed = typeof rpcUrl === "string" ? rpcUrl.trim() : "";
+  if (!trimmed) return "default";
+  try {
+    const parsed = new URL(trimmed);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.protocol}//${parsed.host.toLowerCase()}${pathname}`;
+  } catch {
+    return trimmed.replace(/\/+$/, "").slice(0, 128) || "default";
+  }
+}
+
+/**
  * Create an RPC server. Construction is offline; the network passphrase is
  * verified separately at boot by {@link validateNetworkPassphrase}.
+ * When `config.rpcEgressAllowlist` is configured, validates `config.rpcUrl`
+ * (retaining a credential-free loopback exception for mock mode).
  */
 export function createRpcServer(config: StellarConfig): rpc.Server {
-  const maxResponseBytes = config.rpcMaxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
-  const server = new rpc.Server(config.rpcUrl, {
+  assertRpcEndpointUrl(config.rpcUrl, "STELLAR_RPC_URL");
+  return new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
     timeout: 15000,
@@ -150,6 +166,14 @@ export interface LedgerWindow {
   oldestLedger: number;
   /** Current chain tip. Requests above it are errors. */
   latestLedger: number;
+}
+
+/** A closed ledger range `[startLedger, endLedger]` used for event queries and provider comparisons. */
+export interface ScanLedgerWindow {
+  /** Inclusive start ledger of the scanned window. */
+  startLedger: number;
+  /** Inclusive end ledger of the scanned window. */
+  endLedger: number;
 }
 
 /** Why a ledger window, start ledger, or resume cursor cannot be scanned. */
@@ -433,6 +457,37 @@ export function validateLedgerWindow(health: {
   }
 
   return { oldestLedger, latestLedger };
+}
+
+/**
+ * Validate a closed scan/comparison ledger window `[startLedger, endLedger]`.
+ *
+ * Throws a bounded {@link LedgerWindowError} when either bound is missing,
+ * negative, non-integer, or inverted (`startLedger > endLedger`).
+ */
+export function validateScanWindow(window: {
+  startLedger?: unknown;
+  endLedger?: unknown;
+}): ScanLedgerWindow {
+  const startLedger = window?.startLedger;
+  const endLedger = window?.endLedger;
+
+  if (!isLedgerSequence(startLedger) || !isLedgerSequence(endLedger)) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `scan ledger window is malformed ` +
+        `(start=${boundedLedgerValue(startLedger)}, end=${boundedLedgerValue(endLedger)})`,
+    );
+  }
+  if (startLedger > endLedger) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `scan ledger window is inverted ` +
+        `(start ${startLedger} > end ${endLedger})`,
+    );
+  }
+
+  return { startLedger, endLedger };
 }
 
 /**

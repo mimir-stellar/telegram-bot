@@ -126,6 +126,12 @@ NOTIFY_CATEGORIES=crypto
 > [!NOTE]
 > Because `eventAllowedByCategory` only inspects `claim_created`, there is no environment variable that suppresses `claim_challenged` or `claim_resolved` while keeping `claim_created` enabled.
 
+### Validation Error Codes and Source Ranges
+
+Filter expression errors (`FilterParseError`, `FilterTokenLimitError`, `FilterDepthLimitError` in `src/notifications/filter-expr.ts`) and USDC threshold errors (`InvalidThresholdError` in `src/notifications/amount-threshold.ts`) expose:
+- `code`: stable machine-readable error code (such as `FILTER_UNKNOWN_EVENT`, `FILTER_UNKNOWN_FIELD`, `FILTER_TYPE_MISMATCH`, `FILTER_OPERATOR_NOT_SUPPORTED`, `FILTER_USDC_PRECISION`, `FILTER_SYNTAX_ERROR`, `FILTER_TOKEN_LIMIT`, `FILTER_DEPTH_LIMIT`, `THRESHOLD_NEGATIVE`, `THRESHOLD_PRECISION_EXCEEDED`, `THRESHOLD_MALFORMED`).
+- `range`: 0-based `{ start, end }` character span identifying the invalid token or slice in the original input without echoing the entire expression.
+
 ---
 
 ### Example 2: Squad notifications only
@@ -168,54 +174,54 @@ NOTIFY_CATEGORIES=__none__
 
 ---
 
-## 4. Decimal USDC Threshold Normalization
+## 4. Compiled Notification Filters (Schema Versioning & Fingerprinting)
 
-Both [`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts) and [`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts) normalize equivalent decimal USDC thresholds to 7-decimal atomic units (`bigint`) before comparison:
+The notification filtering subsystem supports typed filter expressions ([`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts)) and integer USDC amount thresholds ([`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts)). Filter rules can be compiled ahead of time into immutable, versioned, and fingerprinted objects.
 
-- **Canonical equivalence**: Equivalent decimal strings (for example `"1"`, `"01"`, `"1.0"`, `"1.00"`, and `"1.0000000"`) normalize identically via `parseUsdcThreshold` / `normalizeUsdcThreshold` and in filter expression comparisons (both explicit `USDC` / `$` literals and bare decimal literals such as `stake >= 10.50`).
-- **Precision limit**: Values exceeding seven fractional digits (for example `"1.00000000"` or `"0.00000001"`) are rejected with `InvalidThresholdError` or `FilterParseError`.
+### 4.1 Schema Normalization and Fingerprint Digests
 
----
+Every compiled filter rule attaches a normalized schema version (`FILTER_SCHEMA_VERSION = 1`) and a deterministic SHA-256 fingerprint digest (`schemaDigest` / `digest` / `fingerprint`):
 
-## 5. Filter Explanation Tree (Operator Diagnostics)
+- **Order-Independent Normalization**: Event schemas and field definitions are sorted alphabetically and canonicalized prior to hashing, ensuring that harmless declaration or key reordering does not alter the digest.
+- **Payload Schema Fingerprint**:
+  - Event-specific rules (e.g. `claim_challenged where stake >= 100 USDC`) carry an `eventDigest` fingerprinting the target event payload schema (`EVENT_PAYLOAD_SCHEMAS[eventName]`).
+  - Global rules without an explicit event name carry a `registryDigest` covering the full schema registry.
 
-[`explainFilterRule(rule, event, options?)`](../src/notifications/filter-expr.ts) explains *why* a parsed filter expression (and, optionally, the amount thresholds) allowed or denied one event. It is a dry-run diagnostic only: the live path still uses `evaluateFilterRule` and `meetsThreshold`, whose exports and semantics are unchanged.
+### 4.2 Detecting Stale Compiled Rules
 
-The tree mirrors the rule and its expression AST:
+When contract schemas evolve or new fields/types are introduced, compiled rules can be verified for freshness via `isFilterRuleStale` or `rule.isStale()`:
 
-| Node `kind` | When present | Meaning |
-| :--- | :--- | :--- |
-| `rule` | Always (root) | Final decision. `matched` and the top-level `reason` always equal `evaluateFilterRule` / `evaluateFilterDryRun`. |
-| `event-name` | The rule names an event | Whether the event is the named one. |
-| `and` / `or` | Logical operators in the condition | Children are the left and right operands, in source order. |
-| `comparison` | Each predicate in the condition | `matched`, `predicate-false`, or `missing-field`. |
-| `threshold` | `options.thresholds` is given | Amount threshold check, evaluated after the expression as in the live path. |
+```ts
+import { compileFilterExpression, isFilterRuleStale } from "./notifications/filter-expr.js";
 
-Each node carries `matched`, an `outcome` (`matched`, `event-name-mismatch`, `missing-field`, `predicate-false`, `below-threshold`, `not-configured`, `not-evaluated`) and a short `reason`. Branches the live evaluator short-circuits (the right side of a failed `and` or a matched `or`, the condition after an event-name mismatch, the threshold after a failed expression) are reported as `not-evaluated`, so the tree shows exactly what the live path looked at. Output is deterministic and JSON-serializable (no `bigint` values).
+const rule = compileFilterExpression("claim_challenged where stake >= 100 USDC");
 
-`renderFilterExplanation(explanation)` renders the tree as indented plain text, one line per node. For the rule `claim_challenged where (stake >= 100 USDC and challenger != "G…") or claimId == 42` with a 10 USDC challenge threshold, against a synthetic 25 USDC challenge on claim 7:
+// Check freshness against current schema definitions:
+const isStale = isFilterRuleStale(rule); // false
 
-```text
-✗ [rule] rule failed (predicate-false): event denied
-  ✓ [event-name] event is claim_challenged
-  ✗ [or] or: neither side matched
-    ✗ [and] and: left side failed; right side not evaluated
-      ✗ [comparison] stake >= 100 USDC: false
-      - [comparison] challenger != <redacted>: not evaluated
-    ✗ [comparison] claimId == 42: false
-  - [threshold] amount threshold: not evaluated
+// If the event schema changes (e.g. fields added, removed, or type modified):
+const modifiedSchemas = { ... };
+isFilterRuleStale(rule, modifiedSchemas); // true (SCHEMA_DIGEST_MISMATCH)
 ```
 
-### 5.1 Privacy
+Staleness checks identify:
+- **`UNCOMPILED_RULE`**: Rules lacking version or digest metadata.
+- **`VERSION_MISMATCH`**: Schema version bumped incompatibly.
+- **`UNKNOWN_EVENT`**: Event removed from the schema registry.
+- **`SCHEMA_DIGEST_MISMATCH`**: Payload fields added, removed, or altered.
+- **`CONDITION_VALIDATION_FAILED`**: Fields referenced by the filter condition are no longer compatible.
 
-Reasons never contain payload values: no addresses, claim titles, summaries, questions, categories, or amounts from the event. String literals written in the rule (which may hold an address, a chat or route identity, or message text) are shown as `<redacted>`. Only schema field names, operators, numeric literals, USDC amounts written in the rule, configured threshold minimums, and the rule's own (schema-validated) event name appear. On an event-name mismatch the event's actual name is not echoed.
+### 4.3 Amount Threshold Compilation
 
-### 5.2 Bounds
+Configured amount thresholds (`marketChallenge`, `squadDeposit`) can also be compiled into equivalent versioned filter rules using `compileAmountThresholdFilters(thresholds)`:
 
-| Option | Default | Minimum | Effect |
-| :--- | :--- | :--- | :--- |
-| `maxNodes` | `MAX_EXPLANATION_NODES` (64) | 1 | Nodes kept, in pre-order. |
-| `maxDepth` | `MAX_EXPLANATION_DEPTH` (32) | 0 | Levels kept below the root. |
-| `maxReasonLength` | `MAX_EXPLANATION_REASON_LENGTH` (96) | 8 | Characters per `reason`; longer reasons end in `…`. |
+```ts
+import { compileAmountThresholdFilters } from "./notifications/amount-threshold.js";
 
-Dropped subtrees are counted in the parent's `omitted` field and `truncated` is set to `true`; truncation never changes `matched` or `reason`. Invalid values (`NaN`, `Infinity`) fall back to the default and values below the minimum are raised to it. The defaults fit the largest expression the parser accepts (`MAX_FILTER_TOKENS`, a left-deep chain of 24 comparisons) without truncation.
+const rules = compileAmountThresholdFilters({
+  marketChallenge: 100_000_000n, // 10 USDC
+  squadDeposit: 50_000_000n,     // 5 USDC
+});
+
+// Each returned rule is a CompiledFilterRule with attached schemaVersion, digest, and evaluate() helper.
+```

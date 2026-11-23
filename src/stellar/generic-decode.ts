@@ -13,11 +13,12 @@
  * 2. Every ScVal type maps to a stable, unambiguous textual representation with a type tag.
  * 3. Hostile nesting (deep maps/vectors, excessive keys, oversized strings/bytes) is strictly bounded.
  * 4. Strings are sanitized to prevent newline/control character injection in logs/chat.
- * 5. Large integers are represented as decimal strings; lossy/unsafe numbers (> MAX_SAFE_INTEGER, non-finite) render as malformed.
+ * 5. Depth truncation is surfaced as the stable `DEPTH_LIMIT_REASON` rather than
+ *    being silently swallowed, so callers can tell a deep payload from a shallow one.
  */
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
-import type { DecoderCapabilityReport } from "./decode.js";
+import type { EventQuarantine } from "./quarantine.js";
 
 // ── Bounded Limits ───────────────────────────────────────────────────────────
 
@@ -39,18 +40,17 @@ export const MAX_GENERIC_BYTES_CHARS = 64;
 /** Hard ceiling on total rendered string representation. */
 export const MAX_GENERIC_TOTAL_CHARS = 2048;
 
-/** Hard ceiling on generic unknown-event diagnostic reasons. */
-export const MAX_GENERIC_DIAGNOSTIC_LENGTH = 200;
+/**
+ * Maximum nested vec/map collection depth in an event payload.
+ *
+ * Independent of XDR byte size: a handful of nested collections is a small
+ * wire value but can still exhaust the recursion budget of native conversion.
+ * The typed decoder applies the same bound before `scValToNative` runs.
+ */
+export const MAX_DECODED_COLLECTION_DEPTH = MAX_GENERIC_DEPTH;
 
-export interface DuplicateMapKeyCollision {
-  /** Bounded representation of the colliding key. */
-  key: string;
-  /** Bounded diagnostic message describing the collision. */
-  reason: string;
-}
-
-/** Maximum number of topics allowed on a single Soroban event (protocol max is 4). */
-export const MAX_GENERIC_TOPICS = 4;
+/** Stable reason reported when an event's collection depth exceeds the bound. */
+export const DEPTH_LIMIT_REASON = "collection depth limit exceeded";
 
 export interface GenericRenderOptions {
   maxDepth?: number;
@@ -58,7 +58,12 @@ export interface GenericRenderOptions {
   maxVecItems?: number;
   maxStringChars?: number;
   maxBytesChars?: number;
-  maxTopics?: number;
+  /**
+   * Optional quarantine instance to preserve undecodable event envelopes.
+   * When provided and an event cannot be decoded cleanly (e.g. malformed XDR or unknown payload),
+   * the raw envelope and source identity are preserved to the quarantine.
+   */
+  quarantine?: EventQuarantine;
 }
 
 export interface GenericEventPayload {
@@ -73,6 +78,8 @@ export interface GenericEventPayload {
 }
 
 export interface GenericDecodedEvent {
+  /** Optional archive record schema version, present on archived/migrated records. */
+  schemaVersion?: number;
   source: string;
   contractId: string;
   ledger: number;
@@ -89,6 +96,8 @@ export interface GenericDecodedEvent {
   topicSummary: string;
   valueSummary: string;
   summary: string;
+  /** Set to {@link DEPTH_LIMIT_REASON} when collection depth exceeded the bound. */
+  reason?: string;
   payload: GenericEventPayload;
   /** Stable status code: `ok`, `unknown_event`, or `malformed_event`. */
   status: "ok" | "unknown_event" | "malformed_event";
@@ -145,170 +154,112 @@ function scValPayload(val: xdr.ScVal): unknown {
   return typeof raw === "function" ? (raw as () => unknown).call(val) : raw;
 }
 
-// ── Duplicate Map Key Detection ──────────────────────────────────────────────
+// ── Collection Depth Probe ───────────────────────────────────────────────────
 
-function boundDiagnostic(message: string, maxLen: number = MAX_GENERIC_DIAGNOSTIC_LENGTH): string {
-  const compact = sanitizeText(message) || "unknown error";
-  const chars = Array.from(compact);
-  return chars.length <= maxLen ? compact : `${chars.slice(0, maxLen - 1).join("")}…`;
+/** Upper bound on nodes visited by the depth probe, so wide payloads stay cheap. */
+const MAX_DEPTH_SCAN_NODES = 10_000;
+
+/** Read an ScVal's arm name and payload without trusting getters. */
+function scValArm(val: unknown): { name: string; payload: unknown } | null {
+  if (val === null || typeof val !== "object") return null;
+  try {
+    const raw = val as { switch?: unknown; type?: unknown; value?: unknown };
+    let name: string;
+    if (typeof raw.switch === "function") {
+      const sw = (raw.switch as () => unknown).call(val);
+      name =
+        typeof sw === "object" && sw !== null && "name" in sw
+          ? String((sw as { name: unknown }).name)
+          : String(sw);
+    } else if (typeof raw.type === "string") {
+      name = raw.type;
+    } else {
+      return null;
+    }
+    let payload: unknown = raw.value;
+    if (typeof payload === "function") payload = (payload as () => unknown).call(val);
+    return { name, payload };
+  } catch {
+    return null;
+  }
 }
 
-function normalizeMapKey(kVal: unknown): string | null {
-  if (kVal === null || kVal === undefined) return "undefined";
-  if (isScValLike(kVal)) {
-    let switchName = "";
-    try {
-      switchName = scValSwitchName(kVal);
-    } catch {
-      return null;
-    }
-    if (switchName === "scvVoid") return "undefined";
-    if (switchName === "scvMap" || switchName === "scvVec") {
-      try {
-        const toXdr = (kVal as unknown as { toXDR?: (format?: string) => unknown }).toXDR;
-        if (typeof toXdr === "function") {
-          const encoded = toXdr.call(kVal, "base64");
-          if (typeof encoded === "string") return `xdr:${encoded}`;
-          if (Buffer.isBuffer(encoded) || encoded instanceof Uint8Array) {
-            return `xdr:${Buffer.from(encoded).toString("base64")}`;
-          }
-        }
-      } catch {
-        // fall through to generic renderer
-      }
-      return renderGenericScVal(kVal, 0);
-    }
-    try {
-      const native = scValToNative(kVal);
-      if (Buffer.isBuffer(native) || native instanceof Uint8Array) {
-        return Buffer.from(native).toString("utf8");
-      }
-      return String(native);
-    } catch {
-      return null;
-    }
+/** Read one field of an ScMapEntry (method in SDK 16, getter in SDK 17). */
+function mapEntryField(entry: unknown, field: "key" | "val"): unknown {
+  if (entry === null || typeof entry !== "object") return undefined;
+  try {
+    const raw = (entry as Record<string, unknown>)[field];
+    return typeof raw === "function" ? (raw as () => unknown).call(entry) : raw;
+  } catch {
+    return undefined;
   }
-  if (Buffer.isBuffer(kVal) || kVal instanceof Uint8Array) {
-    return Buffer.from(kVal).toString("utf8");
+}
+
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  if (val === null || typeof val !== "object" || Array.isArray(val)) return false;
+  if (val instanceof Map || val instanceof Date || ArrayBuffer.isView(val)) return false;
+  const proto = Object.getPrototypeOf(val);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Children of a collection, plus whether `val` is a collection at all. */
+function collectionChildren(val: unknown): { children: unknown[]; isCollection: boolean } {
+  const arm = scValArm(val);
+  if (arm) {
+    if (arm.name !== "scvVec" && arm.name !== "scvMap") {
+      return { children: [], isCollection: false };
+    }
+    if (!Array.isArray(arm.payload)) return { children: [], isCollection: true };
+    const children: unknown[] = [];
+    for (const entry of arm.payload) {
+      if (scValArm(entry)) children.push(entry);
+      else children.push(mapEntryField(entry, "key"), mapEntryField(entry, "val"));
+    }
+    return { children, isCollection: true };
   }
-  return String(kVal);
+  if (Array.isArray(val)) return { children: val, isCollection: true };
+  try {
+    if (val instanceof Map) {
+      return { children: Array.from(val.entries()).flat(), isCollection: true };
+    }
+    if (isPlainObject(val)) return { children: Object.values(val), isCollection: true };
+  } catch {
+    // A hostile getter must not turn the depth probe into an exception.
+    return { children: [], isCollection: true };
+  }
+  return { children: [], isCollection: false };
 }
 
 /**
- * Inspect an ScVal (or native Map/array/object) for conflicting duplicate map
- * keys BEFORE conversion to JavaScript objects.
- *
- * Returns a bounded diagnostic on the first collision found, or `null` if no
- * duplicate map keys exist within `maxDepth`.
+ * Deepest nested vec/map (or native array/object) in `val`, stopping as soon as
+ * `maxDepth` is exceeded. Iterative and exception-safe: it never serializes or
+ * natively converts the payload, so a small but deeply nested value can be
+ * rejected before either operation recurses.
  */
-export function findDuplicateMapKey(
+export function scValCollectionDepth(
   val: unknown,
-  maxDepth: number = MAX_GENERIC_DEPTH,
-  depth: number = 0,
-  visited: WeakSet<object> = new WeakSet(),
-): DuplicateMapKeyCollision | null {
-  if (val === null || val === undefined || typeof val !== "object") return null;
-  if (depth >= maxDepth) return null;
-  if (visited.has(val)) return null;
-  visited.add(val);
+  maxDepth: number = MAX_DECODED_COLLECTION_DEPTH,
+): number {
+  const pending: Array<{ val: unknown; depth: number }> = [{ val, depth: 0 }];
+  const seen = new WeakSet<object>();
+  let deepest = 0;
+  let scanned = 0;
 
-  if (isScValLike(val)) {
-    let switchName = "";
-    try {
-      switchName = scValSwitchName(val);
-    } catch {
-      return null;
+  while (pending.length > 0) {
+    const item = pending.pop()!;
+    if (++scanned > MAX_DEPTH_SCAN_NODES) break;
+    const { children, isCollection } = collectionChildren(item.val);
+    if (!isCollection) continue;
+    const childDepth = item.depth + 1;
+    if (childDepth > deepest) deepest = childDepth;
+    if (deepest > maxDepth) return deepest;
+    if (typeof item.val === "object" && item.val !== null) {
+      if (seen.has(item.val)) continue;
+      seen.add(item.val);
     }
-
-    if (switchName === "scvVec") {
-      try {
-        const rawItems = scValPayload(val);
-        if (Array.isArray(rawItems)) {
-          for (const item of rawItems) {
-            const collision = findDuplicateMapKey(item, maxDepth, depth + 1, visited);
-            if (collision) return collision;
-          }
-        }
-      } catch {
-        return null;
-      }
-      return null;
-    }
-
-    if (switchName === "scvMap") {
-      try {
-        const rawEntries = scValPayload(val);
-        if (!Array.isArray(rawEntries)) return null;
-        const seen = new Set<string>();
-        for (const entry of rawEntries) {
-          const e = entry as { key?: () => unknown; val?: () => unknown };
-          const kVal = typeof e.key === "function" ? e.key() : (entry as { key?: unknown }).key;
-          const vVal = typeof e.val === "function" ? e.val() : (entry as { val?: unknown }).val;
-
-          const keyCollision = findDuplicateMapKey(kVal, maxDepth, depth + 1, visited);
-          if (keyCollision) return keyCollision;
-
-          const normalizedKey = normalizeMapKey(kVal);
-          if (normalizedKey !== null) {
-            if (seen.has(normalizedKey)) {
-              const clippedKey = clipString(normalizedKey, 60);
-              return {
-                key: clippedKey,
-                reason: boundDiagnostic(`duplicate map key collision: "${clippedKey}"`),
-              };
-            }
-            seen.add(normalizedKey);
-          }
-
-          const valCollision = findDuplicateMapKey(vVal, maxDepth, depth + 1, visited);
-          if (valCollision) return valCollision;
-        }
-      } catch {
-        return null;
-      }
-      return null;
-    }
-
-    return null;
+    for (const child of children) pending.push({ val: child, depth: childDepth });
   }
-
-  if (val instanceof Map) {
-    const seen = new Set<string>();
-    for (const [k, v] of val.entries()) {
-      const keyCollision = findDuplicateMapKey(k, maxDepth, depth + 1, visited);
-      if (keyCollision) return keyCollision;
-
-      const normalizedKey = normalizeMapKey(k);
-      if (normalizedKey !== null) {
-        if (seen.has(normalizedKey)) {
-          const clippedKey = clipString(normalizedKey, 60);
-          return {
-            key: clippedKey,
-            reason: boundDiagnostic(`duplicate map key collision: "${clippedKey}"`),
-          };
-        }
-        seen.add(normalizedKey);
-      }
-
-      const valCollision = findDuplicateMapKey(v, maxDepth, depth + 1, visited);
-      if (valCollision) return valCollision;
-    }
-    return null;
-  }
-
-  if (Array.isArray(val)) {
-    for (const item of val) {
-      const collision = findDuplicateMapKey(item, maxDepth, depth + 1, visited);
-      if (collision) return collision;
-    }
-    return null;
-  }
-
-  for (const v of Object.values(val)) {
-    const collision = findDuplicateMapKey(v, maxDepth, depth + 1, visited);
-    if (collision) return collision;
-  }
-  return null;
+  return deepest;
 }
 
 // ── Recursive Renderer ───────────────────────────────────────────────────────
@@ -873,92 +824,30 @@ export function decodeGenericEvent(
       ? (event as { topics: unknown[] }).topics
       : [];
 
-  // Validate topic count before accessing variant positions or parsing payload.
-  if (!hasTopicArray || rawTopics.length === 0 || rawTopics.length > maxTopics) {
-    const reason = !hasTopicArray
-      ? "missing or invalid topic array"
-      : rawTopics.length === 0
-        ? "empty topic array"
-        : `topic count ${rawTopics.length} exceeds maximum of ${maxTopics}`;
-    const summary = `[unknown] (malformed: ${reason})`;
-    return {
-      source,
-      contractId,
-      ledger,
-      txHash,
-      at,
-      eventId,
-      eventType,
-      transactionIndex,
-      operationIndex,
-      inSuccessfulContractCall,
-      eventName: "unknown",
-      topics: [],
-      value: "void",
-      topicSummary: "(none)",
-      valueSummary: "void",
-      summary,
-      payload: {
-        name: "generic",
-        eventName: "unknown",
-        topics: [],
-        value: "void",
-        summary,
-        reason,
-      },
-    };
-  }
-
-  const eventName = extractEventName(rawTopics[0]);
-
+  const eventName = rawTopics.length > 0 ? extractEventName(rawTopics[0]) : "unknown";
   const maxDepth = options?.maxDepth ?? MAX_GENERIC_DEPTH;
-  let duplicateCollision: DuplicateMapKeyCollision | null = null;
-  for (const t of rawTopics) {
-    duplicateCollision = findDuplicateMapKey(t, maxDepth);
-    if (duplicateCollision) break;
-  }
-  if (!duplicateCollision) {
-    duplicateCollision = findDuplicateMapKey(event.value, maxDepth);
-  }
-
-  if (duplicateCollision) {
-    const reason = boundDiagnostic(duplicateCollision.reason);
-    const topics = renderTopics(rawTopics, options);
-    const value = `malformed:${reason}`;
-    const topicSummary = topics.length > 0 ? topics.join(" | ") : "(none)";
-    const valueSummary = value;
-    const summary = `[${eventName}] ${topicSummary} => ${valueSummary}`;
-
-    return {
-      source,
-      contractId,
-      ledger,
-      txHash,
-      at,
-      eventId,
-      eventType,
-      transactionIndex,
-      operationIndex,
-      inSuccessfulContractCall,
-      eventName,
-      topics,
-      value,
-      topicSummary,
-      valueSummary,
-      summary,
-      payload: {
-        name: "unknown",
-        eventName,
-        topics,
-        value,
-        summary,
-        reason,
-      },
-    };
-  }
-
+  const depthExceeded =
+    scValCollectionDepth(event.value, maxDepth) > maxDepth ||
+    rawTopics.some((topic) => scValCollectionDepth(topic, maxDepth) > maxDepth);
   const topics = renderTopics(rawTopics, options);
   const value = renderGenericScVal(event.value, 0, options);
+
+  if (options?.quarantine) {
+    const isUndecodable =
+      eventName === "unknown" ||
+      rawTopics.length === 0 ||
+      topics.some((t) => t === "malformed") ||
+      value === "malformed";
+    if (isUndecodable) {
+      const reason =
+        eventName === "unknown"
+          ? "unrecognized event name"
+          : value === "malformed"
+            ? "malformed value"
+            : "malformed topics";
+      void options.quarantine.quarantine(event, source, reason).catch(() => {});
+    }
+  }
 
   const topicSummary = topics.length > 0 ? topics.join(" | ") : "(none)";
   const valueSummary = value;
@@ -982,23 +871,16 @@ export function decodeGenericEvent(
     topicSummary,
     valueSummary,
     summary,
-    status,
-    reason,
+    ...(depthExceeded ? { reason: DEPTH_LIMIT_REASON } : {}),
     payload: {
       name: "generic",
       eventName,
       topics,
       value,
       summary,
-      status,
-      reason,
+      ...(depthExceeded ? { reason: DEPTH_LIMIT_REASON } : {}),
     },
   };
 }
 
-export {
-  DECODER_FINGERPRINT_VERSION,
-  fingerprintGenericEvent,
-  fingerprintDecoderOutput,
-  type SemanticFingerprint,
-} from "./decoder-fingerprint.js";
+export { adaptArchivedGenericEvent } from "./archive.js";

@@ -1,26 +1,75 @@
-import { createHash, type Hash } from "node:crypto";
-import { open, mkdir, readdir, readFile, rename, rm, unlink, chmod, writeFile } from "node:fs/promises";
+import { open, mkdir, readdir, unlink, chmod, readFile, writeFile, rename } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
-import type { DecodedEvent } from "./decode.js";
-import { validateLedgerRange, type LedgerRange } from "./ledger-range.js";
+import type { DecodedEvent, ContractSource } from "./decode.js";
+import type { GenericDecodedEvent, GenericEventPayload } from "./generic-decode.js";
 
-export { validateLedgerRange, type LedgerRange };
+/** Current on-disk schema version for archived decoded events. */
+export const ARCHIVE_SCHEMA_VERSION = 1 as const;
+
+export type ArchivableEvent = DecodedEvent | GenericDecodedEvent;
+
+export interface ArchivedRecordMeta {
+  schemaVersion: typeof ARCHIVE_SCHEMA_VERSION;
+}
+
+export type ArchivedRecord<T extends ArchivableEvent = ArchivableEvent> = T & ArchivedRecordMeta;
+
+export type ArchiveSchemaSource =
+  | "v1"
+  | "legacy-unversioned"
+  | "legacy-blocktime"
+  | "legacy-envelope";
+
+export interface ArchiveRecordContext {
+  fileName?: string;
+  lineNumber?: number;
+  reviveBigInts?: boolean;
+}
+
+export interface ArchiveMigrateResult<T extends ArchivableEvent = ArchivableEvent> {
+  event: T;
+  migrated: boolean;
+  source: ArchiveSchemaSource;
+  kind: "typed" | "generic";
+  version: number;
+}
 
 export interface EventArchiveOptions {
   dir: string;
   maxBytes?: number;
   maxFiles?: number;
+  schemaVersion?: number;
 }
 
 export interface EventArchive {
-  append(events: readonly DecodedEvent[]): Promise<void>;
+  append(events: readonly ArchivableEvent[]): Promise<void>;
   close(): Promise<void>;
 }
 
 export interface ReadArchiveOptions {
   /** Yield valid records before a malformed record instead of discarding them. Defaults to false. */
   retainCommitted?: boolean;
+  /** Revive bigint fields in event payloads from decimal strings. Defaults to false. */
+  reviveBigInts?: boolean;
+}
+
+export type PrivacyFindingKind = "private_chat_id" | "secret_value";
+
+export interface PrivacyFinding {
+  kind: PrivacyFindingKind;
+  fileName: string;
+  lineNumber: number;
+  jsonPath: string;
+  /** Redacted preview of the matched value; never the raw secret. */
+  preview: string;
+}
+
+export interface PrivacyReviewReport {
+  filesScanned: number;
+  recordsScanned: number;
+  findings: PrivacyFinding[];
 }
 
 export class MalformedArchiveRecordError extends Error {
@@ -40,9 +89,64 @@ export class MalformedArchiveRecordError extends Error {
   }
 }
 
+export class UnsupportedArchiveVersionError extends Error {
+  readonly fileName: string;
+  readonly lineNumber: number;
+  readonly version: unknown;
+
+  constructor(
+    versionOrFileName: unknown,
+    fileNameOrLine?: string | number,
+    maybeLineOrVersion?: number | unknown,
+  ) {
+    let version: unknown;
+    let fileName = "<unknown>";
+    let lineNumber = 1;
+
+    if (typeof fileNameOrLine === "number" && typeof versionOrFileName === "string") {
+      fileName =
+        path
+          .basename(versionOrFileName)
+          .replace(/[\x00-\x1f\x7f]/g, " ")
+          .slice(0, 128) || "<unknown>";
+      lineNumber = fileNameOrLine;
+      version = maybeLineOrVersion;
+    } else {
+      version = versionOrFileName;
+      if (typeof fileNameOrLine === "string") {
+        fileName =
+          path
+            .basename(fileNameOrLine)
+            .replace(/[\x00-\x1f\x7f]/g, " ")
+            .slice(0, 128) || "<unknown>";
+      }
+      if (typeof maybeLineOrVersion === "number") {
+        lineNumber = maybeLineOrVersion;
+      }
+    }
+
+    const safeVersion = String(version).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 32);
+    super(
+      `Unsupported archive schema version ${safeVersion} at ${fileName}:${lineNumber} (expected version ${ARCHIVE_SCHEMA_VERSION})`,
+    );
+    this.name = "UnsupportedArchiveVersionError";
+    this.fileName = fileName;
+    this.lineNumber = lineNumber;
+    this.version = version;
+  }
+}
+
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
 const DEFAULT_MAX_FILES = 10;
 const FILE_MODE = 0o600;
+
+// Telegram chat ids: private chats are positive integers; groups/channels are negative.
+const PRIVATE_CHAT_KEY_PATTERN = /^(chat_?id|chatId|chat_id_private|private_chat_id|from_?id|user_?id)$/i;
+const SECRET_KEY_PATTERN = /(secret|token|password|passwd|api[_-]?key|private[_-]?key|seed|mnemonic)/i;
+// Stellar secret seed (S...), 56 base32 chars.
+const STELLAR_SECRET_SEED_PATTERN = /\bS[A-Z2-7]{55}\b/;
+// Bot token shaped values: <digits>:<35+ url-safe chars>.
+const BOT_TOKEN_PATTERN = /\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/;
 
 function formatArchiveFilename(index: number, timestamp: number): string {
   const ts = new Date(timestamp).toISOString().replace(/[:.]/g, "-");
@@ -50,23 +154,480 @@ function formatArchiveFilename(index: number, timestamp: number): string {
   return `events-${ts}-${idx}.jsonl`;
 }
 
+/** Explicitly stamp an archive record with the current archive schema version. */
+export function toArchivedRecord<T extends ArchivableEvent>(event: T): ArchivedRecord<T> {
+  return {
+    ...event,
+    schemaVersion: ARCHIVE_SCHEMA_VERSION,
+  };
+}
+
+const BIGINT_FIELDS: Record<string, readonly string[]> = {
+  claim_challenged: ["stake"],
+  market_settled: ["totalPaid", "totalFees", "owedToChallengers", "dust"],
+  challenger_paid: ["stake", "gross", "fee", "net"],
+  fee_claimed: ["amount"],
+  withdrawal: ["amount"],
+  withdrawal_pending: ["amount"],
+  deposited: ["amount", "shares"],
+  withdrawn: ["amount"],
+  resolved: ["poolA", "poolB"],
+  claimed: ["gross", "fee", "net"],
+  fees_claimed: ["amount"],
+  fee_accrued: ["amount"],
+};
+
+function revivePayloadBigInts(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object") return payload;
+  const name = (payload as { name?: string }).name;
+  if (!name || typeof name !== "string") return payload;
+  const fields = BIGINT_FIELDS[name];
+  if (!fields) return payload;
+  const copy = { ...(payload as Record<string, unknown>) };
+  for (const f of fields) {
+    const val = copy[f];
+    if (typeof val === "string" && /^-?\d+$/.test(val.trim())) {
+      try {
+        copy[f] = BigInt(val.trim());
+      } catch {
+        // keep string
+      }
+    }
+  }
+  return copy;
+}
+
+function unpackEnvelope(
+  raw: unknown,
+  context?: ArchiveRecordContext,
+): {
+  record: Record<string, unknown>;
+  declaredVersion: unknown;
+  isEnvelope: boolean;
+} {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new MalformedArchiveRecordError(
+      context?.fileName ?? "<unknown>",
+      context?.lineNumber ?? 1,
+    );
+  }
+
+  const obj = raw as Record<string, unknown>;
+
+  let inner: Record<string, unknown> | null = null;
+  let isEnvelope = false;
+
+  if (obj.event && typeof obj.event === "object" && !Array.isArray(obj.event)) {
+    inner = obj.event as Record<string, unknown>;
+    isEnvelope = true;
+  } else if (obj.record && typeof obj.record === "object" && !Array.isArray(obj.record)) {
+    inner = obj.record as Record<string, unknown>;
+    isEnvelope = true;
+  }
+
+  const envelopeVersion =
+    obj.schemaVersion ?? (typeof obj.version === "number" ? obj.version : undefined);
+  const target = inner ?? obj;
+  const targetVersion =
+    target.schemaVersion ?? (typeof target.version === "number" ? target.version : undefined);
+
+  const declaredVersion = envelopeVersion ?? targetVersion ?? obj.format;
+
+  return {
+    record: target,
+    declaredVersion,
+    isEnvelope,
+  };
+}
+
+function validateArchiveVersion(
+  declaredVersion: unknown,
+  context?: ArchiveRecordContext,
+): { versionNumber: number; isHistorical: boolean; sourceKind: ArchiveSchemaSource } {
+  if (declaredVersion === undefined || declaredVersion === null) {
+    return { versionNumber: 1, isHistorical: true, sourceKind: "legacy-unversioned" };
+  }
+
+  if (typeof declaredVersion === "number") {
+    if (declaredVersion === ARCHIVE_SCHEMA_VERSION) {
+      return { versionNumber: 1, isHistorical: false, sourceKind: "v1" };
+    }
+    if (declaredVersion === 0) {
+      return { versionNumber: 1, isHistorical: true, sourceKind: "legacy-unversioned" };
+    }
+    throw new UnsupportedArchiveVersionError(
+      declaredVersion,
+      context?.fileName,
+      context?.lineNumber,
+    );
+  }
+
+  if (typeof declaredVersion === "string") {
+    const trimmed = declaredVersion.trim().toLowerCase();
+    if (
+      trimmed === "1" ||
+      trimmed === "v1" ||
+      trimmed === "mimir-archive-v1" ||
+      trimmed === "archive-v1"
+    ) {
+      return { versionNumber: 1, isHistorical: false, sourceKind: "v1" };
+    }
+    if (trimmed === "0" || trimmed === "v0" || trimmed === "legacy") {
+      return { versionNumber: 1, isHistorical: true, sourceKind: "legacy-unversioned" };
+    }
+    throw new UnsupportedArchiveVersionError(
+      declaredVersion,
+      context?.fileName,
+      context?.lineNumber,
+    );
+  }
+
+  throw new UnsupportedArchiveVersionError(
+    declaredVersion,
+    context?.fileName,
+    context?.lineNumber,
+  );
+}
+
 /**
- * Create an append-only event archive that writes the canonical JSONL export
- * format: UTF-8 encoded, one JSON record per line, delimited by LF (`\n`)
- * regardless of host operating system.
+ * Migration adapter that accepts an archived typed contract event and migrates
+ * any historical schema variations (legacy unversioned, blockTime, txIndex,
+ * envelopes) into a canonical notification-safe DecodedEvent.
  */
+export function adaptArchivedTypedEvent(
+  raw: unknown,
+  context?: ArchiveRecordContext,
+): DecodedEvent {
+  const { record, declaredVersion } = unpackEnvelope(raw, context);
+  validateArchiveVersion(declaredVersion, context);
+
+  const at =
+    typeof record.at === "number" && Number.isFinite(record.at)
+      ? record.at
+      : typeof record.blockTime === "number" && Number.isFinite(record.blockTime)
+        ? record.blockTime
+        : 0;
+
+  const transactionIndex =
+    record.transactionIndex !== undefined
+      ? typeof record.transactionIndex === "number"
+        ? record.transactionIndex
+        : null
+      : record.txIndex !== undefined && typeof record.txIndex === "number"
+        ? record.txIndex
+        : null;
+
+  const operationIndex =
+    record.operationIndex !== undefined
+      ? typeof record.operationIndex === "number"
+        ? record.operationIndex
+        : null
+      : null;
+
+  const eventId =
+    typeof record.eventId === "string"
+      ? record.eventId
+      : typeof record.id === "string" || typeof record.id === "number"
+        ? String(record.id)
+        : "";
+
+  const ledger = typeof record.ledger === "number" ? record.ledger : 0;
+  const txHash = typeof record.txHash === "string" ? record.txHash : "";
+
+  const eventType = typeof record.eventType === "string" ? record.eventType : "contract";
+  const inSuccessfulContractCall =
+    record.inSuccessfulContractCall !== undefined
+      ? Boolean(record.inSuccessfulContractCall)
+      : true;
+
+  const version =
+    typeof record.version === "string" && record.version.length > 0
+      ? record.version
+      : "v1";
+
+  const rawSource = typeof record.source === "string" ? record.source.toLowerCase() : "";
+  const source: ContractSource = rawSource === "squad" ? "squad" : "market";
+
+  const contractId = typeof record.contractId === "string" ? record.contractId : "";
+
+  let payload =
+    record.payload && typeof record.payload === "object"
+      ? { ...(record.payload as Record<string, unknown>) }
+      : null;
+  if (!payload) {
+    const topicName = typeof record.topicName === "string" ? record.topicName : "unknown";
+    payload = { name: topicName };
+  }
+
+  if (context?.reviveBigInts) {
+    payload = revivePayloadBigInts(payload) as any;
+  }
+
+  const migrated: any = {
+    schemaVersion: ARCHIVE_SCHEMA_VERSION,
+    source,
+    contractId,
+    version,
+    ledger,
+    txHash,
+    at,
+    eventId,
+    eventType,
+    transactionIndex,
+    operationIndex,
+    inSuccessfulContractCall,
+    payload,
+  };
+
+  if (record.blockTime !== undefined) migrated.blockTime = record.blockTime;
+  if (record.txIndex !== undefined) migrated.txIndex = record.txIndex;
+  if (record.topicName !== undefined) migrated.topicName = record.topicName;
+  if (record.id !== undefined && record.eventId === undefined) migrated.id = record.id;
+
+  return migrated as DecodedEvent;
+}
+
+/**
+ * Migration adapter that accepts an archived generic contract event and migrates
+ * any historical schema variations into a canonical notification-safe GenericDecodedEvent.
+ */
+export function adaptArchivedGenericEvent(
+  raw: unknown,
+  context?: ArchiveRecordContext,
+): GenericDecodedEvent {
+  const { record, declaredVersion } = unpackEnvelope(raw, context);
+  validateArchiveVersion(declaredVersion, context);
+
+  const at =
+    typeof record.at === "number" && Number.isFinite(record.at)
+      ? record.at
+      : typeof record.blockTime === "number" && Number.isFinite(record.blockTime)
+        ? record.blockTime
+        : 0;
+
+  const transactionIndex =
+    record.transactionIndex !== undefined
+      ? typeof record.transactionIndex === "number"
+        ? record.transactionIndex
+        : null
+      : record.txIndex !== undefined && typeof record.txIndex === "number"
+        ? record.txIndex
+        : null;
+
+  const operationIndex =
+    record.operationIndex !== undefined
+      ? typeof record.operationIndex === "number"
+        ? record.operationIndex
+        : null
+      : null;
+
+  const eventId =
+    typeof record.eventId === "string"
+      ? record.eventId
+      : typeof record.id === "string" || typeof record.id === "number"
+        ? String(record.id)
+        : "";
+
+  const ledger = typeof record.ledger === "number" ? record.ledger : 0;
+  const txHash = typeof record.txHash === "string" ? record.txHash : "";
+  const eventType = typeof record.eventType === "string" ? record.eventType : "contract";
+  const inSuccessfulContractCall =
+    record.inSuccessfulContractCall !== undefined
+      ? Boolean(record.inSuccessfulContractCall)
+      : true;
+  const source =
+    typeof record.source === "string" && record.source.length > 0 ? record.source : "generic";
+  const contractId = typeof record.contractId === "string" ? record.contractId : "";
+
+  const rawPayload =
+    record.payload && typeof record.payload === "object"
+      ? (record.payload as Record<string, unknown>)
+      : undefined;
+
+  const eventName =
+    typeof record.eventName === "string"
+      ? record.eventName
+      : typeof record.topicName === "string"
+        ? record.topicName
+        : rawPayload && typeof rawPayload.eventName === "string"
+          ? rawPayload.eventName
+          : "unknown";
+
+  const topics: string[] = Array.isArray(record.topics)
+    ? record.topics.map(String)
+    : rawPayload && Array.isArray(rawPayload.topics)
+      ? rawPayload.topics.map(String)
+      : [];
+
+  const value =
+    typeof record.value === "string"
+      ? record.value
+      : rawPayload && typeof rawPayload.value === "string"
+        ? rawPayload.value
+        : "()";
+
+  const topicSummary =
+    typeof record.topicSummary === "string"
+      ? record.topicSummary
+      : topics.length > 0
+        ? topics.join(" | ")
+        : eventName;
+
+  const valueSummary =
+    typeof record.valueSummary === "string" ? record.valueSummary : value;
+
+  const summary =
+    typeof record.summary === "string"
+      ? record.summary
+      : rawPayload && typeof rawPayload.summary === "string"
+        ? rawPayload.summary
+        : `[${eventName}] ${topicSummary} => ${valueSummary}`;
+
+  const payload: GenericEventPayload = {
+    name: "generic",
+    eventName,
+    topics,
+    value,
+    summary,
+    ...(rawPayload && typeof rawPayload.reason === "string" ? { reason: rawPayload.reason } : {}),
+  };
+
+  const migrated: any = {
+    schemaVersion: ARCHIVE_SCHEMA_VERSION,
+    source,
+    contractId,
+    ledger,
+    txHash,
+    at,
+    eventId,
+    eventType,
+    transactionIndex,
+    operationIndex,
+    inSuccessfulContractCall,
+    eventName,
+    topics,
+    value,
+    topicSummary,
+    valueSummary,
+    summary,
+    payload,
+  };
+
+  if (record.blockTime !== undefined) migrated.blockTime = record.blockTime;
+  if (record.txIndex !== undefined) migrated.txIndex = record.txIndex;
+  if (record.topicName !== undefined) migrated.topicName = record.topicName;
+  if (record.id !== undefined && record.eventId === undefined) migrated.id = record.id;
+
+  return migrated as GenericDecodedEvent;
+}
+
+function isGenericArchivedRecord(rec: Record<string, unknown>): boolean {
+  if (rec.payload && typeof rec.payload === "object" && (rec.payload as any).name === "generic") {
+    return true;
+  }
+  if (rec.source === "generic") {
+    return true;
+  }
+  if (Array.isArray(rec.topics) && typeof rec.value === "string" && !rec.source) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Detailed migration result for an archived record, indicating whether it was
+ * migrated from a legacy shape, its schema source, and whether it is typed or generic.
+ */
+export function migrateArchivedRecordDetailed(
+  raw: unknown,
+  context?: ArchiveRecordContext,
+): ArchiveMigrateResult {
+  const { record, declaredVersion, isEnvelope } = unpackEnvelope(raw, context);
+  const versionInfo = validateArchiveVersion(declaredVersion, context);
+
+  let sourceKind: ArchiveSchemaSource = versionInfo.sourceKind;
+  if (isEnvelope && sourceKind === "v1") {
+    sourceKind = "legacy-envelope";
+  } else if (record.blockTime !== undefined && record.at === undefined) {
+    sourceKind = "legacy-blocktime";
+  }
+
+  const isGeneric = isGenericArchivedRecord(record);
+  const event = isGeneric
+    ? adaptArchivedGenericEvent(raw, context)
+    : adaptArchivedTypedEvent(raw, context);
+
+  const migrated = versionInfo.isHistorical || isEnvelope || sourceKind !== "v1";
+
+  return {
+    event,
+    migrated,
+    source: sourceKind,
+    kind: isGeneric ? "generic" : "typed",
+    version: versionInfo.versionNumber,
+  };
+}
+
+/**
+ * Universal migration adapter: parses, validates, and migrates any archived decoded
+ * event record (typed or generic, versioned or historical) into its canonical form.
+ * Throws UnsupportedArchiveVersionError on unknown schema versions.
+ */
+export function migrateArchivedRecord<T extends ArchivableEvent = DecodedEvent>(
+  raw: unknown,
+  context?: ArchiveRecordContext,
+): T {
+  return migrateArchivedRecordDetailed(raw, context).event as T;
+}
+
+export const migrateArchivedEvent = migrateArchivedRecord;
+
+export function isArchivedEvent(value: unknown): value is ArchivableEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  return (
+    typeof obj.ledger === "number" &&
+    typeof obj.eventId === "string" &&
+    obj.payload !== undefined &&
+    typeof obj.payload === "object"
+  );
+}
+
 export function createEventArchive(options: EventArchiveOptions): EventArchive {
-  const { dir } = options;
+  const { dir, metadata } = options;
   const maxBytes = Math.max(1, options.maxBytes ?? DEFAULT_MAX_BYTES);
   const maxFiles = Math.max(1, options.maxFiles ?? DEFAULT_MAX_FILES);
+  const writerVersion = negotiateArchiveSchemaVersion({
+    format: ARCHIVE_SCHEMA_FORMAT,
+    mode: "write",
+    requestedVersion: options.schemaVersion,
+  });
 
   let currentHandle: any = null;
   let currentFilePath: string | null = null;
   let currentSize = 0;
   let fileIndex = 0;
   let closed = false;
+  let schemaVerified = false;
 
   let queue: Promise<void> = Promise.resolve();
+
+  async function ensureWriterSchema(): Promise<void> {
+    if (schemaVerified) return;
+    const existing = await readArchiveSchema(dir);
+    if (existing.explicitVersionFound && existing.schemaVersion !== writerVersion) {
+      throw new UnsupportedArchiveSchemaError({
+        code: "UNSUPPORTED_SCHEMA_VERSION",
+        foundVersion: existing.schemaVersion,
+        supportedVersions: SUPPORTED_ARCHIVE_WRITER_VERSIONS,
+        message: `Archive directory schema v${existing.schemaVersion} conflicts with writer v${writerVersion}`,
+      });
+    }
+    if (!existing.explicitVersionFound) {
+      await writeArchiveSchema(dir, writerVersion);
+    }
+    schemaVerified = true;
+  }
 
   async function rotateIfNeeded(additionalBytes: number): Promise<void> {
     if (currentHandle && currentSize + additionalBytes <= maxBytes) {
@@ -111,16 +672,26 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
 
     const st = await currentHandle.stat();
     currentSize = st.size;
+
+    if (hasMetadata && currentSize === 0) {
+      const header = JSON.stringify({ type: "metadata", ...metadata }) + "\n";
+      const headerBuf = Buffer.from(header, "utf8");
+      await currentHandle.write(headerBuf);
+      await currentHandle.sync();
+      currentSize += headerBuf.byteLength;
+    }
   }
 
-  async function doAppend(events: readonly DecodedEvent[]): Promise<void> {
+  async function doAppend(events: readonly ArchivableEvent[]): Promise<void> {
     if (closed) {
       throw new Error("Event archive is closed");
     }
+    await ensureWriterSchema();
     if (!events || events.length === 0) return;
 
     for (const event of events) {
-      const line = JSON.stringify(event, scanJsonReplacer) + "\n";
+      const record = toArchivedRecord(event);
+      const line = JSON.stringify(record, scanJsonReplacer) + "\n";
       const buffer = Buffer.from(line, "utf8");
       const bytes = buffer.byteLength;
 
@@ -146,13 +717,14 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
   }
 
   return {
-    async append(events: readonly DecodedEvent[]): Promise<void> {
+    async append(events: readonly ArchivableEvent[]): Promise<void> {
       queue = queue.then(() => doAppend(events));
       return queue;
     },
     async close(): Promise<void> {
-      queue = queue.then(() => doClose());
-      return queue;
+      const operation = queue.then(() => doClose());
+      queue = operation.catch(() => {});
+      return operation;
     },
   };
 }
@@ -168,204 +740,12 @@ async function listArchiveFiles(dir: string): Promise<string[]> {
   }
 }
 
-export interface CompactArchiveOptions {
-  /** Maximum bytes per output file. Defaults to the archive's 10 MiB rotation size. */
-  maxBytes?: number;
-}
-
-export interface CompactArchiveResult {
-  /** Events retained because their ledger fell inside the requested range. */
-  retained: number;
-  /** Events dropped because their ledger fell outside the requested range. */
-  dropped: number;
-  /** Number of JSONL files in the compacted archive. */
-  files: number;
-  /** SHA-256 of the compacted archive's canonical JSONL records, for evidence. */
-  digest: string;
-}
-
-let compactSequence = 0;
-
-/** Hash one record exactly as `createEventArchive` serializes it. */
-function hashArchiveRecord(hash: Hash, event: DecodedEvent): void {
-  hash.update(JSON.stringify(event, scanJsonReplacer) + "\n");
-}
-
-/**
- * Read a compacted archive back and prove that it contains exactly the
- * retained records: same count, same content digest, every ledger in range.
- */
-async function verifyCompactedArchive(
-  dir: string,
-  range: LedgerRange,
-  expectedCount: number,
-  expectedDigest: string,
-): Promise<string> {
-  const { firstLedger, lastLedger } = range;
-  const hash = createHash("sha256");
-  let count = 0;
-
-  for await (const event of readArchive(dir)) {
-    if (
-      !Number.isSafeInteger(event.ledger) ||
-      event.ledger < firstLedger ||
-      event.ledger > lastLedger
-    ) {
-      throw new Error(
-        `Compaction verification failed: ledger ${event.ledger} is outside ` +
-          `[${firstLedger}, ${lastLedger}]`,
-      );
-    }
-    hashArchiveRecord(hash, event);
-    count += 1;
-  }
-
-  if (count !== expectedCount) {
-    throw new Error(
-      `Compaction verification failed: wrote ${expectedCount} records but read back ${count}`,
-    );
-  }
-
-  const digest = hash.digest("hex");
-  if (digest !== expectedDigest) {
-    throw new Error(
-      "Compaction verification failed: compacted records do not match the retained records",
-    );
-  }
-  return digest;
-}
-
-/**
- * Move the verified compacted directory into place, restoring the source if
- * the swap cannot complete. The source is only touched after verification.
- */
-async function swapArchiveDirectory(
-  tmpDir: string,
-  dir: string,
-  oldDir: string,
-  hasContent: boolean,
-): Promise<void> {
-  await rename(dir, oldDir);
-  try {
-    if (hasContent) {
-      await rename(tmpDir, dir);
-    } else {
-      // An empty range leaves a valid, empty archive directory behind.
-      await mkdir(dir, { recursive: true });
-    }
-  } catch (err) {
-    try {
-      await rename(oldDir, dir);
-    } catch {
-      // best-effort restore; the original error is the actionable one
-    }
-    throw err;
-  }
-
-  try {
-    await rm(oldDir, { recursive: true, force: true });
-  } catch {
-    // The compacted archive is already in place; a leftover backup is harmless.
-  }
-}
-
-/**
- * Atomically compact an archive directory to an inclusive ledger range.
- *
- * Steps:
- * 1. Stream every record from `dir` and write in-range records to a temporary
- *    sibling directory (outside `dir`, so the source is untouched).
- * 2. Read the temporary directory back and verify the record count, a SHA-256
- *    digest of the canonical JSONL records, and that every retained ledger is
- *    in range.
- * 3. Only after verification, swap the compacted directory into place
- *    (rename source aside, rename compacted copy in, remove the backup).
- *
- * A malformed source record, an I/O error, or a failed verification aborts the
- * compaction with `dir` unchanged. Existing archive behavior is unaffected;
- * this is an explicit maintenance operation over a settled capture.
- */
-export async function compactArchive(
-  dir: string,
-  range: LedgerRange,
-  options: CompactArchiveOptions = {},
-): Promise<CompactArchiveResult> {
-  validateLedgerRange(range);
-
-  try {
-    await readdir(dir);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new Error(`Archive directory does not exist: ${dir}`);
-    }
-    throw err;
-  }
-
-  const { firstLedger, lastLedger } = range;
-  const suffix = `${process.pid}-${Date.now()}-${(compactSequence += 1)}`;
-  const tmpDir = `${dir}.compact-${suffix}`;
-  const oldDir = `${dir}.old-${suffix}`;
-
-  let retained = 0;
-  let dropped = 0;
-
-  try {
-    // --- Filter into a temporary sibling directory ---
-    const tmpArchive = createEventArchive({
-      dir: tmpDir,
-      maxBytes: options.maxBytes,
-      maxFiles: Number.MAX_SAFE_INTEGER,
-    });
-    const writeHash = createHash("sha256");
-
-    try {
-      for await (const event of readArchive(dir, { retainCommitted: true })) {
-        if (event.ledger >= firstLedger && event.ledger <= lastLedger) {
-          await tmpArchive.append([event]);
-          hashArchiveRecord(writeHash, event);
-          retained += 1;
-        } else {
-          dropped += 1;
-        }
-      }
-    } finally {
-      await tmpArchive.close();
-    }
-
-    // --- Verify before touching the source ---
-    const digest = await verifyCompactedArchive(
-      tmpDir,
-      range,
-      retained,
-      writeHash.digest("hex"),
-    );
-    const files = (await listArchiveFiles(tmpDir)).length;
-
-    // --- Swap the verified copy into place ---
-    await swapArchiveDirectory(tmpDir, dir, oldDir, files > 0);
-
-    return { retained, dropped, files, digest };
-  } catch (err) {
-    try {
-      await rm(tmpDir, { recursive: true, force: true });
-    } catch {
-      // ignore cleanup failure; the original error is the actionable one
-    }
-    throw err;
-  }
-}
-
-/**
- * Read decoded events from an archive directory in chronological file order.
- * Accepts both LF (`\n`) and CRLF (`\r\n`) line endings without altering record
- * identities, skipping blank lines.
- */
-export async function* readArchive(
+export async function* readArchive<T extends ArchivableEvent = DecodedEvent>(
   dir: string,
   options: ReadArchiveOptions = {},
-): AsyncGenerator<DecodedEvent, void, unknown> {
+): AsyncGenerator<T, void, unknown> {
   const files = await listArchiveFiles(dir);
-  const stagedEvents: DecodedEvent[] = [];
+  const stagedEvents: T[] = [];
   const retainCommitted = options.retainCommitted === true;
 
   for (const file of files) {
@@ -378,17 +758,34 @@ export async function* readArchive(
         const line = lines[index]!;
         const trimmed = line.trim();
         if (!trimmed) continue;
-        let parsed: DecodedEvent;
+        let parsed: unknown;
         try {
-          parsed = JSON.parse(trimmed) as DecodedEvent;
+          parsed = JSON.parse(trimmed);
         } catch {
           throw new MalformedArchiveRecordError(file, index + 1);
         }
 
+        let migrated: T;
+        try {
+          migrated = migrateArchivedRecord<T>(parsed, {
+            fileName: file,
+            lineNumber: index + 1,
+            reviveBigInts: options.reviveBigInts,
+          });
+        } catch (err) {
+          if (
+            err instanceof UnsupportedArchiveVersionError ||
+            err instanceof MalformedArchiveRecordError
+          ) {
+            throw err;
+          }
+          throw new MalformedArchiveRecordError(file, index + 1);
+        }
+
         if (retainCommitted) {
-          yield parsed;
+          yield migrated;
         } else {
-          stagedEvents.push(parsed);
+          stagedEvents.push(migrated);
         }
       }
     } finally {
@@ -400,146 +797,86 @@ export async function* readArchive(
     yield event;
   }
 }
-/** File name of the hash-chained manifest stored alongside archive files. */
-export const ARCHIVE_MANIFEST_FILENAME = "archive.manifest.json";
 
-const MANIFEST_GENESIS_HASH = "0".repeat(64);
-
-/**
- * Hash-chained manifest binding an archive's ordered records, network and
- * ledger bounds to a single digest. Each record hash commits to the previous
- * one, so missing, reordered or altered records fail verification.
- */
-export interface ArchiveManifest {
-  type: "archive-manifest";
-  version: 1;
-  network: string;
-  ledgerMin: number | null;
-  ledgerMax: number | null;
-  recordCount: number;
-  recordHashes: string[];
-  chainHead: string;
+function redactPreview(value: string): string {
+  if (value.length <= 4) return "****";
+  return `${value.slice(0, 2)}***${value.slice(-2)}`;
 }
 
-export interface ArchiveManifestBounds {
-  network: string;
-  ledgerMin: number | null;
-  ledgerMax: number | null;
-}
-
-export interface VerifyArchiveManifestResult {
-  ok: boolean;
-  recordCount: number;
-  reason?: string;
-}
-
-function manifestChainStep(prevHash: string, recordLine: string): string {
-  return createHash("sha256").update(`${prevHash}\n${recordLine}`, "utf8").digest("hex");
-}
-
-/** Read every non-blank record line of the archive in chronological order (LF-normalised). */
-async function readArchiveRecordLines(dir: string): Promise<string[]> {
-  const records: string[] = [];
-  for (const file of await listArchiveFiles(dir)) {
-    const content = await readFile(path.join(dir, file), "utf8");
-    for (const line of content.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (trimmed) records.push(trimmed);
+function scanValue(
+  value: unknown,
+  jsonPath: string,
+  keyHint: string | undefined,
+  emit: (kind: PrivacyFindingKind, jsonPath: string, raw: string) => void,
+): void {
+  if (typeof value === "string") {
+    if (keyHint && PRIVATE_CHAT_KEY_PATTERN.test(keyHint) && /^\d+$/.test(value)) {
+      emit("private_chat_id", jsonPath, value);
+    } else if (keyHint && SECRET_KEY_PATTERN.test(keyHint) && value.length > 0) {
+      emit("secret_value", jsonPath, value);
+    } else {
+      const seed = value.match(STELLAR_SECRET_SEED_PATTERN);
+      if (seed) emit("secret_value", jsonPath, seed[0]);
+      const token = value.match(BOT_TOKEN_PATTERN);
+      if (token) emit("secret_value", jsonPath, token[0]);
+    }
+    return;
+  }
+  if (typeof value === "number" && keyHint && PRIVATE_CHAT_KEY_PATTERN.test(keyHint)) {
+    if (Number.isInteger(value) && value > 0) {
+      emit("private_chat_id", jsonPath, String(value));
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, i) => scanValue(item, `${jsonPath}[${i}]`, undefined, emit));
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      scanValue(child, `${jsonPath}.${key}`, key, emit);
     }
   }
-  return records;
-}
-
-function chainRecords(records: readonly string[]): { recordHashes: string[]; chainHead: string } {
-  const recordHashes: string[] = [];
-  let head = MANIFEST_GENESIS_HASH;
-  for (const record of records) {
-    head = manifestChainStep(head, record);
-    recordHashes.push(head);
-  }
-  return { recordHashes, chainHead: head };
 }
 
 /**
- * Write a hash-chained manifest for the archive in `dir`, atomically
- * (`<manifest>.tmp` then rename). Returns the manifest written.
+ * Deterministically scan archived JSONL records for private chat identifiers and
+ * secret-shaped values. Reads only local archive files; performs no network I/O.
  */
-export async function writeArchiveManifest(
-  dir: string,
-  bounds: ArchiveManifestBounds,
-): Promise<ArchiveManifest> {
-  const records = await readArchiveRecordLines(dir);
-  const { recordHashes, chainHead } = chainRecords(records);
-  const manifest: ArchiveManifest = {
-    type: "archive-manifest",
-    version: 1,
-    network: bounds.network,
-    ledgerMin: bounds.ledgerMin,
-    ledgerMax: bounds.ledgerMax,
-    recordCount: records.length,
-    recordHashes,
-    chainHead,
-  };
-  const target = path.join(dir, ARCHIVE_MANIFEST_FILENAME);
-  const tmp = `${target}.tmp`;
-  await writeFile(tmp, JSON.stringify(manifest, null, 2) + "\n", { encoding: "utf8", mode: FILE_MODE });
-  await rename(tmp, target);
-  return manifest;
-}
+export async function reviewArchivePrivacy(dir: string): Promise<PrivacyReviewReport> {
+  const files = await listArchiveFiles(dir);
+  const findings: PrivacyFinding[] = [];
+  let recordsScanned = 0;
 
-/**
- * Verify the archive in `dir` against its manifest. Fails closed when the
- * manifest is missing or unparseable, and when any record is missing,
- * reordered, altered, or outside the recorded ledger bounds.
- */
-export async function verifyArchiveManifest(dir: string): Promise<VerifyArchiveManifestResult> {
-  let manifest: ArchiveManifest;
-  try {
-    manifest = JSON.parse(
-      await readFile(path.join(dir, ARCHIVE_MANIFEST_FILENAME), "utf8"),
-    ) as ArchiveManifest;
-  } catch (err) {
-    const missing = (err as NodeJS.ErrnoException)?.code === "ENOENT";
-    return { ok: false, recordCount: 0, reason: missing ? "manifest missing" : "manifest parse error" };
-  }
-  if (
-    manifest === null ||
-    typeof manifest !== "object" ||
-    manifest.type !== "archive-manifest" ||
-    !Array.isArray(manifest.recordHashes)
-  ) {
-    return { ok: false, recordCount: 0, reason: "manifest parse error" };
-  }
-
-  const records = await readArchiveRecordLines(dir);
-  if (records.length !== manifest.recordCount || records.length !== manifest.recordHashes.length) {
-    return { ok: false, recordCount: records.length, reason: "record count mismatch" };
-  }
-  let head = MANIFEST_GENESIS_HASH;
-  for (let i = 0; i < records.length; i += 1) {
-    head = manifestChainStep(head, records[i]!);
-    if (head !== manifest.recordHashes[i]) {
-      return { ok: false, recordCount: records.length, reason: `record ${i + 1} altered, reordered or missing` };
-    }
-  }
-  if (head !== manifest.chainHead) {
-    return { ok: false, recordCount: records.length, reason: "chain head mismatch" };
-  }
-  for (const record of records) {
-    let ledger: unknown;
+  for (const file of files) {
+    const handle = await open(path.join(dir, file), "r");
     try {
-      ledger = (JSON.parse(record) as { ledger?: unknown }).ledger;
-    } catch {
-      return { ok: false, recordCount: records.length, reason: "malformed record" };
-    }
-    if (typeof ledger === "number") {
-      if (
-        (manifest.ledgerMin !== null && ledger < manifest.ledgerMin) ||
-        (manifest.ledgerMax !== null && ledger > manifest.ledgerMax)
-      ) {
-        return { ok: false, recordCount: records.length, reason: "ledger bounds mismatch" };
+      const content = await handle.readFile({ encoding: "utf8" });
+      const lines = content.split("\n");
+      for (let index = 0; index < lines.length; index += 1) {
+        const trimmed = lines[index]!.trim();
+        if (!trimmed) continue;
+        recordsScanned += 1;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          throw new MalformedArchiveRecordError(file, index + 1);
+        }
+        scanValue(parsed, "$", undefined, (kind, jsonPath, raw) => {
+          findings.push({
+            kind,
+            fileName: file,
+            lineNumber: index + 1,
+            jsonPath,
+            preview: redactPreview(raw),
+          });
+        });
       }
+    } finally {
+      await handle.close();
     }
   }
-  return { ok: true, recordCount: records.length };
+
+  return { filesScanned: files.length, recordsScanned, findings };
 }

@@ -4,7 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { backupCursor, restoreCursor } from "../dist/cursor-cli.js";
+import {
+  backupCursor,
+  CursorConflictError,
+  inspectCursor,
+  restoreCursor,
+  runCursorCli,
+} from "../dist/cursor-cli.js";
 
 async function withTempDir(run) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-cursor-backup-"));

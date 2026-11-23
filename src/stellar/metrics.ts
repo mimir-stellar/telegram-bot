@@ -18,6 +18,22 @@
  * that clamping happened without any unbounded label cardinality.
  */
 
+import {
+  MetricLabelError,
+  escapeMetricLabelValue,
+  formatMetricLabels,
+  validateMetricLabelKey,
+  validateMetricName,
+} from "../metrics.js";
+
+export {
+  MetricLabelError,
+  escapeMetricLabelValue,
+  formatMetricLabels,
+  validateMetricLabelKey,
+  validateMetricName,
+};
+
 export type RpcOperation = "health" | "events";
 
 /** Bounded set of reasons a sample's duration was dropped/clamped. */
@@ -151,6 +167,39 @@ export class RpcTiming {
       droppedSamples: { ...this.drops },
     };
   }
+}
+
+/**
+ * Bounded capacity gauge for a dead-letter queue.
+ *
+ * Reports only counts (used / max entries and a utilization ratio) and never
+ * message bodies. When the queue is disabled (`maxEntries` of 0 or less, or
+ * not finite), the gauge reports `enabled: false` with zero capacity and a
+ * utilization of 0, so consumers can render "disabled" without dividing by zero.
+ */
+export interface DeadLetterCapacityGauge {
+  enabled: boolean;
+  used: number;
+  max: number;
+  utilization: number;
+}
+
+export function deadLetterCapacityGauge(
+  used: number,
+  maxEntries: number,
+): DeadLetterCapacityGauge {
+  const enabled = Number.isFinite(maxEntries) && maxEntries > 0;
+  if (!enabled) {
+    return { enabled: false, used: 0, max: 0, utilization: 0 };
+  }
+  const max = Math.floor(maxEntries);
+  const safeUsed = Number.isFinite(used) && used > 0 ? Math.min(Math.floor(used), max) : 0;
+  return {
+    enabled: true,
+    used: safeUsed,
+    max,
+    utilization: round(safeUsed / max),
+  };
 }
 
 /** One-line, secret-free timing string for logs and the scan summary. */
@@ -724,4 +773,53 @@ export function formatServiceLevelWindow(report: ServiceLevelWindowReport): stri
     `delivery_success=${succ} attempts=${report.delivery.attempts} ` +
     `avg_lag=${avgLag} max_lag=${maxLag} gaps=${report.dataGap.totalGaps}`
   );
+}
+
+/**
+ * Render an {@link RpcTimingSummary} as Prometheus text exposition lines with
+ * validated label keys and escaped label values (rejecting control-character
+ * injection before exposition).
+ */
+export function renderRpcTimingMetrics(
+  summary: RpcTimingSummary,
+  extraLabels: Readonly<Record<string, string>> = {},
+): string {
+  for (const key of Object.keys(extraLabels)) {
+    validateMetricLabelKey(key);
+    if (key === "operation") {
+      throw new MetricLabelError(
+        "INVALID_LABEL_KEY",
+        'extraLabels must not override reserved RPC metric label "operation"',
+      );
+    }
+  }
+
+  const lines: string[] = [
+    `# HELP mimir_stellar_rpc_operation_requests_total Total Soroban RPC calls by operation`,
+    `# TYPE mimir_stellar_rpc_operation_requests_total counter`,
+  ];
+  for (const op of RPC_OPERATIONS) {
+    const labels = formatMetricLabels({ ...extraLabels, operation: op });
+    lines.push(`mimir_stellar_rpc_operation_requests_total${labels} ${summary.operations[op].requests}`);
+  }
+
+  lines.push(
+    `# HELP mimir_stellar_rpc_operation_failures_total Total failed Soroban RPC calls by operation`,
+    `# TYPE mimir_stellar_rpc_operation_failures_total counter`,
+  );
+  for (const op of RPC_OPERATIONS) {
+    const labels = formatMetricLabels({ ...extraLabels, operation: op });
+    lines.push(`mimir_stellar_rpc_operation_failures_total${labels} ${summary.operations[op].failures}`);
+  }
+
+  lines.push(
+    `# HELP mimir_stellar_rpc_operation_duration_ms_total Cumulative Soroban RPC call duration in ms by operation`,
+    `# TYPE mimir_stellar_rpc_operation_duration_ms_total counter`,
+  );
+  for (const op of RPC_OPERATIONS) {
+    const labels = formatMetricLabels({ ...extraLabels, operation: op });
+    lines.push(`mimir_stellar_rpc_operation_duration_ms_total${labels} ${summary.operations[op].totalMs}`);
+  }
+
+  return `${lines.join("\n")}\n`;
 }

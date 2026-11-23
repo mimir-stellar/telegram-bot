@@ -9,6 +9,7 @@ Operational procedure for recovering missed events and replaying ledger ranges w
 * **The Stellar blockchain is the source of truth.** The notifier is read-only and never holds signing keys, submits transactions, or modifies on-chain state.
 * **Replay is decoupled from the live poller.** Running a replay **never reads from, writes to, or locks** the live cursor file (`CURSOR_FILE`, default `data/cursor.json`). The running daemon's cursor state and scheduling are untouched.
 * **Safe by default (dry-run):** The CLI runs in dry-run mode unless `--send` is explicitly provided. Dry-run mode requires zero Telegram credentials (`BOT_TOKEN` and `TELEGRAM_CHAT_ID` are not needed).
+* **Signed-off delivery:** Every run computes a deterministic plan digest over the normalized range and contract destinations. `--send` requires `--plan-digest` to match that digest, so delivery is tied to a preview an operator actually reviewed.
 * **Bounded execution:** The walk is constrained per contract by `--pages` (default 20) and notification output is capped by `--cap` (default `MAX_NOTIFICATIONS_PER_CYCLE` or 20).
 * **Sanitized output:** Progress messages and error logs are scrubbed via centralized redaction (`src/redact.ts`); bot tokens and credentials never appear in output or JSON reports.
 
@@ -74,6 +75,7 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--cap` | `<number>` | Maximum notifications to send/count per contract. | `config.maxNotificationsPerCycle` in `--send` mode; `20` in dry-run mode |
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
+| `--certificate-file` | `<path>` | Write a deterministic replay completeness certificate (`mimir-replay-certificate-v1`) JSON file atomically. | None |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
 | `--progress-file` | `<path>` | Persist per-page checkpoint state (`mimir-replay-progress-v1`) for resumable replays. Includes a normalized `filterFingerprint` (network, range, contracts, and contract IDs); incompatible resume attempts are rejected with exit code `2` and an actionable message. | None |
 | `--rpm` | `<number>` | Maximum RPC requests per minute across health and event fetches. Must be $> 0$. | Unlimited |
@@ -81,8 +83,8 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 ### Exit Codes
 
 * **`0`:** Scan completed successfully (even if some events were skipped, deduplicated, or capped).
-* **`1`:** Fatal runtime error (RPC unreachable, invalid network passphrase, or missing config in `--send` mode).
-* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, invalid `--contract`/`--rpm`, or an incompatible/corrupt `--progress-file`).
+* **`1`:** Fatal runtime error (RPC unreachable, nonmonotonic RPC page ledger boundaries, invalid network passphrase, or missing config in `--send` mode).
+* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, or invalid `--contract`).
 
 ---
 
@@ -107,6 +109,14 @@ To produce machine-readable JSON for scripting or incident audits:
 ```bash
 npm run replay -- --from 4226500 --to 4226800 --json > replay-plan.json
 ```
+
+The preview prints a `plan` digest that binds the normalized range (`--from`, `--to`, or the chain tip when omitted) to the selected contract destinations and network:
+
+```text
+[replay] plan      f983f09b303d14526a9aa929211b14bb1867663dab5f3d08ec3303222bd82fb4
+```
+
+With `--json`, the same value appears at `report.plan.digest`. It is deterministic: flag order does not matter, and the chain tip is not part of the digest, so the value stays valid as the chain advances. Any change to the range, `--contract` selection, contract ids, or network changes it.
 
 ### Step 2: Review the Replay Report & Boundary Warnings
 
@@ -138,23 +148,28 @@ Examine the progress output on `stderr` (or human logs on `stdout`):
 
 ### Step 3: Execute the Live Replay
 
-Once the dry-run confirms the event counts and targets, execute live delivery by adding `--send`:
+Once the dry-run confirms the event counts and targets, execute live delivery by adding `--send` together with the preview's plan digest:
 
 ```bash
-npm run replay -- --from 4226500 --to 4226800 --send
+npm run replay -- --from 4226500 --to 4226800 --send \
+  --plan-digest f983f09b303d14526a9aa929211b14bb1867663dab5f3d08ec3303222bd82fb4
 ```
 
-If only one contract had missed events, restrict the replay with `--contract`:
+If only one contract had missed events, restrict the replay with `--contract` and sign off the digest from a market-only preview (the digest changes with the destination selection):
 
 ```bash
-npm run replay -- --from 4226500 --to 4226800 --contract market --send
+npm run replay -- --from 4226500 --to 4226800 --contract market --send \
+  --plan-digest <digest-from-market-only-preview>
 ```
 
-For wider ranges spanning many pages, expand the page budget:
+For wider ranges spanning many pages, expand the page budget in the preview and delivery runs alike:
 
 ```bash
-npm run replay -- --from 4226500 --to 4230000 --pages 100 --cap 100 --send
+npm run replay -- --from 4226500 --to 4230000 --pages 100 --cap 100 --send \
+  --plan-digest <digest-from-same-preview>
 ```
+
+`--send` without a digest, with a malformed digest, or with a digest from a different range/destination selection exits `2` before any RPC call or Telegram send. Re-run the preview and review the new plan instead of reusing a stale digest.
 
 ### Step 4: Verify Delivery & Confirm Poller Cursor
 
@@ -176,6 +191,7 @@ The replay engine applies identical decoding and deduplication rules as the live
 3. **Deduplication:** An in-memory `EventDedupWindow` (capacity 256) tracks the canonical `eventKey` across overlapping pages. Duplicate event IDs returned across page boundaries are counted in `duplicates` and suppressed.
 4. **Cap Protection:** If the count of sent notifications reaches `--cap`, subsequent events are skipped with `skipReason = "cap"` to prevent Telegram rate-limiting (HTTP 429).
 5. **Send Errors:** An individual Telegram dispatch failure is logged and recorded as skipped (`skipReason = "send-error"`). It does not abort the remaining replay walk.
+6. **Nonmonotonic Ledger Boundaries:** Each RPC page is validated before decoding, sending, or committing progress. If a page reports a regressing `latestLedger`, a `cursor` ledger behind the prior cursor or committed event ledger, an event ledger behind the committed boundary or decreasing within the page, or a `cursor` ledger behind an event on the same page, replay aborts with a bounded `ReplayConsistencyError` (exit code `1`) and leaves the previously committed progress checkpoint unchanged.
 
 ---
 
@@ -189,7 +205,17 @@ Soroban RPC nodes maintain a rolling window of history (typically ~120,960 ledge
   If an outage lasted longer than the retention window:
   1. The replay CLI can only recover events from `oldestLedger` to the recovery point.
   2. Events prior to `oldestLedger` **cannot be recovered via Soroban RPC**.
-  3. For archival recovery prior to `oldestLedger`, operators must consult an external archival indexer or Stellar Expert block explorer; the Soroban RPC itself cannot serve pruned event history.
+  3. The generated completeness certificate (`report.certificate` or `--certificate-file`) records the `pruned-history` gap and sets `complete: false` so partial or pruned ranges are never marked complete.
+  4. For archival recovery prior to `oldestLedger`, operators must consult an external archival indexer or Stellar Expert block explorer; the Soroban RPC itself cannot serve pruned event history.
+
+### 6.1 Deterministic Completeness Certificate
+
+Every replay run produces a deterministic `mimir-replay-certificate-v1` completeness certificate on `report.certificate` (and optionally written to `--certificate-file <path>`):
+
+* **`requestedRange` & `observedRange`:** Records the requested `[from, to]` bounds alongside the actually observed `[fromLedger, toLedger]` range per contract and overall.
+* **`gaps`:** Lists any unresolved gaps (`pruned-history`, `truncated-pages`, `beyond-tip`, or `scan-error`) with their ledger bounds and reason.
+* **`complete`:** `true` only when every requested target observed its full requested range without pruning, truncation, or scan errors. Partial or pruned ranges are never marked complete.
+* **`digest`:** Deterministic SHA-256 hex digest over the canonical certificate payload (omitting wall-clock timestamps so identical inputs produce identical certificates).
 
 ---
 
@@ -226,3 +252,35 @@ npm run replay:mock -- --from 900 --to 1000 --json
 ```
 
 To stop the mock server, send `Ctrl+C` in Terminal 1.
+
+---
+
+## 8. Archive Schema Versions
+
+The archive helpers expose `getSupportedArchiveSchemaVersions()` and
+`negotiateArchiveSchemaVersion()` from `src/stellar/archive.ts`. The current
+reader and writer support schema version **1** for event archives and scan
+JSONL. Writers reject unsupported requested versions; readers reject unknown
+version metadata instead of interpreting newer records as the current shape.
+
+`createEventArchive({ dir })` writes `archive-schema.json` with the archive
+format and schema version before appending records. Its optional
+`schemaVersion` setting defaults to `1` and rejects unsupported versions.
+Existing archive directories without this sidecar are read as the prior
+version-1 layout for backward compatibility. Set `requireExplicitVersion: true`
+on `readArchive` when a caller must reject such unversioned directories.
+
+The existing `formatScanJsonl(events)` output remains unchanged. To mark a
+capture explicitly, pass the supported writer version:
+
+```ts
+const capture = formatScanJsonl(events, { schemaVersion: 1 });
+const parsed = parseScanJsonl(capture, { requireExplicitVersion: true });
+```
+
+The versioned scan output starts with a `type: "schema"` line declaring
+`format: "mimir-scan-jsonl"` and `schemaVersion: 1`. `parseScanJsonl` also
+accepts existing unversioned output as version 1 unless
+`requireExplicitVersion` is enabled. Both readers accept an
+`acceptedVersions` list to constrain negotiation to a caller's supported
+versions.

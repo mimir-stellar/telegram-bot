@@ -18,7 +18,7 @@
 
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
-import { safeErrorMessage } from "./notifications/format.js";
+import { messagesFor } from "./i18n.js";
 import {
   handleBroadcastCallback,
   handleConfirmationsCallback,
@@ -48,6 +48,8 @@ import {
 } from "./commands/runtime.js";
 
 export {
+  CALLBACK_PAUSE_CANCEL,
+  CALLBACK_PAUSE_CONFIRM,
   classifyCallbackError,
   extractCallbackLogIds,
   formatCallbackErrorLog,
@@ -649,23 +651,34 @@ export async function handlePauseConfirmCallback(
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
   const ageMs = nowMs - messageDate * 1000;
   const actionName = action === CALLBACK_PAUSE_CONFIRM ? "pause_confirm" : "pause_cancel";
+  let answered = false;
   try {
     if (ageMs > PAUSE_CONFIRM_TTL_MS) {
-      await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
-      await ctx.editMessageText(
-        "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
-        TELEGRAM_OPTIONS,
-      );
+      answered = true;
+      const messages = messagesFor(config.locale).callbackMessages;
+      await ctx.answerCallbackQuery({ text: messages.pauseExpiredAlert, show_alert: true });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText(
+            messages.pauseExpiredMessage,
+            TELEGRAM_OPTIONS,
+          );
+        } catch {
+          // ignore edit failure (e.g. message deleted or cannot be edited)
+        }
+      }
       return;
     }
 
     if (action === CALLBACK_PAUSE_CONFIRM) {
       const result = pause();
+      answered = true;
       await ctx.answerCallbackQuery();
-      await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
+      await ctx.editMessageText(pauseMessage(result, config.locale), TELEGRAM_OPTIONS);
       return;
     }
 
+    answered = true;
     await ctx.answerCallbackQuery({ text: "Cancelled." });
     await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
   } catch (err) {
@@ -677,7 +690,9 @@ export async function handlePauseConfirmCallback(
         secrets: [config.botToken],
       }),
     );
-    await safeAnswerCallback(ctx, config, { text: "Action failed" });
+    if (!answered) {
+      await safeAnswerCallback(ctx, config, { text: "Action failed" });
+    }
   }
 }
 
