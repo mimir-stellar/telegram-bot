@@ -284,7 +284,11 @@ test("scanner: malformed XDR decodes to unknown and never throws", async () => {
           ledger: 950,
           txHash: "deadbeef",
           ledgerClosedAt: "2026-01-01T00:00:00Z",
-          topic: [nativeToScVal("claim_created", { type: "symbol" })],
+          topic: [
+            nativeToScVal("claim_created", { type: "symbol" }),
+            nativeToScVal(1n, { type: "u64" }),
+            nativeToScVal("GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW", { type: "string" }),
+          ],
           value: malformedValue,
         },
         {

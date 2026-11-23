@@ -5,7 +5,7 @@
  * here is the order Telegram's menu and `/help` list them in. Adding a command:
  *
  *   1. create `src/commands/<name>.ts` and export a module from
- *      `defineCommand({ command, operatorOnly?, chatAllowlist?, hidden?, handler })`
+ *      `defineCommand({ command, operatorOnly?, chatAllowlist?, hidden?, availability?, handler })`
  *   2. add one import line here — in menu order — and re-export anything
  *      `src/bot.ts` or the tests need
  *   3. if the command is advertised, add its description to
@@ -28,6 +28,7 @@ import "./pause.js";
 import "./resume.js";
 import "./log-export.js"; // hidden: operator log export
 import "./match-preview.js"; // hidden: operator subscription match count
+import "./digest-preview.js"; // hidden: operator pending digest preview
 
 import { COMMAND_DETAILS } from "./help-detail.js";
 import {
@@ -49,29 +50,37 @@ export function validateCommandCatalogue(options?: CommandConsistencyOptions): v
 }
 
 export {
-  CommandConsistencyError,
+  commandAvailabilityReport,
   commandMetadata,
   commandModule,
   defineCommand,
-  findCommandConsistencyIssues,
+  formatCommandAvailabilityReport,
   registeredCommands,
   validateCommandConsistency,
   visibleCommandMetadata,
-  type CommandConsistencyIssue,
-  type CommandConsistencyOptions,
+  type CommandAvailabilityCheck,
+  type CommandAvailabilityCheckResult,
+  type CommandAvailabilityEntry,
+  type CommandAvailabilityReport,
   type CommandDeps,
   type CommandHandler,
   type CommandMetadata,
   type CommandModule,
 } from "./registry.js";
 export {
+  MAX_COMMAND_ARGUMENT_BYTES,
   TELEGRAM_OPTIONS,
   chatAllowed,
+  checkCommandArgumentLength,
   commandArgument,
+  commandArgumentAllowed,
+  commandArgumentTooLongMessage,
   isChatAllowed,
+  isCommandForAnotherBot,
   isOperator,
   operatorAllowed,
   replyMarkdown,
+  type CommandArgumentCheck,
 } from "./runtime.js";
 export {
   CALLBACK_PAUSE_CANCEL,
@@ -103,3 +112,7 @@ export {
   matchPreviewInvalidMessage,
   MATCH_PREVIEW_USAGE,
 } from "./match-preview.js";
+export {
+  digestPreviewCommand,
+  DIGEST_PREVIEW_UNAVAILABLE,
+} from "./digest-preview.js";

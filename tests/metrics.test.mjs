@@ -1,17 +1,6 @@
 /**
  * Metrics unit tests.
  *
- * Tests cover:
- *   - Counter and gauge semantics (increment, set, value)
- *   - render() output format (HELP/TYPE lines, metric names, counter/gauge types)
- *   - HTTP server: GET /metrics, GET /health, non-GET returns 405, unknown path returns 404
- *   - Counter values reflected live in /metrics output
- *   - Security: no secrets appear in /metrics output
- *   - Boundary: negative delta on counter throws
- *   - Boundary: port 0 and 65535 (validated at config level; startServer takes any number)
- *   - Multiple metrics registries are independent
- *   - Server can be closed and the port is released
- *
  * No live network calls, no Testnet RPC, no Telegram credentials.
  */
 
@@ -19,13 +8,12 @@ import assert from "node:assert/strict";
 import { get } from "node:http";
 import test from "node:test";
 
-import { createMetrics, deliveryFailureRate } from "../dist/metrics.js";
+import {
+  createMetrics,
+  DELIVERY_DESTINATION_CLASSES,
+  QUEUE_AGE_BUCKETS_SECONDS,
+} from "../dist/metrics.js";
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/**
- * Perform an HTTP GET against `url` and return { statusCode, headers, body }.
- */
 function httpGet(url) {
   return new Promise((resolve, reject) => {
     const req = get(url, (res) => {
@@ -40,9 +28,6 @@ function httpGet(url) {
   });
 }
 
-/**
- * Perform an HTTP request with an arbitrary method.
- */
 async function httpRequest(method, url) {
   const { request } = await import("node:http");
   const { hostname, port, pathname } = new URL(url);
@@ -60,8 +45,6 @@ async function httpRequest(method, url) {
     r.end();
   });
 }
-
-// ── Counter tests ─────────────────────────────────────────────────────────────
 
 test("counter: starts at zero", () => {
   const m = createMetrics();
@@ -110,8 +93,6 @@ test("counter: multiple counters are independent", () => {
   assert.equal(m.rpcRequests.value(), 3);
   assert.equal(m.eventsDecoded.value(), 0);
 });
-
-// ── Gauge tests ───────────────────────────────────────────────────────────────
 
 test("gauge: starts at zero", () => {
   const m = createMetrics();
@@ -237,7 +218,6 @@ test("render: contains all expected metric names", () => {
 test("render: counters have # TYPE counter", () => {
   const m = createMetrics();
   const output = m.render();
-  // All _total counters should have TYPE counter
   assert.ok(
     output.includes("# TYPE mimir_bot_poll_cycles_total counter"),
     "Missing TYPE counter for poll_cycles_total",
@@ -267,15 +247,8 @@ test("render: contains # HELP lines", () => {
 test("render: initial all-zero values are present", () => {
   const m = createMetrics();
   const output = m.render();
-  // Each metric line has the form: `metric_name value`
-  assert.ok(
-    output.includes("mimir_bot_poll_cycles_total 0"),
-    "Expected poll_cycles_total 0",
-  );
-  assert.ok(
-    output.includes("mimir_bot_consecutive_failures 0"),
-    "Expected consecutive_failures 0",
-  );
+  assert.ok(output.includes("mimir_bot_poll_cycles_total 0"), "Expected poll_cycles_total 0");
+  assert.ok(output.includes("mimir_bot_consecutive_failures 0"), "Expected consecutive_failures 0");
 });
 
 test("render: incremented counter values appear in output", () => {
@@ -299,11 +272,36 @@ test("render: multiple registries are independent", () => {
   assert.equal(m2.pollCycles.value(), 0);
 });
 
-// ── HTTP server tests ─────────────────────────────────────────────────────────
+test("dropped samples: NaN and Infinity are counted and never rendered", () => {
+  const m = createMetrics();
+  m.consecutiveFailures.set(Number.NaN);
+  m.consecutiveFailures.set(Number.POSITIVE_INFINITY);
+  m.consecutiveFailures.set(Number.NEGATIVE_INFINITY);
+
+  const output = m.render();
+  assert.ok(!/NaN|Infinity/.test(output), `non-finite value leaked:\n${output}`);
+  assert.ok(output.includes('mimir_bot_dropped_samples_total{reason="invalid_number"} 3'), output);
+  assert.equal(m.consecutiveFailures.value(), 0);
+});
+
+test("dropped samples: unknown labels are counted under a bounded reason", () => {
+  const m = createMetrics();
+  m.recordDropped("unknown_label");
+  m.recordDropped("unknown_label");
+  const output = m.render();
+  assert.ok(output.includes('mimir_bot_dropped_samples_total{reason="unknown_label"} 2'), output);
+});
+
+test("dropped samples: finite values are unaffected", () => {
+  const m = createMetrics();
+  m.consecutiveFailures.set(4);
+  assert.equal(m.consecutiveFailures.value(), 4);
+  assert.ok(!m.render().includes('reason="invalid_number"} 1'));
+});
 
 test("server: GET /metrics returns 200 with correct content-type", async () => {
   const m = createMetrics();
-  const srv = await m.startServer(0); // port 0 = OS assigns a free port
+  const srv = await m.startServer(0);
   try {
     const res = await httpGet(`http://127.0.0.1:${srv.port}/metrics`);
     assert.equal(res.statusCode, 200, `Expected 200, got ${res.statusCode}`);
@@ -509,50 +507,128 @@ test("security: /health response does not echo request headers", async () => {
   }
 });
 
-// ── Filtered event counters & failure-rate denominator ────────────────────────
+// ── Pending delivery queue age histogram tests ────────────────────────────────
 
-test("filtered counters: start at zero and increment independently by reason", () => {
+test("queue age histogram: uses finite ascending buckets and stable destination classes", () => {
   const m = createMetrics();
-  assert.equal(m.eventsFiltered.value(), 0);
-  assert.equal(m.eventsFilteredFeatureFlag.value(), 0);
-  assert.equal(m.eventsFilteredRule.value(), 0);
+  const h = m.pendingDeliveryQueueAge;
 
-  m.eventsFiltered.inc();
-  m.eventsFilteredFeatureFlag.inc();
-  assert.equal(m.eventsFiltered.value(), 1);
-  assert.equal(m.eventsFilteredFeatureFlag.value(), 1);
-  assert.equal(m.eventsFilteredRule.value(), 0);
-  assert.equal(m.notificationsFailed.value(), 0);
+  assert.deepEqual(h.buckets, QUEUE_AGE_BUCKETS_SECONDS);
+  assert.ok(h.buckets.length > 0, "buckets must be non-empty");
+  for (let i = 0; i < h.buckets.length; i++) {
+    assert.ok(Number.isFinite(h.buckets[i]) && h.buckets[i] > 0, `bucket ${i} must be finite > 0`);
+    if (i > 0) {
+      assert.ok(h.buckets[i] > h.buckets[i - 1], "buckets must be strictly ascending");
+    }
+  }
 
-  m.eventsFiltered.inc();
-  m.eventsFilteredRule.inc();
-  assert.equal(m.eventsFiltered.value(), 2);
-  assert.equal(m.eventsFilteredFeatureFlag.value(), 1);
-  assert.equal(m.eventsFilteredRule.value(), 1);
+  assert.deepEqual(h.destinations, DELIVERY_DESTINATION_CLASSES);
+  assert.ok(h.destinations.includes("channel"));
+  assert.ok(h.destinations.includes("group"));
+  assert.ok(h.destinations.includes("dm"));
+  assert.ok(h.destinations.includes("dead_letter"));
 });
 
-test("filtered counters: rendered output includes stable filtered metric names", () => {
+test("queue age histogram: records cumulative bucket counts, sum, and count per destination", () => {
   const m = createMetrics();
-  m.eventsFiltered.inc(3);
-  m.eventsFilteredFeatureFlag.inc(2);
-  m.eventsFilteredRule.inc(1);
-  const out = m.render();
-  assert.ok(out.includes("mimir_bot_events_filtered_total 3"));
-  assert.ok(out.includes("mimir_bot_events_filtered_feature_flag_total 2"));
-  assert.ok(out.includes("mimir_bot_events_filtered_rule_total 1"));
+  const h = m.pendingDeliveryQueueAge;
+
+  // Exact boundary (1s), mid-range (12s), and above max finite bucket (5000s)
+  h.observe("channel", 1);
+  h.observe("channel", 12);
+  h.observe("channel", 5000);
+  h.observe("dead_letter", 0);
+
+  const channelSnap = h.snapshot("channel");
+  assert.equal(channelSnap.count, 3);
+  assert.equal(channelSnap.sum, 5013);
+
+  const byLe = new Map(channelSnap.buckets.map((b) => [String(b.le), b.count]));
+  assert.equal(byLe.get("1"), 1);
+  assert.equal(byLe.get("5"), 1);
+  assert.equal(byLe.get("15"), 2);
+  assert.equal(byLe.get("3600"), 2);
+  assert.equal(byLe.get("+Inf"), 3);
+
+  const dlqSnap = h.snapshot("dead_letter");
+  assert.equal(dlqSnap.count, 1);
+  assert.equal(dlqSnap.sum, 0);
+  assert.equal(dlqSnap.buckets[0]?.count, 1);
+
+  const dmSnap = h.snapshot("dm");
+  assert.equal(dmSnap.count, 0);
+  assert.equal(dmSnap.sum, 0);
 });
 
-test("deliveryFailureRate: excludes filtered events from denominator and handles zero attempts", () => {
-  assert.equal(deliveryFailureRate(0, 0), 0);
-  assert.equal(deliveryFailureRate(8, 2), 0.2);
-
-  // Filtered events do not affect the failure rate denominator
+test("queue age histogram: observeSince computes age in seconds and clamps clock skew to 0", () => {
   const m = createMetrics();
-  m.notificationsSent.inc(8);
-  m.notificationsFailed.inc(2);
-  m.eventsFiltered.inc(100);
-  assert.equal(
-    deliveryFailureRate(m.notificationsSent.value(), m.notificationsFailed.value()),
-    0.2,
+  const h = m.pendingDeliveryQueueAge;
+
+  h.observeSince("group", 10_000, 12_500); // 2.5s
+  h.observeSince("group", 20_000, 19_000); // clock skew -> clamped to 0s
+
+  const snap = h.snapshot("group");
+  assert.equal(snap.count, 2);
+  assert.equal(snap.sum, 2.5);
+  const byLe = new Map(snap.buckets.map((b) => [String(b.le), b.count]));
+  assert.equal(byLe.get("1"), 1);
+  assert.equal(byLe.get("5"), 2);
+});
+
+test("queue age histogram: renders Prometheus histogram format without chat_id or event_id labels", () => {
+  const m = createMetrics();
+  m.pendingDeliveryQueueAge.observe("channel", 4);
+
+  const output = m.render();
+  assert.ok(
+    output.includes("# TYPE mimir_bot_pending_delivery_queue_age_seconds histogram"),
+    output,
   );
+  assert.ok(
+    output.includes(
+      'mimir_bot_pending_delivery_queue_age_seconds_bucket{destination="channel",le="1"} 0',
+    ),
+    output,
+  );
+  assert.ok(
+    output.includes(
+      'mimir_bot_pending_delivery_queue_age_seconds_bucket{destination="channel",le="5"} 1',
+    ),
+    output,
+  );
+  assert.ok(
+    output.includes(
+      'mimir_bot_pending_delivery_queue_age_seconds_bucket{destination="channel",le="+Inf"} 1',
+    ),
+    output,
+  );
+  assert.ok(
+    output.includes('mimir_bot_pending_delivery_queue_age_seconds_sum{destination="channel"} 4'),
+    output,
+  );
+  assert.ok(
+    output.includes('mimir_bot_pending_delivery_queue_age_seconds_count{destination="channel"} 1'),
+    output,
+  );
+  assert.ok(!output.includes("chat_id="), "Histogram must not expose chat_id labels");
+  assert.ok(!output.includes("event_id="), "Histogram must not expose event_id labels");
+});
+
+test("queue age histogram: rejects chat IDs, event IDs, and invalid ages/timestamps", () => {
+  const m = createMetrics();
+  const h = m.pendingDeliveryQueueAge;
+
+  // High-cardinality identifiers must be rejected
+  assert.throws(() => h.observe("-1001234567890", 5), RangeError);
+  assert.throws(() => h.observe("0005123456-0000000001", 5), RangeError);
+  assert.throws(() => h.snapshot("-1001234567890"), RangeError);
+
+  // Negative or non-finite ages must be rejected
+  assert.throws(() => h.observe("channel", -0.1), RangeError);
+  assert.throws(() => h.observe("channel", Number.NaN), RangeError);
+  assert.throws(() => h.observe("channel", Number.POSITIVE_INFINITY), RangeError);
+
+  // Non-finite timestamps in observeSince must be rejected
+  assert.throws(() => h.observeSince("channel", Number.NaN, 1000), RangeError);
+  assert.throws(() => h.observeSince("channel", 1000, Number.POSITIVE_INFINITY), RangeError);
 });

@@ -11,9 +11,35 @@
  * O(1) in the number of requests and nothing sensitive is retained. The values
  * are wall-clock measurements of this process's own `await`, so they are safe to
  * log and to put in `/status`-style output.
+ *
+ * Dropped samples: observations with a non-finite or negative duration are still
+ * counted as requests (so totals stay honest) but their duration is clamped to 0.
+ * Each such drop is tallied under a bounded reason counter so operators can see
+ * that clamping happened without any unbounded label cardinality.
  */
 
+import {
+  MetricLabelError,
+  escapeMetricLabelValue,
+  formatMetricLabels,
+  validateMetricLabelKey,
+  validateMetricName,
+} from "../metrics.js";
+
+export {
+  MetricLabelError,
+  escapeMetricLabelValue,
+  formatMetricLabels,
+  validateMetricLabelKey,
+  validateMetricName,
+};
+
 export type RpcOperation = "health" | "events";
+
+/** Bounded set of reasons a sample's duration was dropped/clamped. */
+export type RpcDropReason = "non_finite" | "negative";
+
+export const RPC_DROP_REASONS: readonly RpcDropReason[] = ["non_finite", "negative"];
 
 /** Per-operation aggregate. Every quantity is a count or a duration in ms. */
 export interface RpcOperationTiming {
@@ -33,12 +59,18 @@ export interface RpcTimingSummary {
   maxMs: number;
   avgMs: number;
   operations: Record<RpcOperation, RpcOperationTiming>;
+  /** Count of samples whose duration was dropped, keyed by a fixed reason set. */
+  droppedSamples: Record<RpcDropReason, number>;
 }
 
 const RPC_OPERATIONS: readonly RpcOperation[] = ["health", "events"];
 
 function emptyOperation(): RpcOperationTiming {
   return { requests: 0, failures: 0, totalMs: 0, minMs: 0, maxMs: 0 };
+}
+
+function emptyDrops(): Record<RpcDropReason, number> {
+  return { non_finite: 0, negative: 0 };
 }
 
 /** Round to at most 3 decimals so printed numbers stay short and stable. */
@@ -51,6 +83,7 @@ export class RpcTiming {
     health: emptyOperation(),
     events: emptyOperation(),
   };
+  private readonly drops: Record<RpcDropReason, number> = emptyDrops();
   private readonly clock: () => number;
 
   /**
@@ -76,11 +109,19 @@ export class RpcTiming {
 
   /**
    * Record a completed observation. Non-finite or negative durations are
-   * clamped to 0 rather than poisoning the aggregate with `NaN`/negatives.
+   * clamped to 0 rather than poisoning the aggregate with `NaN`/negatives, and
+   * each clamp increments the matching bounded drop counter.
    */
   record(operation: RpcOperation, durationMs: number, ok: boolean): void {
     const aggregate = this.operations[operation];
-    const duration = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : 0;
+    let duration = 0;
+    if (!Number.isFinite(durationMs)) {
+      this.drops.non_finite += 1;
+    } else if (durationMs < 0) {
+      this.drops.negative += 1;
+    } else {
+      duration = durationMs;
+    }
 
     aggregate.requests += 1;
     if (!ok) aggregate.failures += 1;
@@ -123,17 +164,59 @@ export class RpcTiming {
       maxMs: round(maxMs),
       avgMs: requests > 0 ? round(totalMs / requests) : 0,
       operations,
+      droppedSamples: { ...this.drops },
     };
   }
 }
 
+/**
+ * Bounded capacity gauge for a dead-letter queue.
+ *
+ * Reports only counts (used / max entries and a utilization ratio) and never
+ * message bodies. When the queue is disabled (`maxEntries` of 0 or less, or
+ * not finite), the gauge reports `enabled: false` with zero capacity and a
+ * utilization of 0, so consumers can render "disabled" without dividing by zero.
+ */
+export interface DeadLetterCapacityGauge {
+  enabled: boolean;
+  used: number;
+  max: number;
+  utilization: number;
+}
+
+export function deadLetterCapacityGauge(
+  used: number,
+  maxEntries: number,
+): DeadLetterCapacityGauge {
+  const enabled = Number.isFinite(maxEntries) && maxEntries > 0;
+  if (!enabled) {
+    return { enabled: false, used: 0, max: 0, utilization: 0 };
+  }
+  const max = Math.floor(maxEntries);
+  const safeUsed = Number.isFinite(used) && used > 0 ? Math.min(Math.floor(used), max) : 0;
+  return {
+    enabled: true,
+    used: safeUsed,
+    max,
+    utilization: round(safeUsed / max),
+  };
+}
+
 /** One-line, secret-free timing string for logs and the scan summary. */
 export function formatRpcTiming(summary: RpcTimingSummary): string {
-  const { requests, failures, totalMs, avgMs, maxMs, operations } = summary;
+  const { requests, failures, totalMs, avgMs, maxMs, operations, droppedSamples } = summary;
+  // Drop counters are appended only when a sample was actually dropped, so the
+  // common line stays unchanged and operators still see any clamping.
+  const drops = droppedSamples ?? { non_finite: 0, negative: 0 };
+  const dropSuffix =
+    drops.non_finite > 0 || drops.negative > 0
+      ? ` dropped_non_finite=${drops.non_finite} dropped_negative=${drops.negative}`
+      : "";
   return (
     `rpc requests=${requests} failures=${failures} total=${totalMs}ms ` +
     `avg=${avgMs}ms max=${maxMs}ms ` +
-    `health=${operations.health.requests} events=${operations.events.requests}`
+    `health=${operations.health.requests} events=${operations.events.requests}` +
+    dropSuffix
   );
 }
 
@@ -690,4 +773,53 @@ export function formatServiceLevelWindow(report: ServiceLevelWindowReport): stri
     `delivery_success=${succ} attempts=${report.delivery.attempts} ` +
     `avg_lag=${avgLag} max_lag=${maxLag} gaps=${report.dataGap.totalGaps}`
   );
+}
+
+/**
+ * Render an {@link RpcTimingSummary} as Prometheus text exposition lines with
+ * validated label keys and escaped label values (rejecting control-character
+ * injection before exposition).
+ */
+export function renderRpcTimingMetrics(
+  summary: RpcTimingSummary,
+  extraLabels: Readonly<Record<string, string>> = {},
+): string {
+  for (const key of Object.keys(extraLabels)) {
+    validateMetricLabelKey(key);
+    if (key === "operation") {
+      throw new MetricLabelError(
+        "INVALID_LABEL_KEY",
+        'extraLabels must not override reserved RPC metric label "operation"',
+      );
+    }
+  }
+
+  const lines: string[] = [
+    `# HELP mimir_stellar_rpc_operation_requests_total Total Soroban RPC calls by operation`,
+    `# TYPE mimir_stellar_rpc_operation_requests_total counter`,
+  ];
+  for (const op of RPC_OPERATIONS) {
+    const labels = formatMetricLabels({ ...extraLabels, operation: op });
+    lines.push(`mimir_stellar_rpc_operation_requests_total${labels} ${summary.operations[op].requests}`);
+  }
+
+  lines.push(
+    `# HELP mimir_stellar_rpc_operation_failures_total Total failed Soroban RPC calls by operation`,
+    `# TYPE mimir_stellar_rpc_operation_failures_total counter`,
+  );
+  for (const op of RPC_OPERATIONS) {
+    const labels = formatMetricLabels({ ...extraLabels, operation: op });
+    lines.push(`mimir_stellar_rpc_operation_failures_total${labels} ${summary.operations[op].failures}`);
+  }
+
+  lines.push(
+    `# HELP mimir_stellar_rpc_operation_duration_ms_total Cumulative Soroban RPC call duration in ms by operation`,
+    `# TYPE mimir_stellar_rpc_operation_duration_ms_total counter`,
+  );
+  for (const op of RPC_OPERATIONS) {
+    const labels = formatMetricLabels({ ...extraLabels, operation: op });
+    lines.push(`mimir_stellar_rpc_operation_duration_ms_total${labels} ${summary.operations[op].totalMs}`);
+  }
+
+  return `${lines.join("\n")}\n`;
 }

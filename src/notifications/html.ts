@@ -9,7 +9,6 @@
  * Every interpolated dynamic value goes through escapeHtml or escapeHtmlAttr.
  */
 
-import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
   shortAddress,
@@ -24,11 +23,13 @@ import {
   clipUtf16,
   eventExplorerUrl,
   eventAllowedByCategory,
+  eventTxHash,
   safeErrorMessage,
   isolateAmount,
   TELEGRAM_MAX_MESSAGE_LENGTH,
   utf16Length,
 } from "./format.js";
+import { safeLinkUrl } from "./link-safety.js";
 import type { StellarConfig } from "../config.js";
 
 /**
@@ -69,11 +70,26 @@ function whoHtml(address: string): string {
   return `<code>${escapeHtml(shortAddress(address))}</code>`;
 }
 
+/**
+ * Render `label` as an `<a>` link when `url` passes the shared link policy
+ * (`link-safety.ts`), otherwise as inert escaped text with no `href`.
+ */
+export function linkHtml(label: string, url: string | null | undefined): string {
+  const safe = safeLinkUrl(url);
+  if (!safe) return escapeHtml(label);
+  return `<a href="${escapeHtmlAttr(safe)}">${escapeHtml(label)}</a>`;
+}
+
+function txLinkHtml(config: StellarConfig, event: DecodedEvent): string | null {
+  const url = eventExplorerUrl(config, event);
+  if (url) return linkHtml("tx", url);
+  return eventTxHash(event) !== null ? escapeHtml("tx") : null;
+}
+
 function footerHtml(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeHtml(`ledger ${event.ledger}`);
-  const url = eventExplorerUrl(config, event);
-  if (!url) return `<i>${ledger}</i>`;
-  return `<i>${ledger}</i> · <a href="${escapeHtmlAttr(url)}">tx</a>`;
+  const tx = txLinkHtml(config, event);
+  return tx ? `<i>${ledger}</i> · ${tx}` : `<i>${ledger}</i>`;
 }
 
 /**
@@ -197,9 +213,9 @@ export function formatFallbackEventHtml(
   const contract = escapeHtml(shortAddress(event.contractId ?? "unknown"));
   const ledger = escapeHtml(String(event.ledger ?? "unknown"));
   const safeReason = escapeHtml(safeErrorMessage(reason));
-  const txPart = event.txHash
-    ? ` · <a href="${escapeHtmlAttr(txExplorerUrl(config, event.txHash))}">tx</a>`
-    : "";
+  // Never an `<a href="">`: an unusable hash or unsafe origin renders inert text.
+  const tx = event.txHash ? (txLinkHtml(config, event) ?? escapeHtml("tx")) : null;
+  const txPart = tx ? ` · ${tx}` : "";
   const message =
     `⚠️ <b>Event Notification Fallback</b> (${source})\n` +
     `Contract: <code>${contract}</code> · Ledger: ${ledger}${txPart}\n` +

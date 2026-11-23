@@ -71,7 +71,8 @@ Emitted by the poller loop during event ingestion, cursor management, cycle exec
 
 | Field | Type | Description |
 |---|---|---|
-| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"persistent_volume_unwritable"`. |
+| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_permission_denied"`, `"cursor_read_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"persistent_volume_unwritable"`. |
+| `diagnosticCode` | `string` | Stable cursor diagnostic code (`"CURSOR_NOT_FOUND"`, `"CURSOR_PERMISSION_DENIED"`, `"CURSOR_IO_ERROR"`, `"CURSOR_CORRUPT_JSON"`). |
 | `marketContractId` | `string` | Mimir market contract address watched. |
 | `squadContractId` | `string` | Mimir squad contract address watched. |
 | `pollIntervalMs` | `number` | Polling interval in milliseconds. |
@@ -121,14 +122,21 @@ To protect log aggregators and prevent denial-of-service via massive RPC payload
 - **Fail-safe fallback**: If serializing `fields` throws unexpectedly (e.g., via a throwing property getter), the logger retains the original event level and emits the sanitized `msg` string so polling and the process never terminate on logging.
 
 ### Redaction Rules
-Every log record is redacted before it leaves the process via the shared redaction policy in `src/redact.ts`:
-1. **Registered Secrets**: Explicit secrets such as `config.botToken` and `config.chatId` are replaced with `[REDACTED]`.
-2. **Credential Patterns**: Telegram bot tokens (`bot<digits>:<token>` and `<digits>:<token>`), Stellar `S…` seed strkeys, URL userinfo and credential-bearing query parameters, `Bearer …` headers, and `TOKEN=`/`SECRET=`/`PASSWORD=`/`AUTHORIZATION:` key-value pairs are automatically replaced with `[REDACTED]`.
-3. **URL Redaction**: Internal helpers (`redactUrl`) mask HTTP basic auth or query credentials in URLs before logging.
+Every log record is redacted before it leaves the process:
+1. **Registered Secrets**: Explicit secrets such as `config.botToken` and `config.chatId` (including URL percent-encoded variants) are replaced with `[REDACTED]`.
+2. **Telegram Token & Stellar Seed Patterns**: Any substring matching Telegram bot token shape (`(?:bot)?\d{5,}:[A-Za-z0-9_-]{20,}`) or Stellar secret seed strkey (`S` + 55 base32 chars) is automatically replaced with `[REDACTED]`, even if not explicitly registered.
+3. **Consistent URL Component Redaction**: URL redaction (`redactUrl`, `redactInlineUrls`, `redactText`, `redactLine`, and `Logger`) inspects every URL component consistently—masking userinfo (`user:pass@`, `token@`, `:pass@`), secret-shaped path segments, repeated or array-style credential query parameters (`?token=…&token=…`, `?token[]=…`), secret-shaped values under arbitrary query keys, and all non-empty URL `#fragment`s—while preserving safe host, port, route path, public chain strkey (`G…`/`C…`), 64-hex transaction hash, and diagnostic query parameters (`limit=10`, cursors).
 4. **All Fields Protected**: Redaction applies recursively to both the log `msg` and all string values in custom `fields`.
+5. **Terminal Escape Neutralization**: ANSI/CSI, OSC (including hyperlinks and title-spoofing payloads), DCS/APC control strings, and other C0/C1 control sequences (except `\t` and `\n`) are stripped via `stripTerminalEscapes` before emitting human-readable `text` logs, structured `json` fields, or captured `/export` log lines, while preserving ordinary Unicode content.
 
 ### Redaction Policy Self-Check (`npm run doctor`)
 `npm run doctor` runs a `redaction-policy` self-check that passes synthetic secret probes (registered secret, Telegram bot token, Stellar seed strkey, URL userinfo/query credentials, Bearer token, and env key-value secret) through all configured log formats (`text`, `json`). If any probe leaks, the check fails and reports only the leaked field names—never the probe values or raw log lines.
+
+### Callback Error Logging
+Callback query handlers (`src/callbacks.ts`, `src/commands/broadcast.ts`, `src/commands/runtime.ts`, and `bot.catch` in `src/bot.ts`) never serialize full Telegram updates or arbitrary thrown objects:
+- **Stable IDs only**: Logs include only bounded correlation IDs (`update_id`, `callback_query_id`, `action`, and `broadcast_id` when applicable).
+- **Redacted error categories**: Errors are mapped to bounded categories (for example `timeout`, `telegram_api_400:editMessageText`, `telegram_query_expired`, `code:ECONNREFUSED`, `unstructured_update_error`, `runtime_error`) rather than dumping `JSON.stringify(err)` or raw update payloads.
+- **Hostile update bounds**: Deeply nested, circular, or throwing-getter update payloads are never traversed; formatted callback error lines are redacted and hard-capped at 240 characters (`MAX_CALLBACK_ERROR_LOG_LEN`).
 
 ---
 

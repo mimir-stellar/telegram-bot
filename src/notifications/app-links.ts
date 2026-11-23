@@ -21,6 +21,7 @@
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
+import { safeLinkUrl } from "./link-safety.js";
 
 /** Route under the app for each event family. */
 type AppRoute = "claims" | "squads";
@@ -215,5 +216,6 @@ export function appUrlFor(
   base.hash = "";
   const prefix = base.pathname.replace(/\/+$/, "");
   base.pathname = `${prefix}/${target.route}/${encodeURIComponent(target.id)}`;
-  return sanitizeShareLink(base.toString());
+  // Strip private invite parameters first, then apply the shared link policy.
+  return safeLinkUrl(sanitizeShareLink(base.toString()));
 }
