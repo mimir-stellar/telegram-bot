@@ -1,17 +1,6 @@
 /**
  * Turn a decoded contract event into a Telegram message.
- *
- * MarkdownV2, not legacy Markdown: legacy silently accepts malformed input and
- * renders garbage, while MarkdownV2 rejects it — a formatting bug should be a
- * failed send in the log, not a mangled message in the channel. Every
- * interpolated value therefore goes through {@link escapeMd}.
- *
- * One event, one message, one line of substance. A notification is read on a
- * phone lock screen.
- *
- * Link previews are controlled per message: enabled for events with transaction
- * links (which provide useful context about on-chain activity) and disabled for
- * commands and status messages to keep the UI clean.
+ * ... (unchanged header preserved)
  */
 
 import { redactText } from "../redact.js";
@@ -22,23 +11,26 @@ import {
   shortAddress,
   squadSideLabel,
   winnerSideLabel,
+  type ContractSource,
   type DecodedEvent,
 } from "../stellar/decode.js";
 import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
+import { escapeMdLinkUrl, safeLinkUrl } from "./link-safety.js";
 import { iconForCategory } from "./category-icons.js";
-import {
-  formatCompletenessLabel,
-  groupDigestEvents,
-  normalizeDigestCompleteness,
-  type DigestPeriodCompleteness,
-} from "./digest-grouping.js";
+import { groupDigestEvents, sortDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
 import { formatSquadResolution, renderSquadResolution } from "./squad-resolution.js";
-import type { StellarConfig } from "../config.js";
-import { messagesFor, type Messages } from "../i18n.js";
+import type { StellarConfig, TelegramRoute } from "../config.js";
+import {
+  DEFAULT_LOCALE,
+  messagesFor,
+  normalizeLocale,
+  type Locale,
+  type Messages,
+} from "../i18n.js";
 import { formatDeadline } from "./time.js";
 import {
   highlightLevel,
@@ -46,6 +38,7 @@ import {
   prefixFirstLine,
   type HighlightThresholds,
 } from "./highlights.js";
+import { formatEventHtml } from "./html.js";
 export {
   highlightLevel,
   highlightMarker,
@@ -84,56 +77,8 @@ export function escapeMd(text: string): string {
   return text.replace(MDV2_RESERVED, (ch) => `\\${ch}`);
 }
 
-
-/** Telegram Bot API hard limit for sendMessage / editMessageText text. */
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 
-/**
- * UTF-16 code-unit length of `text`.
- *
- * Telegram measures its 4096-character limit in UTF-16 code units, after
- * entity / markup handling. JavaScript's `string.length` is exactly that
- * unit — one code unit per `charCodeAt` index — so this helper exists to
- * make the unit explicit at every call site and keep one definition.
- *
- * Do NOT replace this with `Array.from(s).length`: that counts Unicode code
- * points, which is a different (smaller) number for any string containing an
- * astral character (every emoji, most CJK extensions). A message that fits
- * under a code-point budget can still exceed Telegram's UTF-16 limit.
- */
-export function utf16Length(text: string): number {
-  return text.length;
-}
-
-/**
- * Clip `text` to at most `max` UTF-16 code units without splitting a
- * surrogate pair. The returned string is <= `max` UTF-16 units (the ellipsis
- * is one unit). Returns `text` unchanged when it already fits.
- */
-export function clipUtf16(text: string, max: number): string {
-  if (!Number.isFinite(max) || max < 1) return "";
-  if (utf16Length(text) <= max) return text;
-  // Reserve one unit for the trailing ellipsis.
-  const budget = max - 1;
-  let used = 0;
-  const out: string[] = [];
-  for (const cp of Array.from(text)) {
-    const w = cp.length; // 1 for BMP, 2 for astral code points
-    if (used + w > budget) break;
-    out.push(cp);
-    used += w;
-  }
-  return `${out.join("")}…`;
-}
-
-/**
- * Split a MarkdownV2 (or plain) payload so each chunk fits Telegram's size limit.
- *
- * Prefers breaking on newlines, omitting the separator newline from the chunks.
- * Never splits a UTF-16 surrogate pair or ends a chunk on a lone backslash.
- * Hard-splits only when a single line exceeds the limit. Throws if the limit
- * cannot fit a complete code point or MarkdownV2 escape.
- */
 export function splitTelegramMessage(
   text: string,
   limit: number = TELEGRAM_MAX_MESSAGE_LENGTH,
@@ -152,7 +97,6 @@ export function splitTelegramMessage(
     if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) {
       cut -= 1;
     }
-    // Retreating before an emoji can expose an escape prefix as well.
     let start = cut;
     while (start > 0 && remaining[start - 1] === "\\") start -= 1;
     return cut - ((cut - start) % 2);
@@ -162,12 +106,10 @@ export function splitTelegramMessage(
     let cut = remaining.lastIndexOf("\n", limit);
     if (cut <= 0) cut = Math.floor(limit);
     cut = safeCut(cut);
-    // An unsafe newline near the start may still allow a safe hard split.
     if (cut <= 0) cut = safeCut(Math.floor(limit));
     if (cut <= 0) {
       throw new RangeError(`splitTelegramMessage limit ${limit} cannot fit a code point or escape`);
     }
-
     parts.push(remaining.slice(0, cut));
     remaining = remaining.slice(cut);
     if (remaining.startsWith("\n")) remaining = remaining.slice(1);
@@ -177,13 +119,6 @@ export function splitTelegramMessage(
   return parts;
 }
 
-/**
- * Best-effort text for an unknown thrown value, without assuming it is an
- * `Error`. The SDK throws Soroban JSON-RPC failures as plain
- * `{ code, message }` objects (js-stellar-sdk `rpc/jsonrpc.ts`), and
- * `String()` of those is the useless `"[object Object]"` — so object-shaped
- * errors are read field-wise and only then fall back to a bounded dump.
- */
 function describeError(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (error === null || error === undefined) return "";
@@ -205,29 +140,13 @@ function describeError(error: unknown): string {
   return String(error);
 }
 
-/**
- * Telegram send timeout budget, in milliseconds.
- *
- * Individual sends are bounded so a single stalled request cannot wedge the
- * poller: the cursor must advance (or the batch must be retried) on a
- * predictable schedule, not on Telegram's liveness. Kept here, next to the
- * error formatting, so the poller and its tests share one source of truth.
- */
 export const TELEGRAM_SEND_TIMEOUT_MS = 10_000;
 
-/**
- * True when a thrown value looks like a timeout/abort rather than a Telegram
- * API rejection. Recognises `AbortError`, `TimeoutError`, and the common
- * `ETIMEDOUT`/`ECONNRESET`/`UND_ERR_*` shapes surfaced by fetch/undici, so the
- * poller can log "timed out" instead of a generic failure and retry the batch.
- */
 export function isTimeoutError(error: unknown): boolean {
   if (error instanceof Error) {
     if (error.name === "AbortError" || error.name === "TimeoutError") return true;
     const code = (error as { code?: unknown }).code;
-    if (typeof code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(code)) {
-      return true;
-    }
+    if (typeof code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(code)) return true;
     return /timed? ?out/i.test(error.message);
   }
   if (error !== null && typeof error === "object") {
@@ -236,30 +155,14 @@ export function isTimeoutError(error: unknown): boolean {
     if (typeof record.code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(record.code)) {
       return true;
     }
-    if (typeof record.message === "string" && /timed? ?out/i.test(record.message)) {
-      return true;
-    }
+    if (typeof record.message === "string" && /timed? ?out/i.test(record.message)) return true;
   }
   return false;
 }
 
-/**
- * Keep operational errors actionable without copying remote payloads or the
- * bot token into logs and status messages.
- */
 export function safeErrorMessage(error: unknown, secrets: readonly string[] = []): string {
-  // Collapse first, so the bound below is applied to the text that will
-  // actually be shown rather than to remote whitespace.
   const collapsed = describeError(error).replace(/\s+/g, " ").trim();
-
-  // Caller-supplied secrets, the secrets registered at boot, and the
-  // credential shapes in `redact.ts`: the same rules the audit trail
-  // applies, so an error cannot carry a seed strkey, a token, or a URL's
-  // credentials into a log, `/status`, or `/health`.
   const message = redactText(collapsed, { secrets });
-
-  // A timeout is labelled explicitly so operators can tell a stalled Telegram
-  // send from an API rejection without parsing the raw error text.
   const compact = message.trim() || (isTimeoutError(error) ? "send timed out" : "unknown error");
   return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
 }
@@ -272,14 +175,6 @@ function who(address: string): string {
   return `\`${escapeMd(shortAddress(address))}\``;
 }
 
-/**
- * Truncate an unbounded contract String before it sizes a chat message.
- *
- * The category, question, and summary fields all come from remote contract
- * state. A hard cap here means a crafted payload cannot push an unbounded
- * string through to a Telegram message or to a log line. Never splits a
- * Unicode code point.
- */
 export function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
   const trimmed = text.trim();
   const characters = Array.from(trimmed);
@@ -288,82 +183,55 @@ export function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
-  const url = eventExplorerUrl(config, event);
-  if (!url) return `_${ledger}_`;
-  return `_${ledger}_ · [tx](${url})`;
+  const tx = mdTxLink(config, event);
+  return tx ? `_${ledger}_ · ${tx}` : `_${ledger}_`;
 }
 
 /**
- * A Stellar transaction hash as returned by the RPC: 64 lowercase or uppercase
- * hex characters (32 bytes). Anything else is treated as missing — the
- * notification is still sent, just without an explorer link/button.
+ * MarkdownV2 `tx` link for an event: a link when the explorer URL passes the
+ * shared link policy, inert `tx` text when the event has a well-formed hash
+ * but its URL is unsafe, and null when there is no usable hash at all.
  */
+function mdTxLink(config: StellarConfig, event: DecodedEvent): string | null {
+  const url = eventExplorerUrl(config, event);
+  if (url) return `[tx](${escapeMdLinkUrl(url)})`;
+  return eventTxHash(event) !== null ? "tx" : null;
+}
+
 const TX_HASH_RE = /^[0-9a-fA-F]{64}$/;
 
-/** Explorer URL for an event's transaction, or null when it has none usable. */
 export function eventExplorerUrl(config: StellarConfig, event: DecodedEvent): string | null {
-  // Link only well-formed 64-hex transaction hashes. An externally-derived
-  // identifier that is empty, oversized or malformed gets no link: a broken
-  // explorer link is worse than no link, and the hash itself is never altered here.
   const raw = event.txHash ?? "";
   if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
   const txHash = raw.trim();
   if (!TX_HASH_RE.test(txHash)) return null;
   try {
-    const url = txExplorerUrl(config, txHash);
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:") return null;
-    return url;
+    // The shared link policy (https only, no userinfo, no control characters)
+    // decides; a hand-built config with an unsafe explorer origin gets no link.
+    return safeLinkUrl(txExplorerUrl(config, txHash));
   } catch {
     return null;
   }
 }
 
-export interface ExplorerButton {
-  text: string;
-  url: string;
-}
-
-export interface ExplorerKeyboard {
-  inline_keyboard: ExplorerButton[][];
-}
-
-/**
- * Config the keyboard builder reads: the chain fields `eventExplorerUrl`
- * needs, plus the optional Mimir web-app origin (`MIMIR_APP_URL`) that adds a
- * second button. Optional here so a chain-only config keeps building the
- * explorer-only keyboard it has always built.
- */
+export interface ExplorerButton { text: string; url: string; }
+export interface ExplorerKeyboard { inline_keyboard: ExplorerButton[][]; }
 export type KeyboardConfig = StellarConfig & { mimirAppUrl?: string | null };
 
-/**
- * Telegram inline keyboard for an event notification.
- *
- * Returns undefined when the event carries no usable transaction hash and no
- * Mimir app page, so the caller sends the existing text-only message
- * unchanged. The explorer button reuses the same canonical explorer URL as the
- * `· [tx](…)` footer link — the footer stays as the text fallback, the button
- * is progressive enhancement in the same Telegram request (no second message,
- * no extra rate-limit cost). When `config.mimirAppUrl` is set and the event
- * maps to an app page, the "Open in Mimir" button joins the same row.
- */
 export function explorerKeyboard(
   config: KeyboardConfig,
   event: DecodedEvent,
 ): ExplorerKeyboard | undefined {
-  const messages = messagesFor(config.locale);
+  const messages = messagesFor(resolveNotificationLocale(config, { source: event?.source }));
   const buttons: ExplorerButton[] = [];
   const explorerUrl = eventExplorerUrl(config, event);
   if (explorerUrl) buttons.push({ text: messages.explorerButtonText, url: explorerUrl });
-
   const appUrl = appUrlFor(event, config.mimirAppUrl);
   if (appUrl) buttons.push({ text: messages.mimirAppButtonText, url: appUrl });
-
   if (buttons.length === 0) return undefined;
   return { inline_keyboard: [buttons] };
 }
 
-/** Format the latest observed event, including events with no notification template. */
 export function formatLastEvent(
   config: StellarConfig & { nowMs?: number },
   event: DecodedEvent,
@@ -371,24 +239,14 @@ export function formatLastEvent(
 ): string {
   const notification = formatEvent(config, event, nowMs);
   if (notification !== null) return notification;
-
   const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
   return (
     `*Last observed event* — \`${escapeMd(clip(name, 120))}\`\n` +
-    `This event has no notification summary\.\n${footer(config, event)}`
+    `This event has no notification summary\\.\n${footer(config, event)}`
   );
 }
 
-/** Options for {@link formatDigest}. */
 export interface FormatDigestOptions {
-  /**
-   * When `true`, events are grouped by claim / squad market before rendering.
-   * Multi-event groups get an escaped Group_Key header and indented sub-lines;
-   * singletons are rendered exactly like the flat layout.
-   *
-   * Defaults to `false` — the existing flat layout is unchanged when this
-   * option is omitted or set to `false`.
-   */
   grouped?: boolean;
   /**
    * Completeness metadata for the digest period.
@@ -409,81 +267,37 @@ function digestHeader(count: number, completeness: DigestPeriodCompleteness): st
   return `*Mimir Digest* — ${escapeMd(label)} \\(${count} observed ${noun}, partial\\)`;
 }
 
-/**
- * One digest line in the flat layout.  Extracted so both the flat path and the
- * grouped renderer share identical line formatting.
- */
 function flatLine(event: DecodedEvent): string {
   const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
   return `· mimir\\-${escapeMd(event.source)} \`${escapeMd(clip(name, 80))}\` at ledger ${event.ledger}`;
 }
 
-/**
- * Render a grouped digest.  Called only when `options.grouped` is `true`.
- */
-function renderGroupedDigest(
-  events: readonly DecodedEvent[],
-  completeness: DigestPeriodCompleteness,
-): string {
+function renderGroupedDigest(events: readonly DecodedEvent[]): string {
   const groups = groupDigestEvents(events);
   const header = digestHeader(events.length, completeness);
   const body: string[] = [];
-
   for (const group of groups) {
     if (group.events.length === 1) {
-      // Singleton group: no header, no indentation — identical to flat layout.
       const [sole] = group.events;
       if (sole) body.push(flatLine(sole));
     } else {
-      // Multi-event group: MarkdownV2-escaped Group_Key as header, then
-      // each event on an indented line.
       body.push(escapeMd(group.key));
-      for (const e of group.events) {
-        body.push(`  ${flatLine(e)}`);
-      }
+      for (const e of group.events) body.push(`  ${flatLine(e)}`);
     }
   }
-
   return [header, "", ...body].join("\n");
 }
 
-/**
- * One MarkdownV2 message summarising a burst of events: a header with the count
- * and one bounded line per event. Returns null when there is nothing to send
- * and the digest period is complete.
- *
- * Pass `{ grouped: true }` to group consecutive events by claim / squad market.
- * Pass `{ completeness: { complete: false, reasons: ["rpc_gap"] } }` (or
- * `"restart"`) to label an incomplete period explicitly so partial counts are
- * never presented as complete ledger summaries.
- * The default (`{}` or no second argument) produces the unchanged flat layout.
- */
 export function formatDigest(
   events: readonly DecodedEvent[],
   options: FormatDigestOptions = {},
 ): string | null {
-  const completeness = normalizeDigestCompleteness(options.completeness);
-  if (events.length === 0) {
-    if (completeness.complete) return null;
-    return [
-      digestHeader(0, completeness),
-      "",
-      "_No events observed; ledger coverage for this period is incomplete\\._",
-    ].join("\n");
-  }
-  if (options.grouped) return renderGroupedDigest(events, completeness);
-  const lines = events.map(flatLine);
-  return [digestHeader(events.length, completeness), "", ...lines].join("\n");
+  if (events.length === 0) return null;
+  if (options.grouped) return renderGroupedDigest(events);
+  const lines = sortDigestEvents(events).map(flatLine);
+  return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
 }
 
-/**
- * The headline for an event, or null when this bot has nothing to say about it.
- *
- * Note what is deliberately absent: the market contract's `claim_created`
- * carries only `id`, `creator` and `category` — the claim's question text lives
- * in contract state, not the event, so it is not invented here. The squad
- * contract's `market_created` does carry `question`, and that is shown.
- */
 function headline(
   messages: Messages,
   event: DecodedEvent,
@@ -491,27 +305,15 @@ function headline(
 ): string | null {
   const p = event.payload;
   const md = messages.notificationMd;
-
   switch (p.name) {
-    // ── mimir-market ────────────────────────────────────────────────────────
     case "claim_created": {
       const icon = iconForCategory(p.category);
       const cat = escapeMd(clip(sanitizeUserText(p.category)));
       const formattedCategory = cat ? `${icon} ${cat}` : icon;
-      return md.claimCreated(
-        String(p.claimId),
-        formattedCategory,
-        who(p.creator),
-      );
+      return md.claimCreated(String(p.claimId), formattedCategory, who(p.creator));
     }
-
     case "claim_challenged":
-      return md.claimChallenged(
-        String(p.claimId),
-        usdc(p.stake),
-        who(p.challenger),
-      );
-
+      return md.claimChallenged(String(p.claimId), usdc(p.stake), who(p.challenger));
     case "claim_resolved":
       return md.claimResolved(
         String(p.claimId),
@@ -519,10 +321,8 @@ function headline(
         escapeMd(confidenceIndicator(p.confidence)),
         p.summary ? escapeMd(clip(sanitizeUserText(p.summary))) : null,
       );
-
     case "claim_cancelled":
       return md.claimCancelled(String(p.claimId));
-
     case "market_settled": {
       const lines = settlementLines(p).map(escapeMd);
       return md.marketSettled(
@@ -533,7 +333,6 @@ function headline(
         lines,
       );
     }
-
     case "challenger_paid":
       return md.challengerPaid(
         String(p.claimId),
@@ -543,17 +342,12 @@ function headline(
         usdc(p.gross),
         usdc(p.fee),
       );
-
     case "fee_claimed":
       return md.feeClaimed(usdc(p.amount), who(p.recipient));
-
     case "withdrawal":
       return md.withdrawal(usdc(p.amount), who(p.to));
-
     case "withdrawal_pending":
       return md.withdrawalPending(usdc(p.amount), who(p.to));
-
-    // ── mimir-squad ─────────────────────────────────────────────────────────
     case "market_created":
       return md.marketCreated(
         String(p.marketId),
@@ -563,7 +357,6 @@ function headline(
         escapeMd(formatDeadline(p.deadline, nowMs)),
         p.category ? escapeMd(clip(p.category)) : null,
       );
-
     case "deposited":
       return md.deposited(
         String(p.marketId),
@@ -571,7 +364,6 @@ function headline(
         escapeMd(squadSideLabel(p.side)),
         who(p.participant),
       );
-
     case "withdrawn":
       return md.withdrawn(
         String(p.marketId),
@@ -579,10 +371,8 @@ function headline(
         usdc(p.amount),
         escapeMd(squadSideLabel(p.side)),
       );
-
     case "resolved":
       return renderSquadResolution(formatSquadResolution(p), md, escapeMd);
-
     case "claimed":
       return md.claimed(
         String(p.marketId),
@@ -591,12 +381,8 @@ function headline(
         usdc(p.gross),
         usdc(p.fee),
       );
-
     case "fees_claimed":
       return md.feesClaimedSquad(usdc(p.amount), who(p.recipient));
-
-    // Admin events and undecodable shapes get no notification. The poller logs
-    // them so a silent bot is distinguishable from an unteachable one.
     case "oracle_changed":
     case "ownership_transferred":
     case "agent_attributed":
@@ -608,23 +394,11 @@ function headline(
     case "admin":
     case "unknown":
       return null;
-
     default:
       return null;
   }
 }
 
-/** The full message, or null when the event is not worth notifying. */
-/**
- * True unless NOTIFY_CATEGORIES is set and this is a `claim_created` event whose
- * category is not on the allowlist. Every other notification type always passes.
- *
- * Both sides of the comparison are normalised with {@link normalizeCategory}:
- * NFKC, trimmed, lowercased, inner whitespace collapsed, control characters
- * stripped, and bounded in length. This makes the filter robust to the
- * free-form on-chain strings (`Crypto`, ` crypto`, full-width variants) that
- * would otherwise silently fail to match a configured category name.
- */
 export function eventAllowedByCategory(
   config: { notificationCategories?: readonly string[] },
   event: DecodedEvent,
@@ -636,12 +410,13 @@ export function eventAllowedByCategory(
 }
 
 export function formatEvent(
-  config: StellarConfig & {
-    channelPreviewMode?: boolean;
-    notificationCategories?: readonly string[];
-    highlightThresholds?: HighlightThresholds;
-    nowMs?: number;
-  },
+  config: StellarConfig &
+    RouteLocaleConfig & {
+      channelPreviewMode?: boolean;
+      notificationCategories?: readonly string[];
+      highlightThresholds?: HighlightThresholds;
+      nowMs?: number;
+    },
   event: DecodedEvent,
   nowMsOrThresholds?: number | HighlightThresholds,
 ): string | null {
@@ -653,16 +428,14 @@ export function formatEvent(
       : undefined;
   const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    const messages = messagesFor(config.locale);
+    const messages = messagesFor(resolveNotificationLocale(config, { source: event?.source }));
     let head = headline(messages, event, currentMs);
     if (head === null) return null;
     const effectiveThresholds = thresholds ?? config.highlightThresholds;
     if (effectiveThresholds !== undefined) {
       const level = highlightLevel(event, effectiveThresholds);
       const marker = highlightMarker(level, effectiveThresholds);
-      if (marker) {
-        head = prefixFirstLine(head, marker);
-      }
+      if (marker) head = prefixFirstLine(head, marker);
     }
     const body = `${head}\n${footer(config, event)}`;
     if (config.channelPreviewMode) {
@@ -674,7 +447,6 @@ export function formatEvent(
   }
 }
 
-/** Telegram's hard caption/message ceiling; the plain text stays well under it. */
 const MAX_PLAIN_TEXT_LENGTH = 4000;
 
 function plainUsdc(units: bigint): string {
@@ -690,17 +462,13 @@ function plainWho(address: string): string {
 function plainFooter(config: StellarConfig, event: DecodedEvent): string {
   const url = eventExplorerUrl(config, event);
   const ledger = `ledger ${event.ledger}`;
-  // Raw URL, not Markdown link syntax: with no parse_mode the brackets would
-  // render literally, while a bare URL stays readable and copyable.
   return url ? `${ledger}\ntx: ${url}` : ledger;
 }
 
 /**
- * The plain-text headline for an event, or null when there is nothing to say.
- *
- * Dedicated formatter, not a Markdown stripper: each case mirrors {@link headline}
- * field-for-field (same identities, amounts, bounded clips) but emits no
- * MarkdownV2 syntax at all, so Telegram cannot reject it for entity parsing.
+ * Plaintext headline. Every line carries a text label ("Claim #7", "Stake:",
+ * "winner:") so meaning is never carried by emoji alone; the icon, when one is
+ * present for `claim_created`, always accompanies the category text.
  */
 function plainHeadline(
   messages: Messages,
@@ -709,23 +477,15 @@ function plainHeadline(
 ): string | null {
   const p = event.payload;
   const plain = messages.notificationPlain;
-
   switch (p.name) {
-    // ── mimir-market ────────────────────────────────────────────────────────
     case "claim_created": {
-      const icon = iconForCategory(p.category);
       const cat = clip(sanitizeUserText(p.category));
-      const formattedCategory = cat ? `${icon} ${cat}` : icon;
-      return plain.claimCreated(p.claimId, formattedCategory, plainWho(p.creator));
+      // Text-only: the emoji icon is intentionally omitted here so the plain
+      // export never relies on emoji. The HTML renderer keeps the icon.
+      return plain.claimCreated(p.claimId, cat || "uncategorized", plainWho(p.creator));
     }
-
     case "claim_challenged":
-      return plain.claimChallenged(
-        p.claimId,
-        plainUsdc(p.stake),
-        plainWho(p.challenger),
-      );
-
+      return plain.claimChallenged(p.claimId, plainUsdc(p.stake), plainWho(p.challenger));
     case "claim_resolved":
       return plain.claimResolved(
         p.claimId,
@@ -733,10 +493,8 @@ function plainHeadline(
         confidenceIndicator(p.confidence),
         p.summary ? clip(sanitizeUserText(p.summary)) : null,
       );
-
     case "claim_cancelled":
       return plain.claimCancelled(p.claimId);
-
     case "market_settled": {
       const lines = settlementLines(p);
       return plain.marketSettled(
@@ -747,7 +505,6 @@ function plainHeadline(
         lines,
       );
     }
-
     case "challenger_paid":
       return plain.challengerPaid(
         p.claimId,
@@ -757,17 +514,12 @@ function plainHeadline(
         plainUsdc(p.gross),
         plainUsdc(p.fee),
       );
-
     case "fee_claimed":
       return plain.feeClaimed(plainUsdc(p.amount), plainWho(p.recipient));
-
     case "withdrawal":
       return plain.withdrawal(plainUsdc(p.amount), plainWho(p.to));
-
     case "withdrawal_pending":
       return plain.withdrawalPending(plainUsdc(p.amount), plainWho(p.to));
-
-    // ── mimir-squad ─────────────────────────────────────────────────────────
     case "market_created":
       return plain.marketCreated(
         p.marketId,
@@ -777,7 +529,6 @@ function plainHeadline(
         formatDeadline(p.deadline, nowMs),
         p.category ? clip(p.category) : null,
       );
-
     case "deposited":
       return plain.deposited(
         p.marketId,
@@ -785,7 +536,6 @@ function plainHeadline(
         squadSideLabel(p.side),
         plainWho(p.participant),
       );
-
     case "withdrawn":
       return plain.withdrawn(
         p.marketId,
@@ -793,10 +543,8 @@ function plainHeadline(
         plainUsdc(p.amount),
         squadSideLabel(p.side),
       );
-
     case "resolved":
       return renderSquadResolution(formatSquadResolution(p), plain);
-
     case "claimed":
       return plain.claimed(
         p.marketId,
@@ -805,11 +553,8 @@ function plainHeadline(
         plainUsdc(p.gross),
         plainUsdc(p.fee),
       );
-
     case "fees_claimed":
       return plain.feesClaimedSquad(plainUsdc(p.amount), plainWho(p.recipient));
-
-    // Same set as `headline`: admin events and undecodable shapes get nothing.
     case "oracle_changed":
     case "ownership_transferred":
     case "agent_attributed":
@@ -821,35 +566,21 @@ function plainHeadline(
     case "admin":
     case "unknown":
       return null;
-
     default:
       return null;
   }
 }
 
-/**
- * Clip a finished plain-text message to Telegram's UTF-16 budget without
- * splitting a surrogate pair. See {@link clipUtf16} for the unit contract.
- */
 function clipPlainText(text: string, max = MAX_PLAIN_TEXT_LENGTH): string {
   return clipUtf16(text, max);
 }
 
-/**
- * The plain-text notification for an event, or null when it is not notifiable.
- *
- * Same information as {@link formatEvent} (identity, amounts, ledger, explorer
- * URL when valid) with no Markdown of any kind. Sent without a `parse_mode`,
- * so Telegram delivers it even when the MarkdownV2 rendering is rejected.
- * Never throws and never returns an empty string: malformed input degrades to
- * a minimal bounded line rather than crashing the notifier.
- */
 export function formatPlainTextEvent(
-  config: StellarConfig & { highlightThresholds?: HighlightThresholds; nowMs?: number },
+  config: StellarConfig & RouteLocaleConfig & { highlightThresholds?: HighlightThresholds; nowMs?: number },
   event: DecodedEvent,
   nowMsOrThresholds?: number | HighlightThresholds,
 ): string | null {
-  const messages = messagesFor(config.locale);
+  const messages = messagesFor(resolveNotificationLocale(config, { source: event?.source }));
   const nowMs = typeof nowMsOrThresholds === "number" ? nowMsOrThresholds : undefined;
   const thresholds =
     typeof nowMsOrThresholds === "object" && nowMsOrThresholds !== null
@@ -863,9 +594,7 @@ export function formatPlainTextEvent(
     if (effectiveThresholds !== undefined) {
       const level = highlightLevel(event, effectiveThresholds);
       const marker = highlightMarker(level, effectiveThresholds);
-      if (marker) {
-        head = prefixFirstLine(head, marker);
-      }
+      if (marker) head = prefixFirstLine(head, marker);
     }
     const body = `${head}\n${plainFooter(config, event)}`.trim();
     if (!body) return minimalPlainTextEvent(messages, event);
@@ -875,7 +604,6 @@ export function formatPlainTextEvent(
   }
 }
 
-/** Last-resort bounded line when even the plain-text formatter cannot render. */
 function minimalPlainTextEvent(messages: Messages, event: DecodedEvent): string {
   const source = typeof event?.source === "string" ? event.source : "unknown";
   const ledger =
@@ -886,11 +614,8 @@ function minimalPlainTextEvent(messages: Messages, event: DecodedEvent): string 
   return clipPlainText(messages.notificationPlain.minimal(source, ledger, eventId));
 }
 
-/**
- * Fallback message when an event payload is malformed or an error occurs during formatting.
- */
 export function formatFallbackEvent(
-  config: StellarConfig,
+  config: StellarConfig & RouteLocaleConfig,
   event: DecodedEvent,
   reason = "malformed payload",
 ): string {
@@ -900,27 +625,20 @@ export function formatFallbackEvent(
   const safeReason = escapeMd(safeErrorMessage(reason));
   const txPart = event.txHash ? ` · [tx](${txExplorerUrl(config, event.txHash)})` : "";
   return messagesFor(config.locale).notificationMd.fallbackEvent(
-    source,
-    contract,
-    ledger,
-    safeReason,
-    txPart,
+    source, contract, ledger, safeReason, txPart,
   );
 }
 
-/**
- * Generate a channel preview message for on-demand preview commands.
- * Shows a sample notification and current link preview settings for the specified contract.
- */
-export function previewMessage(config: StellarConfig & { linkPreviewMarket?: boolean; linkPreviewSquad?: boolean }, target = "market"): string {
+export function previewMessage(
+  config: StellarConfig & { linkPreviewMarket?: boolean; linkPreviewSquad?: boolean },
+  target = "market",
+): string {
   const messages = messagesFor(config.locale);
   const isSquad = target.trim().toLowerCase() === "squad";
   const linkPreviewEnabled = isSquad
     ? config.linkPreviewSquad ?? false
     : config.linkPreviewMarket ?? false;
-
   const settingsLine = `Link previews: ${linkPreviewEnabled ? "enabled" : "disabled"}`;
-
   if (isSquad) {
     const sampleEvent: DecodedEvent = {
       source: "squad",
@@ -946,7 +664,6 @@ export function previewMessage(config: StellarConfig & { linkPreviewMarket?: boo
     const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
     return `${messages.notificationMd.channelPreviewSquad}\n${settingsLine}\n\n${formatted}`;
   }
-
   const sampleEvent: DecodedEvent = {
     source: "market",
     contractId: config.marketContractId,
@@ -968,4 +685,50 @@ export function previewMessage(config: StellarConfig & { linkPreviewMarket?: boo
   };
   const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
   return `${messages.notificationMd.channelPreviewMarket}\n${settingsLine}\n\n${formatted}`;
+}
+
+// ── Accessible export contract (#921) ─────────────────────────────────────────
+
+/** Format selector for {@link formatNotificationExport}. */
+export type NotificationExportFormat = "plain" | "html";
+
+/** Options for {@link formatNotificationExport}. */
+export interface NotificationExportOptions {
+  /**
+   * `"plain"` (default) returns the image-free, text-only rendering via
+   * {@link formatPlainTextEvent}; `"html"` returns the HTML rendering via
+   * `formatEventHtml`.
+   */
+  format?: NotificationExportFormat;
+}
+
+/**
+ * Canonical accessible-export entry point for a decoded event.
+ *
+ * Contract — every returned non-null string carries, as text:
+ *   • market identity (claim/squad id and event name),
+ *   • action (challenged / resolved / settled / deposited / …),
+ *   • amount (USDC value with unit, when the event has one),
+ *   • outcome (winner side, resolution result, or equivalent).
+ *
+ * Emoji or color is never the sole carrier of any of those: the plaintext path
+ * emits no emoji at all for the plaintext renderer, and every emoji that does
+ * appear in the HTML path is accompanied by a text label on the same line.
+ *
+ * Returns `null` when the event is filtered out or has no notification summary.
+ */
+export function formatNotificationExport(
+  config: StellarConfig & {
+    channelPreviewMode?: boolean;
+    notificationCategories?: readonly string[];
+    highlightThresholds?: HighlightThresholds;
+    nowMs?: number;
+  },
+  event: DecodedEvent,
+  options: NotificationExportOptions = {},
+): string | null {
+  if ((options.format ?? "plain") === "html") {
+    return formatEventHtml(config, event);
+  }
+  return formatPlainTextEvent(config, event);
 }

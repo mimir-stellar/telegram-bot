@@ -1,5 +1,6 @@
 
 
+
 /**
  * Tests for src/stellar/decode.ts
  *
@@ -11,6 +12,7 @@
  *   - Wrong-type fields
  *   - Oversized strings (clip() in formatEvent)
  *   - Unknown event names (no decoder)
+ *   - Malformed known events (decoder exists but payload is invalid)
  *   - Admin events that are decoded into structured audit records
  *   - Both market and squad sources
  *   - Helpers: formatUsdc, shortAddress, winnerSideLabel, squadSideLabel
@@ -19,9 +21,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { nativeToScVal, Address, Keypair } from "@stellar/stellar-sdk";
+import { nativeToScVal, Address, Keypair, xdr } from "@stellar/stellar-sdk";
 import {
   decodeEvent,
+  explainDecodeEvent,
   formatUsdc,
   shortAddress,
   winnerSideLabel,
@@ -185,6 +188,36 @@ test("decodeEvent: unknown event name yields unknown payload with reason=no deco
   assert.equal(result.payload.reason, "no decoder");
 });
 
+test("decodeEvent: unknown and malformed known events are both nonfatal to polling", () => {
+  // Both cases must return a payload (never throw) so the poller can continue.
+  const unknownRaw = {
+    id: "3-3",
+    contractId: "C1",
+    ledger: 3,
+    txHash: "",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("never_registered_event")],
+    value: nativeToScVal({}),
+  };
+  const malformedRaw = {
+    id: "3-4",
+    contractId: "C1",
+    ledger: 3,
+    txHash: "",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_created")],
+    value: nativeToScVal({ category: "crypto" }),
+  };
+  let unknownResult;
+  let malformedResult;
+  assert.doesNotThrow(() => { unknownResult = decodeEvent("market", unknownRaw); });
+  assert.doesNotThrow(() => { malformedResult = decodeEvent("market", malformedRaw); });
+  assert.equal(unknownResult.payload.name, "unknown");
+  assert.equal(malformedResult.payload.name, "unknown");
+  assert.equal(unknownResult.payload.reason, "no decoder");
+  assert.notEqual(malformedResult.payload.reason, "no decoder");
+});
+
 test("decodeEvent: missing required topic produces unknown with a reason", () => {
   // claim_created expects topics[1] = claimId, topics[2] = creator.
   // Providing only the name topic should produce an unknown with a reason.
@@ -200,6 +233,8 @@ test("decodeEvent: missing required topic produces unknown with a reason", () =>
   let result;
   assert.doesNotThrow(() => { result = decodeEvent("market", raw); });
   assert.equal(result.payload.name, "unknown");
+  assert.equal(result.payload.eventName, "claim_created");
+  assert.notEqual(result.payload.reason, "no decoder");
   assert.ok(result.payload.reason, "reason should be populated");
 });
 
@@ -221,6 +256,10 @@ test("decodeEvent: wrong type for required topic produces unknown — never thro
   assert.doesNotThrow(() => { result = decodeEvent("market", raw); });
   // Either a decode error (unknown) or a successful parse — but no throw.
   assert.ok(result.payload.name === "claim_created" || result.payload.name === "unknown");
+  if (result.payload.name === "unknown") {
+    assert.equal(result.payload.eventName, "claim_created");
+    assert.notEqual(result.payload.reason, "no decoder");
+  }
 });
 
 test("decodeEvent: claim_created decodes correctly", () => {
@@ -413,6 +452,8 @@ test("decodeEvent: squad event with negative amount yields unknown without throw
   let result;
   assert.doesNotThrow(() => { result = decodeEvent("squad", raw); });
   assert.equal(result.payload.name, "unknown");
+  assert.equal(result.payload.eventName, "deposited");
+  assert.notEqual(result.payload.reason, "no decoder");
   assert.match(result.payload.reason, /expected non-negative amount/);
 });
 
@@ -485,6 +526,7 @@ test("malformed XDR in admin event returns unknown payload with bounded reason w
   });
   assert.equal(decoded.payload.name, "unknown");
   assert.equal(decoded.payload.eventName, "oracle_changed");
+  assert.notEqual(decoded.payload.reason, "no decoder");
   assert.ok(typeof decoded.payload.reason === "string");
   assert.ok(decoded.payload.reason.length <= 200);
 
@@ -527,6 +569,7 @@ test("decodeEvent: squad unknown event yields unknown/no decoder", () => {
   };
   const result = decodeEvent("squad", raw);
   assert.equal(result.payload.name, "unknown");
+  assert.equal(result.payload.eventName, "future_event_not_yet_defined");
   assert.equal(result.payload.reason, "no decoder");
 });
 
@@ -693,4 +736,134 @@ test("decodeEvent: claim_cancelled has no value fields and still decodes", () =>
   const result = decodeEvent("market", raw);
   assert.equal(result.payload.name, "claim_cancelled");
   assert.equal(result.payload.claimId, 9);
+});
+
+// ── Numeric safety and lossy coercion rejection ──────────────────────────────
+
+test("decodeEvent: rejects unsafe number coercion in stake amounts", () => {
+  // 1e25 is a float where Number.isInteger(1e25) is true, but Number.isSafeInteger(1e25) is false.
+  // Converting it to BigInt causes lossy corruption of low-order bits.
+  const unsafeStakeEntry = new xdr.ScMapEntry({
+    key: xdr.ScVal.scvSymbol("stake"),
+    val: {
+      type: "scvU64",
+      get value() {
+        return 1e25;
+      },
+      switch: () => ({ name: "scvU64" }),
+    },
+  });
+  const raw = {
+    id: "60-0",
+    contractId: "C1",
+    ledger: 60,
+    txHash: "abc",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_challenged"), scU64(1), scAddress(ADDR)],
+    value: {
+      type: "scvMap",
+      value: [unsafeStakeEntry],
+    },
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "unknown");
+  assert.match(result.payload.reason, /expected safe integer number/);
+});
+
+test("decodeEvent: accepts large integers as decimal strings without loss", () => {
+  const largeDecimalStr = "100000000000000000";
+  const raw = {
+    id: "61-0",
+    contractId: "C1",
+    ledger: 61,
+    txHash: "def",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_challenged"), scU64(2), scAddress(ADDR)],
+    value: nativeToScVal({ stake: largeDecimalStr }),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "claim_challenged");
+  assert.equal(result.payload.stake, 100000000000000000n);
+});
+
+test("decodeEvent: rejects lossy float numbers in claim IDs", () => {
+  const unsafeIdVal = {
+    type: "scvU64",
+    get value() {
+      return 1e25;
+    },
+    switch: () => ({ name: "scvU64" }),
+  };
+  const raw = {
+    id: "62-0",
+    contractId: "C1",
+    ledger: 62,
+    txHash: "123",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [
+      scStr("claim_created"),
+      unsafeIdVal,
+      scAddress(ADDR),
+    ],
+    value: nativeToScVal({ category: "crypto" }),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "unknown");
+  assert.match(result.payload.reason, /expected safe integer number/);
+});
+
+test("decodeEvent: rejects claim IDs exceeding safe integer range when passed as large strings", () => {
+  const unsafeStr = "9007199254740993"; // MAX_SAFE_INTEGER + 2
+  const raw = {
+    id: "63-0",
+    contractId: "C1",
+    ledger: 63,
+    txHash: "123",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [
+      scStr("claim_created"),
+      nativeToScVal(unsafeStr),
+      scAddress(ADDR),
+    ],
+    value: nativeToScVal({ category: "crypto" }),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(result.payload.name, "unknown");
+  assert.match(result.payload.reason, /exceeds the safe integer range/);
+});
+
+test("decodeEvent: toLedger and toPosition reject unsafe numbers and lossy strings", () => {
+  // Ledger with unsafe number (1e25) or lossy string exceeding MAX_SAFE_INTEGER
+  const raw1 = {
+    id: "64-0",
+    contractId: "C1",
+    ledger: 1e25,
+    transactionIndex: "9007199254740993",
+    operationIndex: 12.5, // float
+    txHash: "aaa",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_cancelled"), scU64(1)],
+    value: nativeToScVal({}),
+  };
+  const res1 = decodeEvent("market", raw1);
+  assert.equal(res1.ledger, 0);
+  assert.equal(res1.transactionIndex, null);
+  assert.equal(res1.operationIndex, null);
+
+  // Safe string numbers are preserved
+  const raw2 = {
+    id: "64-1",
+    contractId: "C1",
+    ledger: "55555",
+    transactionIndex: "4",
+    operationIndex: 2,
+    txHash: "bbb",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_cancelled"), scU64(2)],
+    value: nativeToScVal({}),
+  };
+  const res2 = decodeEvent("market", raw2);
+  assert.equal(res2.ledger, 55555);
+  assert.equal(res2.transactionIndex, 4);
+  assert.equal(res2.operationIndex, 2);
 });

@@ -152,6 +152,28 @@ During graceful shutdown, the health server transitions readiness to `false` (HT
     "persistentVolumeAvailable": true,
     "persistentVolumeError": null
   },
+  "dependencies": {
+    // Per-dependency readiness: *why* the bot is not ready, separated into the
+    // four dependencies it relies on. Additive; the overall ok/status above are
+    // unchanged. Every reason is counts + public source names only — never a
+    // token, a chat id, or another private destination identifier.
+    "rpc": {
+      "ready": true,                    // Stellar RPC reachability
+      "reason": null                    // value-free reason, or null when ready
+    },
+    "cursor": {
+      "ready": true,                    // cursor / resume-position usability
+      "reason": null
+    },
+    "route": {
+      "ready": true,                    // a destination is configured per contract
+      "reason": null                    // names the source (market/squad), never the chat id
+    },
+    "delivery": {
+      "ready": true,                    // sends are landing (dead-letter queue empty)
+      "reason": null
+    }
+  },
   "config": {
     // Key names and their source (env var name, default, etc.). No values.
     "BOT_TOKEN": { "source": "env" },
@@ -159,6 +181,43 @@ During graceful shutdown, the health server transitions readiness to `false` (HT
     // … one entry per recognised config key
   }
 }
+```
+
+#### Dependency readiness (`dependencies`)
+
+The `dependencies` object separates *why* the bot is not ready into the four
+dependencies it relies on, so a probe or dashboard can name the bottleneck
+rather than only seeing `status: "degraded"`. It is additive detail: the
+overall `ok` / `status` (and HTTP status code) are unchanged.
+
+| Dependency | Ready when | Not-ready reason (value-free) |
+|---|---|---|
+| `rpc` | RPC is reachable and polls are fresh | `circuit breaker open after N consecutive RPC failures`, `consecutive failures (N) exceed budget (M)`, `no successful poll within <healthStaleMs> ms` |
+| `cursor` | Every watched target's cursor is usable | `stale cursor on market`, `stalled cursor on squad`, or both joined by `;` |
+| `route` | A destination is configured for each watched contract | `no destination configured for market, squad` (names the source, never the chat id) |
+| `delivery` | No sends are parked in the dead-letter queue | `N send(s) awaiting replay in the dead-letter queue` |
+
+`rpc` and `cursor` reuse the same signals that drive the `"degraded"` verdict
+and are suppressed during an intentional operator pause or graceful drain
+(consistent with `status` staying `"ok"` for those states). `route` is
+config-derived and independent of poller state. `delivery` follows the
+dead-letter queue depth and is reported whenever the poller is running, since
+a backlog persists across a pause or drain. When the poller is stopped,
+`rpc`, `cursor` and `delivery` report `poller not running`; `route` still
+reflects configuration.
+
+Every reason is built from counts and public source names (`market`/`squad`)
+only. No token, chat id, or other private destination identifier is ever
+included — the route reason names *which* source lacks a destination, never
+*what* that destination is.
+
+```bash
+# Which dependency is the bottleneck when degraded
+curl -s http://127.0.0.1:8787/health | \
+  jq '.dependencies | to_entries[] | select(.value.ready == false)'
+
+# Delivery backlog depth
+curl -s http://127.0.0.1:8787/health | jq '.dependencies.delivery.ready'
 ```
 
 ```bash
@@ -240,6 +299,10 @@ mimir_telegram_consecutive_failures{network="testnet"} 0
 # HELP mimir_telegram_latest_ledger Highest ledger seen by the poller
 # TYPE mimir_telegram_latest_ledger gauge
 mimir_telegram_latest_ledger{network="testnet"} 5123456
+# HELP mimir_telegram_metric_samples_dropped_total Metric samples dropped before exposition, by bounded reason (invalid_number, unknown_label)
+# TYPE mimir_telegram_metric_samples_dropped_total counter
+mimir_telegram_metric_samples_dropped_total{network="testnet",reason="invalid_number"} 0
+mimir_telegram_metric_samples_dropped_total{network="testnet",reason="unknown_label"} 0
 
 # HELP mimir_telegram_target_last_event_ledger Highest ledger in which an event was processed for a target
 # TYPE mimir_telegram_target_last_event_ledger gauge
@@ -250,6 +313,18 @@ mimir_telegram_target_last_event_ledger{network="testnet",source="squad",contrac
 The `mimir_telegram_latest_ledger` and `mimir_telegram_target_last_event_ledger`
 lines are omitted when no ledger has been observed yet (cold start or no
 events seen).
+
+**Label validation and escaping**: All Prometheus label keys and values emitted
+by `src/metrics.ts`, `src/stellar/metrics.ts`, and `src/health.ts` are validated
+before exposition:
+
+- Label keys must match `/^[a-zA-Z_][a-zA-Z0-9_]*$/` and must not start with the
+  reserved `__` prefix; malformed keys throw `MetricLabelError` before any bytes
+  are emitted.
+- Label values escape backslashes (`\` -> `\\`), double quotes (`"` -> `\"`), and
+  line feeds (`\n` -> `\n`) per Prometheus text format v0.0.4, while rejecting
+  disallowed C0/DEL/C1 control characters (`\r`, `\0`, `\t`, ANSI ESC `\x1b`,
+  etc.) with `MetricLabelError` (`CONTROL_CHARACTER_IN_LABEL_VALUE`).
 
 ```bash
 curl -s http://127.0.0.1:8787/metrics
@@ -346,16 +421,23 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
-| `mimir_bot_last_cycle_events` | gauge | Events observed in the most recent complete poll cycle |
-| `mimir_bot_activity_baseline_events` | gauge | Rolling mean events per cycle at the most recent baseline comparison |
-| `mimir_bot_activity_anomalies_total` | counter | Complete cycles classified as a spike or drop against the rolling baseline |
-| `mimir_bot_notification_age_samples_total` | counter | Confirmed notifications with a known ledger close time (includes `0` ms lag) |
-| `mimir_bot_notification_age_missing_ledger_time_total` | counter | Confirmed notifications whose event lacked a valid ledger close time |
-| `mimir_bot_notification_age_ms_total` | counter | Cumulative end-to-end age (ms) from ledger close time to confirmed send |
-| `mimir_bot_last_notification_age_ms` | gauge | End-to-end age (ms) of the most recent confirmed notification with a known ledger time |
-| `mimir_bot_max_notification_age_ms` | gauge | Maximum observed end-to-end notification age (ms) across confirmed sends |
+| `mimir_bot_pending_delivery_queue_age_seconds` | histogram | Age in seconds of pending deliveries in queue, partitioned by stable `destination` class (`channel`, `group`, `dm`, `dead_letter`) with fixed finite buckets (`1`, `5`, `15`, `30`, `60`, `300`, `900`, `3600`, `+Inf`); never uses chat IDs or event IDs as labels |
 
-> **Note:** Missing ledger close times increment `mimir_bot_notification_age_missing_ledger_time_total` without incrementing `mimir_bot_notification_age_samples_total` or overwriting `mimir_bot_last_notification_age_ms`, distinguishing absent chain timestamps from `0` ms delivery lag.
+#### Registration contract
+
+The registry exposes a `register(name, type, help)` method (see
+`MetricsRegistry` in `src/metrics.ts`). It guards against duplicate registration
+corrupting the exposition output:
+
+- **First call** for a name creates and stores the metric.
+- **Identical re-registration** (same `name`, `type`, and `help`) returns the
+  existing live metric unchanged — safe for module-level init code that runs
+  more than once.
+- **Conflicting re-registration** (same `name`, different `type` or `help`)
+  throws `MetricRegistrationError` so a mismatch is caught at construction
+  time rather than producing a `# TYPE`/`# HELP` line that disagrees with the
+  value line. The error exposes `metricName`, `field` (`"type"` | `"help"`),
+  `existing`, and `attempted` for programmatic inspection.
 
 ```bash
 METRICS_PORT=9090  # in .env or environment

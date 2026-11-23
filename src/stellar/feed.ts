@@ -12,6 +12,7 @@
  */
 
 import { formatPlainTextEvent, eventExplorerUrl } from "../notifications/format.js";
+import { appUrlFor } from "../notifications/app-links.js";
 import type { DecodedEvent } from "./decode.js";
 import type { StellarConfig } from "../config.js";
 
@@ -26,11 +27,16 @@ export const FEED_CONTENT_MAX_CHARS = 2_000;
 export const FEED_TITLE_MAX_CHARS = 500;
 
 /**
- * Explicit RFC 3339 timestamp used when an event or feed has no known ledger
- * close time, avoiding assigning process startup / wall-clock time to
- * historical or timeless entries.
+ * Deterministic fallback `<updated>` timestamp (Unix epoch) used when a feed
+ * has no events or no event carries a valid positive `at` timestamp.
  */
-export const UNKNOWN_EVENT_TIMESTAMP = new Date(0).toISOString();
+export const FEED_EPOCH_UPDATED_AT = "1970-01-01T00:00:00.000Z";
+
+/**
+ * Extension XML namespace for Mimir-specific Atom feed metadata such as
+ * `<mimir:generated>` (RFC 4287 §6).
+ */
+export const MIMIR_FEED_NS = "https://mimir.stellar.org/ns/feed";
 
 /**
  * Escape the five XML predefined entities so a string is safe inside any
@@ -60,6 +66,16 @@ export function stripXmlIllegal(text: string): string {
 }
 
 /**
+ * Strip XML-illegal control characters and clip a string to `max` Unicode code
+ * points, appending an ellipsis when truncated.
+ */
+export function cleanFeedText(text: string, max: number): string {
+  const cleaned = stripXmlIllegal(text);
+  const chars = Array.from(cleaned);
+  return chars.length <= max ? cleaned : `${chars.slice(0, max - 1).join("")}…`;
+}
+
+/**
  * Clip and clean a string for use inside an XML element.
  *
  * Pipeline:
@@ -73,9 +89,7 @@ export function stripXmlIllegal(text: string): string {
  * points and no entity reference is left with a dangling `&` or missing `;`.
  */
 export function xmlText(text: string, max: number): string {
-  if (max < 1) return "";
-  const escaped = escapeXml(stripXmlIllegal(text));
-  return clipEscapedXml(escaped, max);
+  return escapeXml(cleanFeedText(text, max));
 }
 
 /**
@@ -159,6 +173,117 @@ export function safeHttpsUrl(url: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Feed filtering
+// ---------------------------------------------------------------------------
+
+/**
+ * Optional per-contract filter for a feed document.
+ *
+ * `contractIds` is a set of emitting contract ids; when present (and
+ * non-empty) only events whose `contractId` is in the set are included.
+ * `eventNames` optionally narrows further to specific event names.
+ *
+ * Filters are normalized via {@link normalizeFeedFilter} before use so that
+ * equivalent filters (ordering, duplicates, whitespace, casing of contract
+ * ids) produce identical cache identities.
+ */
+export interface FeedFilter {
+  /** Emitting contract ids to include. Empty/undefined means "all contracts". */
+  contractIds?: readonly string[];
+  /** Event names to include. Empty/undefined means "all event names". */
+  eventNames?: readonly string[];
+}
+
+/**
+ * Normalized, canonical form of a {@link FeedFilter}.
+ *
+ * - `contractIds` are trimmed, lower-cased (Stellar contract ids are
+ *   case-insensitive strkeys), de-duplicated, and sorted.
+ * - `eventNames` are trimmed, de-duplicated, and sorted.
+ * - Empty arrays are dropped so "no filter" and "empty filter" collapse to the
+ *   same identity.
+ */
+export interface NormalizedFeedFilter {
+  contractIds?: readonly string[];
+  eventNames?: readonly string[];
+}
+
+function normalizeList(values: readonly string[] | undefined, lower: boolean): string[] | undefined {
+  if (!values || values.length === 0) return undefined;
+  const seen = new Set<string>();
+  for (const raw of values) {
+    const trimmed = raw.trim();
+    if (trimmed === "") continue;
+    seen.add(lower ? trimmed.toLowerCase() : trimmed);
+  }
+  if (seen.size === 0) return undefined;
+  return Array.from(seen).sort();
+}
+
+/**
+ * Normalize a {@link FeedFilter} into a canonical form suitable for cache
+ * identity and for filtering events.  Returns `undefined` when the filter is
+ * absent or effectively empty (i.e. matches everything).
+ */
+export function normalizeFeedFilter(
+  filter: FeedFilter | undefined,
+): NormalizedFeedFilter | undefined {
+  if (!filter) return undefined;
+  const contractIds = normalizeList(filter.contractIds, true);
+  const eventNames = normalizeList(filter.eventNames, false);
+  if (!contractIds && !eventNames) return undefined;
+  return {
+    ...(contractIds ? { contractIds } : {}),
+    ...(eventNames ? { eventNames } : {}),
+  };
+}
+
+/**
+ * Build a stable cache key for a feed document scoped to a normalized filter.
+ *
+ * The key embeds the normalized filter so that two different filters can never
+ * share a cache entry (preventing one contract's feed response from leaking
+ * into another filter).  Equivalent filters normalize to the same key.
+ */
+export function feedCacheKey(
+  baseKey: string,
+  filter: FeedFilter | NormalizedFeedFilter | undefined,
+): string {
+  const normalized = normalizeFeedFilter(filter as FeedFilter | undefined);
+  if (!normalized) return baseKey;
+  const parts: string[] = [];
+  if (normalized.contractIds) {
+    parts.push(`contracts=${normalized.contractIds.map(encodeURIComponent).join(",")}`);
+  }
+  if (normalized.eventNames) {
+    parts.push(`events=${normalized.eventNames.map(encodeURIComponent).join(",")}`);
+  }
+  return `${baseKey}#${parts.join("&")}`;
+}
+
+/**
+ * Return true when `event` matches the (already normalized) filter.
+ * An absent filter matches every event.
+ */
+export function matchesFeedFilter(
+  event: DecodedEvent,
+  filter: NormalizedFeedFilter | undefined,
+): boolean {
+  if (!filter) return true;
+  if (filter.contractIds) {
+    if (!filter.contractIds.includes(event.contractId.toLowerCase())) return false;
+  }
+  if (filter.eventNames) {
+    const name =
+      event.payload.name === "unknown"
+        ? (event.payload.eventName ?? "unknown")
+        : event.payload.name;
+    if (!filter.eventNames.includes(name)) return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Feed entry
 // ---------------------------------------------------------------------------
 
@@ -190,14 +315,76 @@ export interface AtomFeedOptions {
   /** StellarConfig, forwarded to formatPlainTextEvent and eventExplorerUrl. */
   config: StellarConfig;
   /**
-   * Override the feed's `<updated>` timestamp (ISO 8601 / RFC 3339).
-   * Defaults to the `at` field of the most-recent event, or
-   * {@link UNKNOWN_EVENT_TIMESTAMP} (`1970-01-01T00:00:00.000Z`) when no
-   * event has a valid ledger timestamp or the events array is empty.
+   * Override the feed's `<updated>` timestamp (ISO 8601 / RFC 3339), which
+   * represents the last event update time.
+   * Defaults to the `at` field of the most-recent event with `at > 0`, or
+   * {@link FEED_EPOCH_UPDATED_AT} (`1970-01-01T00:00:00.000Z`) when the
+   * events array is empty or contains no valid event timestamps.
    */
   updatedAt?: string;
+  /**
+   * Timestamp when this feed document was generated (ISO 8601 / RFC 3339).
+   * Emitted separately from `<updated>` as `<mimir:generated>` so regenerating
+   * an empty or unchanged feed does not advance `<updated>`.
+   */
+  generatedAt?: string;
   /** Optional subtitle / description for the feed. */
   subtitle?: string;
+  /**
+   * Optional per-contract filter.  When set, only matching events are included
+   * in the feed.  The filter is normalized before use, so equivalent filters
+   * produce identical output.
+   */
+  filter?: FeedFilter;
+}
+
+export interface AtomFeedMetadata {
+  /**
+   * Last event update time (RFC 3339), emitted as Atom `<updated>`.
+   * Derived from `options.updatedAt`, otherwise the max `event.at > 0`,
+   * otherwise {@link FEED_EPOCH_UPDATED_AT}.
+   */
+  updatedAt: string;
+  /**
+   * Feed document generation time (RFC 3339), emitted as `<mimir:generated>`
+   * when provided. Distinct from `updatedAt` so empty or unchanged feeds keep
+   * a stable `<updated>` timestamp across regenerations.
+   */
+  generatedAt: string | null;
+  /** Number of entries in the feed. */
+  entryCount: number;
+  /** True when the feed contains no entries. */
+  isEmpty: boolean;
+}
+
+/**
+ * Resolve feed-level timestamp and cardinality metadata without consulting
+ * wall-clock time, keeping empty and unchanged feeds deterministic.
+ */
+export function resolveAtomFeedMetadata(
+  events: readonly DecodedEvent[],
+  options: Pick<AtomFeedOptions, "updatedAt" | "generatedAt"> = {},
+): AtomFeedMetadata {
+  let updatedAt: string;
+  if (options.updatedAt) {
+    updatedAt = options.updatedAt;
+  } else if (events.length > 0) {
+    const maxAt = events.reduce(
+      (best, e) =>
+        typeof e.at === "number" && Number.isFinite(e.at) && e.at > best ? e.at : best,
+      0,
+    );
+    updatedAt = maxAt > 0 ? new Date(maxAt * 1000).toISOString() : FEED_EPOCH_UPDATED_AT;
+  } else {
+    updatedAt = FEED_EPOCH_UPDATED_AT;
+  }
+
+  return {
+    updatedAt,
+    generatedAt: options.generatedAt ? options.generatedAt : null,
+    entryCount: events.length,
+    isEmpty: events.length === 0,
+  };
 }
 
 /**
@@ -285,12 +472,17 @@ function renderEntry(entry: AtomEntry): string {
  * Build a complete Atom 1.0 feed document string from an array of decoded events.
  *
  * - `<feed id>` is the `selfUrl`.
- * - `<updated>` is the most recent `event.at` timestamp, or `updatedAt` when
- *   provided, or {@link UNKNOWN_EVENT_TIMESTAMP} (`1970-01-01T00:00:00.000Z`)
- *   when no event has a valid ledger timestamp or the event array is empty.
+ * - `<updated>` is the last event update time: `updatedAt` when provided,
+ *   otherwise the most recent positive `event.at` timestamp, otherwise
+ *   {@link FEED_EPOCH_UPDATED_AT} (`1970-01-01T00:00:00.000Z`) so empty or
+ *   unchanged feeds remain deterministic.
+ * - `<mimir:generated>` is emitted separately when `generatedAt` is provided,
+ *   recording feed generation time without altering `<updated>`.
  * - Each event becomes one `<entry>`.  Events with no plain-text rendering still
  *   get an entry (with an empty `<content/>`), so feed readers always see the
  *   full event count.
+ * - When `options.filter` is set, only matching events are included; the filter
+ *   is normalized first so equivalent filters yield identical output.
  * - All dynamic content is XML-escaped; XML-illegal control characters are
  *   stripped before escaping.  Length limits are enforced by Unicode code-point
  *   count *after* XML escaping so entity references (`&amp;`, `&lt;`, …) are
@@ -301,27 +493,17 @@ export function buildAtomFeed(
   options: AtomFeedOptions,
 ): string {
   const { title, selfUrl, config, subtitle } = options;
+  const metadata = resolveAtomFeedMetadata(events, options);
+  const validSelfUrl = safeHttpsUrl(selfUrl) ?? "";
 
-  // Feed <updated>: caller override -> latest valid event.at -> explicit unknown timestamp.
-  let feedUpdated: string;
-  if (options.updatedAt) {
-    feedUpdated = options.updatedAt;
-  } else {
-    const maxAt = events.reduce(
-      (best, e) => (typeof e.at === "number" && Number.isFinite(e.at) && e.at > best ? e.at : best),
-      0,
-    );
-    feedUpdated = maxAt > 0 ? new Date(maxAt * 1000).toISOString() : UNKNOWN_EVENT_TIMESTAMP;
-  }
-
-  const validSelfUrl = safeHttpsUrl(selfUrl);
-  if (validSelfUrl === null) {
-    throw new TypeError("Atom feed selfUrl must be a valid HTTPS URL without credentials");
-  }
+  const feedOpenTag =
+    metadata.generatedAt !== null
+      ? `<feed xmlns="http://www.w3.org/2005/Atom" xmlns:mimir="${MIMIR_FEED_NS}">`
+      : '<feed xmlns="http://www.w3.org/2005/Atom">';
 
   const lines: string[] = [
     '<?xml version="1.0" encoding="UTF-8"?>',
-    '<feed xmlns="http://www.w3.org/2005/Atom">',
+    feedOpenTag,
     `  <title type="text">${xmlText(title, FEED_TITLE_MAX_CHARS)}</title>`,
   ];
 
@@ -330,9 +512,15 @@ export function buildAtomFeed(
   }
 
   lines.push(
-    `  <id>${escapeXml(validSelfUrl)}</id>`,
-    `  <updated>${escapeXml(feedUpdated)}</updated>`,
+    `  <id>${escapeXml(validSelfUrl || selfUrl)}</id>`,
+    `  <updated>${escapeXml(stripXmlIllegal(metadata.updatedAt))}</updated>`,
   );
+
+  if (metadata.generatedAt !== null) {
+    lines.push(
+      `  <mimir:generated>${escapeXml(stripXmlIllegal(metadata.generatedAt))}</mimir:generated>`,
+    );
+  }
 
   if (validSelfUrl) {
     lines.push(
@@ -347,4 +535,187 @@ export function buildAtomFeed(
 
   lines.push("</feed>");
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// JSON Feed 1.1 export (bounded)
+// ---------------------------------------------------------------------------
+
+/** JSON Feed specification version URI (https://jsonfeed.org/version/1.1). */
+export const JSON_FEED_VERSION = "https://jsonfeed.org/version/1.1";
+
+/** Version of the Mimir-specific `_mimir` extension block in JSON Feed output. */
+export const JSON_FEED_SCHEMA_VERSION = 1;
+
+/** Default maximum number of items emitted in a single JSON Feed export. */
+export const JSON_FEED_DEFAULT_MAX_ITEMS = 100;
+
+/** Hard upper bound on `maxItems` to keep JSON Feed exports bounded. */
+export const JSON_FEED_MAX_ITEMS_LIMIT = 500;
+
+export interface JsonFeedItem {
+  /** Permanent tag URI matching {@link AtomEntry.id}. */
+  id: string;
+  /** Human-readable event title, bounded to {@link FEED_TITLE_MAX_CHARS}. */
+  title: string;
+  /** Event ledger close timestamp in RFC 3339 / ISO 8601. */
+  date_published: string;
+  /** Plain-text event rendering, bounded to {@link FEED_CONTENT_MAX_CHARS}. */
+  content_text?: string;
+  /** Sanitized `https:` explorer URL matching {@link AtomEntry.link}. */
+  url?: string;
+  /** Sanitized `https:` Mimir web-app deep link when available. */
+  external_url?: string;
+  /** Event source and event name tags. */
+  tags: string[];
+}
+
+export interface JsonFeedMimirExtension {
+  schema_version: number;
+  updated: string;
+  total_items: number;
+  max_items: number;
+  truncated: boolean;
+}
+
+export interface JsonFeedDocument {
+  version: string;
+  title: string;
+  home_page_url?: string;
+  feed_url?: string;
+  description?: string;
+  _mimir: JsonFeedMimirExtension;
+  items: JsonFeedItem[];
+}
+
+export type JsonFeedConfig = StellarConfig & {
+  /** Optional Mimir web-app base URL (`MIMIR_APP_URL`). */
+  mimirAppUrl?: string | null;
+};
+
+export interface JsonFeedOptions extends Omit<AtomFeedOptions, "config"> {
+  /** StellarConfig (with optional `mimirAppUrl`), forwarded to event/link builders. */
+  config: JsonFeedConfig;
+  /** Optional `https:` home page URL; defaults to `config.mimirAppUrl` when valid. */
+  homePageUrl?: string;
+  /**
+   * Maximum number of items to include in the exported feed.
+   * Defaults to {@link JSON_FEED_DEFAULT_MAX_ITEMS} and is capped at
+   * {@link JSON_FEED_MAX_ITEMS_LIMIT}. Must be a non-negative integer.
+   */
+  maxItems?: number;
+}
+
+function resolveFeedUpdated(
+  events: readonly DecodedEvent[],
+  updatedAt?: string,
+): string {
+  if (updatedAt) return updatedAt;
+  if (events.length > 0) {
+    const maxAt = events.reduce((best, e) => Math.max(best, e.at ?? 0), 0);
+    return new Date(maxAt > 0 ? maxAt * 1000 : Date.now()).toISOString();
+  }
+  return new Date().toISOString();
+}
+
+function resolveMaxItems(maxItems?: number): number {
+  if (maxItems === undefined) return JSON_FEED_DEFAULT_MAX_ITEMS;
+  if (!Number.isInteger(maxItems) || maxItems < 0) {
+    throw new RangeError(
+      `maxItems must be a non-negative integer, received: ${String(maxItems)}`,
+    );
+  }
+  return Math.min(maxItems, JSON_FEED_MAX_ITEMS_LIMIT);
+}
+
+/**
+ * Build one JSON Feed 1.1 item from a decoded event using the same canonical
+ * entry derivation as {@link buildAtomEntry}, preserving ID, timestamp,
+ * bounded plain-text content, and sanitized `https:` explorer and app links.
+ */
+export function buildJsonFeedItem(
+  event: DecodedEvent,
+  config: JsonFeedConfig,
+): JsonFeedItem {
+  const entry = buildAtomEntry(event, config);
+  const eventName =
+    event.payload.name === "unknown"
+      ? (event.payload.eventName ?? "unknown")
+      : event.payload.name;
+
+  const item: JsonFeedItem = {
+    id: entry.id,
+    title: cleanFeedText(entry.title, FEED_TITLE_MAX_CHARS),
+    date_published: entry.updated,
+    tags: [
+      cleanFeedText(event.source, FEED_TITLE_MAX_CHARS),
+      cleanFeedText(eventName, FEED_TITLE_MAX_CHARS),
+    ],
+  };
+
+  if (entry.content !== null) {
+    item.content_text = cleanFeedText(entry.content, FEED_CONTENT_MAX_CHARS);
+  }
+
+  if (entry.link !== null) {
+    item.url = entry.link;
+  }
+
+  const rawAppUrl = appUrlFor(event, config.mimirAppUrl);
+  const appUrl = rawAppUrl ? safeHttpsUrl(rawAppUrl) : null;
+  if (appUrl !== null) {
+    item.external_url = appUrl;
+  }
+
+  return item;
+}
+
+/**
+ * Build a bounded, versioned JSON Feed 1.1 document object from decoded events.
+ *
+ * Preserves input ordering across the bounded slice (`events.slice(0, maxItems)`)
+ * and sanitizes all URLs to `https:` only.
+ */
+export function buildJsonFeedDocument(
+  events: readonly DecodedEvent[],
+  options: JsonFeedOptions,
+): JsonFeedDocument {
+  const { title, selfUrl, config, subtitle, updatedAt, homePageUrl } = options;
+  const maxItems = resolveMaxItems(options.maxItems);
+  const feedUpdated = resolveFeedUpdated(events, updatedAt);
+
+  const validSelfUrl = safeHttpsUrl(selfUrl);
+  const candidateHomeUrl = homePageUrl ?? config.mimirAppUrl ?? null;
+  const validHomeUrl = candidateHomeUrl ? safeHttpsUrl(candidateHomeUrl) : null;
+
+  const boundedEvents = events.slice(0, maxItems);
+  const items = boundedEvents.map((event) => buildJsonFeedItem(event, config));
+
+  const doc: JsonFeedDocument = {
+    version: JSON_FEED_VERSION,
+    title: cleanFeedText(title, FEED_TITLE_MAX_CHARS),
+    ...(validHomeUrl ? { home_page_url: validHomeUrl } : {}),
+    ...(validSelfUrl ? { feed_url: validSelfUrl } : {}),
+    ...(subtitle ? { description: cleanFeedText(subtitle, FEED_TITLE_MAX_CHARS) } : {}),
+    _mimir: {
+      schema_version: JSON_FEED_SCHEMA_VERSION,
+      updated: feedUpdated,
+      total_items: events.length,
+      max_items: maxItems,
+      truncated: events.length > boundedEvents.length,
+    },
+    items,
+  };
+
+  return doc;
+}
+
+/**
+ * Serialize a bounded, versioned JSON Feed 1.1 document as a JSON string.
+ */
+export function buildJsonFeed(
+  events: readonly DecodedEvent[],
+  options: JsonFeedOptions,
+): string {
+  return JSON.stringify(buildJsonFeedDocument(events, options), null, 2);
 }

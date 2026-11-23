@@ -656,7 +656,7 @@ test("claim_challenged MarkdownV2 snapshot matches i18n template exactly", () =>
   });
   const result = formatEvent(config, event);
   assert.match(result, /⚔️ \*Claim \\#7 challenged\*/);
-  assert.match(result, /Stake: \*2\\\.0000000 USDC\*/);
+  assert.match(result, /Stake: \*\u20682\\\.0000000 USDC\u2069\*/);
   assert.match(result, /Challenger: `GABCD`/);
 });
 

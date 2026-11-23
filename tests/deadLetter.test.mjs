@@ -13,7 +13,12 @@ import os from "node:os";
 import path from "node:path";
 import test, { mock } from "node:test";
 
-import { createDeadLetterQueue, makeEntryId } from "../dist/deadLetter.js";
+import {
+  createDeadLetterQueue,
+  DeadLetterDuplicateIdError,
+  findDuplicateEntryIds,
+  makeEntryId,
+} from "../dist/deadLetter.js";
 
 const BOT_TOKEN = "1234567890:" + "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
 
@@ -407,81 +412,135 @@ test("makeEntryId is stable for identical payloads and differs on content", () =
   assert.notEqual(a, d);
 });
 
-test("flush rejects replay of an entry from another network and leaves it unchanged", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-dlq-net-"));
+// ── Duplicate ID validation ───────────────────────────────────────────────────
+
+test("findDuplicateEntryIds returns unique conflicting IDs in first-seen order", () => {
+  assert.deepEqual(findDuplicateEntryIds([{ id: "a" }, { id: "b" }, { id: "c" }]), []);
+  assert.deepEqual(
+    findDuplicateEntryIds([
+      { id: "a" },
+      { id: "b" },
+      { id: "a" },
+      { id: "c" },
+      { id: "b" },
+      { id: "a" },
+    ]),
+    ["a", "b"],
+  );
+});
+
+test("load rejects duplicate IDs and preserves the source file rather than overwriting it", async () => {
+  const warnings = [];
+  mock.method(console, "warn", (...args) => warnings.push(args.join(" ")));
+  try {
+    await withQueue(async ({ queue, filePath }) => {
+      const duplicatePayload = JSON.stringify(
+        {
+          version: 1,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          entries: [
+            {
+              id: "market:10:claim_created:11111111",
+              enqueuedAt: "2026-01-01T00:00:00.000Z",
+              source: "market",
+              ledger: 10,
+              eventName: "claim_created",
+              text: "first body",
+              attempts: 1,
+              lastError: "Telegram 429",
+            },
+            {
+              id: "market:10:claim_created:11111111",
+              enqueuedAt: "2026-01-01T00:01:00.000Z",
+              source: "market",
+              ledger: 10,
+              eventName: "claim_created",
+              text: "conflicting body",
+              attempts: 2,
+              lastError: "Telegram 500",
+            },
+          ],
+        },
+        null,
+        2,
+      );
+      await writeFile(filePath, duplicatePayload, "utf8");
+
+      await queue.load();
+      assert.equal(queue.stats().depth, 0);
+      assert.ok(
+        warnings.some((w) => w.includes("duplicate dead-letter entry id(s)")),
+        "expected duplicate ID warning",
+      );
+
+      // Enqueuing a new message must not overwrite the preserved source file.
+      await queue.enqueue(parked(99, "new message"));
+      assert.equal(queue.stats().depth, 1);
+      const onDisk = await readFile(filePath, "utf8");
+      assert.equal(onDisk, duplicatePayload, "source file must remain untouched for inspection");
+      assert.ok(
+        warnings.some((w) => w.includes("refusing to overwrite")),
+        "expected refusal warning when persisting over preserved file",
+      );
+
+      // Once the operator fixes the file, a subsequent load() re-enables persistence.
+      await writeFile(
+        filePath,
+        JSON.stringify({ version: 1, updatedAt: "2026-01-01T00:02:00.000Z", entries: [] }),
+        "utf8",
+      );
+      await queue.load();
+      await queue.enqueue(parked(100, "after fix"));
+      const afterFix = JSON.parse(await readFile(filePath, "utf8"));
+      assert.equal(afterFix.entries.length, 1);
+      assert.equal(afterFix.entries[0].ledger, 100);
+    });
+  } finally {
+    mock.restoreAll();
+  }
+});
+
+test("load with strict: true throws DeadLetterDuplicateIdError before maxEntries trimming", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-dlq-dup-strict-"));
   const filePath = path.join(directory, "dead-letter.json");
   try {
-    const testnetQueue = createDeadLetterQueue({
+    // Duplicate appears in the oldest entries that would otherwise be trimmed when maxEntries=2.
+    const raw = JSON.stringify(
+      {
+        version: 1,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        entries: [
+          { id: "dup-id", text: "first", ledger: 1 },
+          { id: "dup-id", text: "second", ledger: 2 },
+          { id: "unique-3", text: "third", ledger: 3 },
+          { id: "unique-4", text: "fourth", ledger: 4 },
+        ],
+      },
+      null,
+      2,
+    );
+    await writeFile(filePath, raw, "utf8");
+
+    const queue = createDeadLetterQueue({
       filePath,
-      maxEntries: 10,
-      maxAttempts: 5,
-      networkPassphrase: "Test SDF Network ; September 2015",
-      now: () => 1_700_000_000_000,
-    });
-    await testnetQueue.load();
-    await testnetQueue.enqueue({
-      source: "market",
-      ledger: 42,
-      eventName: "claim_created",
-      text: "testnet notification",
-      error: new Error("Telegram 429"),
+      maxEntries: 2,
+      maxAttempts: 3,
+      strict: true,
     });
 
-    // Switch active configuration to mainnet and also add a legacy entry without networkPassphrase
-    // plus a mainnet entry to verify budget & compatibility.
-    const rawOnDisk = JSON.parse(await readFile(filePath, "utf8"));
-    rawOnDisk.entries.push({
-      id: "market:43:claim_created:11111111",
-      enqueuedAt: "2026-10-18T10:00:00.000Z",
-      source: "market",
-      ledger: 43,
-      eventName: "claim_created",
-      text: "legacy entry",
-      attempts: 1,
-      lastError: "Telegram 429",
-    });
-    await writeFile(filePath, JSON.stringify(rawOnDisk, null, 2), "utf8");
+    await assert.rejects(
+      () => queue.load(),
+      (err) => {
+        assert.ok(err instanceof DeadLetterDuplicateIdError);
+        assert.deepEqual(err.duplicateIds, ["dup-id"]);
+        assert.equal(err.filePath, filePath);
+        assert.match(err.message, /dup-id/);
+        assert.match(err.message, /preserved for inspection/);
+        return true;
+      },
+    );
 
-    const mainnetQueue = createDeadLetterQueue({
-      filePath,
-      maxEntries: 10,
-      maxAttempts: 5,
-      networkPassphrase: "Public Global Stellar Network ; September 2015",
-      now: () => 1_700_000_005_000,
-    });
-    await mainnetQueue.load();
-    await mainnetQueue.enqueue({
-      source: "market",
-      ledger: 44,
-      eventName: "claim_created",
-      text: "mainnet notification",
-      error: new Error("Telegram 503"),
-    });
-
-    const sentLedgers = [];
-    const result = await mainnetQueue.flush(async (_text, entry) => {
-      sentLedgers.push(entry.ledger);
-    }, 2);
-
-    // Legacy (43) and matching mainnet (44) replayed; testnet (42) rejected and left untouched.
-    assert.deepEqual(sentLedgers, [43, 44]);
-    assert.equal(result.sent, 2);
-    assert.equal(result.remaining, 1);
-    assert.equal(result.rejectedNetworkMismatch, 1);
-
-    const persisted = JSON.parse(await readFile(filePath, "utf8"));
-    assert.equal(persisted.entries.length, 1);
-    assert.deepEqual(persisted.entries[0], {
-      id: rawOnDisk.entries[0].id,
-      enqueuedAt: rawOnDisk.entries[0].enqueuedAt,
-      source: "market",
-      ledger: 42,
-      eventName: "claim_created",
-      text: "testnet notification",
-      attempts: 1,
-      lastError: "Telegram 429",
-      networkPassphrase: "Test SDF Network ; September 2015",
-    });
+    assert.equal(await readFile(filePath, "utf8"), raw, "source file must remain untouched");
   } finally {
     await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
