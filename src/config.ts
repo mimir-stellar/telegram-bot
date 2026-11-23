@@ -341,6 +341,8 @@ export interface BotConfig extends StellarConfig {
   interSendDelayMs: number;
   /** Port for the Prometheus `/metrics` listener; null disables it. */
   metricsPort: number | null;
+  /** Versioned metrics reset marker file persisted across restarts. */
+  metricsResetFile?: string;
   /** Optional allowlist of claim categories to notify about. Empty means allow all. */
   notificationCategories: readonly string[];
   /** Event names sent without a notification sound (SILENT_EVENTS). */
@@ -505,6 +507,7 @@ const DEFAULTS = {
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
   countersFile: "./data/counters.json",
+  metricsResetFile: "./data/metrics-reset.json",
   lockFile: "./data/poller.lock",
   statusFile: "./data/status.json",
   maxNotificationsPerCycle: 20,
@@ -1231,6 +1234,10 @@ export function loadConfig(): BotConfig {
     ),
     interSendDelayMs: c.int("INTER_SEND_DELAY_MS", DEFAULTS.interSendDelayMs, 0),
     metricsPort: c.optionalPort("METRICS_PORT"),
+    metricsResetFile: path.resolve(
+      process.cwd(),
+      c.get("METRICS_RESET_FILE") ?? DEFAULTS.metricsResetFile,
+    ),
     notificationCategories: notificationCategoriesFrom(),
     silentEvents: silentEventsFrom(c),
     csvOutputFile: path.resolve(process.cwd(), c.get("CSV_OUTPUT_FILE") ?? DEFAULTS.csvOutputFile),
@@ -1588,6 +1595,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "MAX_NOTIFICATIONS_PER_CYCLE", secret: false, hasBuiltInDefault: true },
   { key: "INTER_SEND_DELAY_MS", secret: false, hasBuiltInDefault: true },
   { key: "METRICS_PORT", secret: false },
+  { key: "METRICS_RESET_FILE", secret: false, hasBuiltInDefault: true },
   { key: "NOTIFY_ENABLED", secret: false, hasBuiltInDefault: true },
   { key: "NOTIFY_MARKET", secret: false, hasBuiltInDefault: true },
   { key: "NOTIFY_SQUAD", secret: false, hasBuiltInDefault: true },

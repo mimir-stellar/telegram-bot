@@ -194,7 +194,17 @@ async function main(): Promise<void> {
   // Create the registry unconditionally; the HTTP server is only started when
   // METRICS_PORT is configured. This means the poller always has a metrics
   // object to call — no null checks needed there.
-  const metrics = createMetrics();
+  const metrics = createMetrics({
+    resetMarkerFile: config.metricsResetFile,
+  });
+  const resetMarkerWarning = metrics.resetMarkerWarning();
+  if (resetMarkerWarning) {
+    Logger.warn("boot", `[boot] metrics reset marker warning: ${resetMarkerWarning}`, {
+      action: "metrics_reset_marker_warning",
+      warning: resetMarkerWarning,
+      generation: metrics.resetMarker().generation,
+    });
+  }
 
   let metricsServer: MetricsServer | null = null;
   if (config.metricsPort !== null) {

@@ -34,9 +34,16 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
-import { DEFAULT_HEALTH_SHUTDOWN_GRACE_MS } from "./config.js";
+
+const DEFAULT_HEALTH_SHUTDOWN_GRACE_MS = 2_000;
 import {
   DEFAULT_SERVICE_LEVEL_WINDOW_SIZE,
+  METRICS_RESET_MARKER_SCHEMA,
+  METRICS_RESET_MARKER_VERSION,
+  type AdvanceMetricsResetMarkerOptions,
+  type MetricsResetMarker,
+  type MetricsResetMarkerResult,
+  type ParseMetricsResetMarkerResult,
   type ServiceLevelCompleteness,
   type ServiceLevelDataGap,
   type ServiceLevelDeliverySuccess,
@@ -46,11 +53,21 @@ import {
   type ServiceLevelWindowOptions,
   type ServiceLevelWindowReport,
   ServiceLevelWindow,
+  advanceMetricsResetMarkerSync,
+  createMetricsResetMarker,
+  formatMetricsResetMarker,
   formatServiceLevelWindow,
+  parseMetricsResetMarker,
 } from "./stellar/metrics.js";
 
 export {
   DEFAULT_SERVICE_LEVEL_WINDOW_SIZE,
+  METRICS_RESET_MARKER_SCHEMA,
+  METRICS_RESET_MARKER_VERSION,
+  type AdvanceMetricsResetMarkerOptions,
+  type MetricsResetMarker,
+  type MetricsResetMarkerResult,
+  type ParseMetricsResetMarkerResult,
   type ServiceLevelCompleteness,
   type ServiceLevelDataGap,
   type ServiceLevelDeliverySuccess,
@@ -60,7 +77,11 @@ export {
   type ServiceLevelWindowOptions,
   type ServiceLevelWindowReport,
   ServiceLevelWindow,
+  advanceMetricsResetMarkerSync,
+  createMetricsResetMarker,
+  formatMetricsResetMarker,
   formatServiceLevelWindow,
+  parseMetricsResetMarker,
 };
 
 import {
@@ -170,8 +191,44 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
-  /** Fixed-bucket RPC latency histogram by bounded operation class. */
-  rpcLatency: RpcLatencyMetrics;
+  /** Total confirmed notifications with a known ledger close time (includes 0ms lag). */
+  notificationAgeSamples: Counter;
+  /** Total confirmed notifications whose event lacked a valid ledger close time. */
+  notificationAgeMissingLedgerTime: Counter;
+  /** Cumulative end-to-end notification age in milliseconds across known-ledger-time samples. */
+  notificationAgeTotalMs: Counter;
+  /** End-to-end age in ms of the most recent confirmed notification with a known ledger time. */
+  lastNotificationAgeMs: Gauge;
+  /** Maximum observed end-to-end notification age in ms across confirmed sends. */
+  maxNotificationAgeMs: Gauge;
+  /**
+   * Monotonically increasing metrics reset generation persisted across restarts.
+   * Increments on each process start so operators can distinguish a restart from
+   * a real activity drop.
+   */
+  resetGeneration: Gauge;
+  /** Unix timestamp in seconds when the current metrics reset generation began. */
+  resetTimestampSeconds: Gauge;
+
+  /** Return a copy of the active versioned metrics reset marker. */
+  resetMarker(): MetricsResetMarker;
+
+  /** Return any non-fatal warning from loading or persisting the reset marker. */
+  resetMarkerWarning(): string | undefined;
+
+  /** Register a custom counter with validated Prometheus label keys. */
+  registerLabeledCounter(
+    name: string,
+    help: string,
+    labelNames: readonly string[],
+  ): LabeledCounter;
+
+  /** Register a custom gauge with validated Prometheus label keys. */
+  registerLabeledGauge(
+    name: string,
+    help: string,
+    labelNames: readonly string[],
+  ): LabeledGauge;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -251,8 +308,61 @@ function makeGauge(): Gauge {
 
 const METRICS_PREFIX = "mimir_bot_";
 
-export function createMetrics(options: CreateMetricsOptions = {}): MetricsRegistry {
-  const rpcLatencyHistogram = new RpcLatencyHistogram(options.rpcLatencyBucketsMs);
+function makeLabeledCounter(name: string, help: string, labels: readonly string[]): LabeledCounter & { _name: string; _help: string; _labels: readonly string[]; _entries(): [string, number][] } {
+  const values = new Map<string, number>(labels.map((l) => [l, 0]));
+  const known = new Set<string>(labels);
+  return {
+    _name: name,
+    _help: help,
+    _labels: labels,
+    inc(reason: string, delta = 1): void {
+      if (delta < 0) throw new RangeError(`LabeledCounter.inc delta must be >= 0; got ${delta}`);
+      const key = known.has(reason) ? reason : "unknown";
+      values.set(key, (values.get(key) ?? 0) + delta);
+    },
+    value(reason: string): number {
+      return values.get(known.has(reason) ? reason : "unknown") ?? 0;
+    },
+    _entries(): [string, number][] {
+      return [...values.entries()];
+    },
+  };
+}
+
+export interface MetricsOptions {
+  /** Optional capacity of the bounded rolling service-level window. */
+  serviceLevelWindowSize?: number | undefined;
+  /**
+   * Optional path to a versioned JSON file persisting the metrics reset
+   * generation across restarts. When omitted, the registry starts at
+   * generation 1 in-memory without touching the filesystem.
+   */
+  resetMarkerFile?: string | undefined;
+  /** Optional clock returning Unix epoch ms for deterministic reset timestamps. */
+  now?: (() => number) | undefined;
+}
+
+export function createMetrics(options?: MetricsOptions): MetricsRegistry {
+  const markerResult: MetricsResetMarkerResult =
+    typeof options?.resetMarkerFile === "string" && options.resetMarkerFile.length > 0
+      ? advanceMetricsResetMarkerSync(options.resetMarkerFile, { now: options.now })
+      : {
+          marker: createMetricsResetMarker(1, options?.now ? options.now() : Date.now()),
+          persisted: false,
+        };
+  const activeResetMarker = markerResult.marker;
+  const activeResetMarkerWarning = markerResult.warning;
+  const droppedSamples = makeLabeledCounter(
+    `${METRICS_PREFIX}dropped_samples_total`,
+    "Metric samples dropped before exposure, by bounded reason.",
+    [...DROP_REASONS, "unknown"],
+  );
+  // Every gauge drops (and counts) non-finite samples instead of exposing them.
+  const makeGauge = (name: string, help: string) =>
+    makeFiniteGauge(name, help, (reason) => droppedSamples.inc(reason));
+  const serviceLevel = new ServiceLevelWindow({
+    windowSize: options?.serviceLevelWindowSize,
+  });
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -341,6 +451,16 @@ export function createMetrics(options: CreateMetricsOptions = {}): MetricsRegist
     `${METRICS_PREFIX}max_notification_age_ms`,
     "Maximum observed end-to-end notification age in milliseconds from ledger close time to confirmed send.",
   );
+  const resetGeneration = makeGauge(
+    `${METRICS_PREFIX}reset_generation`,
+    "Monotonically increasing metrics reset generation persisted across restarts (distinguishes restarts from real activity drops).",
+  );
+  const resetTimestampSeconds = makeGauge(
+    `${METRICS_PREFIX}reset_timestamp_seconds`,
+    "Unix timestamp in seconds when the current metrics reset generation started.",
+  );
+  resetGeneration.set(activeResetMarker.generation);
+  resetTimestampSeconds.set(Math.floor(activeResetMarker.resetAtMs / 1000));
 
   const counters = [
     pollCycles,
@@ -365,8 +485,8 @@ export function createMetrics(options: CreateMetricsOptions = {}): MetricsRegist
     activityBaselineEvents,
     lastNotificationAgeMs,
     maxNotificationAgeMs,
-    deadLetterEntries,
-    deadLetterCapacity,
+    resetGeneration,
+    resetTimestampSeconds,
   ];
 
   /**
@@ -728,9 +848,34 @@ export function createMetrics(options: CreateMetricsOptions = {}): MetricsRegist
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
-    rpcLatency: {
-      observe: (operation, durationMs) => rpcLatencyHistogram.observe(operation, durationMs),
-      snapshot: () => rpcLatencyHistogram.snapshot(),
+    notificationAgeSamples,
+    notificationAgeMissingLedgerTime,
+    notificationAgeTotalMs,
+    lastNotificationAgeMs,
+    maxNotificationAgeMs,
+    resetGeneration,
+    resetTimestampSeconds,
+    resetMarker(): MetricsResetMarker {
+      return { ...activeResetMarker };
+    },
+    resetMarkerWarning(): string | undefined {
+      return activeResetMarkerWarning;
+    },
+    recordNotificationAge,
+    serviceLevel,
+    serviceLevelReport(): ServiceLevelWindowReport {
+      return serviceLevel.report();
+    },
+    recordDelivery(
+      success: boolean,
+      ageMs?: number | null,
+      dataGap?: boolean,
+      gapReason?: ServiceLevelIncompleteReason,
+    ): void {
+      serviceLevel.recordDelivery(success, ageMs, dataGap, gapReason);
+    },
+    recordDataGap(reason?: ServiceLevelIncompleteReason): void {
+      serviceLevel.recordDataGap(reason);
     },
     render,
     startServer,
