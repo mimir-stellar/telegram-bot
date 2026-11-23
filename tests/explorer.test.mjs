@@ -69,7 +69,7 @@ test("existing message content stays intact when the button is added", () => {
 
   const message = formatEvent(config, event);
   assert.match(message, /Claim \\#7 challenged/);
-  assert.match(message, /Stake: \*2\\\.0000000 USDC\*/);
+  assert.match(message, /Stake: \*\u20682\\\.0000000 USDC\u2069\*/);
   // The pre-existing footer link is kept as the text fallback.
   assert.ok(message.includes(`[tx](${eventExplorerUrl(config, event)})`));
   assert.ok(message.includes("_ledger 4226692_"));

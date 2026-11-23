@@ -113,14 +113,20 @@ import {
   isAdminPayload,
   normalizeContractVersion,
   toAdminAuditRecord,
+  isContractVersionSupported,
+  validateDecoderCombinations,
+  getDecoderCapabilityReport,
   type ContractSource,
   type DecodedEvent,
+  type DecoderCapabilityReport,
 } from "./stellar/decode.js";
 
 export interface TargetState {
   source: ContractSource;
   contractId: string;
   version: string;
+  /** Whether the configured contract version is supported by the decoder subsystem. */
+  supportedVersion?: boolean;
   /** Duration of this target's most recent attempted fetch-decode-send cycle. */
   lastCycleMs: number;
   /** Longest attempted cycle for this target since process start. */
@@ -910,6 +916,82 @@ export function cursorQuarantinePath(cursorFile: string, at: Date = new Date()):
   return `${cursorFile}.corrupt.${stamp}`;
 }
 
+/**
+ * Read-only preview of where a cursor recovery would move one target.
+ *
+ * Built only from state the poller already holds (the persisted cursor and the
+ * last retained window it observed). It performs no RPC call and no chain
+ * write, so it is safe to show an operator before they act.
+ */
+export interface CursorRecoveryPreview {
+  source: ContractSource;
+  /** Current persisted position, or `null` when none is held. */
+  oldCursorLedger: number | null;
+  /** Ledger the next scan would resume from if recovery ran now. */
+  proposedLedger: number | null;
+  /** Oldest ledger the RPC was last observed to retain. */
+  retainedFloor: number | null;
+  /** Newest ledger the RPC was last observed to hold. */
+  retainedTip: number | null;
+  /** Estimated unrecoverable ledger range `[from, to)`, or `null` when none. */
+  missedRange: { from: number; to: number } | null;
+  verdict: CursorWindowVerdict["status"];
+}
+
+export function previewCursorRecovery(
+  source: ContractSource,
+  cursor: string | null,
+  window: { oldestLedger: number | null; latestLedger: number | null },
+): CursorRecoveryPreview {
+  const verdict = classifyCursorWindow(cursor, window.oldestLedger);
+  const oldCursorLedger =
+    cursor === null ? null : eventCursorLedger(cursor);
+  const retainedFloor = window.oldestLedger;
+  const retainedTip = window.latestLedger;
+
+  if (verdict.status === "stale") {
+    return {
+      source,
+      oldCursorLedger,
+      proposedLedger: retainedFloor,
+      retainedFloor,
+      retainedTip,
+      missedRange: { from: verdict.cursorLedger, to: verdict.cursorLedger + verdict.missedLedgers },
+      verdict: verdict.status,
+    };
+  }
+
+  return {
+    source,
+    oldCursorLedger,
+    proposedLedger: oldCursorLedger,
+    retainedFloor,
+    retainedTip,
+    missedRange: null,
+    verdict: verdict.status,
+  };
+}
+
+/** Human-readable, bounded preview for the cursor CLI. Never prints raw tokens. */
+export function formatCursorRecoveryPreview(preview: CursorRecoveryPreview): string {
+  const fmt = (n: number | null): string => (n === null ? "unknown" : String(n));
+  const lines = [
+    `[cursor-preview] ${preview.source}: ${preview.verdict}`,
+    `  old position:   ledger ${fmt(preview.oldCursorLedger)}`,
+    `  proposed:       ledger ${fmt(preview.proposedLedger)}`,
+    `  retained window: ${fmt(preview.retainedFloor)}..${fmt(preview.retainedTip)}`,
+  ];
+  if (preview.missedRange !== null) {
+    lines.push(
+      `  estimated missed ledger range: ${preview.missedRange.from}..${preview.missedRange.to} (not recoverable)`,
+    );
+  } else {
+    lines.push("  estimated missed ledger range: none");
+  }
+  lines.push("  no changes were made (preview only)");
+  return lines.join("\n");
+}
+
 function isNullOrString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
 }
@@ -1610,6 +1692,7 @@ export function createPoller(deps: PollerDeps) {
         source: t.source,
         contractId: t.contractId,
         version: normalizeContractVersion(t.version),
+        supportedVersion: isContractVersionSupported(t.source, t.version),
         lastCycleMs: 0,
         maxCycleMs: 0,
         cursor: null,
@@ -1731,6 +1814,12 @@ export function createPoller(deps: PollerDeps) {
     pendingFlush: false,
     lastFlushAt: null,
     suppressedLogs: 0,
+    unsupportedVersions: validateDecoderCombinations(targets).map((f) => ({
+      source: f.source,
+      version: f.version ?? "",
+      fallback: f.fallbackVersion,
+      reason: f.reason,
+    })),
     targets: [],
     sbomDigest: null,
     circuitBreaker: {
@@ -3280,6 +3369,24 @@ export function createPoller(deps: PollerDeps) {
           pollIntervalMs: config.pollIntervalMs,
         },
       );
+      // Flag unsupported contract version combinations before live polling begins.
+      const unsupported = validateDecoderCombinations(targets);
+      for (const flag of unsupported) {
+        Logger.warn(
+          "poller",
+          `[poller] unsupported contract version combination: source=${flag.source} version=${flag.version} fallback=${flag.fallbackVersion}; ${flag.reason}`,
+          {
+            action: "unsupported_contract_version",
+            source: flag.source,
+            version: flag.version,
+            normalizedVersion: flag.normalizedVersion,
+            contractId: flag.contractId,
+            fallbackVersion: flag.fallbackVersion,
+            reason: flag.reason,
+          },
+        );
+      }
+
       await persistStatus();
       await flushAudit();
       void loop();
@@ -3456,6 +3563,11 @@ export function createPoller(deps: PollerDeps) {
     /** Persist buffered audit entries now (used on shutdown). */
     flushAuditFile(): Promise<void> {
       return flushAudit();
+    },
+
+    /** Return decoder capability reports for each configured watch target. */
+    capabilities(): DecoderCapabilityReport[] {
+      return targets.map((t) => getDecoderCapabilityReport(t.source, t.version, t.contractId));
     },
 
     /** Run one polling cycle directly and await its completion. */

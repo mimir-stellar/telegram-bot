@@ -19,6 +19,11 @@ export const STORE_VERSION = 1;
 
 export const DEFAULT_MAX_PER_CHAT = 50;
 
+/**
+ * Maximum number of follows a single chat may hold. Enforced by `FollowStore.follow`
+ * via `maxPerChat`; exposed here so command handlers can report the limit.
+ */
+
 export const DEFAULT_MAX_TOTAL = 5000;
 
 /** Version of the portable chat export format. */
@@ -77,6 +82,32 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Canonical unsigned integer: `0` or a sequence of 1–20 digits with no
+ * leading zero, no sign prefix, no decimal point, and no exponent.
+ *
+ * The upper bound of 20 digits covers u64::MAX (18_446_744_073_709_551_615).
+ */
+const CANONICAL_UINT_RE = /^(0|[1-9]\d{0,19})$/;
+
+/**
+ * An id that "looks numeric" must be a canonical unsigned integer.
+ *
+ * "Looks numeric" is any id that:
+ *   - starts with a digit, sign (`+`/`-`), decimal point, or `0x`/`0X`, OR
+ *   - parses as a finite JavaScript number (catches exponent forms like `1e5`).
+ *
+ * Contract address strkeys (e.g. `CABC…`) and human-readable slugs that
+ * contain no digit-like start characters pass through unchecked.
+ */
+function isCanonicalNumericId(id: string): boolean {
+  const looksNumeric =
+    /^[+\-0-9.]/.test(id) ||
+    (id.length > 0 && Number.isFinite(Number(id)));
+  if (!looksNumeric) return true;
+  return CANONICAL_UINT_RE.test(id);
+}
+
 export function parseRef(ref: string): Ref | null {
   if (typeof ref !== "string") return null;
   const idx = ref.indexOf(":");
@@ -88,6 +119,9 @@ export function parseRef(ref: string): Ref | null {
   // Reject whitespace, control characters and a second ':' in id, so a ref
   // always splits into exactly one kind and one id.
   if (/[\s\u0000-\u001F:]/.test(id)) return null;
+  // Reject non-canonical numeric ids: signed, exponent, leading-zero, or
+  // oversized decimal strings are all rejected here.
+  if (!isCanonicalNumericId(id)) return null;
   return { kind, id };
 }
 
@@ -360,8 +394,11 @@ export class FollowStore {
       throw new FollowStoreError("chatId must be a non-empty string");
     }
     const data = this.read();
-    const refs = [...(data.follows[chatId] ?? [])];
-    return { version: EXPORT_VERSION, chatId, refs };
+    return {
+      version: EXPORT_VERSION,
+      chatId,
+      refs: [...(data.follows[chatId] ?? [])],
+    };
   }
 
   /**

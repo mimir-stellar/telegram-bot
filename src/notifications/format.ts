@@ -26,6 +26,7 @@ import {
 } from "../stellar/decode.js";
 import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
+import { escapeMdLinkUrl, safeLinkUrl } from "./link-safety.js";
 import { iconForCategory } from "./category-icons.js";
 import {
   formatCompletenessLabel,
@@ -288,9 +289,19 @@ export function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
+  const tx = mdTxLink(config, event);
+  return tx ? `_${ledger}_ · ${tx}` : `_${ledger}_`;
+}
+
+/**
+ * MarkdownV2 `tx` link for an event: a link when the explorer URL passes the
+ * shared link policy, inert `tx` text when the event has a well-formed hash
+ * but its URL is unsafe, and null when there is no usable hash at all.
+ */
+function mdTxLink(config: StellarConfig, event: DecodedEvent): string | null {
   const url = eventExplorerUrl(config, event);
-  if (!url) return `_${ledger}_`;
-  return `_${ledger}_ · [tx](${url})`;
+  if (url) return `[tx](${escapeMdLinkUrl(url)})`;
+  return eventTxHash(event) !== null ? "tx" : null;
 }
 
 /**
@@ -305,18 +316,23 @@ export function eventExplorerUrl(config: StellarConfig, event: DecodedEvent): st
   // Link only well-formed 64-hex transaction hashes. An externally-derived
   // identifier that is empty, oversized or malformed gets no link: a broken
   // explorer link is worse than no link, and the hash itself is never altered here.
-  const raw = event.txHash ?? "";
-  if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
-  const txHash = raw.trim();
-  if (!TX_HASH_RE.test(txHash)) return null;
+  const txHash = eventTxHash(event);
+  if (txHash === null) return null;
   try {
-    const url = txExplorerUrl(config, txHash);
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:") return null;
-    return url;
+    // The shared link policy (https only, no userinfo, no control characters)
+    // decides; a hand-built config with an unsafe explorer origin gets no link.
+    return safeLinkUrl(txExplorerUrl(config, txHash));
   } catch {
     return null;
   }
+}
+
+/** The event's transaction hash when it is a well-formed 64-hex value, else null. */
+export function eventTxHash(event: DecodedEvent): string | null {
+  const raw = typeof event?.txHash === "string" ? event.txHash : "";
+  if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
+  const txHash = raw.trim();
+  return TX_HASH_RE.test(txHash) ? txHash : null;
 }
 
 export interface ExplorerButton {

@@ -35,11 +35,20 @@ export class RpcPassphraseError extends Error {
  * verified separately at boot by {@link validateNetworkPassphrase}.
  */
 export function createRpcServer(config: StellarConfig): rpc.Server {
-  return new rpc.Server(config.rpcUrl, {
+  const maxResponseBytes = config.rpcMaxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
+  const server = new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
     timeout: 15000,
   });
+  server.httpClient.defaults.maxContentLength = maxResponseBytes;
+  server.httpClient.interceptors.response.use(
+    (response) => response,
+    (err: unknown) => {
+      throw wrapOversizedResponseError(err, maxResponseBytes);
+    },
+  );
+  return server;
 }
 
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */
@@ -141,6 +150,14 @@ export interface LedgerWindow {
   oldestLedger: number;
   /** Current chain tip. Requests above it are errors. */
   latestLedger: number;
+}
+
+/** A closed ledger range `[startLedger, endLedger]` used for event queries and provider comparisons. */
+export interface ScanLedgerWindow {
+  /** Inclusive start ledger of the scanned window. */
+  startLedger: number;
+  /** Inclusive end ledger of the scanned window. */
+  endLedger: number;
 }
 
 /** Why a ledger window, start ledger, or resume cursor cannot be scanned. */
@@ -424,6 +441,37 @@ export function validateLedgerWindow(health: {
   }
 
   return { oldestLedger, latestLedger };
+}
+
+/**
+ * Validate a closed scan/comparison ledger window `[startLedger, endLedger]`.
+ *
+ * Throws a bounded {@link LedgerWindowError} when either bound is missing,
+ * negative, non-integer, or inverted (`startLedger > endLedger`).
+ */
+export function validateScanWindow(window: {
+  startLedger?: unknown;
+  endLedger?: unknown;
+}): ScanLedgerWindow {
+  const startLedger = window?.startLedger;
+  const endLedger = window?.endLedger;
+
+  if (!isLedgerSequence(startLedger) || !isLedgerSequence(endLedger)) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `scan ledger window is malformed ` +
+        `(start=${boundedLedgerValue(startLedger)}, end=${boundedLedgerValue(endLedger)})`,
+    );
+  }
+  if (startLedger > endLedger) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `scan ledger window is inverted ` +
+        `(start ${startLedger} > end ${endLedger})`,
+    );
+  }
+
+  return { startLedger, endLedger };
 }
 
 /**

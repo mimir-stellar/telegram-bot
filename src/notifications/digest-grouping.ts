@@ -10,6 +10,7 @@
  */
 
 import { compareEvents, sortEvents, type DecodedEvent } from "../stellar/decode.js";
+import { DEFAULT_ALWAYS_SEND_EVENTS, resolveEventName } from "./quiet-hours.js";
 
 export interface DigestGroup {
   /**
@@ -158,3 +159,103 @@ export function groupDigestEvents(events: readonly DecodedEvent[]): DigestGroup[
   }
   return groups;
 }
+
+/**
+ * A page within a multi-page digest.
+ */
+export interface DigestPage<T = DigestGroup[]> {
+  /** 1-based page number */
+  pageNumber: number;
+  /** Total number of pages in the digest */
+  totalPages: number;
+  /** Items / groups belonging to this page */
+  items: T;
+}
+
+/** Options for paginating digest groups into pages. */
+export interface DigestPaginationOptions {
+  /** Maximum number of groups per page (must be > 0). */
+  maxGroupsPerPage?: number;
+  /** Maximum number of events per page across groups (must be > 0). */
+  maxEventsPerPage?: number;
+}
+
+/**
+ * Paginate an array of DigestGroup into pages based on group or event limits.
+ *
+ * Each page is an array of DigestGroup. A group is kept intact on a single page
+ * unless a single group exceeds maxEventsPerPage by itself, in which case it forms
+ * its own page.
+ */
+export function paginateDigestGroups(
+  groups: readonly DigestGroup[],
+  options: DigestPaginationOptions | number,
+): DigestGroup[][] {
+  const maxGroups =
+    typeof options === "number"
+      ? options
+      : Math.max(1, options.maxGroupsPerPage ?? Number.MAX_SAFE_INTEGER);
+  const maxEvents =
+    typeof options === "object" && options.maxEventsPerPage !== undefined
+      ? Math.max(1, options.maxEventsPerPage)
+      : Number.MAX_SAFE_INTEGER;
+
+  if (groups.length === 0) return [];
+  if (maxGroups <= 0) throw new RangeError("maxGroupsPerPage must be > 0");
+
+  const pages: DigestGroup[][] = [];
+  let currentPage: DigestGroup[] = [];
+  let currentEvents = 0;
+
+  for (const group of groups) {
+    const groupEvents = group.events.length;
+    const wouldExceedGroups = currentPage.length >= maxGroups;
+    const wouldExceedEvents =
+      currentPage.length > 0 && currentEvents + groupEvents > maxEvents;
+
+    if (wouldExceedGroups || wouldExceedEvents) {
+      pages.push(currentPage);
+      currentPage = [group];
+      currentEvents = groupEvents;
+    } else {
+      currentPage.push(group);
+      currentEvents += groupEvents;
+    }
+  }
+
+  if (currentPage.length > 0) {
+    pages.push(currentPage);
+  }
+
+  return pages;
+}
+
+/**
+ * Helper to construct a MultiPageDigestPayload from an id and an array of pages.
+ */
+export function createMultiPageDigest<T = string>(
+  id: string,
+  pages: readonly T[],
+): { id: string; pages: readonly T[] } {
+  return { id, pages };
+}
+
+// Re-export delivery and recovery utilities from schedule.js
+export type {
+  PageOutcomeStatus,
+  PageOutcomeRecord,
+  UncertainSend,
+  DigestDeliveryReport,
+  DigestJournalEntry,
+  DigestDeliveryStore,
+  FileDigestDeliveryStoreOptions,
+  MultiPageDigestPayload,
+  DeliverMultiPageDigestOptions,
+  RecoverMultiPageDigestOptions,
+} from "./schedule.js";
+
+export {
+  FileDigestDeliveryStore,
+  deliverMultiPageDigest,
+  recoverMultiPageDigest,
+} from "./schedule.js";

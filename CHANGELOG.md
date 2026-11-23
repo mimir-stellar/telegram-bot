@@ -6,6 +6,14 @@ All notable changes to this project are documented here.
 
 ### Added
 
+**Compaction aggregate reconciliation** (#911)
+
+- `reconcileCompaction(before, after, options?)` in `src/stellar/compaction-reconciliation.ts`
+  compares volume and latency aggregates before and after archive compaction and
+  reports range loss separately from arithmetic mismatch;
+  `renderReconciliationReport()` renders the deterministic text report. See
+  `docs/analytics-export.md`.
+
 **Filter explanation tree**
 
 - `explainFilterRule(rule, event, options?)` in `src/notifications/filter-expr.ts`
@@ -21,6 +29,23 @@ All notable changes to this project are documented here.
   `MAX_EXPLANATION_REASON_LENGTH`); `renderFilterExplanation` renders it as text.
 - Documented in `docs/notification-filters.md` §5; covered by
   `tests/filter-explanation.test.mjs`.
+
+**Read-only cursor consistency check against scan archives**
+
+- `npm run cursor -- check --archive PATH` compares the persisted cursor
+  (`CURSOR_FILE`) with an event archive directory or a `scan --jsonl` export
+  and reports target-identity mismatches (untracked targets, mixed or
+  unexpected contract ids), observed ledger-range gaps and contradictions
+  (archive ends before the cursor's last event, archived events past the
+  cursor's position, processed event ids missing from the archived span,
+  recorded floor-rewind gaps), and archive self-contradictions (event-id vs
+  ledger, conflicting/exact duplicates, out-of-order records). `--json` prints
+  the report as JSON; `--market-contract` / `--squad-contract` (or
+  `MARKET_CONTRACT_ID` / `SQUAD_CONTRACT_ID`) set the expected contract ids.
+- Strictly read-only: it takes no instance lock and never advances, rewinds or
+  writes a cursor or the archive. Exits `0` when no error finding is reported
+  (warnings allowed) and `1` otherwise. The pure report builder lives in
+  `src/cursor-consistency.ts`; `tests/cursor-consistency.test.mjs` covers it.
 
 **Selectable bot language**
 

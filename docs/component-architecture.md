@@ -118,6 +118,7 @@ The archive persists decoded events as rotating canonical JSONL files for offlin
 - `compactArchive(dir, range, options?)`: Atomic, verified archive compaction; returns `{ retained, dropped, files, digest }`.
 - `compactScanJsonl(input, range)`: Returns the re-serialized JSONL plus `{ retained, dropped }`.
 - `validateLedgerRange(range)`: Shared inclusive-range validation.
+- `reconcileCompaction(before, after, options?)` (`src/stellar/compaction-reconciliation.ts`): Pure, deterministic comparison of the volume and latency aggregates before and after compaction. Separates range loss (ledgers lost, marked expected when outside `options.range`) from arithmetic mismatch (aggregates that differ over the ledgers present on both sides). `renderReconciliationReport(report)` renders it as byte-stable text. See [analytics-export.md](analytics-export.md#reconciling-aggregates-across-compaction).
 
 ### Event Decoder (`src/stellar/decode.ts`)
 
@@ -133,6 +134,16 @@ The decoder converts raw Soroban events into typed TypeScript objects. It handle
 - **Market**: `claim_created`, `claim_challenged`, `claim_resolved`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`
 - **Squad**: `market_created`, `deposited`, `withdrawn`, `resolved`, `claimed`, `fees_claimed`
 - **Admin**: Recognized but not notified (`oracle_changed`, `ownership_transferred`, `fee_policy_*`, etc.)
+
+### Analytical Reducers (`src/stellar/*.ts`)
+
+Pure reducers derive aggregate metrics and reports from observed chain events without holding keys or modifying state:
+- **Volume Series** (`src/stellar/volume-series.ts`): Time-bucketed challenge stakes and squad deposits in UTC intervals.
+- **Resolution Latency** (`src/stellar/resolution-latency.ts`): Duration percentiles (p50, p90, max) for resolved claims.
+- **Closing Soon** (`src/stellar/closing-soon.ts`): Squad markets approaching their deadline within a bounded horizon.
+- **Stale Market Watch** (`src/stellar/stale-market.ts`): Identifies open squad markets and prediction claims exceeding a bounded age threshold, labeling all inferred states and maintaining read-only guarantees (no settlement transactions submitted).
+- **Fee Accrual** (`src/stellar/fee-accrual.ts`): Protocol fee accruals from admin events.
+- **Squad Flows & Payouts** (`src/stellar/squad-flows.ts`, `src/stellar/squad-payouts.ts`): Net liquidity and payout invariant accounting.
 
 ### Notification Formatter (`src/notifications/format.ts`)
 

@@ -9,9 +9,9 @@
  *
  * Two families of callbacks share this module:
  *  - navigation/operator actions (`status`, `contracts`, `help`, `pause`,
- *    `resume`, `broadcast`), handled by {@link handleCallbackQuery}. Broadcast
- *    confirmations are bound to a fingerprint of the reviewed destination set
- *    and cancel if route configuration changes before confirmation.
+ *    `resume`, `broadcast`, `confirmations`), handled by {@link handleCallbackQuery}.
+ *    Broadcast confirmations are bound to a fingerprint of the reviewed destination
+ *    set and cancel if route configuration changes before confirmation.
  *  - the `/pause` confirmation buttons, which carry their own payloads and a
  *    TTL, handled by {@link handlePauseConfirmCallback}
  */
@@ -19,7 +19,10 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
 import { safeErrorMessage } from "./notifications/format.js";
-import { handleBroadcastCallback } from "./commands/broadcast.js";
+import {
+  handleBroadcastCallback,
+  handleConfirmationsCallback,
+} from "./commands/broadcast.js";
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
@@ -33,11 +36,35 @@ import { pauseMessage } from "./commands/pause.js";
 import { resumeMessage } from "./commands/resume.js";
 import { statusMessage } from "./commands/status.js";
 import type { CommandDeps } from "./commands/registry.js";
-import { TELEGRAM_OPTIONS, isOperator, safeAnswerCallback } from "./commands/runtime.js";
+import {
+  TELEGRAM_OPTIONS,
+  classifyCallbackError,
+  extractCallbackLogIds,
+  formatCallbackErrorLog,
+  isOperator,
+  safeAnswerCallback,
+  type CallbackErrorLogParams,
+  type CallbackLogIds,
+} from "./commands/runtime.js";
+
+export {
+  classifyCallbackError,
+  extractCallbackLogIds,
+  formatCallbackErrorLog,
+  type CallbackErrorLogParams,
+  type CallbackLogIds,
+};
 
 // ── Callback payload validation ──────────────────────────────────────────────
 
-export type CallbackActionType = "status" | "contracts" | "help" | "pause" | "resume" | "broadcast";
+export type CallbackActionType =
+  | "status"
+  | "contracts"
+  | "help"
+  | "pause"
+  | "resume"
+  | "broadcast"
+  | "confirmations";
 
 export interface ValidCallbackAction {
   type: CallbackActionType;
@@ -61,7 +88,15 @@ export const CALLBACK_FALLBACK_FEEDBACK = "Invalid or unrecognized action";
 export const CALLBACK_UNAUTHORIZED_FEEDBACK = "Unauthorized: operator only";
 
 function isKnownAction(val: string): val is CallbackActionType {
-  return ["status", "contracts", "help", "pause", "resume", "broadcast"].includes(val);
+  return [
+    "status",
+    "contracts",
+    "help",
+    "pause",
+    "resume",
+    "broadcast",
+    "confirmations",
+  ].includes(val);
 }
 
 /** Maximum digits for JavaScript Number.MAX_SAFE_INTEGER (9,007,199,254,740,991 has 16 digits). */
@@ -433,8 +468,9 @@ export async function handleCallbackQuery(
   const validation = validateCallbackData(rawData);
 
   if (!validation.ok) {
+    const ids = extractCallbackLogIds(ctx, [config.botToken]);
     console.warn(
-      `[bot] rejected invalid callback query (${validation.reason}) on update ${ctx.update.update_id}`,
+      `[bot] rejected invalid callback query (${validation.reason}) update_id=${ids.updateId} callback_query_id=${ids.callbackQueryId}`,
     );
     await safeAnswerCallback(ctx, config, {
       text: validation.fallbackText,
@@ -446,10 +482,16 @@ export async function handleCallbackQuery(
   const { action } = validation;
 
   // Enforce operator role authorization
-  if (action.type === "pause" || action.type === "resume" || action.type === "broadcast") {
+  if (
+    action.type === "pause" ||
+    action.type === "resume" ||
+    action.type === "broadcast" ||
+    action.type === "confirmations"
+  ) {
     if (!isOperator(ctx, config)) {
+      const ids = extractCallbackLogIds(ctx, [config.botToken]);
       console.warn(
-        `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
+        `[bot] ignored unauthorized callback action=${action.type} update_id=${ids.updateId} callback_query_id=${ids.callbackQueryId}`,
       );
       await safeAnswerCallback(ctx, config, {
         text: CALLBACK_UNAUTHORIZED_FEEDBACK,
@@ -464,6 +506,11 @@ export async function handleCallbackQuery(
     switch (action.type) {
       case "broadcast": {
         await handleBroadcastCallback(ctx, deps, action.raw);
+        break;
+      }
+
+      case "confirmations": {
+        await handleConfirmationsCallback(ctx, deps, action.raw);
         break;
       }
 
@@ -533,7 +580,12 @@ export async function handleCallbackQuery(
     }
   } catch (err) {
     console.error(
-      `[bot] callback error on action ${action.type}: ${safeErrorMessage(err, [config.botToken])}`,
+      formatCallbackErrorLog({
+        ctx,
+        action: action.type,
+        error: err,
+        secrets: [config.botToken],
+      }),
     );
     await safeAnswerCallback(ctx, config, { text: "Action failed" });
   }
@@ -596,24 +648,37 @@ export async function handlePauseConfirmCallback(
   // Reject stale confirmations so an old message cannot stop the poller later.
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
   const ageMs = nowMs - messageDate * 1000;
-  if (ageMs > PAUSE_CONFIRM_TTL_MS) {
-    await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
-    await ctx.editMessageText(
-      "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
-      TELEGRAM_OPTIONS,
+  const actionName = action === CALLBACK_PAUSE_CONFIRM ? "pause_confirm" : "pause_cancel";
+  try {
+    if (ageMs > PAUSE_CONFIRM_TTL_MS) {
+      await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
+      await ctx.editMessageText(
+        "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
+        TELEGRAM_OPTIONS,
+      );
+      return;
+    }
+
+    if (action === CALLBACK_PAUSE_CONFIRM) {
+      const result = pause();
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Cancelled." });
+    await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
+  } catch (err) {
+    console.error(
+      formatCallbackErrorLog({
+        ctx,
+        action: actionName,
+        error: err,
+        secrets: [config.botToken],
+      }),
     );
-    return;
+    await safeAnswerCallback(ctx, config, { text: "Action failed" });
   }
-
-  if (action === CALLBACK_PAUSE_CONFIRM) {
-    const result = pause();
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
-    return;
-  }
-
-  await ctx.answerCallbackQuery({ text: "Cancelled." });
-  await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────

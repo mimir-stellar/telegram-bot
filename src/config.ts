@@ -58,6 +58,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
+import { DEFAULT_MAX_RESPONSE_BYTES } from "./stellar/rpc-guard.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -183,6 +184,12 @@ export interface StellarConfig {
   networkPassphrase: string;
   /** Optional override for stellar.expert (or compatible) explorer origin. */
   explorerBaseUrl: string;
+  /**
+   * Maximum permitted byte length of a single Soroban RPC HTTP response
+   * (`STELLAR_RPC_MAX_RESPONSE_BYTES`). Optional on this chain-only type so
+   * hand-built configs keep working; defaults to {@link DEFAULT_MAX_RESPONSE_BYTES}.
+   */
+  rpcMaxResponseBytes?: number;
 }
 
 export interface TelegramRoute {
@@ -344,6 +351,12 @@ export interface BotConfig extends StellarConfig {
    */
   healthStaleMs: number;
   /**
+   * How long operational HTTP servers (`/health`, `/metrics`) wait for active or
+   * stalled client sockets to close during shutdown before force-closing them.
+   * `0` force-closes sockets immediately.
+   */
+  healthShutdownGraceMs: number;
+  /**
    * Wall-clock budget for retrying the startup RPC `getHealth()` probe.
    * `0` means a single attempt with no retries.
    */
@@ -396,6 +409,9 @@ export interface BotConfig extends StellarConfig {
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 
+/** Fallback grace period for closing stalled operational HTTP sockets during shutdown. */
+export const DEFAULT_HEALTH_SHUTDOWN_GRACE_MS = 2_000;
+
 /** Fallback per-send budget when a config object predates `TELEGRAM_SEND_TIMEOUT_MS`. */
 export const DEFAULT_TELEGRAM_SEND_TIMEOUT_MS = 10_000;
 
@@ -417,6 +433,7 @@ const DEFAULTS = {
   network: "testnet" as StellarNetwork,
   locale: DEFAULT_LOCALE,
   rpcUrl: NETWORK_RPC_URLS.testnet,
+  rpcMaxResponseBytes: DEFAULT_MAX_RESPONSE_BYTES,
   horizonUrl: NETWORK_HORIZON_URLS.testnet,
   networkPassphrase: NETWORK_PASSPHRASES.testnet,
   pollIntervalMs: 30_000,
@@ -437,8 +454,10 @@ const DEFAULTS = {
   sendJournalFile: "./data/send-journal.jsonl",
   healthHost: "127.0.0.1",
   healthPort: 8787,
-  // 3Ã— default poll interval â€” one missed cycle is fine; three is not.
+  // 3× default poll interval — one missed cycle is fine; three is not.
   healthStaleMs: 90_000,
+  // Short grace period so stalled health/metrics clients cannot hold shutdown open.
+  healthShutdownGraceMs: DEFAULT_HEALTH_SHUTDOWN_GRACE_MS,
   // Retry RPC getHealth at boot for up to 30s (Testnet blips / deploy races).
   startupHealthDeadlineMs: 30_000,
   startupHealthRetryMs: 1_000,
@@ -929,6 +948,11 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     marketContractVersion: c.contractVersion("MARKET_CONTRACT_VERSION", "v1"),
     squadContractVersion: c.contractVersion("SQUAD_CONTRACT_VERSION", "v1"),
     rpcUrl: c.url("STELLAR_RPC_URL", namedDefaults.rpcUrl),
+    rpcMaxResponseBytes: c.int(
+      "STELLAR_RPC_MAX_RESPONSE_BYTES",
+      DEFAULTS.rpcMaxResponseBytes,
+      1,
+    ),
     horizonUrl: c.url("STELLAR_HORIZON_URL", namedDefaults.horizonUrl),
     networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? namedDefaults.passphrase,
     explorerBaseUrl: c.url(
@@ -1027,6 +1051,11 @@ export function loadConfig(): BotConfig {
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
+    healthShutdownGraceMs: c.int(
+      "HEALTH_SHUTDOWN_GRACE_MS",
+      DEFAULTS.healthShutdownGraceMs,
+      0,
+    ),
     // 0 = single attempt (no retries) for the startup RPC probe.
     startupHealthDeadlineMs: c.int(
       "STARTUP_HEALTH_DEADLINE_MS",
@@ -1073,6 +1102,55 @@ export function loadConfig(): BotConfig {
   }
 
   return config;
+}
+
+/** Result of previewing where a notification of a given contract would be routed. */
+export interface RoutingPreview {
+  /** Contract whose events were previewed. */
+  contract: "market" | "squad";
+  /** Destinations that would receive the notification. */
+  matched: string[];
+  /** Destinations dropped by a feature flag or the category allowlist. */
+  filtered: string[];
+  /** Destinations with no usable chat id (empty or unconfigured). */
+  unavailable: string[];
+}
+
+/**
+ * Preview routing for a contract's notifications without any network I/O.
+ * Uses the same chat-id resolution as configured destinations so the preview
+ * matches live delivery targets. Pure: safe to call from `/status` or tests.
+ */
+export function previewRouting(
+  config: BotConfig,
+  contract: "market" | "squad",
+): RoutingPreview {
+  const preview: RoutingPreview = { contract, matched: [], filtered: [], unavailable: [] };
+
+  const enabled =
+    contract === "market" ? config.featureFlags.market : config.featureFlags.squad;
+  const candidate =
+    contract === "market"
+      ? config.marketChatId ?? config.chatId
+      : config.squadChatId ?? config.chatId;
+
+  const destinations = [candidate, ...(config.routes ?? []).map((r) => r.chatId)];
+  const seen = new Set<string>();
+  for (const destination of destinations) {
+    if (destination === undefined || destination === "") {
+      preview.unavailable.push(String(destination ?? ""));
+      continue;
+    }
+    if (seen.has(destination)) continue;
+    seen.add(destination);
+    if (!enabled) {
+      preview.filtered.push(destination);
+    } else {
+      preview.matched.push(destination);
+    }
+  }
+
+  return preview;
 }
 
 /** Check if a host is a loopback address (127.0.0.1, [::1], localhost). */
@@ -1184,6 +1262,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "SQUAD_CONTRACT_VERSION", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_RPC_URL", secret: false, hasBuiltInDefault: true },
+  { key: "STELLAR_RPC_MAX_RESPONSE_BYTES", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_HORIZON_URL", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK_PASSPHRASE", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_EXPLORER_BASE_URL", secret: false, hasBuiltInDefault: true },
@@ -1229,6 +1308,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
     },
   },
   { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
+  { key: "HEALTH_SHUTDOWN_GRACE_MS", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_AUTH_TOKEN", secret: true },
   { key: "STARTUP_HEALTH_DEADLINE_MS", secret: false, hasBuiltInDefault: true },
   { key: "STARTUP_HEALTH_RETRY_MS", secret: false, hasBuiltInDefault: true },

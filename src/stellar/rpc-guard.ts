@@ -82,6 +82,7 @@ export function assertNetworkIdentity(
 }
 
 export type RpcGuardProblem =
+  | "response-oversized"
   | "not-an-object"
   | "events-not-an-array"
   | "events-oversized"

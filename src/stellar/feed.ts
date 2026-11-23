@@ -159,6 +159,117 @@ export function safeHttpsUrl(url: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Feed filtering
+// ---------------------------------------------------------------------------
+
+/**
+ * Optional per-contract filter for a feed document.
+ *
+ * `contractIds` is a set of emitting contract ids; when present (and
+ * non-empty) only events whose `contractId` is in the set are included.
+ * `eventNames` optionally narrows further to specific event names.
+ *
+ * Filters are normalized via {@link normalizeFeedFilter} before use so that
+ * equivalent filters (ordering, duplicates, whitespace, casing of contract
+ * ids) produce identical cache identities.
+ */
+export interface FeedFilter {
+  /** Emitting contract ids to include. Empty/undefined means "all contracts". */
+  contractIds?: readonly string[];
+  /** Event names to include. Empty/undefined means "all event names". */
+  eventNames?: readonly string[];
+}
+
+/**
+ * Normalized, canonical form of a {@link FeedFilter}.
+ *
+ * - `contractIds` are trimmed, lower-cased (Stellar contract ids are
+ *   case-insensitive strkeys), de-duplicated, and sorted.
+ * - `eventNames` are trimmed, de-duplicated, and sorted.
+ * - Empty arrays are dropped so "no filter" and "empty filter" collapse to the
+ *   same identity.
+ */
+export interface NormalizedFeedFilter {
+  contractIds?: readonly string[];
+  eventNames?: readonly string[];
+}
+
+function normalizeList(values: readonly string[] | undefined, lower: boolean): string[] | undefined {
+  if (!values || values.length === 0) return undefined;
+  const seen = new Set<string>();
+  for (const raw of values) {
+    const trimmed = raw.trim();
+    if (trimmed === "") continue;
+    seen.add(lower ? trimmed.toLowerCase() : trimmed);
+  }
+  if (seen.size === 0) return undefined;
+  return Array.from(seen).sort();
+}
+
+/**
+ * Normalize a {@link FeedFilter} into a canonical form suitable for cache
+ * identity and for filtering events.  Returns `undefined` when the filter is
+ * absent or effectively empty (i.e. matches everything).
+ */
+export function normalizeFeedFilter(
+  filter: FeedFilter | undefined,
+): NormalizedFeedFilter | undefined {
+  if (!filter) return undefined;
+  const contractIds = normalizeList(filter.contractIds, true);
+  const eventNames = normalizeList(filter.eventNames, false);
+  if (!contractIds && !eventNames) return undefined;
+  return {
+    ...(contractIds ? { contractIds } : {}),
+    ...(eventNames ? { eventNames } : {}),
+  };
+}
+
+/**
+ * Build a stable cache key for a feed document scoped to a normalized filter.
+ *
+ * The key embeds the normalized filter so that two different filters can never
+ * share a cache entry (preventing one contract's feed response from leaking
+ * into another filter).  Equivalent filters normalize to the same key.
+ */
+export function feedCacheKey(
+  baseKey: string,
+  filter: FeedFilter | NormalizedFeedFilter | undefined,
+): string {
+  const normalized = normalizeFeedFilter(filter as FeedFilter | undefined);
+  if (!normalized) return baseKey;
+  const parts: string[] = [];
+  if (normalized.contractIds) {
+    parts.push(`contracts=${normalized.contractIds.map(encodeURIComponent).join(",")}`);
+  }
+  if (normalized.eventNames) {
+    parts.push(`events=${normalized.eventNames.map(encodeURIComponent).join(",")}`);
+  }
+  return `${baseKey}#${parts.join("&")}`;
+}
+
+/**
+ * Return true when `event` matches the (already normalized) filter.
+ * An absent filter matches every event.
+ */
+export function matchesFeedFilter(
+  event: DecodedEvent,
+  filter: NormalizedFeedFilter | undefined,
+): boolean {
+  if (!filter) return true;
+  if (filter.contractIds) {
+    if (!filter.contractIds.includes(event.contractId.toLowerCase())) return false;
+  }
+  if (filter.eventNames) {
+    const name =
+      event.payload.name === "unknown"
+        ? (event.payload.eventName ?? "unknown")
+        : event.payload.name;
+    if (!filter.eventNames.includes(name)) return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Feed entry
 // ---------------------------------------------------------------------------
 
@@ -198,6 +309,12 @@ export interface AtomFeedOptions {
   updatedAt?: string;
   /** Optional subtitle / description for the feed. */
   subtitle?: string;
+  /**
+   * Optional per-contract filter.  When set, only matching events are included
+   * in the feed.  The filter is normalized before use, so equivalent filters
+   * produce identical output.
+   */
+  filter?: FeedFilter;
 }
 
 /**
@@ -291,6 +408,8 @@ function renderEntry(entry: AtomEntry): string {
  * - Each event becomes one `<entry>`.  Events with no plain-text rendering still
  *   get an entry (with an empty `<content/>`), so feed readers always see the
  *   full event count.
+ * - When `options.filter` is set, only matching events are included; the filter
+ *   is normalized first so equivalent filters yield identical output.
  * - All dynamic content is XML-escaped; XML-illegal control characters are
  *   stripped before escaping.  Length limits are enforced by Unicode code-point
  *   count *after* XML escaping so entity references (`&amp;`, `&lt;`, …) are
@@ -302,49 +421,16 @@ export function buildAtomFeed(
 ): string {
   const { title, selfUrl, config, subtitle } = options;
 
-  // Feed <updated>: caller override -> latest valid event.at -> explicit unknown timestamp.
+  const normalizedFilter = normalizeFeedFilter(options.filter);
+  const filteredEvents = normalizedFilter
+    ? events.filter((event) => matchesFeedFilter(event, normalizedFilter))
+    : events;
+
+  // Feed <updated>: caller override → latest event.at → now.
   let feedUpdated: string;
   if (options.updatedAt) {
     feedUpdated = options.updatedAt;
-  } else {
-    const maxAt = events.reduce(
-      (best, e) => (typeof e.at === "number" && Number.isFinite(e.at) && e.at > best ? e.at : best),
-      0,
-    );
-    feedUpdated = maxAt > 0 ? new Date(maxAt * 1000).toISOString() : UNKNOWN_EVENT_TIMESTAMP;
-  }
+  } else if (filteredEvents.length > 0) {
+    const maxAt = filteredEvents.
 
-  const validSelfUrl = safeHttpsUrl(selfUrl);
-  if (validSelfUrl === null) {
-    throw new TypeError("Atom feed selfUrl must be a valid HTTPS URL without credentials");
-  }
-
-  const lines: string[] = [
-    '<?xml version="1.0" encoding="UTF-8"?>',
-    '<feed xmlns="http://www.w3.org/2005/Atom">',
-    `  <title type="text">${xmlText(title, FEED_TITLE_MAX_CHARS)}</title>`,
-  ];
-
-  if (subtitle) {
-    lines.push(`  <subtitle type="text">${xmlText(subtitle, FEED_TITLE_MAX_CHARS)}</subtitle>`);
-  }
-
-  lines.push(
-    `  <id>${escapeXml(validSelfUrl)}</id>`,
-    `  <updated>${escapeXml(feedUpdated)}</updated>`,
-  );
-
-  if (validSelfUrl) {
-    lines.push(
-      `  <link rel="self" type="application/atom+xml" href="${escapeXml(validSelfUrl)}"/>`,
-    );
-  }
-
-  for (const event of events) {
-    const entry = buildAtomEntry(event, config);
-    lines.push(renderEntry(entry));
-  }
-
-  lines.push("</feed>");
-  return lines.join("\n");
-}
+/* … truncated 1019 chars — edit only what you need near the top … */

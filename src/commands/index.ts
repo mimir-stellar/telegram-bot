@@ -28,6 +28,7 @@ import "./pause.js";
 import "./resume.js";
 import "./log-export.js"; // hidden: operator log export
 import "./match-preview.js"; // hidden: operator subscription match count
+import "./digest-preview.js"; // hidden: operator pending digest preview
 
 import { COMMAND_DETAILS } from "./help-detail.js";
 import {
@@ -65,13 +66,18 @@ export {
   type CommandModule,
 } from "./registry.js";
 export {
+  MAX_COMMAND_ARGUMENT_BYTES,
   TELEGRAM_OPTIONS,
   chatAllowed,
+  checkCommandArgumentLength,
   commandArgument,
+  commandArgumentAllowed,
+  commandArgumentTooLongMessage,
   isChatAllowed,
   isOperator,
   operatorAllowed,
   replyMarkdown,
+  type CommandArgumentCheck,
 } from "./runtime.js";
 export {
   CALLBACK_PAUSE_CANCEL,
@@ -103,3 +109,7 @@ export {
   matchPreviewInvalidMessage,
   MATCH_PREVIEW_USAGE,
 } from "./match-preview.js";
+export {
+  digestPreviewCommand,
+  DIGEST_PREVIEW_UNAVAILABLE,
+} from "./digest-preview.js";

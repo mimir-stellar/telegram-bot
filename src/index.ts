@@ -197,7 +197,9 @@ async function main(): Promise<void> {
   let metricsServer: MetricsServer | null = null;
   if (config.metricsPort !== null) {
     try {
-      metricsServer = await metrics.startServer(config.metricsPort);
+      metricsServer = await metrics.startServer(config.metricsPort, "127.0.0.1", {
+        shutdownGraceMs: config.healthShutdownGraceMs,
+      });
     } catch (err) {
       // Metrics are optional. A port conflict or privilege error must not
       // prevent the bot from starting — just log and continue.

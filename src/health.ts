@@ -10,13 +10,19 @@
 
 import crypto from "node:crypto";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
 
 import {
   emptyActivityBaseline,
   type ActivityBaselineSnapshot,
 } from "./activity-baseline.js";
-import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
+import {
+  configProvenance,
+  DEFAULT_HEALTH_SHUTDOWN_GRACE_MS,
+  networkLabel,
+  type BotConfig,
+  type ConfigProvenance,
+} from "./config.js";
 import type { LogCapture } from "./logger.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
@@ -36,6 +42,15 @@ export interface HealthDeps {
    * {@link configProvenance}; either way only key names and origins are served.
    */
   provenance?: () => ConfigProvenance;
+}
+
+export interface HealthCloseOptions {
+  /**
+   * Milliseconds to wait for active or stalled client sockets to close during
+   * shutdown before force-closing them. Defaults to `config.healthShutdownGraceMs`
+   * (or {@link DEFAULT_HEALTH_SHUTDOWN_GRACE_MS}); `0` force-closes immediately.
+   */
+  gracePeriodMs?: number;
 }
 
 export interface HealthServer {
@@ -174,12 +189,60 @@ export interface HealthReport {
     persistentVolumeError: string | null;
   };
   /**
+   * Per-dependency readiness, separating *why* the bot is not ready into the
+   * four dependencies it relies on: reaching the RPC, a usable cursor, a
+   * configured route, and working delivery. Additive detail; the overall
+   * {@link HealthReport.ok} / {@link HealthReport.status} are unchanged.
+   */
+  dependencies: HealthDependencies;
+  /**
    * Where configuration came from: each setting's name and the source that
    * supplied it. No value — secret or not — is ever included, so an operator
    * can confirm *which* token and chat id this process is using without either
    * of them leaving the process.
    */
   config: ConfigProvenance;
+}
+
+/** Readiness of a single dependency the bot relies on to deliver notifications. */
+export interface DependencyReadiness {
+  /** True when this dependency is ready to serve. */
+  ready: boolean;
+  /**
+   * Value-free reason this dependency is not ready, or `null` when ready.
+   * Built only from counts and public source names (`market`/`squad`); never a
+   * token, a chat id, or another private destination identifier.
+   */
+  reason: string | null;
+}
+
+/**
+ * The four dependencies the notifier relies on, assessed separately so an
+ * operator or probe can tell *which* one is the bottleneck rather than only
+ * that the overall status is degraded.
+ *
+ * `rpc` and `cursor` mirror the signals behind {@link HealthReport.status}'s
+ * `"degraded"` verdict (consecutive failures, a stale success, a stale or
+ * stalled cursor). `route` and `delivery` are independent: a route is ready as
+ * soon as a destination is configured for each watched contract, and delivery
+ * is ready when no sends are parked in the dead-letter queue. None of the
+ * reasons ever carries a credential or a private destination identifier.
+ */
+export interface HealthDependencies {
+  /** Stellar RPC reachability: the chain reads this process depends on. */
+  rpc: DependencyReadiness;
+  /** Cursor / resume-position usability across watched targets. */
+  cursor: DependencyReadiness;
+  /**
+   * Telegram route configuration: a destination is configured for each watched
+   * contract. Reasons name the source (`market`/`squad`), never the chat id.
+   */
+  route: DependencyReadiness;
+  /**
+   * Telegram delivery: sends are landing. Not ready when sends are parked in
+   * the dead-letter queue. Counts only; never message text or a destination.
+   */
+  delivery: DependencyReadiness;
 }
 
 const CURSOR_PREVIEW_LEN = 24;
@@ -262,6 +325,119 @@ export function chainClockLabel(chainClockAt: number | null | undefined, nowMs: 
   return skewMs >= 0
     ? `local clock ${human} ahead of chain`
     : `chain clock ${human} ahead of local`;
+}
+
+/**
+ * Assess the four dependencies separately so a probe can tell *which* one is
+ * the bottleneck, not just that the overall status is degraded.
+ *
+ * - `rpc` and `cursor` reuse the same signals that drive `status === "degraded"`
+ *   (consecutive failures, a stale success, a stale or stalled cursor). They
+ *   are suppressed during an intentional pause or drain, mirroring how the
+ *   overall status stays `"ok"` for those states.
+ * - `route` is config-derived and independent of poller state: a destination
+ *   is configured for each watched contract. Reasons name the source
+ *   (`market`/`squad`), never the chat id.
+ * - `delivery` follows the dead-letter queue depth: a non-zero depth is a real
+ *   backlog that persists across a pause or drain, so it is reported whenever
+ *   the poller is running (only a stopped poller reports "poller not running").
+ *
+ * Every reason is built from counts and public source names only.
+ */
+function assessDependencies(
+  config: BotConfig,
+  poller: PollerStatus,
+  nowMs: number,
+): HealthDependencies {
+  const stopped = !poller.running;
+  // Paused and draining are intentional: like the overall status, they do not
+  // make an *active-polling* dependency not-ready on their own.
+  const intentional = poller.paused === true || poller.stopping === true;
+
+  // --- RPC: chain reachability -------------------------------------------
+  let rpc: DependencyReadiness;
+  if (stopped) {
+    rpc = { ready: false, reason: "poller not running" };
+  } else if (intentional) {
+    rpc = { ready: true, reason: null };
+  } else {
+    const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
+    if (poller.circuitBreaker?.open === true) {
+      rpc = {
+        ready: false,
+        reason: `circuit breaker open after ${poller.circuitBreaker.failureCount} consecutive RPC failures`,
+      };
+    } else if (poller.consecutiveFailures >= failureBudget) {
+      rpc = {
+        ready: false,
+        reason: `consecutive failures (${poller.consecutiveFailures}) exceed budget (${failureBudget})`,
+      };
+    } else if (
+      poller.lastSuccessAt !== null &&
+      config.healthStaleMs > 0 &&
+      nowMs - (poller.lastSuccessAt as number) > config.healthStaleMs
+    ) {
+      rpc = { ready: false, reason: `no successful poll within ${config.healthStaleMs} ms` };
+    } else {
+      rpc = { ready: true, reason: null };
+    }
+  }
+
+  // --- Cursor: resume-position usability --------------------------------
+  let cursor: DependencyReadiness;
+  if (stopped) {
+    cursor = { ready: false, reason: "poller not running" };
+  } else if (intentional) {
+    cursor = { ready: true, reason: null };
+  } else {
+    const staleSources: string[] = [];
+    const stalledSources: string[] = [];
+    for (const t of poller.targets) {
+      if (t.cursorStale === true) staleSources.push(t.source);
+      if (t.cursorStalled === true) stalledSources.push(t.source);
+    }
+    const parts: string[] = [];
+    if (staleSources.length > 0) parts.push(`stale cursor on ${staleSources.join(", ")}`);
+    if (stalledSources.length > 0) parts.push(`stalled cursor on ${stalledSources.join(", ")}`);
+    cursor =
+      parts.length > 0
+        ? { ready: false, reason: parts.join("; ") }
+        : { ready: true, reason: null };
+  }
+
+  // --- Route: a destination is configured for each watched contract -----
+  // Config-derived and independent of poller state. The route exists as soon
+  // as the process boots with a valid config; a missing destination is the
+  // only failure mode and it names the source, never the chat id.
+  const defaultChat = config.chatId || config.chatIds?.[0] || "";
+  const routeMissing: string[] = [];
+  for (const t of poller.targets) {
+    const dest =
+      t.source === "market"
+        ? config.marketChatId || defaultChat
+        : config.squadChatId || defaultChat;
+    if (!dest) routeMissing.push(t.source);
+  }
+  const route: DependencyReadiness =
+    routeMissing.length > 0
+      ? { ready: false, reason: `no destination configured for ${routeMissing.join(", ")}` }
+      : { ready: true, reason: null };
+
+  // --- Delivery: Telegram sends are landing -----------------------------
+  let delivery: DependencyReadiness;
+  if (stopped) {
+    delivery = { ready: false, reason: "poller not running" };
+  } else {
+    // A non-zero depth is a persistent backlog that survives a pause or drain,
+    // so it is reported whenever the poller is running rather than suppressed.
+    const depth = poller.deadLetter?.depth ?? 0;
+    delivery =
+      depth > 0
+        ? { ready: false, reason: `${depth} send(s) awaiting replay in the dead-letter queue` }
+        : { ready: true, reason: null };
+  }
+
+  return { rpc, cursor, route, delivery };
 }
 
 /**
@@ -392,6 +568,7 @@ export function buildHealthReport(
       persistentVolumeAvailable: poller.persistentVolumeAvailable ?? true,
       persistentVolumeError: poller.persistentVolumeError ?? null,
     },
+    dependencies: assessDependencies(config, poller, nowMs),
     config: provenance,
   };
 }
@@ -484,12 +661,14 @@ function sendJson(
   res: http.ServerResponse,
   statusCode: number,
   body: unknown,
+  closing = false,
 ): void {
   const payload = `${JSON.stringify(body)}\n`;
   res.writeHead(statusCode, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "content-length": Buffer.byteLength(payload),
+    ...(closing ? { connection: "close" } : {}),
   });
   res.end(payload);
 }
@@ -519,8 +698,19 @@ function sendUnauthorized(res: http.ServerResponse): void {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "content-length": "0",
+    ...(closing ? { connection: "close" } : {}),
   });
   res.end();
+}
+
+function resolveShutdownGraceMs(overrideMs: number | undefined, configMs: number | undefined): number {
+  if (typeof overrideMs === "number" && Number.isFinite(overrideMs)) {
+    return Math.max(0, Math.trunc(overrideMs));
+  }
+  if (typeof configMs === "number" && Number.isFinite(configMs)) {
+    return Math.max(0, Math.trunc(configMs));
+  }
+  return DEFAULT_HEALTH_SHUTDOWN_GRACE_MS;
 }
 
 /**
@@ -551,7 +741,15 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     };
   }
 
+  const sockets = new Set<Socket>();
+  let closing = false;
+  let closePromise: Promise<void> | null = null;
+
   const server = http.createServer((req, res) => {
+    if (closing) {
+      res.setHeader("Connection", "close");
+    }
+
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
@@ -568,7 +766,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
 
     // Check authentication for all routes when token is configured
     if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
-      sendUnauthorized(res);
+      sendUnauthorized(res, closing);
       return;
     }
 
@@ -586,13 +784,18 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     if (method === "GET" && (url.pathname === "/health/live" || url.pathname === "/livez")) {
       // Liveness: the process is up and the HTTP server can answer. Do not
       // reflect poller degradation here — supervisors use /health for that.
-      sendJson(res, 200, {
-        ok: true,
-        status: "live",
-        service: "mimir-telegram-bot",
-        version: config.version,
-        checkedAt: new Date(now()).toISOString(),
-      });
+      sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          status: "live",
+          service: "mimir-telegram-bot",
+          version: config.version,
+          checkedAt: new Date(now()).toISOString(),
+        },
+        closing,
+      );
       return;
     }
 
@@ -602,22 +805,35 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         "content-type": "text/plain; version=0.0.4; charset=utf-8",
         "cache-control": "no-store",
         "content-length": Buffer.byteLength(metrics),
+        ...(closing ? { connection: "close" } : {}),
       });
       res.end(metrics);
       return;
     }
 
     if (method === "GET" && url.pathname === "/") {
-      sendJson(res, 200, {
-        service: "mimir-telegram-bot",
-        health: "/health",
-        live: "/health/live",
-        metrics: "/metrics",
-      });
+      sendJson(
+        res,
+        200,
+        {
+          service: "mimir-telegram-bot",
+          health: "/health",
+          live: "/health/live",
+          metrics: "/metrics",
+        },
+        closing,
+      );
       return;
     }
 
-    sendJson(res, 404, { ok: false, error: "not_found" });
+    sendJson(res, 404, { ok: false, error: "not_found" }, closing);
+  });
+
+  server.on("connection", (socket: Socket) => {
+    sockets.add(socket);
+    socket.once("close", () => {
+      sockets.delete(socket);
+    });
   });
 
   // Failures after listen (e.g. client aborts) must not take down the notifier.
@@ -634,6 +850,13 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     `[health] listening on ${url} (GET /health, GET /health/live` +
       `${logs && logs.capacity() > 0 ? ", GET /health/diag" : ""})`,
   );
+
+  const forceDestroySockets = (): void => {
+    server.closeAllConnections?.();
+    for (const socket of sockets) {
+      if (!socket.destroyed) socket.destroy();
+    }
+  };
 
   return {
     url,

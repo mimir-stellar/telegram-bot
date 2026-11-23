@@ -46,6 +46,12 @@ The residual USDC amount reported in the `dust` field of a claim's
 A fee rate in basis points, where 100 bps equals 1%, so `feeBps: 200` represents
 2% in [`SquadMarketCreatedPayload`](../src/stellar/decode.ts#L136-L145).
 
+## Inferred state
+
+A read-only analytical state (such as `inferred_stale` or `inferred_overdue`) derived
+from observing event logs without a corresponding resolution event on-chain.
+The bot never acts as an oracle, holds signing keys, or submits settlement transactions.
+
 ## Ledger
 
 A numbered batch of Stellar transactions; the `ledger` field in
@@ -82,6 +88,12 @@ One of a squad market's two positions, Side A (`1`) or Side B (`2`) in
 A two-sided market tracked by `mimir-squad`, identified by `marketId` and
 described by a `question`, `captain`, `deadline` and `feeBps`
 ([`SquadMarketCreatedPayload`](../src/stellar/decode.ts#L136-L145)).
+
+## Stale market
+
+An open squad market or prediction claim whose elapsed duration since creation
+(or declared deadline) has exceeded a configurable age threshold without an
+observed on-chain resolution or cancellation event.
 
 ## Stake
 

@@ -79,3 +79,51 @@ partial:
 
 An open claim is normal on a live archive, so `complete: false` is a signal to
 read the counts, not an error.
+
+## Reconciling aggregates across compaction
+
+`compactArchive()` drops every ledger outside the requested range, so the
+volume and latency aggregates change by design. `reconcileCompaction(before,
+after, { range, bucket })` in `src/stellar/compaction-reconciliation.ts` checks
+that they changed *only* by design. It is a library function (no CLI, no new
+configuration, no environment variables) and it is pure: read the archive with
+`readArchive()` before and after compacting, then pass both event lists in.
+
+It reports two failure classes separately:
+
+| Class | What it means | How it is found |
+|---|---|---|
+| Range loss | Ledgers that carried events before and carry none after | Ledger sets are diffed; each lost run is reported with inclusive bounds, ledger and event counts. A run outside `range` is `expected`; a run inside it (or any run when `range` is omitted) is unexpected. `impact` gives the stake, deposits and paired claims that disappear with the lost ledgers. |
+| Arithmetic mismatch | Aggregates that differ even though the ledgers are still there | `volumeSeries()` and `resolutionLatency()` are re-run over the ledgers present on **both** sides only, and every differing total, bucket, latency summary and per-claim duration is listed with `before`, `after` and `delta`. |
+
+Because range loss is removed before the arithmetic comparison, a dropped
+ledger never appears as a mismatch and an altered value never appears as range
+loss. Ledgers present only after compaction are reported as range gain.
+`ok` is `true` when there is no unexpected range loss, no range gain and no
+mismatch; `findings` lists the failing classes in a fixed order.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `bucket` | `"day"` | Volume bucket width (`"hour"` or `"day"`), passed to `volumeSeries()` |
+| `range` | none | The inclusive `LedgerRange` the compaction retained; validated with `validateLedgerRange()` |
+
+The report object is deep-equal for the same inputs regardless of input order,
+and `renderReconciliationReport(report)` renders LF text with no clock or host
+data, so it can be diffed or stored as evidence:
+
+```text
+Compaction reconciliation report (v1)
+status: FAIL (range-loss)
+bucket: day
+compaction range: 100..300
+before: events=8 invalid=0 ledgers 100..400
+after:  events=6 invalid=0 ledgers 100..300
+
+Range loss: 2 span(s), expected events=1, unexpected events=1
+  120..120  ledgers=1 events=1  UNEXPECTED
+  400..400  ledgers=1 events=1  expected (outside compaction range)
+  impact: challengeStake=5000000 squadDeposit=0 pairedClaims=1
+Range gain: 0 span(s)
+
+Arithmetic mismatches (shared ledgers only): 0
+```

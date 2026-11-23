@@ -1,5 +1,5 @@
 import { createHash, type Hash } from "node:crypto";
-import { open, mkdir, readdir, rename, rm, unlink, chmod } from "node:fs/promises";
+import { open, mkdir, readdir, readFile, rename, rm, unlink, chmod, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
@@ -399,4 +399,147 @@ export async function* readArchive(
   for (const event of stagedEvents) {
     yield event;
   }
+}
+/** File name of the hash-chained manifest stored alongside archive files. */
+export const ARCHIVE_MANIFEST_FILENAME = "archive.manifest.json";
+
+const MANIFEST_GENESIS_HASH = "0".repeat(64);
+
+/**
+ * Hash-chained manifest binding an archive's ordered records, network and
+ * ledger bounds to a single digest. Each record hash commits to the previous
+ * one, so missing, reordered or altered records fail verification.
+ */
+export interface ArchiveManifest {
+  type: "archive-manifest";
+  version: 1;
+  network: string;
+  ledgerMin: number | null;
+  ledgerMax: number | null;
+  recordCount: number;
+  recordHashes: string[];
+  chainHead: string;
+}
+
+export interface ArchiveManifestBounds {
+  network: string;
+  ledgerMin: number | null;
+  ledgerMax: number | null;
+}
+
+export interface VerifyArchiveManifestResult {
+  ok: boolean;
+  recordCount: number;
+  reason?: string;
+}
+
+function manifestChainStep(prevHash: string, recordLine: string): string {
+  return createHash("sha256").update(`${prevHash}\n${recordLine}`, "utf8").digest("hex");
+}
+
+/** Read every non-blank record line of the archive in chronological order (LF-normalised). */
+async function readArchiveRecordLines(dir: string): Promise<string[]> {
+  const records: string[] = [];
+  for (const file of await listArchiveFiles(dir)) {
+    const content = await readFile(path.join(dir, file), "utf8");
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed) records.push(trimmed);
+    }
+  }
+  return records;
+}
+
+function chainRecords(records: readonly string[]): { recordHashes: string[]; chainHead: string } {
+  const recordHashes: string[] = [];
+  let head = MANIFEST_GENESIS_HASH;
+  for (const record of records) {
+    head = manifestChainStep(head, record);
+    recordHashes.push(head);
+  }
+  return { recordHashes, chainHead: head };
+}
+
+/**
+ * Write a hash-chained manifest for the archive in `dir`, atomically
+ * (`<manifest>.tmp` then rename). Returns the manifest written.
+ */
+export async function writeArchiveManifest(
+  dir: string,
+  bounds: ArchiveManifestBounds,
+): Promise<ArchiveManifest> {
+  const records = await readArchiveRecordLines(dir);
+  const { recordHashes, chainHead } = chainRecords(records);
+  const manifest: ArchiveManifest = {
+    type: "archive-manifest",
+    version: 1,
+    network: bounds.network,
+    ledgerMin: bounds.ledgerMin,
+    ledgerMax: bounds.ledgerMax,
+    recordCount: records.length,
+    recordHashes,
+    chainHead,
+  };
+  const target = path.join(dir, ARCHIVE_MANIFEST_FILENAME);
+  const tmp = `${target}.tmp`;
+  await writeFile(tmp, JSON.stringify(manifest, null, 2) + "\n", { encoding: "utf8", mode: FILE_MODE });
+  await rename(tmp, target);
+  return manifest;
+}
+
+/**
+ * Verify the archive in `dir` against its manifest. Fails closed when the
+ * manifest is missing or unparseable, and when any record is missing,
+ * reordered, altered, or outside the recorded ledger bounds.
+ */
+export async function verifyArchiveManifest(dir: string): Promise<VerifyArchiveManifestResult> {
+  let manifest: ArchiveManifest;
+  try {
+    manifest = JSON.parse(
+      await readFile(path.join(dir, ARCHIVE_MANIFEST_FILENAME), "utf8"),
+    ) as ArchiveManifest;
+  } catch (err) {
+    const missing = (err as NodeJS.ErrnoException)?.code === "ENOENT";
+    return { ok: false, recordCount: 0, reason: missing ? "manifest missing" : "manifest parse error" };
+  }
+  if (
+    manifest === null ||
+    typeof manifest !== "object" ||
+    manifest.type !== "archive-manifest" ||
+    !Array.isArray(manifest.recordHashes)
+  ) {
+    return { ok: false, recordCount: 0, reason: "manifest parse error" };
+  }
+
+  const records = await readArchiveRecordLines(dir);
+  if (records.length !== manifest.recordCount || records.length !== manifest.recordHashes.length) {
+    return { ok: false, recordCount: records.length, reason: "record count mismatch" };
+  }
+  let head = MANIFEST_GENESIS_HASH;
+  for (let i = 0; i < records.length; i += 1) {
+    head = manifestChainStep(head, records[i]!);
+    if (head !== manifest.recordHashes[i]) {
+      return { ok: false, recordCount: records.length, reason: `record ${i + 1} altered, reordered or missing` };
+    }
+  }
+  if (head !== manifest.chainHead) {
+    return { ok: false, recordCount: records.length, reason: "chain head mismatch" };
+  }
+  for (const record of records) {
+    let ledger: unknown;
+    try {
+      ledger = (JSON.parse(record) as { ledger?: unknown }).ledger;
+    } catch {
+      return { ok: false, recordCount: records.length, reason: "malformed record" };
+    }
+    if (typeof ledger === "number") {
+      if (
+        (manifest.ledgerMin !== null && ledger < manifest.ledgerMin) ||
+        (manifest.ledgerMax !== null && ledger > manifest.ledgerMax)
+      ) {
+        return { ok: false, recordCount: records.length, reason: "ledger bounds mismatch" };
+      }
+    }
+  }
+  return { ok: true, recordCount: records.length };
 }
