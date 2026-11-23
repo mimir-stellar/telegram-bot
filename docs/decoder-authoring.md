@@ -312,6 +312,7 @@ When an error occurs during decoding:
 * [`diagnostic(err)`](../src/stellar/decode.ts) and [`sanitizeReason(reason)`](../src/stellar/decode.ts) redact bot tokens, API keys, and sensitive credential patterns.
 * Diagnostic reasons are capped at `MAX_DIAGNOSTIC_LENGTH` (200 characters) to prevent log bloat.
 * Error messages state expectations without echoing raw attacker-controlled payloads.
+* [`explainDecodeEvent(source, event, versionOrOptions)`](../src/stellar/decode.ts) and [`explainGenericEvent(rawEvent, source, options)`](../src/stellar/generic-decode.ts) expose single-event explain mode returning `selectedSchema`, `fieldChecks`, and `rejectionReason` with raw values redacted and bounded.
 
 ---
 

@@ -23,9 +23,11 @@ import {
   safeHttpsUrl,
   buildAtomEntry,
   buildAtomFeed,
+  resolveAtomFeedMetadata,
   FEED_CONTENT_MAX_CHARS,
   FEED_TITLE_MAX_CHARS,
-  UNKNOWN_EVENT_TIMESTAMP,
+  FEED_EPOCH_UPDATED_AT,
+  MIMIR_FEED_NS,
 } from "../dist/stellar/feed.js";
 
 // ---------------------------------------------------------------------------
@@ -620,4 +622,122 @@ test("buildAtomFeed: entry link element is absent for event with no txHash", () 
   const feed = buildAtomFeed([event], FEED_OPTS);
   // No link rel=alternate should appear anywhere in a single-entry feed
   assert.ok(!feed.includes('rel="alternate"'), "no link should appear for missing txHash");
+});
+
+// ---------------------------------------------------------------------------
+// Feed generation time vs last event update time
+// ---------------------------------------------------------------------------
+
+test("resolveAtomFeedMetadata: empty feed uses deterministic epoch updatedAt and separate generatedAt", () => {
+  const meta = resolveAtomFeedMetadata([], {
+    generatedAt: "2026-08-21T10:00:00.000Z",
+  });
+  assert.deepEqual(meta, {
+    updatedAt: FEED_EPOCH_UPDATED_AT,
+    generatedAt: "2026-08-21T10:00:00.000Z",
+    entryCount: 0,
+    isEmpty: true,
+  });
+});
+
+test("resolveAtomFeedMetadata: unchanged events keep updatedAt fixed while generatedAt advances", () => {
+  const events = [
+    makeEvent({ at: 1_700_000_100 }),
+    makeEvent({ at: 1_700_000_200 }),
+  ];
+  const first = resolveAtomFeedMetadata(events, {
+    generatedAt: "2026-08-21T10:00:00.000Z",
+  });
+  const second = resolveAtomFeedMetadata(events, {
+    generatedAt: "2026-08-21T10:05:00.000Z",
+  });
+
+  const expectedUpdated = new Date(1_700_000_200 * 1000).toISOString();
+  assert.equal(first.updatedAt, expectedUpdated);
+  assert.equal(second.updatedAt, expectedUpdated);
+  assert.equal(first.generatedAt, "2026-08-21T10:00:00.000Z");
+  assert.equal(second.generatedAt, "2026-08-21T10:05:00.000Z");
+  assert.equal(first.entryCount, 2);
+  assert.equal(first.isEmpty, false);
+});
+
+test("resolveAtomFeedMetadata: events with missing, zero, negative, or non-finite at fall back to epoch", () => {
+  const events = [
+    makeEvent({ at: 0 }),
+    makeEvent({ at: -50 }),
+    makeEvent({ at: Number.NaN }),
+    makeEvent({ at: Number.POSITIVE_INFINITY }),
+  ];
+  const meta = resolveAtomFeedMetadata(events, {
+    generatedAt: "2026-08-21T10:00:00.000Z",
+  });
+  assert.equal(meta.updatedAt, FEED_EPOCH_UPDATED_AT);
+  assert.equal(meta.generatedAt, "2026-08-21T10:00:00.000Z");
+  assert.equal(meta.entryCount, 4);
+  assert.equal(meta.isEmpty, false);
+});
+
+test("buildAtomFeed: deterministic snapshot for empty feed without generatedAt", () => {
+  const feed = buildAtomFeed([], FEED_OPTS);
+  const expected = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<feed xmlns="http://www.w3.org/2005/Atom">',
+    '  <title type="text">Mimir Events</title>',
+    "  <id>https://example.com/feed.atom</id>",
+    `  <updated>${FEED_EPOCH_UPDATED_AT}</updated>`,
+    '  <link rel="self" type="application/atom+xml" href="https://example.com/feed.atom"/>',
+    "</feed>",
+  ].join("\n");
+
+  assert.equal(feed, expected);
+});
+
+test("buildAtomFeed: deterministic snapshot for empty feed with generatedAt", () => {
+  const generatedAt = "2026-08-21T10:00:00.000Z";
+  const feed = buildAtomFeed([], { ...FEED_OPTS, generatedAt });
+  const expected = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    `<feed xmlns="http://www.w3.org/2005/Atom" xmlns:mimir="${MIMIR_FEED_NS}">`,
+    '  <title type="text">Mimir Events</title>',
+    "  <id>https://example.com/feed.atom</id>",
+    `  <updated>${FEED_EPOCH_UPDATED_AT}</updated>`,
+    `  <mimir:generated>${generatedAt}</mimir:generated>`,
+    '  <link rel="self" type="application/atom+xml" href="https://example.com/feed.atom"/>',
+    "</feed>",
+  ].join("\n");
+
+  assert.equal(feed, expected);
+});
+
+test("buildAtomFeed: regenerating an unchanged feed updates <mimir:generated> without changing <updated>", () => {
+  const events = [makeEvent({ at: 1_700_000_200 })];
+  const expectedUpdated = new Date(1_700_000_200 * 1000).toISOString();
+
+  const feed1 = buildAtomFeed(events, {
+    ...FEED_OPTS,
+    generatedAt: "2026-08-21T10:00:00.000Z",
+  });
+  const feed2 = buildAtomFeed(events, {
+    ...FEED_OPTS,
+    generatedAt: "2026-08-21T10:05:00.000Z",
+  });
+
+  assert.ok(feed1.includes(`  <updated>${expectedUpdated}</updated>`));
+  assert.ok(feed2.includes(`  <updated>${expectedUpdated}</updated>`));
+  assert.ok(feed1.includes("  <mimir:generated>2026-08-21T10:00:00.000Z</mimir:generated>"));
+  assert.ok(feed2.includes("  <mimir:generated>2026-08-21T10:05:00.000Z</mimir:generated>"));
+  assert.notEqual(feed1, feed2);
+});
+
+test("buildAtomFeed: hostile generatedAt is sanitized and XML-escaped", () => {
+  const feed = buildAtomFeed([], {
+    ...FEED_OPTS,
+    generatedAt: '2026-08-21T10:00:00Z\x00<bad>&"',
+  });
+  assert.ok(!feed.includes("\x00"), "NUL byte must not appear in <mimir:generated>");
+  assert.ok(!feed.includes("<bad>"), "raw XML tag must not appear in <mimir:generated>");
+  assert.ok(
+    feed.includes("  <mimir:generated>2026-08-21T10:00:00Z&lt;bad&gt;&amp;&quot;</mimir:generated>"),
+    "<mimir:generated> must be XML-escaped",
+  );
 });
