@@ -26,13 +26,9 @@ import {
 } from "../stellar/decode.js";
 import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
+import { escapeMdLinkUrl, safeLinkUrl } from "./link-safety.js";
 import { iconForCategory } from "./category-icons.js";
-import {
-  formatCompletenessLabel,
-  groupDigestEvents,
-  normalizeDigestCompleteness,
-  type DigestPeriodCompleteness,
-} from "./digest-grouping.js";
+import { groupDigestEvents, sortDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
@@ -288,9 +284,19 @@ export function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
+  const tx = mdTxLink(config, event);
+  return tx ? `_${ledger}_ · ${tx}` : `_${ledger}_`;
+}
+
+/**
+ * MarkdownV2 `tx` link for an event: a link when the explorer URL passes the
+ * shared link policy, inert `tx` text when the event has a well-formed hash
+ * but its URL is unsafe, and null when there is no usable hash at all.
+ */
+function mdTxLink(config: StellarConfig, event: DecodedEvent): string | null {
   const url = eventExplorerUrl(config, event);
-  if (!url) return `_${ledger}_`;
-  return `_${ledger}_ · [tx](${url})`;
+  if (url) return `[tx](${escapeMdLinkUrl(url)})`;
+  return eventTxHash(event) !== null ? "tx" : null;
 }
 
 /**
@@ -305,18 +311,23 @@ export function eventExplorerUrl(config: StellarConfig, event: DecodedEvent): st
   // Link only well-formed 64-hex transaction hashes. An externally-derived
   // identifier that is empty, oversized or malformed gets no link: a broken
   // explorer link is worse than no link, and the hash itself is never altered here.
-  const raw = event.txHash ?? "";
-  if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
-  const txHash = raw.trim();
-  if (!TX_HASH_RE.test(txHash)) return null;
+  const txHash = eventTxHash(event);
+  if (txHash === null) return null;
   try {
-    const url = txExplorerUrl(config, txHash);
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:") return null;
-    return url;
+    // The shared link policy (https only, no userinfo, no control characters)
+    // decides; a hand-built config with an unsafe explorer origin gets no link.
+    return safeLinkUrl(txExplorerUrl(config, txHash));
   } catch {
     return null;
   }
+}
+
+/** The event's transaction hash when it is a well-formed 64-hex value, else null. */
+export function eventTxHash(event: DecodedEvent): string | null {
+  const raw = typeof event?.txHash === "string" ? event.txHash : "";
+  if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
+  const txHash = raw.trim();
+  return TX_HASH_RE.test(txHash) ? txHash : null;
 }
 
 export interface ExplorerButton {
@@ -375,7 +386,7 @@ export function formatLastEvent(
   const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
   return (
     `*Last observed event* — \`${escapeMd(clip(name, 120))}\`\n` +
-    `This event has no notification summary\.\n${footer(config, event)}`
+    `This event has no notification summary\\.\n${footer(config, event)}`
   );
 }
 
@@ -386,8 +397,12 @@ export interface FormatDigestOptions {
    * Multi-event groups get an escaped Group_Key header and indented sub-lines;
    * singletons are rendered exactly like the flat layout.
    *
-   * Defaults to `false` — the existing flat layout is unchanged when this
-   * option is omitted or set to `false`.
+   * Defaults to `false` — the existing one-bullet-per-event flat layout is
+   * unchanged when this option is omitted or set to `false`.
+   *
+   * Both layouts order events via {@link sortDigestEvents}: chain close time,
+   * then canonical chain identity when timestamps are equal. This makes replay
+   * and live processing emit byte-identical digests for the same event set.
    */
   grouped?: boolean;
   /**
@@ -457,23 +472,17 @@ function renderGroupedDigest(
  * `"restart"`) to label an incomplete period explicitly so partial counts are
  * never presented as complete ledger summaries.
  * The default (`{}` or no second argument) produces the unchanged flat layout.
+ * Both layouts use deterministic chain-time + canonical-identity ordering, so
+ * equal timestamps never make replay output depend on arrival order.
  */
 export function formatDigest(
   events: readonly DecodedEvent[],
   options: FormatDigestOptions = {},
 ): string | null {
-  const completeness = normalizeDigestCompleteness(options.completeness);
-  if (events.length === 0) {
-    if (completeness.complete) return null;
-    return [
-      digestHeader(0, completeness),
-      "",
-      "_No events observed; ledger coverage for this period is incomplete\\._",
-    ].join("\n");
-  }
-  if (options.grouped) return renderGroupedDigest(events, completeness);
-  const lines = events.map(flatLine);
-  return [digestHeader(events.length, completeness), "", ...lines].join("\n");
+  if (events.length === 0) return null;
+  if (options.grouped) return renderGroupedDigest(events);
+  const lines = sortDigestEvents(events).map(flatLine);
+  return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
 }
 
 /**
@@ -898,7 +907,10 @@ export function formatFallbackEvent(
   const contract = escapeMd(shortAddress(event.contractId ?? "unknown"));
   const ledger = escapeMd(String(event.ledger ?? "unknown"));
   const safeReason = escapeMd(safeErrorMessage(reason));
-  const txPart = event.txHash ? ` · [tx](${txExplorerUrl(config, event.txHash)})` : "";
+  // Same link policy as the regular footer: a safe link, inert `tx` text when
+  // a hash is present but no safe URL can be built, never an empty `[tx]()`.
+  const tx = event.txHash ? (mdTxLink(config, event) ?? "tx") : null;
+  const txPart = tx ? ` · ${tx}` : "";
   return messagesFor(config.locale).notificationMd.fallbackEvent(
     source,
     contract,

@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import test from "node:test";
 
 import {
+  assertAllowedRpcUrl,
   assertEventsResponse,
   clampRetryDelayMs,
   DEFAULT_MAX_EVENTS_PER_RESPONSE,
   parseRetryAfterHeaderMs,
   RpcResponseShapeError,
+  wrapOversizedResponseError,
 } from "../dist/stellar/rpc-guard.js";
 import {
   DEFAULT_RPC_MAX_BACKOFF_MS,

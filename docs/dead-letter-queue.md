@@ -46,7 +46,7 @@ The dead-letter file is written atomically (via a write-to-temporary-file and re
 Each entry in `entries` mirrors the `DeadLetterEntry` TypeScript interface defined in [`src/deadLetter.ts`](file:///c:/Users/HP/drips/work/telegram-bot/src/deadLetter.ts):
 
 * `id` (`string`): Stable unique identifier within the queue (see [Entry ID Generation](#entry-id-generation-makeentryid)).
-* `enqueuedAt` (`string`): ISO 8601 timestamp recording when the failure was first enqueued.
+* `enqueuedAt` (`string | null`): ISO 8601 timestamp recording when the failure was first enqueued (`null` for legacy entries loaded without a valid timestamp).
 * `source` (`string`): Originating contract source name (e.g. `market` or `squad`).
 * `ledger` (`number`): Stellar ledger sequence number where the event occurred.
 * `eventName` (`string`): Contract event topic/name (e.g. `MarketCreated`, `BetPlaced`, `Resolved`).
@@ -70,6 +70,7 @@ Format:
 
 * `shortHash(text)`: A 32-bit non-cryptographic polynomial hash (`h * 31 + charCode`) formatted as an 8-character zero-padded hexadecimal string.
 * **Deduplication**: If an identical event failure is enqueued again while an entry with the same ID is already present in the queue, a duplicate entry is not added. Instead, the existing entry's `attempts` counter increments and `lastError` updates with the latest failure.
+* **Duplicate ID Validation on Load**: Every entry in `dead-letter.json` must have a unique `id`. If a hand-edited or corrupted file contains conflicting entries with the same `id`, validation rejects the file before applying `maxEntries` trimming and preserves the source file untouched on disk for operator inspection rather than silently overwriting it. The offline `dlq` CLI (`list`, `show`, `purge`) exits with status `1` and reports the conflicting IDs.
 
 ---
 
@@ -88,7 +89,10 @@ The queue is strictly bounded across every dimension:
 1. **Depth Limit (`DEAD_LETTER_MAX` / `maxEntries`)**:
    * Configured via `DEAD_LETTER_MAX` (default `100`).
    * When enqueuing a new entry into a queue that has reached `maxEntries`, the **oldest** entry is dropped and counted (`dropped` counter). This prevents permanently failing sends from expanding the file indefinitely.
-2. **Attempt Limit (`DEAD_LETTER_MAX_ATTEMPTS` / `maxAttempts`)**:
+2. **Age Limit (`DEAD_LETTER_MAX_AGE_MS` / `maxAgeMs`)**:
+   * Configured via `DEAD_LETTER_MAX_AGE_MS` (default `604800000` ms / 7 days).
+   * Entries older than `maxAgeMs` are evicted on `load()`, `enqueue()`, and `flush()`, and counted in the `expired` stat (`status.deadLetter.expired` and `dlq list --json`). Expired entries are evicted before capacity checks so newly failed entries are preserved.
+3. **Attempt Limit (`DEAD_LETTER_MAX_ATTEMPTS` / `maxAttempts`)**:
    * Configured via `DEAD_LETTER_MAX_ATTEMPTS` (default `10`).
    * If a message fails replay `maxAttempts` times, it is deemed a "poison entry" (e.g. invalid formatting rejected by Telegram) and is dropped from the queue.
 3. **Payload Truncation**:
@@ -136,7 +140,12 @@ Diagnostics and errors are written to `stderr`, keeping `stdout` clean and machi
 
 ## Operator Inspection with `jq`
 
-Because the file contains standard JSON, operators can safely inspect queue status and contents on host or container storage using `jq`.
+Operators can inspect and purge the queue offline with `npm run dlq -- <list|show <id>|purge>`.
+
+* `npm run dlq -- list` computes the queue's age (`age=...`, and `oldestEnqueuedAt` / `oldestAgeMs` / `oldestAge` / `missingTimestamps` under `--json`) from the **oldest retained failure's original `enqueuedAt` timestamp**, not the file's modification time (`mtime`).
+* Legacy entries missing a valid `enqueuedAt` timestamp are preserved with `enqueuedAt: null` and reported explicitly as `unknown` / `missing legacy timestamp` rather than being backfilled with the current time.
+
+Because the file contains standard JSON, operators can also safely inspect queue status and contents on host or container storage using `jq`.
 
 ### 1. Check queue depth and last updated time
 ```bash

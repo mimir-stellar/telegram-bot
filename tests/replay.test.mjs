@@ -41,7 +41,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { runReplayCli } from "../dist/stellar/replay.js";
+import { buildReplayPlan, runReplayCli } from "../dist/stellar/replay.js";
 import { MARKET_CONTRACT, SQUAD_CONTRACT } from "./fixtures/events.mjs";
 import { createTempDataDir } from "./helpers/temp-data.mjs";
 
@@ -119,6 +119,19 @@ function fakeConfig(overrides = {}) {
     explorerBaseUrl: "https://stellar.expert/explorer",
     ...overrides,
   };
+}
+
+function planDigestFor({ from = "4000", to = null, contracts = ["market", "squad"] } = {}) {
+  const config = fakeConfig();
+  return buildReplayPlan({
+    network: "testnet",
+    from,
+    to,
+    targets: contracts.map((source) => ({
+      source,
+      contractId: source === "market" ? config.marketContractId : config.squadContractId,
+    })),
+  }).digest;
 }
 
 const CAPTURED_LOGS = [];
@@ -214,7 +227,7 @@ test("--send mode calls the injected sender for each event", async () => {
     sentTexts.push({ text, source });
   };
   const { report, exitCode } = await runReplayCli({
-    argv: ["node", "replay-cli.ts", "--from", "4000", "--send"],
+    argv: ["node", "replay-cli.ts", "--from", "4000", "--send", "--plan-digest", planDigestFor()],
     deps: { config: fakeConfig(), server, send: mockSend, progress: captureProgress },
   });
   assert.equal(exitCode, 0);
@@ -407,7 +420,7 @@ test("send failure is counted as skipped and does not abort run", async () => {
   };
   // The event decodes as unknown, so send won't be called; but the run must complete.
   const { report, exitCode } = await runReplayCli({
-    argv: ["node", "replay-cli.ts", "--from", "4000", "--send"],
+    argv: ["node", "replay-cli.ts", "--from", "4000", "--send", "--plan-digest", planDigestFor()],
     deps: { config: fakeConfig(), server, send: failingSend, progress: captureProgress },
   });
   assert.equal(exitCode, 0); // scan completed; unknown events skip before send
@@ -546,7 +559,7 @@ test("report dryRun field is false when --send is passed", async () => {
   });
   const mockSend = async () => {};
   const { report } = await runReplayCli({
-    argv: ["node", "replay-cli.ts", "--from", "4000", "--send"],
+    argv: ["node", "replay-cli.ts", "--from", "4000", "--send", "--plan-digest", planDigestFor()],
     deps: { config: fakeConfig(), server, send: mockSend, progress: captureProgress },
   });
   assert.ok(report !== null);
