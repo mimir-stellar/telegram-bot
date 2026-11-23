@@ -170,6 +170,36 @@ export const EVENT_PAYLOAD_SCHEMAS: Record<string, Record<string, FieldDefinitio
   },
 };
 
+/**
+ * Known non-payload metadata fields that may appear in event-less filter expressions.
+ */
+const METADATA_FIELD_SCHEMAS: Record<string, FieldDefinition> = {
+  ledger: { type: "number" },
+};
+
+/**
+ * Unified field lookup across all event payload schemas and metadata fields,
+ * used when a filter expression omits the event name.
+ */
+const GLOBAL_FIELD_SCHEMAS: Record<string, FieldDefinition> = (() => {
+  const combined: Record<string, FieldDefinition> = { ...METADATA_FIELD_SCHEMAS };
+  for (const schema of Object.values(EVENT_PAYLOAD_SCHEMAS)) {
+    for (const [field, def] of Object.entries(schema)) {
+      if (!(field in combined)) {
+        combined[field] = def;
+      }
+    }
+  }
+  return combined;
+})();
+
+function getFieldDefinition(eventName: string | undefined, field: string): FieldDefinition | undefined {
+  if (eventName) {
+    return EVENT_PAYLOAD_SCHEMAS[eventName]?.[field];
+  }
+  return GLOBAL_FIELD_SCHEMAS[field];
+}
+
 /** Maximum allowed non-EOF tokens in a single filter expression before parsing. */
 export const MAX_FILTER_TOKENS = 100;
 
@@ -610,8 +640,8 @@ export class FilterParser {
       );
     }
 
-    // Validate fields against schema if eventName is specified
-    if (condition && eventName) {
+    // Validate fields and unit compatibility against schema
+    if (condition) {
       validateConditionAgainstSchema(condition, eventName);
     }
 
@@ -739,64 +769,60 @@ export class FilterParser {
   }
 }
 
-/** Validate fields and types in condition against the given event payload schema. */
-export function validateConditionAgainstSchema(condition: ExprNode, eventName: string): void {
-  const schema = EVENT_PAYLOAD_SCHEMAS[eventName];
-  if (!schema) return;
-  const currentSchema = schema;
+/** Validate a single comparison node against its resolved FieldDefinition. */
+function validateComparisonField(
+  node: Extract<ExprNode, { type: "comparison" }>,
+  fieldDef: FieldDefinition,
+): void {
+  switch (fieldDef.type) {
+    case "string":
+      if (node.value.kind !== "string") {
+        throw new FilterParseError(
+          `Field "${node.field}" is a string, but got ${node.value.kind} literal`,
+          node.valuePos,
+        );
+      }
+      if (node.op !== "==" && node.op !== "!=") {
+        throw new FilterParseError(
+          `Operator "${node.op}" cannot be used on string field "${node.field}" (only == and != are supported)`,
+          node.fieldPos,
+        );
+      }
+      break;
 
-  function traverse(node: ExprNode): void {
-    if (node.type === "logical") {
-      traverse(node.left);
-      traverse(node.right);
-      return;
-    }
+    case "boolean":
+      if (node.value.kind !== "boolean") {
+        throw new FilterParseError(
+          `Field "${node.field}" is a boolean, but got ${node.value.kind} literal`,
+          node.valuePos,
+        );
+      }
+      if (node.op !== "==" && node.op !== "!=") {
+        throw new FilterParseError(
+          `Operator "${node.op}" cannot be used on boolean field "${node.field}"`,
+          node.fieldPos,
+        );
+      }
+      break;
 
-    const fieldDef = currentSchema[node.field];
-    if (!fieldDef) {
-      throw new FilterParseError(
-        `Unknown field "${node.field}" for event "${eventName}"`,
-        node.fieldPos,
-      );
-    }
-
-    // Check type compatibility
-    switch (fieldDef.type) {
-      case "string":
-        if (node.value.kind !== "string") {
-          throw new FilterParseError(
-            `Field "${node.field}" is a string, but got ${node.value.kind} literal`,
-            node.valuePos,
-          );
-        }
-        if (node.op !== "==" && node.op !== "!=") {
-          throw new FilterParseError(
-            `Operator "${node.op}" cannot be used on string field "${node.field}" (only == and != are supported)`,
-            node.fieldPos,
-          );
-        }
-        break;
-
-      case "boolean":
-        if (node.value.kind !== "boolean") {
-          throw new FilterParseError(
-            `Field "${node.field}" is a boolean, but got ${node.value.kind} literal`,
-            node.valuePos,
-          );
-        }
-        if (node.op !== "==" && node.op !== "!=") {
-          throw new FilterParseError(
-            `Operator "${node.op}" cannot be used on boolean field "${node.field}"`,
-            node.fieldPos,
-          );
-        }
-        break;
-
-      case "bigint":
-        // Bigint fields (like stake, amount) can be compared to usdc literals or numbers
+    case "bigint":
+      if (fieldDef.isUsdcAmount) {
         if (node.value.kind !== "usdc" && node.value.kind !== "number") {
           throw new FilterParseError(
-            `Field "${node.field}" is a numeric/USDC amount, but got ${node.value.kind} literal`,
+            `Field "${node.field}" is a USDC amount, but got ${node.value.kind} literal`,
+            node.valuePos,
+          );
+        }
+      } else {
+        if (node.value.kind === "usdc") {
+          throw new FilterParseError(
+            `Mixed-unit comparison: field "${node.field}" is not a USDC amount, cannot compare with usdc literal`,
+            node.valuePos,
+          );
+        }
+        if (node.value.kind !== "number") {
+          throw new FilterParseError(
+            `Field "${node.field}" is an integer, but got ${node.value.kind} literal`,
             node.valuePos,
           );
         }
@@ -809,11 +835,61 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
       case "number":
         if (node.value.kind !== "number") {
           throw new FilterParseError(
-            `Field "${node.field}" is a number, but got ${node.value.kind} literal`,
+            `Field "${node.field}" is an integer, cannot compare with fractional number ${node.value.value}`,
             node.valuePos,
           );
         }
-        break;
+      }
+      break;
+
+    case "number":
+      if (node.value.kind === "usdc") {
+        throw new FilterParseError(
+          `Mixed-unit comparison: field "${node.field}" is a number (not a USDC amount), cannot compare with usdc literal`,
+          node.valuePos,
+        );
+      }
+      if (node.value.kind !== "number") {
+        throw new FilterParseError(
+          `Field "${node.field}" is a number, but got ${node.value.kind} literal`,
+          node.valuePos,
+        );
+      }
+      break;
+  }
+}
+
+/**
+ * Validate fields, types, and unit compatibility in condition against the event
+ * payload schema (or global known fields when eventName is omitted).
+ */
+export function validateConditionAgainstSchema(condition: ExprNode, eventName?: string): void {
+  const schema = eventName ? EVENT_PAYLOAD_SCHEMAS[eventName] : undefined;
+  if (eventName && !schema) return;
+
+  function traverse(node: ExprNode): void {
+    if (node.type === "logical") {
+      traverse(node.left);
+      traverse(node.right);
+      return;
+    }
+
+    if (schema) {
+      const fieldDef = schema[node.field];
+      if (!fieldDef) {
+        throw new FilterParseError(
+          `Unknown field "${node.field}" for event "${eventName}"`,
+          node.fieldPos,
+        );
+      }
+      validateComparisonField(node, fieldDef);
+      return;
+    }
+
+    // Event-less rule: validate any known schema/metadata field to catch mixed-unit comparisons early.
+    const knownFieldDef = GLOBAL_FIELD_SCHEMAS[node.field];
+    if (knownFieldDef) {
+      validateComparisonField(node, knownFieldDef);
     }
   }
 
@@ -1001,8 +1077,9 @@ function compareValues(
   actual: unknown,
   op: ComparisonOp,
   literal: LiteralValue,
+  isUsdcAmount = false,
 ): boolean {
-  // BigInt actual value comparison (e.g. stake, amount in DecodedEvent)
+  // BigInt actual value comparison (USDC atomic amounts or integer counts like shares)
   if (typeof actual === "bigint") {
     let targetBigInt: bigint;
     if (literal.kind === "usdc") {
@@ -1011,7 +1088,10 @@ function compareValues(
       const raw = literal.raw ?? String(literal.value);
       targetBigInt = parseUsdcStringToUnits(raw);
     } else {
-      return false;
+      if (literal.kind !== "number" || !Number.isInteger(literal.value)) {
+        return false;
+      }
+      targetBigInt = BigInt(literal.value);
     }
 
     switch (op) {
@@ -1030,16 +1110,12 @@ function compareValues(
     }
   }
 
-  // Number actual value comparison (e.g. claimId, confidence, side)
+  // Number actual value comparison (e.g. claimId, confidence, side, ledger)
   if (typeof actual === "number") {
-    let targetNum: number;
-    if (literal.kind === "number") {
-      targetNum = literal.value;
-    } else if (literal.kind === "usdc") {
-      targetNum = Number(literal.atomic) / Number(USDC_SCALE);
-    } else {
+    if (literal.kind !== "number") {
       return false;
     }
+    const targetNum = literal.value;
 
     switch (op) {
       case "==":

@@ -82,8 +82,11 @@ import {
 } from "./deadLetter.js";
 import {
   createSendJournal,
+  type OrphanDecision,
+  type OrphanedJournalEntry,
   type SendJournal,
 } from "./notifications/send-journal.js";
+import { resolveRouteChatId } from "./notifications/notifier.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -419,6 +422,8 @@ export interface CursorFile {
    * it, so the on-disk format stays version 1 either way.
    */
   chainClockAt?: number | null;
+  /** Optional network identifier for backup ownership validation. */
+  network?: string;
   targets: Record<string, CursorTarget>;
   /**
    * Bounded history of cursor recovery actions (floor rewinds, operator
@@ -432,6 +437,8 @@ export interface CursorFile {
 interface CursorTarget {
   cursor: string | null;
   lastEventLedger: number | null;
+  /** Optional contract identifier for backup ownership validation. */
+  contractId?: string;
   /**
    * Recently processed event ids, oldest first. Additive and bounded: older
    * cursor files without it load as an empty window, and new files stay small
@@ -720,6 +727,14 @@ export interface PollerDeps {
   targetBackoffOptions?: TargetBackoffOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
+  /**
+   * Explicit recovery policy for orphaned send-journal entries whose route was
+   * removed or whose network identity changed. When omitted, orphaned entries
+   * are skipped (never silently replayed).
+   */
+  onOrphanedJournalEntry?: (
+    orphan: OrphanedJournalEntry,
+  ) => OrphanDecision | Promise<OrphanDecision>;
   /**
    * Tuning for the rolling activity baseline. Defaults are production values;
    * tests can shrink the window to observe a comparison quickly.
@@ -1153,9 +1168,14 @@ function normalizeTargetEntry(value: unknown, label: string): CursorTargetEntry 
   // only when the file had them.
   const recent = value.recentEventIds;
   const rewindFromLedger = parseRewindFromLedger(value.rewindFromLedger);
+  const contractId =
+    typeof value.contractId === "string" && value.contractId.trim().length > 0
+      ? value.contractId.trim()
+      : undefined;
   return {
     cursor,
     lastEventLedger,
+    ...(contractId !== undefined ? { contractId } : {}),
     ...(Array.isArray(recent)
       ? { recentEventIds: recent.filter((id): id is string => typeof id === "string") }
       : {}),
@@ -2497,6 +2517,8 @@ export function createPoller(deps: PollerDeps) {
             ledger: event.ledger,
             eventName: event.payload.name,
             textHash,
+            chatId: resolveRouteChatId(config, event.source),
+            networkPassphrase: config.networkPassphrase,
             at: now(),
           });
         } catch (err) {
@@ -3355,8 +3377,37 @@ export function createPoller(deps: PollerDeps) {
       // the cursor commit. Treat them as committed so a restart never duplicates
       // them (the existing lossy cursor-commit policy).
       if (sendJournal) {
-        for (const entry of await sendJournal.loadPending()) {
+        const recoveryContext = {
+          resolveRouteChatId: (s: string) =>
+            resolveRouteChatId(config, s === "market" || s === "squad" ? s : undefined),
+          networkPassphrase: config.networkPassphrase,
+        };
+        const { valid, orphaned } = await sendJournal.classifyPending(recoveryContext);
+        for (const entry of valid) {
           maybeSent.add(entry.id);
+        }
+        if (orphaned.length > 0) {
+          if (deps.onOrphanedJournalEntry) {
+            const recovered = await sendJournal.recoverOrphans(
+              recoveryContext,
+              deps.onOrphanedJournalEntry,
+            );
+            for (const entry of recovered.reroutedEntries) {
+              maybeSent.add(entry.id);
+            }
+            Logger.warn(
+              "poller",
+              `recovered ${orphaned.length} orphaned send-journal entries ` +
+                `(discarded=${recovered.discarded}, rerouted=${recovered.rerouted})`,
+            );
+          } else {
+            Logger.warn(
+              "poller",
+              `skipped ${orphaned.length} orphaned send-journal entr${orphaned.length === 1 ? "y" : "ies"} ` +
+                `(requires explicit discard or reroute decision): ` +
+                orphaned.map((o) => `${o.entry.id}:${o.reason}`).join(", "),
+            );
+          }
         }
         await sendJournal.compact();
       }
