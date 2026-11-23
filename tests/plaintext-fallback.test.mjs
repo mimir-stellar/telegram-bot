@@ -6,7 +6,12 @@ import path from "node:path";
 
 import { GrammyError } from "grammy";
 
-import { createNotifier, isMarkdownParseError } from "../dist/bot.js";
+import {
+  createNotifier,
+  isMarkdownParseError,
+  notifierDiagnostics,
+  resetNotifierDiagnostics,
+} from "../dist/bot.js";
 import {
   formatEvent,
   formatPlainTextEvent,
@@ -107,6 +112,52 @@ test("isMarkdownParseError matches only Telegram entity-parse failures", () => {
   for (const err of notParse) {
     assert.equal(isMarkdownParseError(err), false, String(err && err.description ? err.description : err));
   }
+});
+
+test("isMarkdownParseError matches unsupported and unknown parse-mode responses", () => {
+  const unsupported = [
+    { error_code: 400, description: "Bad Request: unsupported parse_mode" },
+    { error_code: 400, description: "Bad Request: parse_mode is not supported" },
+    { error_code: 400, description: "Bad Request: unknown parse mode" },
+    { description: "Bad Request: unsupported parse mode" },
+  ];
+  for (const err of unsupported) {
+    assert.equal(isMarkdownParseError(err), true, err.description);
+  }
+  assert.equal(
+    isMarkdownParseError({ error_code: 429, description: "Too Many Requests: unsupported parse_mode" }),
+    false,
+    "non-400 responses never qualify",
+  );
+});
+
+test("unsupported parse mode falls back once and records the selected mode", async () => {
+  resetNotifierDiagnostics();
+  const config = testnetConfig();
+  const text = formatEvent(config, claimChallengedEvent());
+  const plain = formatPlainTextEvent(config, claimChallengedEvent());
+  const err = new GrammyError(
+    "Call to 'sendMessage' failed!",
+    { ok: false, error_code: 400, description: "Bad Request: unsupported parse_mode" },
+    "sendMessage",
+    {},
+  );
+  const { fakeBot, sent } = collectingBot(async (n) => {
+    if (n === 1) throw err;
+    return {};
+  });
+
+  await createNotifier(fakeBot, config)(text, "market", {
+    plainText: plain,
+    eventRef: { eventId: "123-0", ledger: 4226692, source: "market" },
+  });
+
+  assert.equal(sent.length, 2, "one MarkdownV2 attempt and exactly one plain-text fallback");
+  assert.equal(sent[1][2].parse_mode, undefined);
+  assert.equal(notifierDiagnostics.lastParseFallback?.selectedMode, "plain-text");
+  assert.equal(notifierDiagnostics.lastParseFallback?.source, "market");
+  assert.match(notifierDiagnostics.lastParseFallback?.error ?? "", /parse_mode|unsupported/i);
+  assert.equal(notifierDiagnostics.lastParseFallback?.error.includes(config.botToken), false);
 });
 
 // ── Positive ─────────────────────────────────────────────────────────────────

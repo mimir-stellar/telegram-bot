@@ -23,9 +23,10 @@ import {
   safeHttpsUrl,
   buildAtomEntry,
   buildAtomFeed,
+  resolveAtomFeedMetadata,
   FEED_CONTENT_MAX_CHARS,
   FEED_TITLE_MAX_CHARS,
-  UNKNOWN_EVENT_TIMESTAMP,
+  AtomEventRing,
 } from "../dist/stellar/feed.js";
 
 // ---------------------------------------------------------------------------
@@ -620,4 +621,40 @@ test("buildAtomFeed: entry link element is absent for event with no txHash", () 
   const feed = buildAtomFeed([event], FEED_OPTS);
   // No link rel=alternate should appear anywhere in a single-entry feed
   assert.ok(!feed.includes('rel="alternate"'), "no link should appear for missing txHash");
+});
+
+// ---------------------------------------------------------------------------
+// AtomEventRing
+// ---------------------------------------------------------------------------
+
+test("AtomEventRing: retains insertion order up to capacity", () => {
+  const ring = new AtomEventRing(3);
+  const events = [makeEvent(), makeEvent(), makeEvent()];
+  for (const event of events) ring.push(event);
+  assert.equal(ring.size, 3);
+  assert.deepEqual(ring.snapshot(), events);
+});
+
+test("AtomEventRing: drops the oldest event once capacity is exceeded", () => {
+  const ring = new AtomEventRing(2);
+  const events = [makeEvent(), makeEvent(), makeEvent()];
+  for (const event of events) ring.push(event);
+  assert.equal(ring.size, 2);
+  assert.deepEqual(ring.snapshot(), events.slice(1));
+});
+
+test("AtomEventRing: snapshot is a copy and cannot mutate retention", () => {
+  const ring = new AtomEventRing(2);
+  const first = makeEvent();
+  ring.push(first);
+  const snapshot = ring.snapshot();
+  snapshot.push(makeEvent());
+  assert.equal(ring.size, 1);
+  assert.deepEqual(ring.snapshot(), [first]);
+});
+
+test("AtomEventRing: rejects non-positive and non-integer capacity", () => {
+  assert.throws(() => new AtomEventRing(0), RangeError);
+  assert.throws(() => new AtomEventRing(-1), RangeError);
+  assert.throws(() => new AtomEventRing(1.5), RangeError);
 });

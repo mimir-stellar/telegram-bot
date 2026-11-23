@@ -92,6 +92,18 @@ The bot reads only public chain data. It does not hold signing keys or any crede
 - **No bot tokens in logs**: Bot tokens are redacted from all logs, error messages, and persisted files
 - **No payment amounts**: Notification messages are formatted with amounts displayed, but amounts are not stored separately in files
 - **No Telegram user IDs**: User IDs may appear transiently in log lines (which are redacted) but are not persisted to disk
+- **No RPC URL in metric labels**: Latency histograms use a fixed provider identity and bounded operation class; query strings and hosts are never exported
+
+## Privacy review mode for shareable archives
+
+Before sharing an event archive (JSONL capture) outside the operator's environment, run the privacy review mode. It scans the archive for:
+
+- **Private chat identifiers**: numeric Telegram chat ids and `@username` handles
+- **Secret-shaped values**: Telegram bot tokens, secret/seed strkeys (`S…`, `D…`, `B…`, `T…`), URLs, and opaque tokens of 40 or more characters
+
+The review is deterministic and offline. It does not contact Telegram, Soroban RPC, or any other service. It produces a findings report listing each finding's line number, category, and a redacted preview; the raw matched value is never echoed in the report. Findings are sorted by line and category so repeated runs over the same input produce identical output.
+
+The review only reports; it does not modify the archive. Operators should review the findings and remove or redact the flagged lines before sharing the file.
 
 ## How to delete all stored data
 
@@ -125,7 +137,7 @@ The bot applies the following redaction rules to all operator-facing text (logs,
 - Secret/seed strkeys (`S[A-Z2-7]{55}`) → `[redacted:secret key]`
 - URLs → `[redacted:url]`
 - Any ≥40-character opaque token (except public G…/C… strkeys) → `[redacted:long token]`
-- Credential-bearing query strings (`token=…`, `authorization: …`) → redacted
+- Credential-bearing query strings (`token=…`, repeated `?token=…&token=…`, array-style `?token[]=…`, and `authorization: …`), URL userinfo (`user:pass@` or `token@`), secret-shaped URL path segments, and non-empty URL `#fragment`s → redacted while preserving safe host and path diagnostics
 - Chat ids in status file → coarse shape only (`…1234` or `@x…`)
 - Full Stellar strkeys in logs → shortened form (`GDV6…PKZI`)
 

@@ -126,7 +126,11 @@ test("decodeEvent boundary: malformed XDR value never crashes decoder", () => {
     contractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
     ledger: 103,
     txHash: "tx126",
-    topic: [xdr.ScVal.scvSymbol("claim_created")],
+    topic: [
+      xdr.ScVal.scvSymbol("claim_created"),
+      xdr.ScVal.scvU64(1n),
+      xdr.ScVal.scvString("GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW"),
+    ],
     value: {
       // Intentionally invalid ScVal object that will fail scValToNative
       switch: () => {

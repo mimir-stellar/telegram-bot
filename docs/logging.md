@@ -6,12 +6,15 @@ This document describes the structured logging system implemented in `src/logger
 
 ## Overview & Configuration
 
-The bot supports two log formats configured via environment variables:
+The bot supports two console log formats and an optional size-rotated JSONL file sink:
 
 | Variable | Values / Format | Default | Description |
 |---|---|---|---|
 | `LOG_FORMAT` | `text`, `json` | `text` | When set to `json`, emits one self-contained, un-indented JSON object per log record on stdout/stderr. Case-insensitive; falls back to `text` if invalid. |
 | `LOG_LEVEL` | `debug`, `info`, `warn`, `error`, `fatal` | `info` | Minimum log severity to emit. Records with lower severity are suppressed. Case-insensitive; falls back to `info` if invalid. |
+| `LOG_FILE` | file path | *(unset — disabled)* | Optional local JSONL operational log. Every emitted record is appended as one redacted JSON line regardless of `LOG_FORMAT`. |
+| `LOG_FILE_MAX_BYTES` | positive integer | `10485760` (10 MiB) | Rotate the active file after it grows past this many bytes. Invalid or non-positive values fall back to the default. |
+| `LOG_FILE_MAX_FILES` | `1`–`50` | `5` | Total local files retained: the active file plus `.1` through `.N-1`. Invalid values use the default; values above `50` are clamped. |
 
 In addition, standard output streams follow severity conventions:
 - `error` and `fatal` are written to `stderr` (`console.error`).
@@ -71,7 +74,8 @@ Emitted by the poller loop during event ingestion, cursor management, cycle exec
 
 | Field | Type | Description |
 |---|---|---|
-| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"persistent_volume_unwritable"`. |
+| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_permission_denied"`, `"cursor_read_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"persistent_volume_unwritable"`. |
+| `diagnosticCode` | `string` | Stable cursor diagnostic code (`"CURSOR_NOT_FOUND"`, `"CURSOR_PERMISSION_DENIED"`, `"CURSOR_IO_ERROR"`, `"CURSOR_CORRUPT_JSON"`). |
 | `marketContractId` | `string` | Mimir market contract address watched. |
 | `squadContractId` | `string` | Mimir squad contract address watched. |
 | `pollIntervalMs` | `number` | Polling interval in milliseconds. |
@@ -121,11 +125,12 @@ To protect log aggregators and prevent denial-of-service via massive RPC payload
 - **Fail-safe fallback**: If serializing `fields` throws unexpectedly (e.g., via a throwing property getter), the logger retains the original event level and emits the sanitized `msg` string so polling and the process never terminate on logging.
 
 ### Redaction Rules
-Every log record is redacted before it leaves the process via the shared redaction policy in `src/redact.ts`:
-1. **Registered Secrets**: Explicit secrets such as `config.botToken` and `config.chatId` are replaced with `[REDACTED]`.
-2. **Credential Patterns**: Telegram bot tokens (`bot<digits>:<token>` and `<digits>:<token>`), Stellar `S…` seed strkeys, URL userinfo and credential-bearing query parameters, `Bearer …` headers, and `TOKEN=`/`SECRET=`/`PASSWORD=`/`AUTHORIZATION:` key-value pairs are automatically replaced with `[REDACTED]`.
-3. **URL Redaction**: Internal helpers (`redactUrl`) mask HTTP basic auth or query credentials in URLs before logging.
+Every log record is redacted before it leaves the process:
+1. **Registered Secrets**: Explicit secrets such as `config.botToken` and `config.chatId` (including URL percent-encoded variants) are replaced with `[REDACTED]`.
+2. **Telegram Token & Stellar Seed Patterns**: Any substring matching Telegram bot token shape (`(?:bot)?\d{5,}:[A-Za-z0-9_-]{20,}`) or Stellar secret seed strkey (`S` + 55 base32 chars) is automatically replaced with `[REDACTED]`, even if not explicitly registered.
+3. **Consistent URL Component Redaction**: URL redaction (`redactUrl`, `redactInlineUrls`, `redactText`, `redactLine`, and `Logger`) inspects every URL component consistently—masking userinfo (`user:pass@`, `token@`, `:pass@`), secret-shaped path segments, repeated or array-style credential query parameters (`?token=…&token=…`, `?token[]=…`), secret-shaped values under arbitrary query keys, and all non-empty URL `#fragment`s—while preserving safe host, port, route path, public chain strkey (`G…`/`C…`), 64-hex transaction hash, and diagnostic query parameters (`limit=10`, cursors).
 4. **All Fields Protected**: Redaction applies recursively to both the log `msg` and all string values in custom `fields`.
+5. **Terminal Escape Neutralization**: ANSI/CSI, OSC (including hyperlinks and title-spoofing payloads), DCS/APC control strings, and other C0/C1 control sequences (except `\t` and `\n`) are stripped via `stripTerminalEscapes` before emitting human-readable `text` logs, structured `json` fields, or captured `/export` log lines, while preserving ordinary Unicode content.
 
 ### Redaction Policy Self-Check (`npm run doctor`)
 `npm run doctor` runs a `redaction-policy` self-check that passes synthetic secret probes (registered secret, Telegram bot token, Stellar seed strkey, URL userinfo/query credentials, Bearer token, and env key-value secret) through all configured log formats (`text`, `json`). If any probe leaks, the check fails and reports only the leaked field names—never the probe values or raw log lines.
@@ -153,26 +158,37 @@ Repetitive RPC errors or network disconnects can flood aggregators. The poller p
 
 ---
 
+## Size-Based JSONL Rotation (`LOG_FILE`)
+
+When `LOG_FILE` is set, every log record that passes `LOG_LEVEL` is redacted and appended as a single-line JSON object to that path, even while stdout/stderr stay in `text` mode.
+
+- A write that would push the active file past `LOG_FILE_MAX_BYTES` rotates first: `<LOG_FILE>.<k>` shifts to `<LOG_FILE>.<k+1>`, the active file becomes `.1`, and any archive index at or above `LOG_FILE_MAX_FILES` is removed. `LOG_FILE_MAX_FILES=1` keeps only the active file.
+- Writes and rotations are serialized, so records emitted during a rotation are queued rather than lost. If a rename fails, the failure is reported and the pending record is still appended to the active file when it remains writable.
+- Disk failures are reported separately from normal log records on stderr as `[logger] jsonl disk failure stage=... reason=...` and are counted by `Logger.getJsonlStats()` with a stage (`mkdir`, `stat`, `rotate`, `write`, `cleanup`) and reason (`disk_full`, `permission_denied`, `read_only_fs`, `busy`, `path_error`, `io_error`).
+- Graceful shutdown flushes queued writes before exit. Setting `LOG_FILE` does not change console output or redaction.
+
+---
+
 ## Aggregator Ingestion & `jq` Examples
 
 Because each JSON line is valid JSON, standard tools like `jq`, Vector, FluentBit, Datadog Agent, or Promtail/Loki can ingest and index fields directly.
 
 ### Filter All Errors and Fatal Messages
 ```bash
-tail -f mimir.log | jq -c 'select(.level == "error" or .level == "fatal")'
+tail -f mimir.jsonl | jq -c 'select(.level == "error" or .level == "fatal")'
 ```
 
 ### Filter Poller Errors with Message, Action, and Ledger
 ```bash
-cat mimir.log | jq 'select(.component == "poller" and .level == "error") | {ts, action, ledger, error, msg}'
+cat mimir.jsonl | jq 'select(.component == "poller" and .level == "error") | {ts, action, ledger, error, msg}'
 ```
 
 ### Inspect Startup / Boot Configuration and Warnings
 ```bash
-cat mimir.log | jq 'select(.component == "boot") | {ts, level, action, warning, msg}'
+cat mimir.jsonl | jq 'select(.component == "boot") | {ts, level, action, warning, msg}'
 ```
 
 ### Track Skipped or Dropped Events
 ```bash
-cat mimir.log | jq 'select(.action == "event_skipped" or .action == "notification_cap_reached") | {ts, eventName, ledger, reason}'
+cat mimir.jsonl | jq 'select(.action == "event_skipped" or .action == "notification_cap_reached") | {ts, eventName, ledger, reason}'
 ```

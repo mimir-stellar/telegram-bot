@@ -22,7 +22,8 @@ with health checks.
 Because both listeners bind `127.0.0.1` by default, any client on the same
 host can read them. If you deploy on a platform that routes probes from a
 different host (container network, Kubernetes pod network, Railway health
-checker) you must change the bind address:
+checker) you must change the bind address. The optional `/atom` route is served
+by the health listener and inherits the same bind and bearer-token rules.
 
 ```dotenv
 HEALTH_HOST=0.0.0.0   # reachable from any interface
@@ -55,9 +56,12 @@ Never returns a non-200.
   "service": "mimir-telegram-bot",
   "health": "/health",
   "live": "/health/live",
-  "metrics": "/metrics"
+  "metrics": "/metrics",
+  "atom": "/atom"
 }
 ```
+
+`atom` appears only when `ATOM_FEED_ENABLED=true`.
 
 ```bash
 curl -s http://127.0.0.1:8787/
@@ -314,6 +318,15 @@ The `mimir_telegram_latest_ledger` and `mimir_telegram_target_last_event_ledger`
 lines are omitted when no ledger has been observed yet (cold start or no
 events seen).
 
+`GET /metrics` also emits `mimir_telegram_rpc_request_latency_ms` (`_bucket`,
+`_sum`, `_count`): a Prometheus histogram of timed RPC awaits (`getEvents` pages
+and a `getHealth` probe when the scan performs one), in milliseconds. Bounds are
+fixed (`5`, `10`, `25`, `50`, `100`, `250`, `500`, `1_000`, `5_000`, `15_000`,
+plus `+Inf`) and the only series labels are `network`, the constant
+`provider="soroban-rpc"`, and a bounded `operation` (`health`, `events`,
+`other`). `STELLAR_RPC_URL` — including any query string or host — is never a
+label.
+
 ```bash
 curl -s http://127.0.0.1:8787/metrics
 
@@ -354,19 +367,54 @@ curl -s -o /dev/null -w "%{http_code}" \
 
 ---
 
-### Unsupported HTTP methods on health routes
+### `GET /atom` (opt-in, disabled by default)
 
-Any non-`GET` request (such as `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, or
-`HEAD`) to a health-server `GET` route (`/`, `/health`, `/healthz`,
-`/health/live`, `/livez`, or `/metrics`) is rejected without reading or mutating
-poller state. When `HEALTH_AUTH_TOKEN` is configured, authentication is still
-checked first and unauthenticated requests receive `401`.
+Read-only [Atom 1.0](https://www.rfc-editor.org/rfc/rfc4287) projection of the
+most recent decoded chain events. It reuses `buildAtomFeed` from
+`src/stellar/feed.ts` and never signs, submits, or mutates chain state.
 
-**Response — 405**, `Allow: GET`, `Cache-Control: no-store`
+Enable it with `ATOM_FEED_ENABLED=true`. The route lives on the health listener,
+so it inherits `HEALTH_HOST`, `HEALTH_PORT`, and `HEALTH_AUTH_TOKEN`: a non-loopback
+bind still needs a bearer token, and the same `Authorization: Bearer <token>`
+header is required on this route. `HEALTH_PORT=0` disables the listener and
+therefore the feed.
 
-```json
-{ "ok": false, "error": "method_not_allowed" }
+At most `ATOM_FEED_MAX_ENTRIES` events (default `50`) are retained in memory;
+the oldest are dropped first. Retention is independent of notification delivery,
+so a failed Telegram send does not remove an event from the feed. The feed is a
+best-effort, process-local view — the Stellar ledger remains authoritative and
+the feed makes no exactly-once claim. An empty feed is served before the first
+event arrives, with zero `<entry>` elements.
+
+**Response — 200**, `Content-Type: application/atom+xml; charset=utf-8`
+
+```bash
+curl -s http://127.0.0.1:8787/atom
 ```
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title type="text">Mimir Events (testnet)</title>
+  <id>http://127.0.0.1:8787/atom</id>
+  <updated>2026-11-20T12:00:00.000Z</updated>
+  <entry>
+    <title type="text">mimir-market: claim_created</title>
+    <id>tag:mimir,event:Test%20SDF%20Network%20%3B%20September%202015:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB:1234-0</id>
+    <updated>2026-11-20T12:00:00.000Z</updated>
+    <link rel="alternate" type="text/html" href="https://stellar.expert/explorer/testnet/tx/abc"/>
+    <content type="text">Claim #7 created in crypto</content>
+  </entry>
+</feed>
+```
+
+A loopback `http://` self URL is escaped into `<id>` but produces no
+`<link rel="self">` (the builder only emits https self links). Set
+`ATOM_FEED_SELF_URL` to a public https URL when a reverse proxy exposes the feed.
+
+**Response — 404** when `ATOM_FEED_ENABLED` is false.
+**Response — 405** with `Allow: GET` for non-GET methods while enabled.
+**Response — 401** when a bearer token is configured and the request lacks it.
 
 ---
 
@@ -409,17 +457,7 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
-| `mimir_bot_metric_samples_dropped_total` | counter | Samples dropped before exposition, labelled by bounded `reason` (`invalid_number`, `unknown_label`); NaN/Infinity are never emitted |
-| `mimir_bot_last_cycle_events` | gauge | Events observed in the most recent complete poll cycle |
-| `mimir_bot_activity_baseline_events` | gauge | Rolling mean events per cycle at the most recent baseline comparison |
-| `mimir_bot_activity_anomalies_total` | counter | Complete cycles classified as a spike or drop against the rolling baseline |
-| `mimir_bot_notification_age_samples_total` | counter | Confirmed notifications with a known ledger close time (includes `0` ms lag) |
-| `mimir_bot_notification_age_missing_ledger_time_total` | counter | Confirmed notifications whose event lacked a valid ledger close time |
-| `mimir_bot_notification_age_ms_total` | counter | Cumulative end-to-end age (ms) from ledger close time to confirmed send |
-| `mimir_bot_last_notification_age_ms` | gauge | End-to-end age (ms) of the most recent confirmed notification with a known ledger time |
-| `mimir_bot_max_notification_age_ms` | gauge | Maximum observed end-to-end notification age (ms) across confirmed sends |
-
-> **Note:** Missing ledger close times increment `mimir_bot_notification_age_missing_ledger_time_total` without incrementing `mimir_bot_notification_age_samples_total` or overwriting `mimir_bot_last_notification_age_ms`, distinguishing absent chain timestamps from `0` ms delivery lag.
+| `mimir_bot_rpc_request_latency_ms` | histogram | Fixed-bucket RPC latency in ms by bounded operation class and constant `provider="soroban-rpc"`; no URL or query-string labels |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment
@@ -470,6 +508,8 @@ methods (`Allow: GET` header set).
 | Health | GET | `/health/live` | 200 | Liveness only (no poller state) |
 | Health | GET | `/livez` | 200 | Alias for `/health/live` |
 | Health | GET | `/metrics` | 200 | Prometheus text (poller-level) |
+| Health | GET | `/atom` | 200, 401, 404 | Bounded read-only Atom feed (`ATOM_FEED_ENABLED` only) |
+| Health | non-GET | `/atom` | 401, 405 | Read-only: `Allow: GET` when enabled |
 | Health | POST | `/telegram-webhook` | 200, 401, 404 | Webhook updates (webhook mode only) |
 | Health | non-GET | `/`, `/health`, `/healthz`, `/health/live`, `/livez`, `/metrics` | 405 | Method not allowed (`Allow: GET`) |
 | Health | GET | `<other>` | 404 | — |
@@ -487,7 +527,9 @@ methods (`Allow: GET` header set).
 | `HEALTH_HOST` | `127.0.0.1` | Bind address for the health server |
 | `HEALTH_PORT` | `8787` (or `PORT` if set by platform) | TCP port; `0` disables the listener |
 | `HEALTH_STALE_MS` | `90000` | `/health` returns 503 if no successful poll within this window |
-| `HEALTH_AUTH_TOKEN` | _(unset — auth disabled)_ | Bearer token required for every health-server route; headers over 4096 UTF-8 bytes get the same empty 401 as malformed values |
+| `ATOM_FEED_ENABLED` | `false` | Enables the read-only `GET /atom` route on the health listener |
+| `ATOM_FEED_MAX_ENTRIES` | `50` | Maximum decoded events retained for the feed (minimum 1) |
+| `ATOM_FEED_SELF_URL` | _(unset)_ | Optional public https URL used as the feed's `<link rel="self">` |
 | `METRICS_PORT` | _(unset — disabled)_ | TCP port for the separate metrics server; omit to disable |
 
 See [configuration-reference.md](configuration-reference.md) for all

@@ -11,16 +11,19 @@ const PUBLIC_LINES = [
   "/start — What this bot does",
   "/help — Show help",
   "/about — About this bot",
+  "/menu — Show navigation menu",
   "/status — Last\\-seen ledger and watched contracts",
+  "/events — Recent observed contract events",
   "/contracts — Contract ids and explorer links",
+  "/filters — Active notification filters and routing",
   "/health — Health assessment and operational readiness",
   "/preview — Preview channel notification formatting",
   "/categories — Observed claim categories and counts",
 ];
 const ALL_LINES = [
-  ...PUBLIC_LINES.slice(0, 4),
+  ...PUBLIC_LINES.slice(0, 5),
   "/audit — Operator only: audit report \\(redacted, bounded\\)",
-  ...PUBLIC_LINES.slice(4),
+  ...PUBLIC_LINES.slice(5),
   "/pause — Operator only: pause new scans",
   "/resume — Operator only: resume polling now",
 ];
@@ -65,7 +68,7 @@ for (const operatorId of [null, "42"]) {
         assert.ok(description.length >= 1 && description.length <= 256);
       }
     }
-    assert.equal(handlers.size, 13, "disabled operator handlers still enforce authorization");
+    assert.equal(handlers.size, 12, "disabled operator handlers still enforce authorization");
   });
 }
 

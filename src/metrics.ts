@@ -8,11 +8,18 @@
  *    them can derive rates with `rate()` / `increase()` reliably.
  *  - Gauges represent momentary state (e.g. consecutive_failures) that can
  *    go up or down.
+ *  - RPC latency is a fixed-bucket histogram keyed by a constant provider
+ *    identity and a bounded operation class; the RPC URL is never a label.
  *  - The output format is Prometheus text exposition v0.0.4, which every
  *    current Prometheus/OpenMetrics scraper understands.
  *  - Secrets: the /metrics response carries only operational counters derived
  *    from in-process state. It never echoes env vars, bot tokens, or cursor
  *    file contents.
+ *  - Duplicate registration: a second call to register() with the same name
+ *    is accepted silently when the type and help string are identical
+ *    (idempotent). A conflicting type or help string throws
+ *    MetricRegistrationError so callers find mismatches at construction time
+ *    rather than producing corrupt Prometheus exposition output.
  *
  * Usage:
  *   const metrics = createMetrics();
@@ -54,6 +61,11 @@ export {
   formatServiceLevelWindow,
 };
 
+import {
+  RpcLatencyHistogram,
+  type RpcLatencySnapshot,
+} from "./stellar/metrics.js";
+
 // ── Metric types ──────────────────────────────────────────────────────────────
 
 export interface Counter {
@@ -89,21 +101,16 @@ export interface Gauge {
   value(): number;
 }
 
-export interface MetricsServerOptions {
-  /**
-   * Milliseconds to wait for active or stalled client sockets to close during
-   * shutdown before force-closing them. Defaults to
-   * {@link DEFAULT_HEALTH_SHUTDOWN_GRACE_MS}; `0` force-closes immediately.
-   */
-  shutdownGraceMs?: number;
+export interface CreateMetricsOptions {
+  /** Optional custom finite upper bounds (in ms) for RPC latency buckets. */
+  rpcLatencyBucketsMs?: readonly number[];
 }
 
-export interface MetricsCloseOptions {
-  /**
-   * Milliseconds to wait for active or stalled client sockets to close during
-   * shutdown before force-closing them. Overrides `shutdownGraceMs`.
-   */
-  gracePeriodMs?: number;
+export interface RpcLatencyMetrics {
+  /** Record one RPC latency observation; provider identity is always fixed. */
+  observe(operation: unknown, durationMs: number): void;
+  /** Read the fixed-bucket snapshot for the current process. */
+  snapshot(): RpcLatencySnapshot;
 }
 
 /** A running HTTP server returned by {@link MetricsRegistry.startServer}. */
@@ -161,62 +168,35 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
-  /**
-   * Samples dropped before exposure, labelled by bounded reason
-   * (`invalid_number`, `unknown_label`, or `unknown`).
-   */
-  droppedSamples: LabeledCounter;
-  /** Count one dropped sample under a bounded reason (unknown reasons fold into `unknown`). */
-  recordDropped(reason: string): void;
-  /** Record a numeric sample for a gauge; non-finite values are dropped and counted. */
-  setGaugeSafe(gauge: Gauge, value: number): void;
-  /** Total confirmed notifications with a known ledger close time (includes 0ms lag). */
-  notificationAgeSamples: Counter;
-  /** Total confirmed notifications whose event lacked a valid ledger close time. */
-  notificationAgeMissingLedgerTime: Counter;
-  /** Cumulative end-to-end notification age in milliseconds across known-ledger-time samples. */
-  notificationAgeTotalMs: Counter;
-  /** End-to-end age in ms of the most recent confirmed notification with a known ledger time. */
-  lastNotificationAgeMs: Gauge;
-  /** Maximum observed end-to-end notification age in ms across confirmed sends. */
-  maxNotificationAgeMs: Gauge;
-
-  /**
-   * Record one confirmed notification's end-to-end age in milliseconds, or `null`
-   * when the source event lacked a valid ledger close time. Distinguishes missing
-   * ledger time (`notificationAgeMissingLedgerTime`) from zero delivery lag
-   * (`notificationAgeSamples` incremented with `0` ms).
-   */
-  recordNotificationAge(ageMs: number | null): void;
-
-  /** Bounded rolling service-level window tracker. */
-  serviceLevel: ServiceLevelWindow;
-
-  /**
-   * Generate the machine-readable service-level window report from bounded local samples.
-   */
-  serviceLevelReport(): ServiceLevelWindowReport;
-
-  /**
-   * Record a delivery attempt into the service-level window.
-   */
-  recordDelivery(
-    success: boolean,
-    ageMs?: number | null,
-    dataGap?: boolean,
-    gapReason?: ServiceLevelIncompleteReason,
-  ): void;
-
-  /**
-   * Record a data gap event into the service-level window.
-   */
-  recordDataGap(reason?: ServiceLevelIncompleteReason): void;
+  /** Fixed-bucket RPC latency histogram by bounded operation class. */
+  rpcLatency: RpcLatencyMetrics;
 
   /**
    * Render the registry as a Prometheus text exposition string.
    * Includes HELP and TYPE comment lines so Prometheus autodiscovery works.
    */
   render(): string;
+
+  /**
+   * Register a metric by name.
+   *
+   * - **First call** for a name: creates and stores the metric, returns it.
+   * - **Identical re-registration** (same `name`, `type`, and `help`): returns
+   *   the existing metric unchanged — safe to call from module-level init code
+   *   that runs more than once (e.g. in tests that share a registry, or in a
+   *   module that is imported by multiple callers).
+   * - **Conflicting re-registration** (same `name`, different `type` or
+   *   `help`): throws {@link MetricRegistrationError}. A conflict at
+   *   construction time is far easier to debug than a silent corruption of the
+   *   Prometheus exposition output that only surfaces when a scraper complains.
+   *
+   * The returned metric is typed as `Counter` when `type === "counter"` and
+   * as `Gauge` when `type === "gauge"`. Use the overloads to get the precise
+   * type back without an explicit cast.
+   */
+  register(name: string, type: "counter", help: string): Counter;
+  register(name: string, type: "gauge", help: string): Gauge;
+  register(name: string, type: MetricType, help: string): Counter | Gauge;
 
   /**
    * Start an HTTP server on `port` that serves GET /metrics.
@@ -238,11 +218,9 @@ export interface MetricsRegistry {
 
 // ── Implementation ────────────────────────────────────────────────────────────
 
-function makeCounter(name: string, help: string): Counter & { _name: string; _help: string } {
+function makeCounter(): Counter {
   let _value = 0;
   return {
-    _name: name,
-    _help: help,
     inc(delta = 1): void {
       if (delta < 0) throw new RangeError(`Counter.inc delta must be >= 0; got ${delta}`);
       _value += delta;
@@ -253,15 +231,9 @@ function makeCounter(name: string, help: string): Counter & { _name: string; _he
   };
 }
 
-function makeFiniteGauge(
-  name: string,
-  help: string,
-  onDrop: (reason: DropReason) => void,
-): Gauge & { _name: string; _help: string } {
+function makeGauge(): Gauge {
   let _value = 0;
   return {
-    _name: name,
-    _help: help,
     set(value: number): void {
       if (!Number.isFinite(value)) {
         onDrop("invalid_number");
@@ -277,44 +249,8 @@ function makeFiniteGauge(
 
 const METRICS_PREFIX = "mimir_bot_";
 
-function makeLabeledCounter(name: string, help: string, labels: readonly string[]): LabeledCounter & { _name: string; _help: string; _labels: readonly string[]; _entries(): [string, number][] } {
-  const values = new Map<string, number>(labels.map((l) => [l, 0]));
-  const known = new Set<string>(labels);
-  return {
-    _name: name,
-    _help: help,
-    _labels: labels,
-    inc(reason: string, delta = 1): void {
-      if (delta < 0) throw new RangeError(`LabeledCounter.inc delta must be >= 0; got ${delta}`);
-      const key = known.has(reason) ? reason : "unknown";
-      values.set(key, (values.get(key) ?? 0) + delta);
-    },
-    value(reason: string): number {
-      return values.get(known.has(reason) ? reason : "unknown") ?? 0;
-    },
-    _entries(): [string, number][] {
-      return [...values.entries()];
-    },
-  };
-}
-
-export interface MetricsOptions {
-  /** Optional capacity of the bounded rolling service-level window. */
-  serviceLevelWindowSize?: number | undefined;
-}
-
-export function createMetrics(options?: MetricsOptions): MetricsRegistry {
-  const droppedSamples = makeLabeledCounter(
-    `${METRICS_PREFIX}dropped_samples_total`,
-    "Metric samples dropped before exposure, by bounded reason.",
-    [...DROP_REASONS, "unknown"],
-  );
-  // Every gauge drops (and counts) non-finite samples instead of exposing them.
-  const makeGauge = (name: string, help: string) =>
-    makeFiniteGauge(name, help, (reason) => droppedSamples.inc(reason));
-  const serviceLevel = new ServiceLevelWindow({
-    windowSize: options?.serviceLevelWindowSize,
-  });
+export function createMetrics(options: CreateMetricsOptions = {}): MetricsRegistry {
+  const rpcLatencyHistogram = new RpcLatencyHistogram(options.rpcLatencyBucketsMs);
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
     "Total number of poll cycles started.",
@@ -375,6 +311,14 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     `${METRICS_PREFIX}activity_anomalies_total`,
     "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
   );
+  const deadLetterEntries = makeGauge(
+    `${METRICS_PREFIX}dead_letter_entries`,
+    "Entries currently held in the dead-letter queue (0 when the queue is disabled).",
+  );
+  const deadLetterCapacity = makeGauge(
+    `${METRICS_PREFIX}dead_letter_capacity`,
+    "Maximum entries the dead-letter queue can hold (0 when the queue is disabled).",
+  );
   const notificationAgeSamples = makeCounter(
     `${METRICS_PREFIX}notification_age_samples_total`,
     "Total confirmed notifications with a known ledger close time (includes 0ms lag).",
@@ -419,60 +363,192 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     activityBaselineEvents,
     lastNotificationAgeMs,
     maxNotificationAgeMs,
+    deadLetterEntries,
+    deadLetterCapacity,
   ];
 
-  const baseFailedInc = notificationsFailed.inc;
-  notificationsFailed.inc = (delta = 1) => {
-    baseFailedInc(delta);
-    for (let i = 0; i < delta; i += 1) {
-      serviceLevel.recordDelivery(false, null);
+  /**
+   * Create a metric on first sight, or return the existing one on an identical
+   * re-registration. Reject conflicts on `type` or `help` loudly.
+   */
+  function register(name: string, type: MetricType, help: string): Counter | Gauge {
+    const existing = registry.get(name);
+    if (existing !== undefined) {
+      if (existing.type !== type) {
+        throw new MetricRegistrationError(name, "type", existing.type, type);
+      }
+      if (existing.help !== help) {
+        throw new MetricRegistrationError(name, "help", existing.help, help);
+      }
+      return existing.metric;
     }
-  };
 
-  const baseStaleCursorInc = staleCursorEvents.inc;
-  staleCursorEvents.inc = (delta = 1) => {
-    baseStaleCursorInc(delta);
-    for (let i = 0; i < delta; i += 1) {
-      serviceLevel.recordDataGap("stale_cursor");
-    }
-  };
+    const metric =
+      type === "counter"
+        ? makeCounter()
+        : makeGauge();
+    registry.set(name, { name, type, help, metric });
+    return metric;
+  }
 
-  function recordNotificationAge(ageMs: number | null): void {
-    if (ageMs === null || typeof ageMs !== "number" || !Number.isFinite(ageMs)) {
-      notificationAgeMissingLedgerTime.inc();
-      serviceLevel.recordDelivery(true, null, true, "missing_ledger_time");
-      return;
+  interface LabeledMetricFamily {
+    name: string;
+    help: string;
+    type: "counter" | "gauge";
+    labelNames: readonly string[];
+    series: Map<string, number>;
+  }
+  const labeledFamilies: LabeledMetricFamily[] = [];
+  const registeredNames = new Set<string>([
+    ...counters.map((c) => c._name),
+    ...gauges.map((g) => g._name),
+  ]);
+
+  function canonicalizeDeclaredLabels(
+    declared: readonly string[],
+    labels: Readonly<Record<string, string>>,
+  ): string {
+    if (!labels || typeof labels !== "object" || Array.isArray(labels)) {
+      throw new MetricLabelError("INVALID_LABEL_KEY", "Labels must be a plain object");
     }
-    const clampedMs = Math.max(0, Math.round(ageMs));
-    notificationAgeSamples.inc();
-    notificationAgeTotalMs.inc(clampedMs);
-    lastNotificationAgeMs.set(clampedMs);
-    if (clampedMs > maxNotificationAgeMs.value()) {
-      maxNotificationAgeMs.set(clampedMs);
+    const providedKeys = Object.keys(labels);
+    for (const k of providedKeys) {
+      validateMetricLabelKey(k);
+      if (!declared.includes(k)) {
+        throw new MetricLabelError(
+          "UNDECLARED_LABEL_KEY",
+          `Undeclared label key ${JSON.stringify(k)} (expected: ${declared.join(", ")})`,
+        );
+      }
     }
-    serviceLevel.recordDelivery(true, clampedMs, false);
+    const ordered: Record<string, string> = {};
+    for (const key of declared) {
+      if (!Object.prototype.hasOwnProperty.call(labels, key)) {
+        throw new MetricLabelError(
+          "MISSING_LABEL_KEY",
+          `Missing required label key ${JSON.stringify(key)}`,
+        );
+      }
+      ordered[key] = labels[key]!;
+    }
+    return formatMetricLabels(ordered);
+  }
+
+  function registerLabeledCounter(
+    name: string,
+    help: string,
+    labelNames: readonly string[],
+  ): LabeledCounter {
+    const validName = validateMetricName(name);
+    if (registeredNames.has(validName)) {
+      throw new MetricLabelError(
+        "DUPLICATE_METRIC_NAME",
+        `Prometheus metric family ${JSON.stringify(validName)} is already registered`,
+      );
+    }
+    const escapedHelp = escapeMetricHelp(help);
+    const validKeys = labelNames.map((k) => validateMetricLabelKey(k));
+    registeredNames.add(validName);
+    const family: LabeledMetricFamily = {
+      name: validName,
+      help: escapedHelp,
+      type: "counter",
+      labelNames: validKeys,
+      series: new Map(),
+    };
+    labeledFamilies.push(family);
+    return {
+      inc(labels, delta = 1): void {
+        if (delta < 0 || !Number.isFinite(delta)) {
+          throw new RangeError(`Counter.inc delta must be a finite number >= 0; got ${delta}`);
+        }
+        const renderedLabels = canonicalizeDeclaredLabels(validKeys, labels);
+        family.series.set(renderedLabels, (family.series.get(renderedLabels) ?? 0) + delta);
+      },
+      value(labels): number {
+        const renderedLabels = canonicalizeDeclaredLabels(validKeys, labels);
+        return family.series.get(renderedLabels) ?? 0;
+      },
+    };
+  }
+
+  function registerLabeledGauge(
+    name: string,
+    help: string,
+    labelNames: readonly string[],
+  ): LabeledGauge {
+    const validName = validateMetricName(name);
+    if (registeredNames.has(validName)) {
+      throw new MetricLabelError(
+        "DUPLICATE_METRIC_NAME",
+        `Prometheus metric family ${JSON.stringify(validName)} is already registered`,
+      );
+    }
+    const escapedHelp = escapeMetricHelp(help);
+    const validKeys = labelNames.map((k) => validateMetricLabelKey(k));
+    registeredNames.add(validName);
+    const family: LabeledMetricFamily = {
+      name: validName,
+      help: escapedHelp,
+      type: "gauge",
+      labelNames: validKeys,
+      series: new Map(),
+    };
+    labeledFamilies.push(family);
+    return {
+      set(labels, value): void {
+        if (!Number.isFinite(value)) {
+          throw new RangeError(`Gauge.set value must be finite; got ${value}`);
+        }
+        const renderedLabels = canonicalizeDeclaredLabels(validKeys, labels);
+        family.series.set(renderedLabels, value);
+      },
+      value(labels): number {
+        const renderedLabels = canonicalizeDeclaredLabels(validKeys, labels);
+        return family.series.get(renderedLabels) ?? 0;
+      },
+    };
   }
 
   function render(): string {
     const lines: string[] = [];
 
-    for (const c of counters) {
-      lines.push(`# HELP ${c._name} ${c._help}`);
-      lines.push(`# TYPE ${c._name} counter`);
-      lines.push(`${c._name} ${c.value()}`);
+    for (const { name, type, help, metric } of registry.values()) {
+      lines.push(`# HELP ${name} ${help}`);
+      lines.push(`# TYPE ${name} ${type}`);
+      lines.push(`${name} ${metric.value()}`);
     }
 
-    lines.push(`# HELP ${droppedSamples._name} ${droppedSamples._help}`);
-    lines.push(`# TYPE ${droppedSamples._name} counter`);
-    for (const [reason, v] of droppedSamples._entries()) {
-      lines.push(`${droppedSamples._name}{reason="${reason}"} ${v}`);
+    for (const h of histograms) {
+      lines.push(`# HELP ${h._name} ${h._help}`);
+      lines.push(`# TYPE ${h._name} histogram`);
+      for (const destination of h.destinations) {
+        const snap = h.snapshot(destination);
+        for (const bucket of snap.buckets) {
+          lines.push(
+            `${h._name}_bucket{destination="${destination}",le="${bucket.le}"} ${bucket.count}`,
+          );
+        }
+        lines.push(`${h._name}_sum{destination="${destination}"} ${snap.sum}`);
+        lines.push(`${h._name}_count{destination="${destination}"} ${snap.count}`);
+      }
     }
 
-    for (const g of gauges) {
-      lines.push(`# HELP ${g._name} ${g._help}`);
-      lines.push(`# TYPE ${g._name} gauge`);
-      lines.push(`${g._name} ${g.value()}`);
+    for (const family of labeledFamilies) {
+      if (family.series.size === 0) continue;
+      lines.push(`# HELP ${family.name} ${family.help}`);
+      lines.push(`# TYPE ${family.name} ${family.type}`);
+      for (const [renderedLabels, val] of family.series.entries()) {
+        lines.push(`${family.name}${renderedLabels} ${val}`);
+      }
     }
+
+    lines.push(
+      ...rpcLatencyHistogram.renderPrometheusLines(
+        `${METRICS_PREFIX}rpc_request_latency_ms`,
+        "Soroban RPC latency in milliseconds across fixed buckets by operation.",
+      ),
+    );
 
     // Prometheus text format requires a trailing newline.
     return lines.join("\n") + "\n";
@@ -650,41 +726,14 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
-    droppedSamples,
-    recordDropped(reason: string): void {
-      droppedSamples.inc(reason);
-    },
-    setGaugeSafe(gauge: Gauge, value: number): void {
-      if (!Number.isFinite(value)) {
-        droppedSamples.inc("invalid_number");
-        return;
-      }
-      gauge.set(value);
-    },
-    notificationAgeSamples,
-    notificationAgeMissingLedgerTime,
-    notificationAgeTotalMs,
-    lastNotificationAgeMs,
-    maxNotificationAgeMs,
-    recordNotificationAge,
-    serviceLevel,
-    serviceLevelReport(): ServiceLevelWindowReport {
-      return serviceLevel.report();
-    },
-    recordDelivery(
-      success: boolean,
-      ageMs?: number | null,
-      dataGap?: boolean,
-      gapReason?: ServiceLevelIncompleteReason,
-    ): void {
-      serviceLevel.recordDelivery(success, ageMs, dataGap, gapReason);
-    },
-    recordDataGap(reason?: ServiceLevelIncompleteReason): void {
-      serviceLevel.recordDataGap(reason);
+    rpcLatency: {
+      observe: (operation, durationMs) => rpcLatencyHistogram.observe(operation, durationMs),
+      snapshot: () => rpcLatencyHistogram.snapshot(),
     },
     render,
     startServer,
-  };
+    register,
+  } as unknown as MetricsRegistry;
 }
 
 export type Metrics = ReturnType<typeof createMetrics>;

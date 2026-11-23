@@ -70,6 +70,9 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "HEALTH_PORT",
   "PORT",
   "HEALTH_STALE_MS",
+  "ATOM_FEED_ENABLED",
+  "ATOM_FEED_MAX_ENTRIES",
+  "ATOM_FEED_SELF_URL",
   "STARTUP_HEALTH_DEADLINE_MS",
   "STARTUP_HEALTH_RETRY_MS",
   "SHUTDOWN_TIMEOUT_MS",
@@ -79,6 +82,9 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "LINK_PREVIEW_SQUAD",
   "LOG_LEVEL",
   "LOG_FORMAT",
+  "LOG_FILE",
+  "LOG_FILE_MAX_BYTES",
+  "LOG_FILE_MAX_FILES",
   "LOG_SAMPLE_MAX_PER_WINDOW",
   "LOG_SAMPLE_WINDOW_MS",
   "LOG_BUFFER_LINES",
@@ -212,6 +218,12 @@ function resolveSettingValue(
       return String(config.healthPort);
     case "HEALTH_STALE_MS":
       return String(config.healthStaleMs);
+    case "ATOM_FEED_ENABLED":
+      return String(config.atomFeedEnabled);
+    case "ATOM_FEED_MAX_ENTRIES":
+      return String(config.atomFeedMaxEntries);
+    case "ATOM_FEED_SELF_URL":
+      return config.atomFeedSelfUrl;
     case "SHUTDOWN_TIMEOUT_MS":
       return String(config.shutdownTimeoutMs);
     case "TELEGRAM_SEND_TIMEOUT_MS":

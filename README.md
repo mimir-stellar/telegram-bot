@@ -92,6 +92,7 @@ deployments continue unchanged and the operator commands are ignored.
 cp .env.example .env     # then fill in BOT_TOKEN and TELEGRAM_CHAT_ID
 npm install
 npm run doctor           # verify environment and .env configuration
+npm run support-bundle   # print a redacted JSON bundle for support requests
 npm run dev              # tsx, restarts on change
 ```
 
@@ -131,6 +132,7 @@ looks healthy but notifies nobody.
 | `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip/dedup counters (plus messages dropped by a shutdown drain and cursors automatically rewound to the retained floor), and the last error |
 | `/audit` | Operator only. The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
+| `/filters` | Active notification filters from the effective config: global feature flags, enabled/disabled event types, category allowlist, and redacted global versus route-specific chat routing settings |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
@@ -347,23 +349,31 @@ npm run replay -- --from 4226500 --to 4226800    # bounded range
 npm run replay -- --from 4226500 --send          # send to Telegram (needs BOT_TOKEN)
 npm run replay -- --from 4226500 --contract market  # one contract only
 npm run replay -- --from 4226500 --json          # machine-readable mimir-replay-v1
+npm run replay -- --from 4226500 --jsonl         # streaming mimir-replay-jsonl-v1
+npm run replay -- --merge-chunks c1.jsonl,c2.jsonl --out merged.jsonl  # merge chunks
 npm run replay -- --from 4226500 --pages 5       # walk at most 5 pages per contract
 npm run replay -- --from 4226500 --cap 10        # cap at 10 notifications per contract
 npm run replay:mock -- --from 4226500            # local mock profile, no credentials
+npm run replay -- --archive scan.json            # offline replay from mimir-scan-v1 archive
 ```
 
 **Flags:**
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--from <ledger\|cursor>` | (required) | Start of the range — a ledger number or an opaque RPC cursor |
+| `--from <ledger\|cursor>` | (required unless `--archive` is set) | Start of the range — a ledger number or an opaque RPC cursor |
 | `--to <ledger>` | chain tip | End of the range (inclusive). Clamped to the tip when above it |
+| `--archive <path>` | off | Replay offline from a validated `mimir-scan-v1` scanner archive without contacting RPC; enforces schema (`mimir-scan-v1`) and network identity before processing |
 | `--send` | off | Actually post to Telegram; requires `BOT_TOKEN` and `TELEGRAM_CHAT_ID` |
 | `--contract market\|squad` | both | Scan only the named contract |
 | `--pages <n>` | 20 | Page budget per contract |
 | `--cap <n>` | `MAX_NOTIFICATIONS_PER_CYCLE` | Maximum notifications per contract per run |
 | `--show <n>` | 0 | Include the last *n* decoded events per target in the report |
 | `--json` | off | Machine-readable `mimir-replay-v1` JSON on stdout; progress on stderr |
+| `--jsonl` | off | Streaming `mimir-replay-jsonl-v1` JSONL on stdout (or `--out`); bounded memory, progress on stderr |
+| `--merge-chunks <paths>` | — | Merge comma-separated or repeated replay chunk files (JSONL or `mimir-replay-v1` JSON) into a single canonical, deduplicated streaming JSONL report |
+| `--out <path>` | stdout | Write `--jsonl` or `--merge-chunks` output to a file instead of stdout |
+| `--dedup-window <n>` | 256 | Bounded deduplication window size for `--merge-chunks` (`0` disables dedup) |
 | `--mock` | off | `MIMIR_PROFILE=mock`: local RPC, fixture contracts, no credentials needed |
 
 **Default mode is dry-run.** Events are decoded and counted; nothing is posted to
@@ -501,7 +511,7 @@ end. `npm test` covers all of it (`tests/mock-*.test.mjs`); run just those with
 
 ## Decoded event payload caps
 
-Each Soroban event is size-checked **before** native decoding in
+Each Soroban event is size- and depth-checked **before** native decoding in
 `src/stellar/decode.ts`:
 
 | Cap | Default | Failure mode |
@@ -509,10 +519,34 @@ Each Soroban event is size-checked **before** native decoding in
 | Event `value` XDR | 16 KiB (`MAX_DECODED_EVENT_XDR_BYTES`) | Event becomes `unknown` with a short reason; cursor still advances |
 | Per-topic XDR | 1 KiB (`MAX_EVENT_TOPIC_XDR_BYTES`) | Same |
 | Decoded string field | 2048 chars (`MAX_DECODED_STRING_CHARS`) | Same |
+| Nested collection depth | 5 (`MAX_DECODED_COLLECTION_DEPTH`, shared with `MAX_GENERIC_DEPTH`) | Event becomes `unknown` with reason `collection depth limit exceeded`; cursor still advances |
+
+Depth is bounded independently of byte size: a small payload made of many
+nested vecs/maps is rejected before `scValToNative` recurses. The generic
+decoder (`src/stellar/generic-decode.ts`) keeps its bounded rendering and exposes
+the same `DEPTH_LIMIT_REASON` on `payload.reason`. Callers can override the typed
+bound per call with `DecodeOptions.maxDepth`.
 
 Oversized or malformed events never crash the poller and are never re-logged as
 raw remote bytes — only a truncated reason string is kept. No configuration
 change is required; existing cursors remain valid.
+
+### Event archive & JSONL streaming bounds
+
+Rotating event archives (`src/stellar/archive.ts`) and JSONL streams
+(`src/stellar/scan-jsonl.ts`) are read incrementally with a fixed-size chunk
+buffer and a bounded line buffer so memory usage stays independent of total
+archive size:
+
+| Constant / Option | Default | Failure mode |
+|---|---|---|
+| `DEFAULT_MAX_JSONL_LINE_BYTES` / `maxLineBytes` | 64 KiB (`65536`) | Throws `JsonlLineTooLongError` **before** UTF-8 decoding or `JSON.parse` (error message is bounded and never echoes raw record bytes) |
+| `DEFAULT_JSONL_CHUNK_BYTES` / `chunkBytes` | 64 KiB (`65536`) | Throws `RangeError` if not a positive finite integer |
+
+`readArchive(dir, options?)` remains backward-compatible when called without
+options; `readArchiveFile(filePath, options?)`, `parseJsonlStream(chunks, options?)`,
+and `streamBoundedJsonlLines(chunks, options?)` expose the same bounded
+streaming interface for single files and arbitrary async chunk streams.
 
 ## How the polling works
 
@@ -696,12 +730,12 @@ change and must be deployed together with a recorded fixture and an operational
 note. The chain remains authoritative if the bot version cannot decode an event.
 
 RPC configuration is read-only: `STELLAR_RPC_URL` must point to a Soroban RPC
-endpoint, and `STELLAR_NETWORK_PASSPHRASE` controls network labeling for
-explorer links. The client sends no signing material and creates no wallet.
-Explorer path components are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL`
-values are supported without changing cursor or decoder compatibility.
-Notifications only link `https:` URLs; any other explorer or app origin renders
-the `tx` label as inert text (see [docs/notification-links.md](docs/notification-links.md)).
+endpoint without embedded credentials (`user:pass@host` is rejected before
+startup, reporting only the affected configuration key), and
+`STELLAR_NETWORK_PASSPHRASE` controls network labeling for explorer links. The
+client sends no signing material and creates no wallet. Explorer path components
+are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL` values are supported without
+changing cursor or decoder compatibility.
 
 ## Cursor persistence
 
@@ -953,6 +987,38 @@ Two things it deliberately does not do:
 `DEAD_LETTER_FILE` disables the queue entirely, and the poller then behaves
 exactly as it did before the queue existed.
 
+## Scheduled digests
+
+Set `DIGEST_SCHEDULE` to buffer notifiable events and deliver them as a grouped
+digest on a UTC cadence instead of sending each event immediately:
+
+- `DIGEST_SCHEDULE` — `daily@HH:mm` or `weekly@day HH:mm` (UTC, `day` in
+  `sun`..`sat`). Unset (default) preserves immediate per-event delivery with no
+  digest checkpoint I/O.
+- `DIGEST_CHECKPOINT_FILE` — path to the versioned JSON checkpoint storing
+  pending events and the last completed run timestamp (default
+  `./data/digest-checkpoint.json`).
+- `DIGEST_MAX_PENDING` — maximum pending events retained between scheduled runs
+  (default `200`). When full, the oldest pending events are evicted first so
+  memory and disk usage remain bounded.
+- **Bounded continuation pages** — when a digest exceeds Telegram's 4096-character
+  message limit, `formatDigestPages` splits it deterministically on complete event
+  summaries (repeating the group header when a multi-event group spans pages) and
+  includes `(page/total)` with the stable total event count in every page header.
+
+Restart behavior:
+
+- On startup, the poller restores `lastRunMs` and pending events from
+  `DIGEST_CHECKPOINT_FILE` (truncating to `DIGEST_MAX_PENDING` if the cap
+  shrank). A corrupt or incompatible checkpoint is quarantined beside the live
+  file (`*.corrupt.<timestamp>`) and treated as a clean cold start.
+- If a scheduled boundary was missed while the bot was down, the scheduler
+  flushes the restored pending events once on startup; on a cold start with no
+  prior run, it waits for the next scheduled boundary.
+- Delivery is best-effort (never claiming exactly-once): pending events are
+  cleared only after the Telegram send succeeds, and a failed send keeps them
+  buffered for the next scheduled boundary.
+
 ## Graceful shutdown
 
 `SIGINT`/`SIGTERM` starts a bounded drain rather than a hard stop:
@@ -1081,9 +1147,10 @@ proxy requirements, secret lifecycle, verification, and rollback steps.
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
-| `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
+| `GET` / `HEAD /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped, draining, or degraded (repeated RPC failures or a stale success window). `GET` returns the JSON report (including `poller.paused` and `poller.suppressedLogs`); `HEAD` returns the same status and headers without a response body or full report serialization. |
+| `GET` / `HEAD /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening (`HEAD` omits the response body). |
 | `GET /health/diag` | The same report `/export` produces in the chat, as plain text. `404` when log capture is off. For an operator with host access but no seat in the chat. |
+| `GET /atom` | Opt-in (`ATOM_FEED_ENABLED=true`), read-only Atom 1.0 feed of the most recent decoded events, bounded by `ATOM_FEED_MAX_ENTRIES`. `404` while disabled, `405` for non-GET. Inherits the health listener's bind address and bearer token. See [HTTP endpoints](docs/http-endpoints.md). |
 
 **Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:
 ```bash
@@ -1158,7 +1225,9 @@ Configuration (see `.env.example`):
 - `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
-- `HEALTH_AUTH_TOKEN` — optional bearer token for all health/metrics routes; an Authorization header over 4096 UTF-8 bytes (including `Bearer `) is rejected with the same empty `401` as any malformed value
+- `ATOM_FEED_ENABLED` — enable the read-only `GET /atom` feed (default `false`)
+- `ATOM_FEED_MAX_ENTRIES` — maximum decoded events retained for that feed (default `50`, minimum `1`)
+- `ATOM_FEED_SELF_URL` — optional public https URL used as the feed's self link (default unset)
 - A stale cursor rejection independently makes `GET /health` return `503` until its target scans successfully; `HEALTH_STALE_MS` does not disable this cursor alert.
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)

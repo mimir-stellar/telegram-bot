@@ -36,6 +36,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     description: "Show the bot version, the Stellar network it watches, and where its source lives.",
     examples: ["/about"],
   },
+  menu: {
+    usage: "/menu",
+    arguments: "None",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Show an interactive navigation menu with buttons for status, contracts, and help.",
+    examples: ["/menu"],
+  },
   status: {
     usage: "/status",
     arguments: "None",
@@ -43,6 +51,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     operatorOnly: false,
     description: "Display the last-seen ledger number, watched contracts, poller health, and sync status.",
     examples: ["/status"],
+  },
+  events: {
+    usage: "/events [page]",
+    arguments: "[page] (optional, default: 1) — positive integer page of retained recent event summaries",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Display a paginated, bounded list of recent canonical contract event summaries retained in memory.",
+    examples: ["/events", "/events 1", "/events 2"],
   },
   audit: {
     usage: "/audit",
@@ -59,6 +75,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     operatorOnly: false,
     description: "Display watched Soroban contract addresses (market and squad) with links to Stellar block explorers.",
     examples: ["/contracts"],
+  },
+  filters: {
+    usage: "/filters",
+    arguments: "None",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Display active notification filters, global feature flags, category allowlists, and redacted chat routing settings.",
+    examples: ["/filters"],
   },
   health: {
     usage: "/health",
