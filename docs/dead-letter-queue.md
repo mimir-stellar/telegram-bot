@@ -1,0 +1,207 @@
+# Dead-Letter Queue (DLQ)
+
+Operational reference for inspecting, understanding, and managing failed Telegram notifications stored in the dead-letter queue.
+
+## Overview
+
+The Mimir Telegram notifier prioritizes the Stellar blockchain as the authoritative source of truth. Telegram delivery is deliberately decoupled and lossy: when a notification fails to send after in-cycle retries, the poller does not hold back the chain cursor, as wedging the cursor on a delivery failure would halt ingestion or cause unbounded backlogs.
+
+Instead, failed sends are persisted locally to disk in the file configured by `DEAD_LETTER_FILE` (defaults to `./data/dead-letter.json`). On subsequent poll cycles, parked messages are automatically replayed in chronological order once Telegram delivery succeeds again.
+
+If `DEAD_LETTER_FILE` is unset or empty, persistence is disabled and the queue operates purely in memory.
+
+---
+
+## File Format & Entry Fields
+
+The dead-letter file is written atomically (via a write-to-temporary-file and rename pattern) and adheres to the following JSON schema:
+
+```json
+{
+  "version": 1,
+  "updatedAt": "2026-10-18T15:00:00.000Z",
+  "entries": [
+    {
+      "id": "market:123456:MarketCreated:a1b2c3d4",
+      "enqueuedAt": "2026-10-18T14:59:50.000Z",
+      "source": "market",
+      "ledger": 123456,
+      "eventName": "MarketCreated",
+      "correlationId": "evt_0123456789abcdef01234567",
+      "text": "Formatted MarkdownV2 message body…",
+      "attempts": 1,
+      "lastError": "Telegram API 429: Too Many Requests: retry after 5"
+    }
+  ]
+}
+```
+
+### Top-Level Fields (`DeadLetterFile`)
+
+* `version` (`number`): Format version integer (currently `1`).
+* `updatedAt` (`string`): ISO 8601 timestamp of when the file was last written or modified.
+* `entries` (`DeadLetterEntry[]`): List of parked dead-letter items.
+
+### Entry Fields (`DeadLetterEntry`)
+
+Each entry in `entries` mirrors the `DeadLetterEntry` TypeScript interface defined in [`src/deadLetter.ts`](file:///c:/Users/HP/drips/work/telegram-bot/src/deadLetter.ts):
+
+* `id` (`string`): Stable unique identifier within the queue (see [Entry ID Generation](#entry-id-generation-makeentryid)).
+* `enqueuedAt` (`string | null`): ISO 8601 timestamp recording when the failure was first enqueued (`null` for legacy entries loaded without a valid timestamp).
+* `source` (`string`): Originating contract source name (e.g. `market` or `squad`).
+* `ledger` (`number`): Stellar ledger sequence number where the event occurred.
+* `eventName` (`string`): Contract event topic/name (e.g. `MarketCreated`, `BetPlaced`, `Resolved`).
+* `correlationId` (`string`, optional): Stable opaque event-derived identifier shared with poller delivery logs. It hashes only the source and chain identity metadata; it never includes message text or credentials. Older entries without this field remain valid.
+* `text` (`string`): The formatted Telegram `MarkdownV2` message body. Bounded and truncated to at most 4,000 characters (`TEXT_TRUNCATE`).
+* `attempts` (`number`): The number of delivery attempts made so far (starts at `1` upon initial enqueue and increments on each failed replay).
+* `lastError` (`string | null`): Scrubbed, redacted error message from the most recent send failure, truncated to at most 200 characters (`ERROR_TRUNCATE`). Sensitive secrets like `BOT_TOKEN` are scrubbed via `safeErrorMessage`.
+* `networkPassphrase` (`string`, optional): Stellar network passphrase where the failure originated. When configured on the queue, `flush` compares each entry's `networkPassphrase` against the active network and rejects replay of entries from another network, leaving them unchanged on disk.
+
+---
+
+## Entry ID Generation (`makeEntryId`)
+
+Entry IDs are generated deterministically by the `makeEntryId` function in [`src/deadLetter.ts`](file:///c:/Users/HP/drips/work/telegram-bot/src/deadLetter.ts):
+
+$$\text{id} = \text{source} : \text{ledger} : \text{eventName} : \text{shortHash}(\text{text})$$
+
+Format:
+```
+<source>:<ledger>:<eventName>:<shortHash(text)>
+```
+
+* `shortHash(text)`: A 32-bit non-cryptographic polynomial hash (`h * 31 + charCode`) formatted as an 8-character zero-padded hexadecimal string.
+* **Deduplication**: If an identical event failure is enqueued again while an entry with the same ID is already present in the queue, a duplicate entry is not added. Instead, the existing entry's `attempts` counter increments and `lastError` updates with the latest failure.
+* **Duplicate ID Validation on Load**: Every entry in `dead-letter.json` must have a unique `id`. If a hand-edited or corrupted file contains conflicting entries with the same `id`, validation rejects the file before applying `maxEntries` trimming and preserves the source file untouched on disk for operator inspection rather than silently overwriting it. The offline `dlq` CLI (`list`, `show`, `purge`) exits with status `1` and reports the conflicting IDs.
+
+---
+
+## Retry Behaviour, Flushes, and Limits
+
+### Automatic Replay (`flush`)
+
+* Parked messages are replayed during the poll cycle before processing newly scanned events, allowing the channel to catch up in chronological order.
+* Flushes are rate-budgeted: at most `MAX_NOTIFICATIONS_PER_CYCLE` (default `20`) messages are replayed per cycle. This prevents recovery bursts from flooding Telegram channels or triggering Telegram rate limits.
+* Replays use `sendWithRetry` with exponential backoff and redaction.
+
+### Bounds and Poison Entry Drops
+
+The queue is strictly bounded across every dimension:
+
+1. **Depth Limit (`DEAD_LETTER_MAX` / `maxEntries`)**:
+   * Configured via `DEAD_LETTER_MAX` (default `100`).
+   * When enqueuing a new entry into a queue that has reached `maxEntries`, the **oldest** entry is dropped and counted (`dropped` counter). This prevents permanently failing sends from expanding the file indefinitely.
+2. **Age Limit (`DEAD_LETTER_MAX_AGE_MS` / `maxAgeMs`)**:
+   * Configured via `DEAD_LETTER_MAX_AGE_MS` (default `604800000` ms / 7 days).
+   * Entries older than `maxAgeMs` are evicted on `load()`, `enqueue()`, and `flush()`, and counted in the `expired` stat (`status.deadLetter.expired` and `dlq list --json`). Expired entries are evicted before capacity checks so newly failed entries are preserved.
+3. **Attempt Limit (`DEAD_LETTER_MAX_ATTEMPTS` / `maxAttempts`)**:
+   * Configured via `DEAD_LETTER_MAX_ATTEMPTS` (default `10`).
+   * If a message fails replay `maxAttempts` times, it is deemed a "poison entry" (e.g. invalid formatting rejected by Telegram) and is dropped from the queue.
+3. **Payload Truncation**:
+   * Message text is truncated to 4,000 characters.
+   * Error messages are scrubbed of secrets and truncated to 200 characters.
+
+---
+
+## Capacity Utilization Gauge
+
+The queue exposes a bounded capacity gauge for dashboards and alerting. It reports only counts and never message bodies (`text`) or error text, so it is safe to publish to metrics backends.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `used` | `number` | Current number of parked entries. |
+| `max` | `number` | Configured depth limit (`DEAD_LETTER_MAX`, default `100`). |
+| `utilization` | `number` | `used / max`, bounded to the range `0`–`1`. |
+
+* When the queue is **disabled** (`DEAD_LETTER_FILE` unset or empty, or the queue is otherwise turned off), the gauge reports `used: 0`, `max: 0`, and `utilization: 0`. A disabled queue never parks entries, so the gauge reads as idle rather than as an error, and no division by zero occurs.
+* `utilization` is clamped to `1` so that transient overshoot never reports above full capacity.
+
+## Offline Inspection CLI (`src/dlq-cli.ts`)
+
+Operators can inspect and purge `DEAD_LETTER_FILE` offline without contacting Stellar or Telegram:
+
+```bash
+node dist/dlq-cli.js list [--file PATH] [--json]
+node dist/dlq-cli.js show <id> [--file PATH] [--json]
+node dist/dlq-cli.js purge [--older-than <dur>] [--yes] [--file PATH] [--json]
+```
+
+Diagnostics and errors are written to `stderr`, keeping `stdout` clean and machine-readable (for example, valid JSON when `--json` is passed).
+
+### Exit Codes
+
+| Exit Code | Meaning |
+|---|---|
+| `0` | Success (including `list` when `DEAD_LETTER_FILE` does not exist yet) |
+| `1` | Unknown entry (`show <id>` did not match any entry) |
+| `2` | Invalid CLI arguments or usage |
+| `3` | Malformed dead-letter file (invalid JSON, unsupported version, or invalid entry schema) |
+| `4` | Dead-letter file access or I/O failure (e.g. permission denied or directory path) |
+
+---
+
+## Operator Inspection with `jq`
+
+Operators can inspect and purge the queue offline with `npm run dlq -- <list|show <id>|purge>`.
+
+* `npm run dlq -- list` computes the queue's age (`age=...`, and `oldestEnqueuedAt` / `oldestAgeMs` / `oldestAge` / `missingTimestamps` under `--json`) from the **oldest retained failure's original `enqueuedAt` timestamp**, not the file's modification time (`mtime`).
+* Legacy entries missing a valid `enqueuedAt` timestamp are preserved with `enqueuedAt: null` and reported explicitly as `unknown` / `missing legacy timestamp` rather than being backfilled with the current time.
+
+Because the file contains standard JSON, operators can also safely inspect queue status and contents on host or container storage using `jq`.
+
+### 1. Check queue depth and last updated time
+```bash
+jq '{version, updatedAt, depth: (.entries | length)}' data/dead-letter.json
+```
+
+### 2. View summary of all parked messages (source, ledger, event, attempts, and error)
+```bash
+jq '.entries[] | {id, source, ledger, eventName, attempts, lastError, enqueuedAt}' data/dead-letter.json
+```
+
+### 3. Identify messages near the maximum retry limit (at risk of being dropped)
+```bash
+jq '.entries[] | select(.attempts >= 8)' data/dead-letter.json
+```
+
+### 4. View unique errors causing send failures
+```bash
+jq -r '.entries[].lastError' data/dead-letter.json | sort | uniq -c
+```
+
+### 5. Inspect the full message body of a specific entry
+```bash
+jq -r '.entries[] | select(.id == "market:123456:MarketCreated:a1b2c3d4") | .text' data/dead-letter.json
+```
+
+---
+
+## When to Delete or Clear the File
+
+Under normal operation, **operators should not need to manually delete the file**. The dead-letter queue will drain automatically once Telegram connectivity is restored, and poison or overflow messages are dropped gracefully per the limits.
+
+However, manual deletion or clearing of `DEAD_LETTER_FILE` is appropriate in the following circumstances:
+
+1. **Permanent Bot Configuration Change / Channel Abandonment**:
+   * If the bot token was revoked and replaced with a bot for a different chat or the target channel was permanently deleted, old parked messages may continuously fail to deliver.
+2. **Unrecoverable Poison Backlog**:
+   * If bad formatting or invalid Markdown payloads bypassed validation and fill the queue, and you prefer not to wait for entries to exhaust `DEAD_LETTER_MAX_ATTEMPTS`.
+3. **Corrupt Dead-Letter File**:
+   * If manual edits or disk corruption make `data/dead-letter.json` unparseable (the bot logs `[dead-letter] unreadable queue at ...; starting empty`), removing the corrupt file allows a fresh clean file to be written.
+
+### Safe File Clearing Procedure
+
+> [!WARNING]
+> Always verify the bot's status and ensure you are not clearing the cursor file (`cursor.json`). Only touch `dead-letter.json`.
+
+1. **Option A: Stop the bot, remove the file, and restart**:
+   ```bash
+   rm -f data/dead-letter.json
+   ```
+   The notifier will initialize an empty queue upon the next cycle.
+
+2. **Option B: Reset contents while running**:
+   Write a valid empty schema so the next poll cycle loads an empty queue cleanly:
+   ```bash
+   echo '{"version":1,"updatedAt":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'","entries":[]}' > data/dead-letter.json
+   ```

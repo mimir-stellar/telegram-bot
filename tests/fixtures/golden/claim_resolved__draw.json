@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5011,
+    "txHash": "",
+    "at": 1724005011,
+    "eventId": "5011-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_resolved",
+      "claimId": 22,
+      "winnerSide": 3,
+      "summary": "Evidence equally supports both sides.",
+      "confidence": 50,
+      "evidenceHash": "aaaabbbb"
+    }
+  },
+  "md": "⚖️ *Claim \\#22 resolved* — winner: *draw*\nConfidence: █████░░░░░ 50%\n_Evidence equally supports both sides\\._\n_ledger 5011_",
+  "plain": "Claim #22 resolved — winner: draw\nConfidence: █████░░░░░ 50%\nEvidence equally supports both sides.\nledger 5011"
+}

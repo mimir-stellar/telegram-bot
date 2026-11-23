@@ -1,0 +1,339 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  DEFAULT_LOG_FORMAT,
+  DEFAULT_LOG_LEVEL,
+  LOG_FORMAT_ENV,
+  LOG_LEVEL_ENV,
+  MAX_LOG_FIELD_CHARS,
+  Logger,
+  parseLogFormat,
+  parseLogLevel,
+  redactLine,
+} from "../dist/logger.js";
+import { stripTerminalEscapes } from "../dist/redact.js";
+
+/** Collect rendered lines instead of writing to the process's own streams. */
+function captureConsole() {
+  const lines = [];
+  Logger.configure({ sink: (level, line) => lines.push({ level, line }) });
+  return lines;
+}
+
+test.afterEach(() => {
+  Logger.reset();
+});
+
+test("defaults keep the process quiet only below info, and render text", () => {
+  assert.equal(DEFAULT_LOG_LEVEL, "info");
+  assert.equal(DEFAULT_LOG_FORMAT, "text");
+  Logger.reset();
+  assert.equal(Logger.getLevel(), "info");
+  assert.equal(Logger.getFormat(), "text");
+});
+
+test("parseLogLevel accepts the five levels, case-insensitively", () => {
+  assert.equal(parseLogLevel("debug"), "debug");
+  assert.equal(parseLogLevel("INFO"), "info");
+  assert.equal(parseLogLevel(" warn "), "warn");
+  assert.equal(parseLogLevel("error"), "error");
+  assert.equal(parseLogLevel("fatal"), "fatal");
+});
+
+test("parseLogLevel falls back to the default rather than silencing logs", () => {
+  // A typo in a deployment must not turn logging off entirely.
+  assert.equal(parseLogLevel("verbose"), DEFAULT_LOG_LEVEL);
+  assert.equal(parseLogLevel(""), DEFAULT_LOG_LEVEL);
+  assert.equal(parseLogLevel(undefined), DEFAULT_LOG_LEVEL);
+  assert.equal(parseLogLevel(null), DEFAULT_LOG_LEVEL);
+});
+
+test("parseLogFormat only accepts json, and defaults to text", () => {
+  assert.equal(parseLogFormat("json"), "json");
+  assert.equal(parseLogFormat(" JSON "), "json");
+  assert.equal(parseLogFormat("text"), "text");
+  assert.equal(parseLogFormat("yaml"), DEFAULT_LOG_FORMAT);
+  assert.equal(parseLogFormat(undefined), DEFAULT_LOG_FORMAT);
+});
+
+test("text format emits exactly the message a console call would have", () => {
+  const lines = captureConsole();
+  Logger.info("poller", "[poller] watching market=C1 squad=C2 every 5000ms", {
+    marketContractId: "C1",
+  });
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].line, "[poller] watching market=C1 squad=C2 every 5000ms");
+  assert.equal(lines[0].level, "info");
+});
+
+test("level filtering drops below the threshold and keeps above it", () => {
+  Logger.configure({ level: "warn" });
+  const lines = captureConsole();
+  Logger.debug("x", "debug");
+  Logger.info("x", "info");
+  Logger.warn("x", "warn");
+  Logger.error("x", "error");
+  Logger.fatal("x", "fatal");
+  assert.deepEqual(
+    lines.map((l) => l.level),
+    ["warn", "error", "fatal"],
+  );
+});
+
+test("fatal survives the strictest threshold", () => {
+  Logger.configure({ level: "fatal" });
+  const lines = captureConsole();
+  Logger.error("x", "error");
+  Logger.fatal("x", "fatal");
+  assert.deepEqual(lines.map((l) => l.level), ["fatal"]);
+});
+
+test("json format emits one parseable object per line with the fields", () => {
+  Logger.configure({ format: "json", now: () => new Date("2026-01-02T03:04:05.000Z") });
+  const lines = captureConsole();
+  Logger.info("poller", "[poller] resumed from /tmp/cursor", {
+    action: "resume",
+    targets: [{ source: "market", cursor: "123-0" }],
+  });
+
+  assert.equal(lines.length, 1);
+  assert.ok(!lines[0].line.includes("\n"), "one record is one line");
+  const record = JSON.parse(lines[0].line);
+  assert.equal(record.ts, "2026-01-02T03:04:05.000Z");
+  assert.equal(record.level, "info");
+  assert.equal(record.component, "poller");
+  assert.equal(record.msg, "[poller] resumed from /tmp/cursor");
+  assert.equal(record.action, "resume");
+  assert.deepEqual(record.targets, [{ source: "market", cursor: "123-0" }]);
+});
+
+test("the canonical keys cannot be shadowed by a caller's fields", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+  Logger.warn("real", "real message", { level: "info", component: "fake", msg: "fake" });
+  const record = JSON.parse(lines[0].line);
+  assert.equal(record.level, "warn");
+  assert.equal(record.component, "real");
+  assert.equal(record.msg, "real message");
+});
+
+test("a registered secret is redacted in the message and in every field", () => {
+  const token = "123456789:" + "AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIII";
+  Logger.configure({ format: "json", secrets: [token] });
+  const lines = captureConsole();
+  Logger.fatal("process", `[fatal] telegram long-polling failed: ${token}`, {
+    error: `401 from https://api.telegram.org/bot${token}/getUpdates`,
+    nested: { token },
+  });
+  assert.ok(!lines[0].line.includes(token), "the token must not survive anywhere");
+  const record = JSON.parse(lines[0].line);
+  assert.match(record.msg, /\[REDACTED\]/);
+  assert.match(record.error, /\[REDACTED\]/);
+  assert.equal(record.nested.token, "[REDACTED]");
+});
+
+test("a Telegram-shaped token is redacted even when its value is not registered", () => {
+  // The process handlers run before config is loaded, so they cannot register
+  // the token — the shape has to be enough.
+  const lines = captureConsole();
+  Logger.configure({ format: "json" });
+  Logger.error("process", "[error] unhandled rejection: 9876543210:AbCdEfGhIjKlMnOpQrStUvWx", {});
+  assert.ok(!lines[0].line.includes("AbCdEfGhIjKlMnOpQrStUvWx"));
+  assert.match(lines[0].line, /\[REDACTED\]/);
+});
+
+test("text format redacts too, not only json", () => {
+  const token = "55555:" + "QQQQQQQQQQQQQQQQQQQQQQQQ";
+  Logger.configure({ format: "text", secrets: [token] });
+  const lines = captureConsole();
+  Logger.error("x", `failed with ${token}`);
+  assert.equal(lines[0].line, "failed with [REDACTED]");
+});
+
+test("fields are JSON-safe: bigint stringified, undefined dropped, depth bounded", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+  const cyclic = { name: "deep" };
+  cyclic.self = cyclic;
+  Logger.info("x", "msg", {
+    amount: 20_000_000n,
+    absent: undefined,
+    missing: null,
+    cyclic,
+  });
+  const record = JSON.parse(lines[0].line);
+  assert.equal(record.amount, "20000000");
+  assert.ok(!("absent" in record), "undefined is dropped rather than serialized");
+  assert.equal(record.missing, null);
+  // A cyclic field is bounded by depth instead of throwing in JSON.stringify:
+  // `cyclic` sits at depth 0, so four levels down the cycle is cut.
+  assert.equal(record.cyclic.name, "deep");
+  assert.equal(record.cyclic.self.self.self.self, "[depth-limit]");
+});
+
+test("a long field is truncated to the log field budget", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+  Logger.info("x", "msg", { reason: "r".repeat(MAX_LOG_FIELD_CHARS * 2) });
+  const record = JSON.parse(lines[0].line);
+  assert.equal(record.reason.length, MAX_LOG_FIELD_CHARS);
+  assert.ok(record.reason.endsWith("…"));
+});
+
+test("a field that cannot be serialized degrades to the message, never throws", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+  const hostile = {};
+  Object.defineProperty(hostile, "boom", {
+    enumerable: true,
+    get() {
+      throw new Error("getter blew up");
+    },
+  });
+  assert.doesNotThrow(() => Logger.info("x", "still logged", { hostile }));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].line, "still logged");
+});
+
+test("configureFromEnv reads the level and format variables", () => {
+  Logger.configureFromEnv({ [LOG_LEVEL_ENV]: "ERROR", [LOG_FORMAT_ENV]: "json" });
+  assert.equal(Logger.getLevel(), "error");
+  assert.equal(Logger.getFormat(), "json");
+
+  Logger.configureFromEnv({ [LOG_LEVEL_ENV]: "nonsense", [LOG_FORMAT_ENV]: "nonsense" });
+  assert.equal(Logger.getLevel(), DEFAULT_LOG_LEVEL);
+  assert.equal(Logger.getFormat(), DEFAULT_LOG_FORMAT);
+});
+
+test("reset restores the defaults and drops registered secrets", () => {
+  const token = "123456789:" + "AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIII";
+  Logger.configure({ level: "debug", format: "json", secrets: [token] });
+  Logger.reset();
+  assert.equal(Logger.getLevel(), DEFAULT_LOG_LEVEL);
+  assert.equal(Logger.getFormat(), DEFAULT_LOG_FORMAT);
+  const lines = captureConsole();
+  Logger.info("x", token);
+  // Text default, and the shape regex still catches it.
+  assert.equal(lines[0].line, "[REDACTED]");
+});
+
+test("unsupported types and circular references are replaced with bounded sentinels", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+
+  const circularObj = { name: "parent" };
+  circularObj.child = { parent: circularObj };
+
+  const circularArr = ["first"];
+  circularArr.push(circularArr);
+
+  Logger.warn("poller", "cycle_details", {
+    circularObj,
+    circularArr,
+    sym: Symbol("debug-symbol"),
+    fnArr: [() => "ignored"],
+    fn: () => "ignored",
+  });
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].level, "warn");
+  const record = JSON.parse(lines[0].line);
+  assert.equal(record.level, "warn");
+  assert.equal(record.component, "poller");
+  assert.equal(record.msg, "cycle_details");
+  assert.equal(record.circularObj.name, "parent");
+  assert.equal(record.circularObj.child.parent.child.parent, "[depth-limit]");
+  assert.equal(record.circularArr[0], "first");
+  assert.equal(record.circularArr[1][1][1][1], "[depth-limit]");
+  assert.equal(record.sym, "[unsupported:symbol]");
+  assert.equal(record.fnArr[0], "[unsupported:function]");
+});
+
+test("serialization failure preserves event level and stable message", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+
+  const poisoned = {};
+  Object.defineProperty(poisoned, "blowup", {
+    enumerable: true,
+    get() {
+      throw new Error("unexpected serialization crash");
+    },
+  });
+
+  assert.doesNotThrow(() => {
+    Logger.error("poller", "polling failed due to transient network error", {
+      detail: poisoned,
+    });
+  });
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].level, "error");
+  assert.equal(lines[0].line, "polling failed due to transient network error");
+});
+
+test("throwing log sink does not terminate caller", () => {
+  Logger.configure({
+    format: "json",
+    sink: () => {
+      throw new Error("sink stream write error");
+    },
+  });
+
+  assert.doesNotThrow(() => {
+    Logger.info("poller", "cycle_complete", { cycle: 1 });
+  });
+});
+
+test("text mode strips ANSI/CSI and OSC terminal escape sequences", () => {
+  Logger.configure({ format: "text" });
+  const lines = captureConsole();
+
+  Logger.warn(
+    "poller",
+    "market \x1b[31mERROR\x1b[0m \x1b]0;spoofed-title\x07 \x1b]8;;https://evil.example\x1b\\click\x1b]8;;\x1b\\",
+  );
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].line, "market ERROR  click");
+  assert.equal(/\x1b|\x07/.test(lines[0].line), false);
+});
+
+test("json mode strips ANSI/OSC sequences from untrusted fields as well as message", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+
+  Logger.error("poller", "failed \x1b[2J\x1b[H", {
+    reason: "\x1b]52;c;SGVsbG8=\x07bad\x1b[31m payload\x1b[0m",
+    nested: { label: "\x9b31mred\x9b0m" },
+  });
+
+  const record = JSON.parse(lines[0].line);
+  assert.equal(record.msg, "failed ");
+  assert.equal(record.reason, "bad payload");
+  assert.equal(record.nested.label, "red");
+});
+
+test("terminal escape neutralization preserves ordinary Unicode content and whitespace", () => {
+  Logger.configure({ format: "text" });
+  const lines = captureConsole();
+
+  const unicodeMsg = "Market: café 🚀 👨‍👩‍👧‍👦 市場 هل ستفوز · …\n\tsecond line";
+  Logger.info("poller", unicodeMsg);
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].line, unicodeMsg);
+});
+
+test("boundary: unterminated OSC, truncated CSI, bare ESC, and CR overwrite are neutralized", () => {
+  assert.equal(stripTerminalEscapes(""), "");
+  assert.equal(stripTerminalEscapes("prefix \x1b]0;unterminated-title"), "prefix ");
+  assert.equal(stripTerminalEscapes("prefix \x1b[31"), "prefix ");
+  assert.equal(stripTerminalEscapes("ok\x1b"), "ok");
+  assert.equal(stripTerminalEscapes("real\rFAKE"), "realFAKE");
+  assert.equal(stripTerminalEscapes("\x1bcreset"), "reset");
+  assert.equal(redactLine("log \x1b[31mred\x1b[0m \x1b]0;t\x07", []), "log red ");
+});
+
+

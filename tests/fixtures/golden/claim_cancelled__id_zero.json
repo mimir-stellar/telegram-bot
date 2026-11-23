@@ -1,0 +1,21 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5017,
+    "txHash": "",
+    "at": 1724005017,
+    "eventId": "5017-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_cancelled",
+      "claimId": 0
+    }
+  },
+  "md": "🚫 *Claim \\#0 cancelled* — stakes returned\n_ledger 5017_",
+  "plain": "Claim #0 cancelled — stakes returned\nledger 5017"
+}

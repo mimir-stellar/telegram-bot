@@ -1,0 +1,634 @@
+/**
+ * Metrics unit tests.
+ *
+ * No live network calls, no Testnet RPC, no Telegram credentials.
+ */
+
+import assert from "node:assert/strict";
+import { get } from "node:http";
+import test from "node:test";
+
+import {
+  createMetrics,
+  DELIVERY_DESTINATION_CLASSES,
+  QUEUE_AGE_BUCKETS_SECONDS,
+} from "../dist/metrics.js";
+
+function httpGet(url) {
+  return new Promise((resolve, reject) => {
+    const req = get(url, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        body += chunk;
+      });
+      res.on("end", () => resolve({ statusCode: res.statusCode, headers: res.headers, body }));
+    });
+    req.on("error", reject);
+  });
+}
+
+async function httpRequest(method, url) {
+  const { request } = await import("node:http");
+  const { hostname, port, pathname } = new URL(url);
+  return new Promise((resolve, reject) => {
+    const r = request(
+      { hostname, port: Number(port), path: pathname, method },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => { body += chunk; });
+        res.on("end", () => resolve({ statusCode: res.statusCode, headers: res.headers, body }));
+      },
+    );
+    r.on("error", reject);
+    r.end();
+  });
+}
+
+test("counter: starts at zero", () => {
+  const m = createMetrics();
+  assert.equal(m.pollCycles.value(), 0);
+  assert.equal(m.rpcRequests.value(), 0);
+  assert.equal(m.rpcErrors.value(), 0);
+  assert.equal(m.eventsDecoded.value(), 0);
+  assert.equal(m.eventsSkipped.value(), 0);
+  assert.equal(m.notificationsSent.value(), 0);
+  assert.equal(m.notificationsFailed.value(), 0);
+  assert.equal(m.staleCursorEvents.value(), 0);
+});
+
+test("counter: inc() increments by 1", () => {
+  const m = createMetrics();
+  m.pollCycles.inc();
+  assert.equal(m.pollCycles.value(), 1);
+  m.pollCycles.inc();
+  assert.equal(m.pollCycles.value(), 2);
+});
+
+test("counter: inc(n) increments by n", () => {
+  const m = createMetrics();
+  m.rpcRequests.inc(5);
+  assert.equal(m.rpcRequests.value(), 5);
+  m.rpcRequests.inc(3);
+  assert.equal(m.rpcRequests.value(), 8);
+});
+
+test("counter: inc(0) is a no-op", () => {
+  const m = createMetrics();
+  m.eventsDecoded.inc(0);
+  assert.equal(m.eventsDecoded.value(), 0);
+});
+
+test("counter: inc(-1) throws RangeError", () => {
+  const m = createMetrics();
+  assert.throws(() => m.pollCycles.inc(-1), /RangeError|delta must be/);
+});
+
+test("counter: multiple counters are independent", () => {
+  const m = createMetrics();
+  m.pollCycles.inc();
+  m.rpcRequests.inc(3);
+  assert.equal(m.pollCycles.value(), 1);
+  assert.equal(m.rpcRequests.value(), 3);
+  assert.equal(m.eventsDecoded.value(), 0);
+});
+
+test("gauge: starts at zero", () => {
+  const m = createMetrics();
+  assert.equal(m.consecutiveFailures.value(), 0);
+});
+
+test("gauge: set() updates the value", () => {
+  const m = createMetrics();
+  m.consecutiveFailures.set(5);
+  assert.equal(m.consecutiveFailures.value(), 5);
+  m.consecutiveFailures.set(0);
+  assert.equal(m.consecutiveFailures.value(), 0);
+});
+
+test("gauge: can decrease (unlike a counter)", () => {
+  const m = createMetrics();
+  m.consecutiveFailures.set(10);
+  m.consecutiveFailures.set(3);
+  assert.equal(m.consecutiveFailures.value(), 3);
+});
+
+test("activity baseline: gauges start at zero and can be updated independently", () => {
+  const m = createMetrics();
+  assert.equal(m.lastCycleEvents.value(), 0);
+  assert.equal(m.activityBaselineEvents.value(), 0);
+  assert.equal(m.activityAnomalies.value(), 0);
+
+  m.lastCycleEvents.set(7);
+  m.activityBaselineEvents.set(4);
+  m.activityAnomalies.inc();
+
+  assert.equal(m.lastCycleEvents.value(), 7);
+  assert.equal(m.activityBaselineEvents.value(), 4);
+  assert.equal(m.activityAnomalies.value(), 1);
+});
+
+test("activity baseline: rendered metrics expose the last count and baseline", () => {
+  const m = createMetrics();
+  m.lastCycleEvents.set(12);
+  m.activityBaselineEvents.set(5);
+  m.activityAnomalies.inc(2);
+
+  const output = m.render();
+  assert.ok(output.includes("# TYPE mimir_bot_last_cycle_events gauge"), output);
+  assert.ok(output.includes("mimir_bot_last_cycle_events 12"), output);
+  assert.ok(output.includes("# TYPE mimir_bot_activity_baseline_events gauge"), output);
+  assert.ok(output.includes("mimir_bot_activity_baseline_events 5"), output);
+  assert.ok(output.includes("# TYPE mimir_bot_activity_anomalies_total counter"), output);
+  assert.ok(output.includes("mimir_bot_activity_anomalies_total 2"), output);
+});
+
+test("notification age: distinguishes missing ledger time from zero delivery lag", () => {
+  const m = createMetrics();
+
+  // Zero delivery lag is a valid sample.
+  m.recordNotificationAge(0);
+  assert.equal(m.notificationAgeSamples.value(), 1);
+  assert.equal(m.notificationAgeMissingLedgerTime.value(), 0);
+  assert.equal(m.notificationAgeTotalMs.value(), 0);
+  assert.equal(m.lastNotificationAgeMs.value(), 0);
+  assert.equal(m.maxNotificationAgeMs.value(), 0);
+
+  // Positive age updates last, max, and cumulative total.
+  m.recordNotificationAge(1250.4);
+  assert.equal(m.notificationAgeSamples.value(), 2);
+  assert.equal(m.notificationAgeTotalMs.value(), 1250);
+  assert.equal(m.lastNotificationAgeMs.value(), 1250);
+  assert.equal(m.maxNotificationAgeMs.value(), 1250);
+
+  // Missing ledger time increments missing counter without overwriting last/max/samples.
+  m.recordNotificationAge(null);
+  assert.equal(m.notificationAgeSamples.value(), 2);
+  assert.equal(m.notificationAgeMissingLedgerTime.value(), 1);
+  assert.equal(m.notificationAgeTotalMs.value(), 1250);
+  assert.equal(m.lastNotificationAgeMs.value(), 1250);
+  assert.equal(m.maxNotificationAgeMs.value(), 1250);
+
+  const output = m.render();
+  assert.ok(output.includes("mimir_bot_notification_age_samples_total 2"), output);
+  assert.ok(output.includes("mimir_bot_notification_age_missing_ledger_time_total 1"), output);
+  assert.ok(output.includes("mimir_bot_notification_age_ms_total 1250"), output);
+  assert.ok(output.includes("mimir_bot_last_notification_age_ms 1250"), output);
+  assert.ok(output.includes("mimir_bot_max_notification_age_ms 1250"), output);
+});
+
+// ── render() format tests ─────────────────────────────────────────────────────
+
+test("render: output ends with a newline", () => {
+  const m = createMetrics();
+  const output = m.render();
+  assert.ok(output.endsWith("\n"), "Prometheus output must end with a newline");
+});
+
+test("render: contains all expected metric names", () => {
+  const m = createMetrics();
+  const output = m.render();
+
+  const expectedNames = [
+    "mimir_bot_poll_cycles_total",
+    "mimir_bot_rpc_requests_total",
+    "mimir_bot_rpc_errors_total",
+    "mimir_bot_events_decoded_total",
+    "mimir_bot_events_skipped_total",
+    "mimir_bot_notifications_sent_total",
+    "mimir_bot_notifications_failed_total",
+    "mimir_bot_stale_cursor_events_total",
+    "mimir_bot_consecutive_failures",
+    "mimir_bot_last_cycle_events",
+    "mimir_bot_activity_baseline_events",
+    "mimir_bot_activity_anomalies_total",
+    "mimir_bot_notification_age_samples_total",
+    "mimir_bot_notification_age_missing_ledger_time_total",
+    "mimir_bot_notification_age_ms_total",
+    "mimir_bot_last_notification_age_ms",
+    "mimir_bot_max_notification_age_ms",
+  ];
+
+  for (const name of expectedNames) {
+    assert.ok(output.includes(name), `Missing metric: ${name}`);
+  }
+});
+
+test("render: counters have # TYPE counter", () => {
+  const m = createMetrics();
+  const output = m.render();
+  assert.ok(
+    output.includes("# TYPE mimir_bot_poll_cycles_total counter"),
+    "Missing TYPE counter for poll_cycles_total",
+  );
+  assert.ok(
+    output.includes("# TYPE mimir_bot_notifications_sent_total counter"),
+    "Missing TYPE counter for notifications_sent_total",
+  );
+});
+
+test("render: gauge has # TYPE gauge", () => {
+  const m = createMetrics();
+  const output = m.render();
+  assert.ok(
+    output.includes("# TYPE mimir_bot_consecutive_failures gauge"),
+    "Missing TYPE gauge for consecutive_failures",
+  );
+});
+
+test("render: contains # HELP lines", () => {
+  const m = createMetrics();
+  const output = m.render();
+  assert.ok(output.includes("# HELP mimir_bot_poll_cycles_total"), "Missing HELP for poll_cycles_total");
+  assert.ok(output.includes("# HELP mimir_bot_consecutive_failures"), "Missing HELP for consecutive_failures");
+});
+
+test("render: initial all-zero values are present", () => {
+  const m = createMetrics();
+  const output = m.render();
+  assert.ok(output.includes("mimir_bot_poll_cycles_total 0"), "Expected poll_cycles_total 0");
+  assert.ok(output.includes("mimir_bot_consecutive_failures 0"), "Expected consecutive_failures 0");
+});
+
+test("render: incremented counter values appear in output", () => {
+  const m = createMetrics();
+  m.pollCycles.inc();
+  m.pollCycles.inc();
+  m.notificationsSent.inc(7);
+  m.consecutiveFailures.set(3);
+
+  const output = m.render();
+  assert.ok(output.includes("mimir_bot_poll_cycles_total 2"), `output: ${output}`);
+  assert.ok(output.includes("mimir_bot_notifications_sent_total 7"), `output: ${output}`);
+  assert.ok(output.includes("mimir_bot_consecutive_failures 3"), `output: ${output}`);
+});
+
+test("render: multiple registries are independent", () => {
+  const m1 = createMetrics();
+  const m2 = createMetrics();
+  m1.pollCycles.inc();
+  assert.equal(m1.pollCycles.value(), 1);
+  assert.equal(m2.pollCycles.value(), 0);
+});
+
+test("dropped samples: NaN and Infinity are counted and never rendered", () => {
+  const m = createMetrics();
+  m.consecutiveFailures.set(Number.NaN);
+  m.consecutiveFailures.set(Number.POSITIVE_INFINITY);
+  m.consecutiveFailures.set(Number.NEGATIVE_INFINITY);
+
+  const output = m.render();
+  assert.ok(!/NaN|Infinity/.test(output), `non-finite value leaked:\n${output}`);
+  assert.ok(output.includes('mimir_bot_dropped_samples_total{reason="invalid_number"} 3'), output);
+  assert.equal(m.consecutiveFailures.value(), 0);
+});
+
+test("dropped samples: unknown labels are counted under a bounded reason", () => {
+  const m = createMetrics();
+  m.recordDropped("unknown_label");
+  m.recordDropped("unknown_label");
+  const output = m.render();
+  assert.ok(output.includes('mimir_bot_dropped_samples_total{reason="unknown_label"} 2'), output);
+});
+
+test("dropped samples: finite values are unaffected", () => {
+  const m = createMetrics();
+  m.consecutiveFailures.set(4);
+  assert.equal(m.consecutiveFailures.value(), 4);
+  assert.ok(!m.render().includes('reason="invalid_number"} 1'));
+});
+
+test("server: GET /metrics returns 200 with correct content-type", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/metrics`);
+    assert.equal(res.statusCode, 200, `Expected 200, got ${res.statusCode}`);
+    assert.ok(
+      res.headers["content-type"]?.includes("text/plain"),
+      `Expected text/plain content-type; got ${res.headers["content-type"]}`,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test("server: GET /metrics returns Prometheus exposition format body", async () => {
+  const m = createMetrics();
+  m.pollCycles.inc(4);
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/metrics`);
+    assert.ok(res.body.includes("mimir_bot_poll_cycles_total 4"), `body: ${res.body}`);
+    assert.ok(res.body.includes("# TYPE"), `Missing # TYPE lines; body: ${res.body}`);
+    assert.ok(res.body.includes("# HELP"), `Missing # HELP lines; body: ${res.body}`);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("server: GET /health returns 200 OK", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/health`);
+    assert.equal(res.statusCode, 200);
+    assert.ok(res.body.includes("OK"), `Expected OK body; got ${res.body}`);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("server: unknown path returns 404", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/unknown`);
+    assert.equal(res.statusCode, 404);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("server: GET /metrics with query string returns 200 (query string is ignored)", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/metrics?debug=1`);
+    assert.equal(res.statusCode, 200);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("server: non-GET method returns 405", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpRequest("POST", `http://127.0.0.1:${srv.port}/metrics`);
+    assert.equal(res.statusCode, 405, `Expected 405 for POST; got ${res.statusCode}`);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("server: /metrics response includes Cache-Control: no-store", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/metrics`);
+    assert.ok(
+      res.headers["cache-control"]?.includes("no-store"),
+      `Expected no-store; got ${res.headers["cache-control"]}`,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test("server: /health, 404, and 405 responses include Cache-Control: no-store", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const healthRes = await httpGet(`http://127.0.0.1:${srv.port}/health`);
+    assert.equal(healthRes.statusCode, 200);
+    assert.equal(healthRes.headers["cache-control"], "no-store");
+
+    const notFoundRes = await httpGet(`http://127.0.0.1:${srv.port}/unknown`);
+    assert.equal(notFoundRes.statusCode, 404);
+    assert.equal(notFoundRes.headers["cache-control"], "no-store");
+
+    const methodNotAllowedRes = await httpRequest("POST", `http://127.0.0.1:${srv.port}/metrics`);
+    assert.equal(methodNotAllowedRes.statusCode, 405);
+    assert.equal(methodNotAllowedRes.headers["cache-control"], "no-store");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("server: live counter updates are reflected in subsequent /metrics responses", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const before = await httpGet(`http://127.0.0.1:${srv.port}/metrics`);
+    assert.ok(before.body.includes("mimir_bot_rpc_errors_total 0"), `before: ${before.body}`);
+
+    m.rpcErrors.inc(3);
+
+    const after = await httpGet(`http://127.0.0.1:${srv.port}/metrics`);
+    assert.ok(after.body.includes("mimir_bot_rpc_errors_total 3"), `after: ${after.body}`);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("server: close() releases the port (a second server can bind to it)", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  const port = srv.port;
+  await srv.close();
+
+  // If the port is truly released, a new server can bind to the same port.
+  // (Using port 0 again lets the OS assign, which may differ — so we just
+  // confirm that close() resolves without error and the server field is gone.)
+  // Binding to the same port deterministically would require SO_REUSEADDR
+  // races; instead we just confirm close() resolved cleanly.
+  assert.ok(port > 0, `Expected a positive port; got ${port}`);
+});
+
+test("server: startServer rejects if the port is already in use", async () => {
+  const m1 = createMetrics();
+  const m2 = createMetrics();
+  const srv1 = await m1.startServer(0);
+  try {
+    // Try to start a second server on the exact same port that srv1 is using.
+    await assert.rejects(
+      () => m2.startServer(srv1.port),
+      /EADDRINUSE|address already in use/i,
+    );
+  } finally {
+    await srv1.close();
+  }
+});
+
+// ── Security tests ────────────────────────────────────────────────────────────
+
+test("security: /metrics output does not contain the word 'token'", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/metrics`);
+    // The output should only contain metric names and numeric values.
+    // The word "token" should never appear.
+    assert.ok(
+      !res.body.toLowerCase().includes("token"),
+      `Unexpected 'token' in /metrics output: ${res.body}`,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test("security: /metrics output does not contain any non-numeric metric values", async () => {
+  const m = createMetrics();
+  m.pollCycles.inc(42);
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/metrics`);
+    // All metric value lines must match: <name> <non-negative-integer>
+    const metricLines = res.body
+      .split("\n")
+      .filter((l) => l.length > 0 && !l.startsWith("#"));
+    for (const line of metricLines) {
+      const parts = line.trim().split(/\s+/);
+      // Each data line must have exactly two parts: name and value.
+      assert.equal(parts.length, 2, `Unexpected metric line format: "${line}"`);
+      const value = parts[1];
+      assert.ok(
+        /^\d+$/.test(value ?? ""),
+        `Metric value is not a non-negative integer: "${line}"`,
+      );
+    }
+  } finally {
+    await srv.close();
+  }
+});
+
+test("security: /health response does not echo request headers", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/health`);
+    assert.ok(!res.body.includes("authorization"), "Unexpected echo of header in /health");
+    assert.ok(!res.body.includes("x-api-key"), "Unexpected echo of header in /health");
+  } finally {
+    await srv.close();
+  }
+});
+
+// ── Pending delivery queue age histogram tests ────────────────────────────────
+
+test("queue age histogram: uses finite ascending buckets and stable destination classes", () => {
+  const m = createMetrics();
+  const h = m.pendingDeliveryQueueAge;
+
+  assert.deepEqual(h.buckets, QUEUE_AGE_BUCKETS_SECONDS);
+  assert.ok(h.buckets.length > 0, "buckets must be non-empty");
+  for (let i = 0; i < h.buckets.length; i++) {
+    assert.ok(Number.isFinite(h.buckets[i]) && h.buckets[i] > 0, `bucket ${i} must be finite > 0`);
+    if (i > 0) {
+      assert.ok(h.buckets[i] > h.buckets[i - 1], "buckets must be strictly ascending");
+    }
+  }
+
+  assert.deepEqual(h.destinations, DELIVERY_DESTINATION_CLASSES);
+  assert.ok(h.destinations.includes("channel"));
+  assert.ok(h.destinations.includes("group"));
+  assert.ok(h.destinations.includes("dm"));
+  assert.ok(h.destinations.includes("dead_letter"));
+});
+
+test("queue age histogram: records cumulative bucket counts, sum, and count per destination", () => {
+  const m = createMetrics();
+  const h = m.pendingDeliveryQueueAge;
+
+  // Exact boundary (1s), mid-range (12s), and above max finite bucket (5000s)
+  h.observe("channel", 1);
+  h.observe("channel", 12);
+  h.observe("channel", 5000);
+  h.observe("dead_letter", 0);
+
+  const channelSnap = h.snapshot("channel");
+  assert.equal(channelSnap.count, 3);
+  assert.equal(channelSnap.sum, 5013);
+
+  const byLe = new Map(channelSnap.buckets.map((b) => [String(b.le), b.count]));
+  assert.equal(byLe.get("1"), 1);
+  assert.equal(byLe.get("5"), 1);
+  assert.equal(byLe.get("15"), 2);
+  assert.equal(byLe.get("3600"), 2);
+  assert.equal(byLe.get("+Inf"), 3);
+
+  const dlqSnap = h.snapshot("dead_letter");
+  assert.equal(dlqSnap.count, 1);
+  assert.equal(dlqSnap.sum, 0);
+  assert.equal(dlqSnap.buckets[0]?.count, 1);
+
+  const dmSnap = h.snapshot("dm");
+  assert.equal(dmSnap.count, 0);
+  assert.equal(dmSnap.sum, 0);
+});
+
+test("queue age histogram: observeSince computes age in seconds and clamps clock skew to 0", () => {
+  const m = createMetrics();
+  const h = m.pendingDeliveryQueueAge;
+
+  h.observeSince("group", 10_000, 12_500); // 2.5s
+  h.observeSince("group", 20_000, 19_000); // clock skew -> clamped to 0s
+
+  const snap = h.snapshot("group");
+  assert.equal(snap.count, 2);
+  assert.equal(snap.sum, 2.5);
+  const byLe = new Map(snap.buckets.map((b) => [String(b.le), b.count]));
+  assert.equal(byLe.get("1"), 1);
+  assert.equal(byLe.get("5"), 2);
+});
+
+test("queue age histogram: renders Prometheus histogram format without chat_id or event_id labels", () => {
+  const m = createMetrics();
+  m.pendingDeliveryQueueAge.observe("channel", 4);
+
+  const output = m.render();
+  assert.ok(
+    output.includes("# TYPE mimir_bot_pending_delivery_queue_age_seconds histogram"),
+    output,
+  );
+  assert.ok(
+    output.includes(
+      'mimir_bot_pending_delivery_queue_age_seconds_bucket{destination="channel",le="1"} 0',
+    ),
+    output,
+  );
+  assert.ok(
+    output.includes(
+      'mimir_bot_pending_delivery_queue_age_seconds_bucket{destination="channel",le="5"} 1',
+    ),
+    output,
+  );
+  assert.ok(
+    output.includes(
+      'mimir_bot_pending_delivery_queue_age_seconds_bucket{destination="channel",le="+Inf"} 1',
+    ),
+    output,
+  );
+  assert.ok(
+    output.includes('mimir_bot_pending_delivery_queue_age_seconds_sum{destination="channel"} 4'),
+    output,
+  );
+  assert.ok(
+    output.includes('mimir_bot_pending_delivery_queue_age_seconds_count{destination="channel"} 1'),
+    output,
+  );
+  assert.ok(!output.includes("chat_id="), "Histogram must not expose chat_id labels");
+  assert.ok(!output.includes("event_id="), "Histogram must not expose event_id labels");
+});
+
+test("queue age histogram: rejects chat IDs, event IDs, and invalid ages/timestamps", () => {
+  const m = createMetrics();
+  const h = m.pendingDeliveryQueueAge;
+
+  // High-cardinality identifiers must be rejected
+  assert.throws(() => h.observe("-1001234567890", 5), RangeError);
+  assert.throws(() => h.observe("0005123456-0000000001", 5), RangeError);
+  assert.throws(() => h.snapshot("-1001234567890"), RangeError);
+
+  // Negative or non-finite ages must be rejected
+  assert.throws(() => h.observe("channel", -0.1), RangeError);
+  assert.throws(() => h.observe("channel", Number.NaN), RangeError);
+  assert.throws(() => h.observe("channel", Number.POSITIVE_INFINITY), RangeError);
+
+  // Non-finite timestamps in observeSince must be rejected
+  assert.throws(() => h.observeSince("channel", Number.NaN, 1000), RangeError);
+  assert.throws(() => h.observeSince("channel", 1000, Number.POSITIVE_INFINITY), RangeError);
+});

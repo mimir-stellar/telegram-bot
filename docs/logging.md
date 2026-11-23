@@ -1,0 +1,213 @@
+# Structured Logging & JSON Mode Reference
+
+This document describes the structured logging system implemented in `src/logger.ts`, including the JSON line schema, log levels, scopes (components), field boundaries, sampling controls, redaction guarantees, and examples for log aggregator ingestion and filtering.
+
+---
+
+## Overview & Configuration
+
+The bot supports two console log formats and an optional size-rotated JSONL file sink:
+
+| Variable | Values / Format | Default | Description |
+|---|---|---|---|
+| `LOG_FORMAT` | `text`, `json` | `text` | When set to `json`, emits one self-contained, un-indented JSON object per log record on stdout/stderr. Case-insensitive; falls back to `text` if invalid. |
+| `LOG_LEVEL` | `debug`, `info`, `warn`, `error`, `fatal` | `info` | Minimum log severity to emit. Records with lower severity are suppressed. Case-insensitive; falls back to `info` if invalid. |
+| `LOG_FILE` | file path | *(unset — disabled)* | Optional local JSONL operational log. Every emitted record is appended as one redacted JSON line regardless of `LOG_FORMAT`. |
+| `LOG_FILE_MAX_BYTES` | positive integer | `10485760` (10 MiB) | Rotate the active file after it grows past this many bytes. Invalid or non-positive values fall back to the default. |
+| `LOG_FILE_MAX_FILES` | `1`–`50` | `5` | Total local files retained: the active file plus `.1` through `.N-1`. Invalid values use the default; values above `50` are clamped. |
+
+In addition, standard output streams follow severity conventions:
+- `error` and `fatal` are written to `stderr` (`console.error`).
+- `warn` is written to `console.warn`.
+- `debug` and `info` are written to `stdout` (`console.log`).
+
+---
+
+## JSON Line Shape & Schema
+
+When `LOG_FORMAT=json`, each log entry is serialized as a single-line JSON string (`{"ts":...,"level":...,"component":...,"msg":...,...}`).
+
+### Canonical Envelope Fields
+
+Every JSON log record contains these canonical top-level fields (guaranteed not to be overwritten or shadowed by caller-supplied fields):
+
+| Field | Type | Description |
+|---|---|---|
+| `ts` | `string` | ISO 8601 UTC timestamp of emission (e.g. `"2026-10-18T19:45:00.000Z"`). |
+| `level` | `string` | Log severity level: `"debug"`, `"info"`, `"warn"`, `"error"`, or `"fatal"`. |
+| `component` | `string` | Log scope / subsystem emitting the record (e.g. `"boot"`, `"poller"`, `"shutdown"`, `"process"`). |
+| `msg` | `string` | Redacted log message string. |
+
+### Contextual Fields
+
+Callers pass optional metadata objects that are merged directly at top-level into the record.
+
+Common convention across components:
+- `action`: A machine-readable snake_case identifier indicating the specific event or failure (e.g. `"start"`, `"paused"`, `"resumed"`, `"rpc_health"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"cursor_persist_failed"`, `"uncaught_exception"`, `"unhandled_rejection"`).
+
+---
+
+## Scopes (Components) & Known Fields
+
+### 1. `boot`
+Emitted during initialization, configuration loading, RPC health checks, and Telegram client startup.
+
+| Field | Type | Description |
+|---|---|---|
+| `action` | `string` | `"rpc_health"`, `"telegram_start_failed"`, `"config_error"`, `"startup_failed"`. |
+| `profile` | `string` | Active profile name when `MIMIR_PROFILE` is set. |
+| `operatorConfigured` | `boolean` | Whether an operator Telegram user ID is configured. |
+| `channelPreviewMode` | `boolean` | Whether channel preview mode is enabled. |
+| `provenance` | `object` | Safe breakdown of config settings and their sources (environment, defaults, files), value-free. |
+| `warning` | `string` | Warning messages generated during configuration provenance parsing. |
+| `attempts` | `number` | Number of RPC connection attempts performed during startup health check. |
+| `status` | `string` | RPC startup health status (e.g. `"ok"`). |
+| `oldestLedger` | `number` | Earliest available ledger retained by Soroban RPC. |
+| `latestLedger` | `number` | Most recent ledger known to Soroban RPC. |
+| `telegramOk` | `boolean` | `true` when Telegram connection / webhook verification succeeds. |
+| `mode` | `string` | Telegram mode (`"webhook"`). |
+| `username` | `string` | Bot username when running in polling mode. |
+| `problems` | `string[]` | List of validation problems on `ConfigError`. |
+
+### 2. `poller`
+Emitted by the poller loop during event ingestion, cursor management, cycle execution, and rate limiting.
+
+| Field | Type | Description |
+|---|---|---|
+| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"notification_sent"` (debug level), `"notification_send_failed"`, `"persistent_volume_unwritable"`. |
+| `marketContractId` | `string` | Mimir market contract address watched. |
+| `squadContractId` | `string` | Mimir squad contract address watched. |
+| `pollIntervalMs` | `number` | Polling interval in milliseconds. |
+| `cursorFile` | `string` | Path to persistent cursor file. |
+| `quarantined` | `string` | Destination path of quarantined corrupt cursor file. |
+| `cursorDir` | `string` | Directory of cursor storage volume. |
+| `targets` | `array` | Array of watch targets, each containing `{ source, cursor, lastEventLedger, rewindFromLedger }`. |
+| `source` | `string` | Event origin contract (`"market"` or `"squad"`). |
+| `eventName` | `string` | Bounded contract event topic/name (max 80 chars). |
+| `eventId` | `string` | Unique event ID assigned by Soroban RPC. |
+| `correlationId` | `string` | Stable, opaque `evt_` identifier derived from event identity; shared by delivery and dead-letter records. |
+| `cycleCorrelationId` | `string` | Random ID for the poll cycle, retained separately from per-notification correlation IDs. |
+| `ledger` | `number` | Ledger sequence number of the event. |
+| `reason` | `string` | Reason for skipping, quarantining, or failing. |
+| `error` | `string` | Sanitized error message text. |
+| `maxNotificationsPerCycle` | `number` | The configured per-cycle notification limit. |
+| `droppedEvent` | `string` | Name of event dropped when cycle cap is exceeded. |
+
+### 3. `dead-letter`
+Emitted when a notification is parked, replayed, or dropped from the bounded dead-letter queue.
+
+| Field | Type | Description |
+|---|---|---|
+| `action` | `string` | `"notification_parked"`, `"notification_replayed"`, `"notification_replay_failed"`, `"notification_dropped"`, `"queue_full"`, or `"queue_persist_failed"`. |
+| `correlationId` | `string` | The same event-derived identifier used by the poller delivery record; absent for legacy queue entries. |
+| `source` | `string` | Originating contract source (`"market"` or `"squad"`). |
+| `eventName` | `string` | Contract event name. |
+| `ledger` | `number` | Ledger sequence number of the event. |
+| `attempts` | `number` | Delivery attempt count where applicable. |
+| `error` | `string` | Redacted and bounded delivery error, never the notification body. |
+
+### 4. `shutdown`
+Emitted during process signal trapping and graceful teardown drain.
+
+| Field | Type | Description |
+|---|---|---|
+| `action` | `string` | `"teardown_timeout"`, `"drain_failed"`, `"health_close_failed"`, `"telegram_stop_failed"`, `"metrics_close_failed"`. |
+| `signal` | `string` | Operating system signal caught (e.g. `"SIGINT"`, `"SIGTERM"`). |
+| `forced` | `boolean` | `true` if a second signal forced an immediate non-graceful exit. |
+| `teardownBudgetMs` | `number` | Maximum allowed timeout before forcing process exit. |
+| `drained` | `boolean` | Whether the poller successfully finished in-flight work before exit. |
+| `cursorFlushed` | `boolean` | Whether cursor state was successfully flushed to disk. |
+| `waitedMs` | `number` | Milliseconds spent waiting for poller drain. |
+
+### 5. `process`
+Emitted by top-level Node.js error listeners.
+
+| Field | Type | Description |
+|---|---|---|
+| `action` | `string` | `"unhandled_rejection"`, `"uncaught_exception"`. |
+
+---
+
+## Safety Bounds & Redaction
+
+### Field Bounds
+To protect log aggregators and prevent denial-of-service via massive RPC payloads:
+- **String length truncation**: Any string field value longer than `MAX_LOG_FIELD_CHARS` (`1,000` characters) is truncated to 999 characters and suffixed with an ellipsis (`…`).
+- **Object depth limit & circular references**: Deeply nested JSON structures are traversed up to `MAX_FIELD_DEPTH` (`4` levels). Anything deeper is replaced with `"[depth-limit]"`, and circular references encountered during error redaction (`redactError`) are replaced with `"[circular]"`.
+- **BigInt serialization**: `BigInt` values are converted to standard numeric strings (`value.toString()`).
+- **Unsupported & Exotic values**: Symbols and functions are safely replaced with bounded sentinels (`"[unsupported:symbol]"`, `"[unsupported:function]"`), or omitted when undefined.
+- **Fail-safe fallback**: If serializing `fields` throws unexpectedly (e.g., via a throwing property getter), the logger retains the original event level and emits the sanitized `msg` string so polling and the process never terminate on logging.
+
+### Redaction Rules
+Every log record is redacted before it leaves the process:
+1. **Registered Secrets**: Explicit secrets such as `config.botToken` and `config.chatId` (including URL percent-encoded variants) are replaced with `[REDACTED]`.
+2. **Telegram Token & Stellar Seed Patterns**: Any substring matching Telegram bot token shape (`(?:bot)?\d{5,}:[A-Za-z0-9_-]{20,}`) or Stellar secret seed strkey (`S` + 55 base32 chars) is automatically replaced with `[REDACTED]`, even if not explicitly registered.
+3. **Consistent URL Component Redaction**: URL redaction (`redactUrl`, `redactInlineUrls`, `redactText`, `redactLine`, and `Logger`) inspects every URL component consistently—masking userinfo (`user:pass@`, `token@`, `:pass@`), secret-shaped path segments, repeated or array-style credential query parameters (`?token=…&token=…`, `?token[]=…`), secret-shaped values under arbitrary query keys, and all non-empty URL `#fragment`s—while preserving safe host, port, route path, public chain strkey (`G…`/`C…`), 64-hex transaction hash, and diagnostic query parameters (`limit=10`, cursors).
+4. **All Fields Protected**: Redaction applies recursively to both the log `msg` and all string values in custom `fields`.
+5. **Terminal Escape Neutralization**: ANSI/CSI, OSC (including hyperlinks and title-spoofing payloads), DCS/APC control strings, and other C0/C1 control sequences (except `\t` and `\n`) are stripped via `stripTerminalEscapes` before emitting human-readable `text` logs, structured `json` fields, or captured `/export` log lines, while preserving ordinary Unicode content.
+
+### Redaction Policy Self-Check (`npm run doctor`)
+`npm run doctor` runs a `redaction-policy` self-check that passes synthetic secret probes (registered secret, Telegram bot token, Stellar seed strkey, URL userinfo/query credentials, Bearer token, and env key-value secret) through all configured log formats (`text`, `json`). If any probe leaks, the check fails and reports only the leaked field names—never the probe values or raw log lines.
+
+### Callback Error Logging
+Callback query handlers (`src/callbacks.ts`, `src/commands/broadcast.ts`, `src/commands/runtime.ts`, and `bot.catch` in `src/bot.ts`) never serialize full Telegram updates or arbitrary thrown objects:
+- **Stable IDs only**: Logs include only bounded correlation IDs (`update_id`, `callback_query_id`, `action`, and `broadcast_id` when applicable).
+- **Redacted error categories**: Errors are mapped to bounded categories (for example `timeout`, `telegram_api_400:editMessageText`, `telegram_query_expired`, `code:ECONNREFUSED`, `unstructured_update_error`, `runtime_error`) rather than dumping `JSON.stringify(err)` or raw update payloads.
+- **Hostile update bounds**: Deeply nested, circular, or throwing-getter update payloads are never traversed; formatted callback error lines are redacted and hard-capped at 240 characters (`MAX_CALLBACK_ERROR_LOG_LEN`).
+
+Per-notification `correlationId` values are the first 96 bits of a SHA-256 digest
+over the event source and chain identity metadata. They do not include formatted
+notification text or credentials. Poll-cycle UUIDs remain separate and continue
+to identify the most recently started cycle in health/status output.
+
+---
+
+## Error Sampling (`LOG_SAMPLE_WINDOW_MS` & `LOG_SAMPLE_MAX_PER_WINDOW`)
+
+Repetitive RPC errors or network disconnects can flood aggregators. The poller passes errors through a bounded error sampler:
+
+- **`LOG_SAMPLE_MAX_PER_WINDOW`** (default: `3`): Maximum number of identical error lines printed per sampling key within a time window.
+- **`LOG_SAMPLE_WINDOW_MS`** (default: `300000`, 5 minutes; minimum: `1000`): Duration of the rolling window in milliseconds.
+
+### Behavior:
+1. The first `LOG_SAMPLE_MAX_PER_WINDOW` errors for a key inside the window are printed in full.
+2. Subsequent repeats for that key within the window are suppressed and counted.
+3. When the window expires, the first new occurrence prints with a notice indicating how many repeats were held back (e.g. `[+N identical lines suppressed in the last 300s]`).
+4. In JSON mode, sampled errors still emit structured logs with canonical `level: "error"` and scope `component: "poller"`.
+
+---
+
+## Size-Based JSONL Rotation (`LOG_FILE`)
+
+When `LOG_FILE` is set, every log record that passes `LOG_LEVEL` is redacted and appended as a single-line JSON object to that path, even while stdout/stderr stay in `text` mode.
+
+- A write that would push the active file past `LOG_FILE_MAX_BYTES` rotates first: `<LOG_FILE>.<k>` shifts to `<LOG_FILE>.<k+1>`, the active file becomes `.1`, and any archive index at or above `LOG_FILE_MAX_FILES` is removed. `LOG_FILE_MAX_FILES=1` keeps only the active file.
+- Writes and rotations are serialized, so records emitted during a rotation are queued rather than lost. If a rename fails, the failure is reported and the pending record is still appended to the active file when it remains writable.
+- Disk failures are reported separately from normal log records on stderr as `[logger] jsonl disk failure stage=... reason=...` and are counted by `Logger.getJsonlStats()` with a stage (`mkdir`, `stat`, `rotate`, `write`, `cleanup`) and reason (`disk_full`, `permission_denied`, `read_only_fs`, `busy`, `path_error`, `io_error`).
+- Graceful shutdown flushes queued writes before exit. Setting `LOG_FILE` does not change console output or redaction.
+
+---
+
+## Aggregator Ingestion & `jq` Examples
+
+Because each JSON line is valid JSON, standard tools like `jq`, Vector, FluentBit, Datadog Agent, or Promtail/Loki can ingest and index fields directly.
+
+### Filter All Errors and Fatal Messages
+```bash
+tail -f mimir.jsonl | jq -c 'select(.level == "error" or .level == "fatal")'
+```
+
+### Filter Poller Errors with Message, Action, and Ledger
+```bash
+cat mimir.jsonl | jq 'select(.component == "poller" and .level == "error") | {ts, action, ledger, error, msg}'
+```
+
+### Inspect Startup / Boot Configuration and Warnings
+```bash
+cat mimir.jsonl | jq 'select(.component == "boot") | {ts, level, action, warning, msg}'
+```
+
+### Track Skipped or Dropped Events
+```bash
+cat mimir.jsonl | jq 'select(.action == "event_skipped" or .action == "notification_cap_reached") | {ts, eventName, ledger, reason}'
+```

@@ -1,0 +1,25 @@
+{
+  "event": {
+    "source": "market",
+    "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "version": "v1",
+    "ledger": 5014,
+    "txHash": "",
+    "at": 1724005014,
+    "eventId": "5014-0",
+    "eventType": "contract",
+    "transactionIndex": null,
+    "operationIndex": null,
+    "inSuccessfulContractCall": null,
+    "payload": {
+      "name": "claim_resolved",
+      "claimId": 25,
+      "winnerSide": 2,
+      "summary": "Result: *yes* (confidence_high). See [evidence](https://example.com).",
+      "confidence": 99,
+      "evidenceHash": "ff00ff00"
+    }
+  },
+  "md": "⚖️ *Claim \\#25 resolved* — winner: *challengers*\nConfidence: ██████████ 99%\n_Result: \\*yes\\* \\(confidence\\_high\\)\\. See \\[evidence\\]\\(https://example\\.com\\)\\._\n_ledger 5014_",
+  "plain": "Claim #25 resolved — winner: challengers\nConfidence: ██████████ 99%\nResult: *yes* (confidence_high). See [evidence](https://example.com).\nledger 5014"
+}

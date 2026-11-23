@@ -1,0 +1,251 @@
+# Changelog
+
+All notable changes to this project are documented here.
+
+## [Unreleased]
+
+### Added
+
+**Archive coverage comparison**
+
+- `compareLedgerCoverage(first, second, options?)` in
+  `src/stellar/scan-jsonl.ts` (re-exported by `src/stellar/archive-coverage.ts`)
+  compares two ledger captures and reports missing and overlapping ledger spans
+  with stable per-side event counts, per-ledger count drift and spans present
+  only in the second capture.
+- `options.range` declares an intentionally retained/filtered ledger range;
+  `options.expectedRange` declares the acquisition scope. Missing ledgers
+  outside those bounds are reported as intentional filtering (`expected: true`,
+  `filtered`), while ledgers absent inside them are incomplete acquisition
+  (`incomplete`) and fail the comparison.
+- `compareArchiveCoverage()`, `compareArchiveDirCoverage()` and
+  `compareScanJsonlCoverage()` accept archive directories, canonical scan JSONL,
+  raw archive JSONL or JSON event arrays as inputs;
+  `formatArchiveCoverageReport()` (`renderArchiveCoverageReport()`,
+  `formatCoverageReport()`, `renderCoverageReport()`) renders a deterministic
+  text report. Existing archive, compaction and JSONL behavior is unchanged.
+  Documented in `docs/component-architecture.md`; covered by
+  `tests/archive-coverage.test.mjs`.
+
+**Compaction aggregate reconciliation** (#911)
+
+- `reconcileCompaction(before, after, options?)` in `src/stellar/compaction-reconciliation.ts`
+  compares volume and latency aggregates before and after archive compaction and
+  reports range loss separately from arithmetic mismatch;
+  `renderReconciliationReport()` renders the deterministic text report. See
+  `docs/analytics-export.md`.
+
+**Filter explanation tree**
+
+- `explainFilterRule(rule, event, options?)` in `src/notifications/filter-expr.ts`
+  returns a deterministic tree mirroring the filter expression AST (`rule`,
+  `event-name`, `and`/`or`, `comparison`, and an optional `threshold` node), with
+  each node's `matched`, `outcome` and a short reason. Short-circuited branches are
+  reported as `not-evaluated`; the root always agrees with `evaluateFilterRule` /
+  `evaluateFilterDryRun`, whose behavior is unchanged.
+- Reasons never include payload values, and string literals from the rule are shown
+  as `<redacted>`, so addresses, route identities and message text stay out of the
+  output. The tree is bounded by node count, depth and reason length
+  (`MAX_EXPLANATION_NODES`, `MAX_EXPLANATION_DEPTH`,
+  `MAX_EXPLANATION_REASON_LENGTH`); `renderFilterExplanation` renders it as text.
+- Documented in `docs/notification-filters.md` §5; covered by
+  `tests/filter-explanation.test.mjs`.
+
+**Read-only cursor consistency check against scan archives**
+
+- `npm run cursor -- check --archive PATH` compares the persisted cursor
+  (`CURSOR_FILE`) with an event archive directory or a `scan --jsonl` export
+  and reports target-identity mismatches (untracked targets, mixed or
+  unexpected contract ids), observed ledger-range gaps and contradictions
+  (archive ends before the cursor's last event, archived events past the
+  cursor's position, processed event ids missing from the archived span,
+  recorded floor-rewind gaps), and archive self-contradictions (event-id vs
+  ledger, conflicting/exact duplicates, out-of-order records). `--json` prints
+  the report as JSON; `--market-contract` / `--squad-contract` (or
+  `MARKET_CONTRACT_ID` / `SQUAD_CONTRACT_ID`) set the expected contract ids.
+- Strictly read-only: it takes no instance lock and never advances, rewinds or
+  writes a cursor or the archive. Exits `0` when no error finding is reported
+  (warnings allowed) and `1` otherwise. The pure report builder lives in
+  `src/cursor-consistency.ts`; `tests/cursor-consistency.test.mjs` covers it.
+
+**Selectable bot language**
+
+- `src/i18n.ts` now ships a message catalog per locale behind
+  `messagesFor(locale)`, with `en` as the base and fallback catalog and `es`
+  shipped. The named English exports (`HELP_TITLE`, `NOTIFICATION_MD`, ...) stay
+  the reference strings, so existing imports and tests keep working.
+- `MIMIR_LOCALE` selects the language at startup (`en` default, `es` shipped).
+  Case and a region suffix (`es-MX`, `es_419`) are accepted; an unsupported
+  value fails config validation with the supported list. The choice is carried
+  on the config as `config.locale` and reported by `configProvenance()`.
+- Notifications, the inline keyboard labels, `/help`, the Telegram command menu
+  and pause/resume replies now render from the catalog selected by
+  `config.locale`, so switching languages does not require rebuilding the call
+  sites.
+- `docs/translating.md` documents choosing and adding a language;
+  `tests/i18n-locale.test.mjs` covers selection and config validation, and the
+  MarkdownV2 linter now validates every shipped locale.
+
+**Per-cycle activity baseline**
+
+- The poller now keeps a bounded rolling window of events observed per complete poll
+  cycle (`src/activity-baseline.ts`). Each cycle is compared with the mean and sample
+  standard deviation of the cycles before it and classified as `normal`, `spike`
+  (z ≥ 3) or `drop` (z ≤ −3); until ten cycles exist it reports `warming-up`. Partial
+  cycles — one target in backoff or failed — are not recorded, so an RPC problem is not
+  mistaken for a quiet chain.
+- Anomalies are logged once as a bounded `[poller] activity spike|drop: …` line and
+  counted in `mimir_bot_activity_anomalies_total`.
+- `GET /health` exposes the full snapshot at `poller.activity` (window size, samples,
+  last value, baseline mean and standard deviation, z-score, classification and anomaly
+  count). Both metrics endpoints expose the last cycle's events, the baseline mean, the
+  z-score and the anomaly count (`mimir_bot_*` and `mimir_telegram_activity_*`).
+- The health-report JSON schema is updated with the new closed `activity` object.
+
+**Malformed-event robustness**
+
+- `clip()` is now applied to the `category` field in `claim_created` notifications (bounded
+  to 80 characters). `question` in `market_created` and `summary` in `claim_resolved` were
+  already clipped at 200 characters. This prevents a crafted or unexpectedly long contract
+  string from producing an oversized Telegram message or an unbounded log line.
+- `clip()` is now exported from `src/notifications/format.ts` so it can be used from tests
+  and shared utilities without re-implementing the cap logic.
+- The event name and decode-error reason logged when skipping an `unknown` event are now
+  bounded (80 and 120 characters respectively) to prevent unbounded remote payloads reaching
+  log output.
+
+**Stale cursor detection**
+
+- The poller now warns when a persisted cursor points to a ledger that is more than 12 096
+  ledgers (~10 % of the Testnet retention window) behind the RPC's current `oldestLedger`.
+  Events in the gap will never be delivered; the warning names the cursor file path and
+  explains how to recover (`delete the cursor file to cold-start`).
+- The threshold constant `STALE_CURSOR_LEDGER_LAG` is documented inline.
+
+**Configurable inter-send delay**
+
+- New env var `INTER_SEND_DELAY_MS` (default `1500`) controls the pause between successive
+  Telegram sends in one poll cycle. The previous hardcoded `1500 ms` constant is now a
+  validated config field (`interSendDelayMs` on `BotConfig`), documented in `.env.example`,
+  and accessible to tests without any fixed delay (`interSendDelayMs: 0`).
+
+**Rate-cap logging**
+
+- When `MAX_NOTIFICATIONS_PER_CYCLE` is reached the poller now emits a single
+  `console.warn` for the entire cycle (not one per dropped event) that names the cap,
+  explains what to do, and confirms that the cursor still advances.
+
+**Consecutive-failure circuit-breaker logging**
+
+- When the poller completes a cycle where every contract scan failed, it increments
+  `consecutiveFailures` (this existed before). It now also emits a structured `console.warn`
+  the first time the count crosses each threshold (5, 10, 25, 50, 100). The warning names
+  the RPC URL, the last error (bounded to 200 characters), and confirms the cursor is intact.
+
+**Cursor file version guard**
+
+- `loadCursors()` now explicitly checks `parsed.version`. If the field is absent or is not
+  `1`, the poller cold-starts and logs an actionable warning rather than silently proceeding
+  with an unknown file layout. This protects against reading a cursor file written by a
+  future release after a downgrade.
+
+**Scanner CLI improvements**
+
+- `--contract <market|squad>` flag added: scans only the named contract instead of both.
+  Passing an unrecognised value exits immediately with a clear error message.
+- `--help` / `-h` flag added: prints the full usage block and exits without making any
+  network calls.
+- `--pages` and `--show` flags now validate their arguments (must be integers within a
+  stated range) and exit with an error rather than silently using `NaN`.
+- `--show` is capped at 200 decoded events per contract (`SCAN_SHOW_MAX`).
+
+**Log safety**
+
+- The bot token, private keys, and payment proofs are never logged. No log path in the
+  poller, bot, or config loader references `config.botToken`.
+- Remote string payloads (`eventName`, decode reasons, error messages) that reach log lines
+  are passed through `clip()` with explicit bounds before logging.
+- `errMessage()` in `poller.ts` always returns a plain string, so stack traces from the RPC
+  or grammy are bounded by JavaScript's own `Error.message` field rather than re-serialised
+  response bodies.
+
+### Changed
+
+- `clip()` in `src/notifications/format.ts` is now `export`ed (was a module-private
+  function). No callers outside the module existed before; making it exported enables direct
+  testing without duplication.
+- The standalone `events.ts` CLI `flag()` helper is joined by `flagBool()` and `flagInt()`
+  to support the new validated flags.
+- `SEND_SPACING_MS` in `poller.ts` (previously a module-level constant) is replaced by
+  `config.interSendDelayMs` so the value is configurable without a code change.
+
+### Tests
+
+- **`tests/format.test.mjs`** — extended with 7 new cases:
+  - `clip()` at exactly the boundary, over the boundary, empty string, and whitespace-only
+    input.
+  - Category bounded in `claim_created` notification.
+  - Question bounded in `market_created` notification.
+  - Summary bounded in `claim_resolved` notification.
+- **`tests/config.test.mjs`** — new file, 22 cases:
+  - `BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `MARKET_CONTRACT_ID` required-field validation.
+  - Multi-problem collection in one `ConfigError`.
+  - `INTER_SEND_DELAY_MS`: default, `0`, custom value, non-integer, negative.
+  - `MAX_NOTIFICATIONS_PER_CYCLE`: default, minimum (1), below minimum (0).
+  - `POLL_INTERVAL_MS`: below 5000 rejected, exactly 5000 accepted.
+  - Chat ID: numeric negative, `@channelusername`, invalid format.
+  - `networkLabel`: testnet, public, custom.
+  - `loadStellarConfig` works without Telegram credentials.
+  - `ConfigError` message content and `problems` array.
+- **`tests/poller.test.mjs`** — new file, 10 cases:
+  - Version guard: no version field → cold-start + warning; version 99 → cold-start + warning;
+    version 1 → no version warning.
+  - Rate-cap warning text contains the cap value.
+  - `interSendDelayMs` config field is present and typed correctly.
+  - Circuit breaker: `consecutiveFailures` increments after all scans fail.
+  - Stale cursor: warning emitted when lag exceeds threshold; no warning when within range.
+  - Log safety: bot token does not appear in any log output during poller construction.
+
+### CI
+
+- `.github/workflows/ci.yml` now runs `npm test` (which includes `tsc` + all three test
+  files) rather than running `npm run typecheck` and `npm run build` separately. The
+  previous two-step job is replaced by a single `Build and test` step.
+
+---
+
+## Failure modes, cursor safety, and deployment impact
+
+### Failure modes
+
+| Failure | What happens | Recovery |
+|---|---|---|
+| RPC call fails | That contract's scan is skipped for one cycle; cursor is left untouched | Auto-resumes next cycle |
+| RPC retention gap (stale cursor) | Warning logged; events in the gap are not posted | Delete cursor file; bot cold-starts from the current tip |
+| Telegram send fails | One message is dropped; cursor still advances | None — notifications are lossy by design |
+| Cursor file missing | Cold-start `START_LOOKBACK_LEDGERS` behind the tip | Normal operation |
+| Cursor file unreadable or corrupt | Cold-start; warning logged | Normal operation |
+| Cursor file has unknown version | Cold-start; warning logged with recovery instructions | Normal operation |
+| All contracts fail for N consecutive cycles | Structured warning at thresholds 5, 10, 25, 50, 100 | Check RPC and Telegram connectivity |
+| `MAX_NOTIFICATIONS_PER_CYCLE` reached | Remaining events in the cycle skipped; one warning logged; cursor advances | Raise the cap or wait for the backlog to drain |
+
+### Cursor safety
+
+The cursor file is written with a write-then-rename pattern (`.tmp` → final), so a crash
+mid-write cannot produce a truncated file that replays the entire retained history.
+
+The file includes a `version: 1` field. Future schema changes will use a different version
+number; the poller will cold-start rather than silently misread an unknown layout.
+
+On an ephemeral filesystem (e.g. a container without a persistent volume), every restart is a
+cold start. Mount `data/` (or the path in `CURSOR_FILE`) on a persistent volume to preserve
+the resume position across restarts.
+
+### Deployment impact of this change
+
+- **New env var `INTER_SEND_DELAY_MS`** — optional, default `1500`. Existing deployments are
+  unaffected; the default matches the previous hardcoded constant.
+- **No change to the cursor file format** — existing `data/cursor.json` files with
+  `"version": 1` load without modification.
+- **CI now runs the test suite** — `npm test` replaces the previous typecheck-only CI job.
+  The build output is still produced as part of `npm test`.
