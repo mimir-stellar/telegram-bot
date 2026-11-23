@@ -11,18 +11,22 @@ const PUBLIC_LINES = [
   "/start — What this bot does",
   "/help — Show help",
   "/about — About this bot",
+  "/menu — Show navigation menu",
   "/status — Last\\-seen ledger and watched contracts",
+  "/events — Recent observed contract events",
   "/contracts — Contract ids and explorer links",
+  "/filters — Active notification filters and routing",
   "/health — Health assessment and operational readiness",
   "/preview — Preview channel notification formatting",
   "/stats — Notification and RPC counters with process uptime",
 ];
 const ALL_LINES = [
-  ...PUBLIC_LINES.slice(0, 4),
+  ...PUBLIC_LINES.slice(0, 5),
   "/audit — Operator only: audit report \\(redacted, bounded\\)",
-  ...PUBLIC_LINES.slice(4),
+  ...PUBLIC_LINES.slice(4, 7),
   "/pause — Operator only: pause new scans",
   "/resume — Operator only: resume polling now",
+  ...PUBLIC_LINES.slice(7),
 ];
 
 function fixture(operatorTelegramUserId) {
@@ -49,10 +53,15 @@ for (const operatorId of [null, "42"]) {
       assert.deepEqual(replies, [[INTRO + lines.join("\n"), OPTIONS]]);
       assert.ok(replies[0][0].length < 4096);
     }
-    assert.deepEqual(menus[0].map(({ command }) => command), lines.map((line) => line.split(" ")[0].slice(1)));
-    for (const { command, description } of menus[0]) {
-      assert.ok(handlers.has(command), `${command} has a handler`);
-      assert.ok(description.length >= 1 && description.length <= 256);
+    const publicNames = PUBLIC_LINES.map((line) => line.split(" ")[0].slice(1));
+    assert.equal(menus.length, operatorId === null ? 1 : 2);
+    assert.deepEqual(menus[0].map(({ command }) => command), publicNames);
+    if (operatorId !== null) {
+      assert.deepEqual(
+        menus[1].map(({ command }) => command),
+        lines.map((line) => line.split(" ")[0].slice(1)),
+      );
+      assert.equal(menus[1].some(({ command }) => command === "audit"), true);
     }
     assert.equal(handlers.size, 12, "disabled operator handlers still enforce authorization");
   });
@@ -63,7 +72,10 @@ test("a new registration reflects operator configuration after restart", async (
   await registerCommands(first.bot, first.config);
   const restarted = fixture(null);
   await registerCommands(restarted.bot, restarted.config);
-  assert.equal(first.menus[0].some(({ command }) => command === "audit"), true);
+  assert.equal(first.menus.length, 2);
+  assert.equal(first.menus[0].some(({ command }) => command === "audit"), false);
+  assert.equal(first.menus[1].some(({ command }) => command === "audit"), true);
+  assert.equal(restarted.menus.length, 1);
   assert.equal(restarted.menus[0].some(({ command }) => ["audit", "pause", "resume"].includes(command)), false);
 });
 

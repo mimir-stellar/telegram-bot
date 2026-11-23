@@ -18,6 +18,7 @@ import test from "node:test";
 
 import { Address, Keypair, nativeToScVal } from "@stellar/stellar-sdk";
 
+import { Logger } from "../dist/logger.js";
 import { createPoller } from "../dist/poller.js";
 import { createTempDataDir } from "./helpers/temp-data.mjs";
 
@@ -110,10 +111,19 @@ async function waitFor(cond, timeoutMs = 4_000) {
 
 test("dlq: a send that exhausts its retries is parked and the cursor still advances", async () => {
   const dir = await createTempDataDir("mimir-dlq-park-");
+  const logLines = [];
+  const deliveryCorrelationIds = [];
+  let notificationText = "";
+  Logger.configure({
+    format: "json",
+    sink: (_level, line) => logLines.push(line),
+  });
   const poller = createPoller({
     config: baseConfig(dir),
     server: makeServer(),
-    send: async () => {
+    send: async (text, _source, extra) => {
+      notificationText = text;
+      deliveryCorrelationIds.push(extra?.eventRef?.correlationId);
       throw new Error(`Telegram unavailable for https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`);
     },
     ...FAST_SEND,
@@ -137,10 +147,21 @@ test("dlq: a send that exhausts its retries is parked and the cursor still advan
     assert.equal(parked.entries.length, status.deadLetter.depth);
     assert.equal(parked.entries[0].source, "market");
     assert.ok(typeof parked.entries[0].text === "string" && parked.entries[0].text.length > 0);
+    const correlationId = parked.entries[0].correlationId;
+    assert.match(correlationId, /^evt_[0-9a-f]{24}$/);
+    assert.equal(deliveryCorrelationIds[0], correlationId);
+    const records = logLines.map((line) => JSON.parse(line));
+    assert.ok(records.some((record) =>
+      record.action === "notification_send_failed" && record.correlationId === correlationId));
+    assert.ok(records.some((record) =>
+      record.action === "notification_parked" && record.correlationId === correlationId));
+    assert.equal(JSON.stringify(records).includes(notificationText), false);
+    assert.equal(JSON.stringify(records).includes(BOT_TOKEN), false);
     // The one thing that must never be persisted.
     assert.equal(JSON.stringify(parked).includes(BOT_TOKEN), false);
   } finally {
     await poller.stop();
+    Logger.reset();
     await dir.cleanup();
   }
 });
@@ -176,12 +197,16 @@ test("dlq: the next cycle replays a parked send once Telegram recovers", async (
   const dir = await createTempDataDir("mimir-dlq-replay-");
   let fail = true;
   const delivered = [];
+  const failedCorrelationIds = [];
   const poller = createPoller({
     config: baseConfig(dir),
     server: makeServer(),
-    send: async (text, source) => {
-      if (fail) throw new Error("Telegram down");
-      delivered.push([source, text]);
+    send: async (text, source, extra) => {
+      if (fail) {
+        failedCorrelationIds.push(extra?.eventRef?.correlationId);
+        throw new Error("Telegram down");
+      }
+      delivered.push([source, text, extra?.eventRef?.correlationId]);
     },
     ...FAST_SEND,
   });
@@ -195,9 +220,11 @@ test("dlq: the next cycle replays a parked send once Telegram recovers", async (
     await waitFor(() => poller.status().deadLetter.replayed >= 1);
     assert.ok(poller.status().deadLetter.depth < parkedDepth, "the queue drained");
     // Replayed to the chat the original attempt was routed to.
-    assert.equal(
-      delivered.some(([source]) => source === "market"),
-      true,
+    assert.ok(delivered.some(([source]) => source === "market"));
+    assert.ok(
+      failedCorrelationIds.some((failedId) =>
+        delivered.some(([, , replayedId]) => replayedId === failedId)),
+      "the parked notification keeps its correlation ID during replay",
     );
   } finally {
     await poller.stop();

@@ -35,6 +35,22 @@ Both endpoints also export a comparison of the latest **complete** poll cycle wi
 | `mimir_telegram_activity_deviation` | z-score of the latest cycle against the baseline (0 while warming up). |
 | `mimir_telegram_activity_anomalies_total` / `mimir_bot_activity_anomalies_total` | Complete cycles classified as a spike (z ≥ 3) or drop (z ≤ −3). |
 
+### RPC latency histogram
+
+Both endpoints also export `mimir_telegram_rpc_request_latency_ms` /
+`mimir_bot_rpc_request_latency_ms` with `_bucket`, `_sum`, and `_count` series.
+The buckets are fixed (`5`–`15_000` ms, plus `+Inf`) and the only partitions are
+`network`, `provider="soroban-rpc"`, and `operation` (`health`, `events`,
+`other`). The RPC URL is deliberately not a label, so changing
+`STELLAR_RPC_URL` (or adding a query string) cannot create a new series.
+
+```promql
+# Approximate p95 getEvents latency over the last 15 minutes.
+histogram_quantile(0.95, sum by (le) (
+  rate(mimir_telegram_rpc_request_latency_ms_bucket{operation="events"}[15m])
+))
+```
+
 The same snapshot is available from `curl -s http://127.0.0.1:8787/health | jq .poller.activity`. A spike is not a fault by itself — a genuinely busy chain should not page anyone — so read it as context next to `eventsSkipped`, the notification cap, and `poller.error`. A sustained *drop* on an otherwise active contract more often means a broken filter, a cursor problem, or an upstream outage:
 
 ```promql

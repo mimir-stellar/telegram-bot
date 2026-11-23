@@ -4,12 +4,14 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  ArchiveMetadataConflictError,
   createEventArchive,
   MalformedArchiveRecordError,
   readArchive,
   writeArchiveManifest,
   verifyArchiveManifest,
 } from "../dist/stellar/archive.js";
+import { buildPrivacyReviewReport } from "../dist/stellar/privacy-review.js";
 import { withTempDataDir } from "./helpers/temp-data.mjs";
 
 function makeDummyEvent(id, amountBigInt = 10000000n) {
@@ -51,6 +53,7 @@ test("archive creates files with 0o600 permissions and appends events", async ()
     }
 
     assert.equal(readBack.length, 1);
+    assert.equal(readBack[0].schemaVersion, 1);
     assert.equal(readBack[0].eventId, "event-1");
     // Verify bigint round-trip as string
     assert.equal(readBack[0].payload.stake, "5000000000000000000");
@@ -58,8 +61,9 @@ test("archive creates files with 0o600 permissions and appends events", async ()
     // Check mode if on posix
     if (process.platform !== "win32") {
       const files = await import("node:fs/promises").then((fs) => fs.readdir(archiveDir));
-      assert.ok(files.length > 0);
-      const st = await stat(path.join(archiveDir, files[0]));
+      const archiveFiles = files.filter((file) => file.endsWith(".jsonl"));
+      assert.ok(archiveFiles.length > 0);
+      const st = await stat(path.join(archiveDir, archiveFiles[0]));
       assert.equal(st.mode & 0o777, 0o600);
     }
   });
@@ -287,7 +291,7 @@ test("archive accepts LF and CRLF input without changing record identities and w
     await archive.close();
 
     const fs = await import("node:fs/promises");
-    const lfFiles = await fs.readdir(lfDir);
+    const lfFiles = (await fs.readdir(lfDir)).filter((file) => file.endsWith(".jsonl"));
     assert.equal(lfFiles.length, 1);
     const lfRaw = await fs.readFile(path.join(lfDir, lfFiles[0]), "utf8");
     assert.equal(lfRaw.includes("\r\n"), false, "canonical archive output must use LF, not CRLF");

@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { resolutionLatency } from "../dist/stellar/resolution-latency.js";
+import {
+  resolutionLatency,
+  IncompleteCaptureError,
+  assertCompleteCapture,
+} from "../dist/stellar/resolution-latency.js";
 
 function mockEvent({ name, claimId, ledger, at, contractId = "C1", txHash = "hash" }) {
   return {
@@ -158,45 +162,131 @@ test("resolutionLatency: computes percentiles deterministically with multiple da
   assert.deepEqual(report.resolved.summary.max, { seconds: 100, ledgers: 10 });
 });
 
-test("resolutionLatency: resolved and cancelled for same claim is an explicit conflict", () => {
+// ── Capture Completeness & Gap Information Coverage ─────────────────────────
+
+test("resolutionLatency: carries observed ledger range and gap information in report", () => {
   const events = [
-    mockEvent({ name: "claim_created", claimId: 7, ledger: 100, at: 1000 }),
-    mockEvent({ name: "claim_resolved", claimId: 7, ledger: 120, at: 1040 }),
-    mockEvent({ name: "claim_cancelled", claimId: 7, ledger: 130, at: 1080 }),
+    mockEvent({ name: "claim_created", claimId: 1, ledger: 50, at: 1000 }),
+    mockEvent({ name: "claim_resolved", claimId: 1, ledger: 75, at: 1100 }),
+    mockEvent({ name: "claim_created", claimId: 2, ledger: 60, at: 1050 }),
   ];
 
   const report = resolutionLatency(events);
-
-  assert.deepEqual(report.conflicts, [
-    {
-      claimId: 7,
-      resolutionLedgers: [120],
-      cancellationLedgers: [130],
-      reason: "resolved_and_cancelled",
-    },
-  ]);
-  assert.equal(report.excludedCount, 1);
-  assert.equal(report.resolved.claims.length, 0);
-  assert.equal(report.cancelled.claims.length, 0);
+  assert.ok(report.completeness);
+  assert.equal(report.completeness.startLedger, 50);
+  assert.equal(report.completeness.endLedger, 75);
+  assert.deepEqual(report.completeness.ledgerRange, { fromLedger: 50, toLedger: 75 });
+  assert.deepEqual(report.completeness.gaps, []);
+  assert.equal(report.completeness.hasGaps, false);
+  assert.equal(report.completeness.totalMissedLedgers, 0);
+  assert.equal(report.completeness.isComplete, false);
+  assert.equal(report.completeness.isPartial, true);
+  assert.strictEqual(report.capture, report.completeness);
 });
 
-test("resolutionLatency: multiple resolutions for same claim is an explicit conflict", () => {
+test("resolutionLatency: carries explicit options, ledger range bounds, and gaps", () => {
   const events = [
-    mockEvent({ name: "claim_created", claimId: 8, ledger: 100, at: 1000 }),
-    mockEvent({ name: "claim_resolved", claimId: 8, ledger: 110, at: 1010 }),
-    mockEvent({ name: "claim_resolved", claimId: 8, ledger: 115, at: 1015 }),
+    mockEvent({ name: "claim_created", claimId: 1, ledger: 100, at: 1000 }),
+    mockEvent({ name: "claim_resolved", claimId: 1, ledger: 150, at: 1200 }),
   ];
 
-  const report = resolutionLatency(events);
+  const report = resolutionLatency(events, {
+    fromLedger: 50,
+    toLedger: 200,
+    gaps: [{ fromLedger: 110, toLedger: 125 }],
+    isComplete: true, // overridden by presence of gaps
+  });
 
-  assert.deepEqual(report.conflicts, [
-    {
-      claimId: 8,
-      resolutionLedgers: [110, 115],
-      cancellationLedgers: [],
-      reason: "multiple_resolutions",
-    },
+  assert.equal(report.completeness.startLedger, 50);
+  assert.equal(report.completeness.endLedger, 200);
+  assert.deepEqual(report.completeness.ledgerRange, { fromLedger: 50, toLedger: 200 });
+  assert.equal(report.completeness.hasGaps, true);
+  assert.equal(report.completeness.totalMissedLedgers, 16);
+  assert.equal(report.completeness.isComplete, false);
+  assert.equal(report.completeness.isPartial, true);
+  assert.deepEqual(report.completeness.gaps, [
+    { fromLedger: 110, toLedger: 125, missedLedgers: 16 },
   ]);
-  assert.equal(report.excludedCount, 1);
-  assert.equal(report.resolved.claims.length, 0);
+});
+
+test("resolutionLatency: complete series without gaps reports isComplete true", () => {
+  const events = [
+    mockEvent({ name: "claim_created", claimId: 1, ledger: 10, at: 1000 }),
+    mockEvent({ name: "claim_resolved", claimId: 1, ledger: 20, at: 1060 }),
+  ];
+
+  const report = resolutionLatency(events, { isComplete: true });
+  assert.equal(report.completeness.isComplete, true);
+  assert.equal(report.completeness.isPartial, false);
+  assert.equal(report.completeness.hasGaps, false);
+  assert.equal(report.completeness.totalMissedLedgers, 0);
+});
+
+test("resolutionLatency: failure case - requireComplete throws IncompleteCaptureError on partial capture", () => {
+  const events = [
+    mockEvent({ name: "claim_created", claimId: 1, ledger: 10, at: 1000 }),
+    mockEvent({ name: "claim_resolved", claimId: 1, ledger: 20, at: 1060 }),
+  ];
+
+  assert.throws(
+    () => {
+      resolutionLatency(events, { requireComplete: true });
+    },
+    (err) => {
+      assert.ok(err instanceof IncompleteCaptureError);
+      assert.match(err.message, /Cannot present partial capture as global market totals/);
+      assert.equal(err.startLedger, 10);
+      assert.equal(err.endLedger, 20);
+      return true;
+    },
+  );
+});
+
+test("resolutionLatency: failure case - requireComplete throws IncompleteCaptureError when gaps exist", () => {
+  const events = [
+    mockEvent({ name: "claim_created", claimId: 1, ledger: 10, at: 1000 }),
+    mockEvent({ name: "claim_resolved", claimId: 1, ledger: 20, at: 1060 }),
+  ];
+
+  assert.throws(
+    () => {
+      resolutionLatency(events, {
+        isComplete: true,
+        requireComplete: true,
+        gaps: [{ fromLedger: 12, toLedger: 14 }],
+      });
+    },
+    (err) => {
+      assert.ok(err instanceof IncompleteCaptureError);
+      assert.equal(err.totalMissedLedgers, 3);
+      assert.equal(err.gaps.length, 1);
+      return true;
+    },
+  );
+});
+
+test("resolutionLatency: assertCompleteCapture validates report completeness", () => {
+  const events = [
+    mockEvent({ name: "claim_created", claimId: 1, ledger: 10, at: 1000 }),
+    mockEvent({ name: "claim_resolved", claimId: 1, ledger: 20, at: 1060 }),
+  ];
+
+  const partialReport = resolutionLatency(events);
+  assert.throws(() => {
+    assertCompleteCapture(partialReport);
+  }, IncompleteCaptureError);
+
+  const completeReport = resolutionLatency(events, { isComplete: true });
+  assert.doesNotThrow(() => {
+    assertCompleteCapture(completeReport);
+  });
+});
+
+test("resolutionLatency: boundary cases - empty input and custom range without events", () => {
+  const emptyReport = resolutionLatency([], { fromLedger: 500, toLedger: 600 });
+  assert.equal(emptyReport.completeness.startLedger, 500);
+  assert.equal(emptyReport.completeness.endLedger, 600);
+  assert.deepEqual(emptyReport.completeness.ledgerRange, { fromLedger: 500, toLedger: 600 });
+  assert.equal(emptyReport.completeness.isComplete, false);
+  assert.equal(emptyReport.completeness.isPartial, true);
 });

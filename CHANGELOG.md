@@ -6,6 +6,27 @@ All notable changes to this project are documented here.
 
 ### Added
 
+**Archive coverage comparison**
+
+- `compareLedgerCoverage(first, second, options?)` in
+  `src/stellar/scan-jsonl.ts` (re-exported by `src/stellar/archive-coverage.ts`)
+  compares two ledger captures and reports missing and overlapping ledger spans
+  with stable per-side event counts, per-ledger count drift and spans present
+  only in the second capture.
+- `options.range` declares an intentionally retained/filtered ledger range;
+  `options.expectedRange` declares the acquisition scope. Missing ledgers
+  outside those bounds are reported as intentional filtering (`expected: true`,
+  `filtered`), while ledgers absent inside them are incomplete acquisition
+  (`incomplete`) and fail the comparison.
+- `compareArchiveCoverage()`, `compareArchiveDirCoverage()` and
+  `compareScanJsonlCoverage()` accept archive directories, canonical scan JSONL,
+  raw archive JSONL or JSON event arrays as inputs;
+  `formatArchiveCoverageReport()` (`renderArchiveCoverageReport()`,
+  `formatCoverageReport()`, `renderCoverageReport()`) renders a deterministic
+  text report. Existing archive, compaction and JSONL behavior is unchanged.
+  Documented in `docs/component-architecture.md`; covered by
+  `tests/archive-coverage.test.mjs`.
+
 **Compaction aggregate reconciliation** (#911)
 
 - `reconcileCompaction(before, after, options?)` in `src/stellar/compaction-reconciliation.ts`

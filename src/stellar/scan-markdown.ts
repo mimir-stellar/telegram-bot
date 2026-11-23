@@ -1,4 +1,90 @@
 import { summarizePayloadForLog } from "./decode.js";
+
+/** Patterns that suggest a private chat identifier or secret-shaped value. */
+const SECRET_PATTERNS: RegExp[] = [
+  /\b\d{6,}:[A-Za-z0-9_-]{30,}\b/g,
+  /\bS[A-Z2-7]{55}\b/g,
+  /\b(?:api[_-]?key|secret|token|password)\s*[:=]\s*\S+/gi,
+];
+
+const CHAT_ID_PATTERN = /\b(?:chat[_-]?id|telegram[_-]?id)\s*[:=]\s*-?\d{5,}\b/gi;
+
+export type PrivacyFindingKind = "private-chat-id" | "secret-value";
+
+export interface PrivacyFinding {
+  kind: PrivacyFindingKind;
+  source: string;
+  ledger: string;
+  txHash: string;
+  field: string;
+  match: string;
+}
+
+export interface PrivacyReport {
+  findings: PrivacyFinding[];
+  scannedEvents: number;
+}
+
+/**
+ * Deterministically scan a {@link ScanJsonReport} for private chat identifiers
+ * and secret-shaped values. Performs no network access. Matched values are
+  * redacted in the returned findings.
+ */
+export function reviewScanReportPrivacy(report: ScanJsonReport): PrivacyReport {
+  const findings: PrivacyFinding[] = [];
+  let scannedEvents = 0;
+
+  for (const target of report?.targets ?? []) {
+    const source = String(target.source ?? "");
+    const events = Array.isArray(target.events) ? target.events : [];
+    for (const event of events) {
+      scannedEvents += 1;
+      const text = summarizePayloadForLog(event.payload);
+      const ledger = String(event.ledger ?? "");
+      const txHash = typeof event.txHash === "string" ? event.txHash : "";
+      const base = { source, ledger, txHash, field: "payload" };
+
+      for (const pattern of CHAT_ID_PATTERN.source ? [CHAT_ID_PATTERN] : []) {
+        for (const m of text.matchAll(new RegExp(pattern.source, pattern.flags))) {
+          findings.push({ kind: "private-chat-id", ...base, match: redact(m[0]) });
+        }
+      }
+      for (const pattern of SECRET_PATTERNS) {
+        for (const m of text.matchAll(new RegExp(pattern.source, pattern.flags))) {
+          findings.push({ kind: "secret-value", ...base, match: redact(m[0]) });
+        }
+      }
+    }
+  }
+
+  return { findings, scannedEvents };
+}
+
+function redact(value: string): string {
+  if (value.length <= 4) return "****";
+  return `${value.slice(0, 2)}****${value.slice(-2)}`;
+}
+
+/** Render a {@link PrivacyReport} as deterministic Markdown. */
+export function formatPrivacyReportMarkdown(report: PrivacyReport): string {
+  const lines: string[] = [
+    `Scanned events: ${report.scannedEvents}`,
+    `Findings: ${report.findings.length}`,
+    "",
+  ];
+  if (report.findings.length === 0) {
+    lines.push("No private chat identifiers or secret-shaped values detected.");
+    return lines.join("\n") + "\n";
+  }
+  lines.push("| Kind | Source | Ledger | Tx | Field | Match |");
+  lines.push("| --- | --- | --- | --- | --- | --- |");
+  for (const f of report.findings) {
+    lines.push(
+      `| ${escapeMarkdownCell(f.kind)} | ${escapeMarkdownCell(f.source)} | ${escapeMarkdownCell(f.ledger)} | ${escapeMarkdownCell(shortTxHash(f.txHash))} | ${escapeMarkdownCell(f.field)} | ${escapeMarkdownCell(f.match)} |`,
+    );
+  }
+  return lines.join("\n") + "\n";
+}
 import type { ScanJsonEvent, ScanJsonReport } from "./events.js";
 
 /** Default maximum number of event rows rendered before appending a trailing "N more" row. */

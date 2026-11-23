@@ -168,6 +168,8 @@ rarely conflicts with another in-flight branch):
      chatAllowlist: true, // optional: only chats in ALLOWED_CHAT_IDS
      operatorOnly: false, // optional: operator-only, silently ignored otherwise
      hidden: false,       // optional: registered but not advertised in the menu
+     availability: (deps) => // optional: omit from menu & explain why disabled when data source is absent
+       deps?.logs ? { available: true } : { available: false, reason: "Log buffer unavailable." },
      handler: async (ctx, deps) => {
        await ctx.reply(widgetMessage(deps.config), TELEGRAM_OPTIONS);
      },
@@ -177,17 +179,22 @@ rarely conflicts with another in-flight branch):
    The handler receives `(ctx, deps)`; `deps` is the same object `createBot` took
    (config, poller status, pause/resume, audit, logs). Authorization is applied by
    the registrar from `operatorOnly`/`chatAllowlist` — do not repeat it in the
-   handler.
+   handler. Use `commandAvailabilityReport(deps)` (and `formatCommandAvailabilityReport`)
+   to inspect which commands are enabled or disabled for a given runtime dependency set,
+   and pass `deps` to `visibleCommandMetadata(config, deps)` to keep unavailable
+   commands out of the public menu.
 2. Add one import line to `src/commands/index.ts`, in menu order.
 3. If the command is advertised, add its description to `COMMAND_DESCRIPTIONS`
    (both locales) in `src/i18n.ts` and its entry to `COMMAND_DETAILS` in
    `src/commands/help-detail.ts`. `/help`, the Telegram menu and the detail pages
-   are generated from those tables, and startup validation
-   (`validateCommandCatalogue`) rejects any advertised command that lacks a live
-   registered handler (or any catalogue/menu/help mismatch) before the bot boots.
-4. Cover the handler in `tests/` like any other command; `tests/command-modules.test.mjs`
-   checks the registry invariants (unique names, menu parity, central authorization,
-   and startup consistency validation).
+   are generated from those tables.
+4. `commandMenus()` in `src/commands/registry.ts` keeps `operatorOnly` modules out
+   of the default Telegram menu and advertises them only in the configured
+   operator's private chat. Do not treat that as authorization: Telegram caches
+   menus, and the registrar's gates run on every update.
+5. Cover the handler in `tests/` like any other command; `tests/command-modules.test.mjs`
+   checks the registry invariants (unique names, menu parity, central authorization),
+   and `tests/command-menu-scope.test.mjs` covers menu scoping.
 
 ## Where things live
 

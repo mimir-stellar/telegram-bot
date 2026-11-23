@@ -268,20 +268,30 @@ Failure detection in `decodeEvent` follows a strict sequence:
    - Missing or non-array `event.topic` → `{ name: "unknown", eventName: "", reason: "missing or invalid topic array" }`.
    - Empty `event.topic` → `{ name: "unknown", eventName: "", reason: "empty topic array" }`.
    - Missing or non-string `topic[0]` → `{ name: "unknown", eventName: "", reason: "topic[0] is not an event name string" }`.
-2. **Wire Caps Assertion (Throws `DecodeError`):**
+2. **Collection Depth Guard (Throws `DecodeError`):**
+   - [`scValCollectionDepth`](../src/stellar/generic-decode.ts) walks vec/map nesting in `event.value` and every topic without serializing or natively converting them.
+   - Depth $> \texttt{MAX\_DECODED\_COLLECTION\_DEPTH}$ (5, the same default as `MAX_GENERIC_DEPTH`) throws `DecodeError(DEPTH_LIMIT_REASON)`, yielding `{ name: "unknown", eventName, reason: "collection depth limit exceeded" }`.
+   - This bound is independent of XDR byte size and can be overridden per call with `DecodeOptions.maxDepth`.
+3. **Wire Caps Assertion (Throws `DecodeError`):**
    - [`assertEventXdrWithinCap(event)`](../src/stellar/decode.ts) checks:
      - Total event XDR $\le$ `MAX_DECODED_EVENT_XDR_BYTES` (16,384 bytes / 16 KiB).
      - Individual topic XDR $\le$ `MAX_EVENT_TOPIC_XDR_BYTES` (1,024 bytes / 1 KiB).
      - Thrown before `scValToNative(event.value)` allocates JavaScript objects.
-3. **Value Deserialization (Guarded Catch):**
-   - [`findDuplicateMapKey`](../src/stellar/generic-decode.ts) inspects `ScVal` maps (and nested vectors/maps) for conflicting duplicate keys (including cross-type JS property key collisions such as `scvSymbol("stake")` vs `scvString("stake")`) **before** conversion to JavaScript objects. Both `decodeEvent` and `decodeGenericEvent` reject colliding maps with a bounded `unknown` event diagnostic (`reason` $\le 200$ chars).
+4. **Value Deserialization (Guarded Catch):**
    - Deserialization errors from `scValToNative(event.value)` return `{ name: "unknown", eventName, reason: "malformed XDR value: ..." }`.
-4. **Field-Level Validation Errors (Caught by Outer Catch):**
+5. **Field-Level Validation Errors (Caught by Outer Catch):**
    - Thrown by scalar helpers when a field is missing, has an unexpected type, or exceeds bounds. Caught by the outer `try/catch` and formatted using `diagnostic(err)`.
-5. **Missing Decoder:**
+6. **Missing Decoder:**
    - When the decoder returns `null`, yields `{ name: "unknown", eventName, reason: "no decoder" }`.
 
-### 6.2 Scalar Parsing Helpers
+### 6.2 Undecodable Event Quarantine (`src/stellar/quarantine.ts`)
+
+For offline reprocessing, both `decodeEvent` (in `src/stellar/decode.ts`) and `decodeGenericEvent` (in `src/stellar/generic-decode.ts`) support an opt-in `quarantine` option (`EventQuarantine`):
+- When an event envelope is undecodable (missing/malformed topics, malformed XDR value, oversized wire XDR, or unrecognized payload), its bounded raw XDR envelope and source contract identity are captured to a local quarantine file (`quarantine-*.jsonl`).
+- The quarantine enforces byte limits (`DEFAULT_QUARANTINE_MAX_BYTES` = 10 MiB, `DEFAULT_QUARANTINE_ROTATION_BYTES` = 1 MiB) and age limits (`DEFAULT_QUARANTINE_MAX_AGE_MS` = 7 days) via FIFO rotation and pruning. Single envelope payloads exceeding `MAX_QUARANTINE_ENVELOPE_BYTES` (64 KiB) are rejected to prevent storage denial-of-service.
+- Persisted records can be offline reprocessed in typed mode (`reprocess({ mode: "typed" })`) or generic mode (`reprocess({ mode: "generic" })`).
+
+### 6.3 Scalar Parsing Helpers
 
 Always parse fields using the tested helpers in `src/stellar/decode.ts`:
 
@@ -312,6 +322,7 @@ When an error occurs during decoding:
 * [`diagnostic(err)`](../src/stellar/decode.ts) and [`sanitizeReason(reason)`](../src/stellar/decode.ts) redact bot tokens, API keys, and sensitive credential patterns.
 * Diagnostic reasons are capped at `MAX_DIAGNOSTIC_LENGTH` (200 characters) to prevent log bloat.
 * Error messages state expectations without echoing raw attacker-controlled payloads.
+* [`explainDecodeEvent(source, event, versionOrOptions)`](../src/stellar/decode.ts) and [`explainGenericEvent(rawEvent, source, options)`](../src/stellar/generic-decode.ts) expose single-event explain mode returning `selectedSchema`, `fieldChecks`, and `rejectionReason` with raw values redacted and bounded.
 
 ---
 
@@ -353,7 +364,39 @@ Decoder output drift is tracked with a versioned SHA-256 semantic fingerprint in
 
 ---
 
-## 8. Contributor PR Checklist
+## 8. Archived Decoded Event Schema & Migration Adapters
+
+Decoded events can be archived to rotating JSON Lines (`JSONL`) files via [`src/stellar/archive.ts`](../src/stellar/archive.ts).
+
+### 8.1 Explicit Schema Versioning
+
+All newly archived records are explicitly stamped with `schemaVersion: ARCHIVE_SCHEMA_VERSION` (currently `1`).
+
+```ts
+import { ARCHIVE_SCHEMA_VERSION, toArchivedRecord } from "./archive.js";
+
+const record = toArchivedRecord(decodedEvent);
+// record.schemaVersion === 1
+```
+
+### 8.2 Migration Adapters
+
+When replaying or inspecting event archives, [`readArchive`](../src/stellar/archive.ts) and migration adapter functions (`migrateArchivedRecord`, `adaptArchivedTypedEvent`, `adaptArchivedGenericEvent`) handle historical schema evolution:
+
+1. **Current Schema (`schemaVersion: 1`)**: Validated and returned in canonical form.
+2. **Historical Versions (`legacy-unversioned`, `legacy-blocktime`, `legacy-envelope`)**:
+   - `blockTime` mapped to canonical `at`
+   - `txIndex` mapped to canonical `transactionIndex`
+   - Envelopes (`{ event: { ... } }`) unpacked
+   - Preserves backward-compatible legacy accessors while enforcing notification-safe metadata.
+3. **Unknown Versions**:
+   - Explicitly rejected with `UnsupportedArchiveVersionError`.
+   - Never echoes sensitive payload data in error messages.
+   - Respects `retainCommitted: true` to yield prior valid events before failing.
+
+---
+
+## 9. Contributor PR Checklist
 
 Contributors submitting decoder changes should copy and complete this checklist in their PR description:
 

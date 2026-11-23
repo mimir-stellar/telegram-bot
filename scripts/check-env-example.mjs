@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
  * Verify that `.env.example` stays in sync with the configuration keys the bot
- * actually reads (`CONFIG_KEYS` / `configProvenance` in `dist/config.js`).
+ * actually reads (`CONFIG_KEYS` / `configProvenance` in `dist/config.js` and
+ * `LOGGER_CONFIG_KEYS` in `dist/logger.js`).
  *
  * Checks:
- *   1. Every key declared in `dist/config.js` metadata appears in `.env.example`
+ *   1. Every key declared in config or logger metadata appears in `.env.example`
  *      (either commented or uncommented).
- *   2. Every key in `.env.example` is declared in `dist/config.js` metadata
+ *   2. Every key in `.env.example` is declared in that metadata
  *      (no dead/stale keys that the code never reads).
  *   3. Every key marked `secret: true` in metadata appears in `.env.example`
  *      with an empty value only (`KEY=` or `# KEY=`).
@@ -22,6 +23,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_ENV_EXAMPLE_PATH = path.resolve(__dirname, "../.env.example");
 export const DEFAULT_DIST_CONFIG_PATH = path.resolve(__dirname, "../dist/config.js");
+export const DEFAULT_DIST_LOGGER_PATH = path.resolve(__dirname, "../dist/logger.js");
 
 const UNCOMMENTED_LINE_RE = /^(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*)$/;
 const COMMENTED_LINE_RE = /^#\s*([A-Z][A-Z0-9_]*)=(.*)$/;
@@ -96,31 +98,54 @@ export function parseEnvExample(content) {
 }
 
 /**
- * Load key metadata from compiled `dist/config.js`.
+ * Load key metadata from compiled config and logger modules.
  *
  * @param {string} [distConfigPath]
+ * @param {string} [distLoggerPath]
  * @returns {Promise<Array<{ key: string, secret: boolean }>>}
  */
-export async function loadKeyMetadata(distConfigPath = DEFAULT_DIST_CONFIG_PATH) {
-  const mod = await import(pathToFileURL(distConfigPath).href);
-  if (Array.isArray(mod.CONFIG_KEYS)) {
-    return mod.CONFIG_KEYS.map((entry) => ({
-      key: entry.key,
-      secret: Boolean(entry.secret),
-    }));
-  }
-  if (typeof mod.configProvenance === "function") {
-    const provenance = mod.configProvenance();
-    if (provenance && Array.isArray(provenance.entries)) {
-      return provenance.entries.map((entry) => ({
-        key: entry.key,
-        secret: Boolean(entry.secret),
-      }));
+export async function loadKeyMetadata(
+  distConfigPath = DEFAULT_DIST_CONFIG_PATH,
+  distLoggerPath = DEFAULT_DIST_LOGGER_PATH,
+) {
+  const [configMod, loggerMod] = await Promise.all([
+    import(pathToFileURL(distConfigPath).href),
+    import(pathToFileURL(distLoggerPath).href),
+  ]);
+
+  const byKey = new Map();
+  for (const [mod, modulePath] of [
+    [configMod, distConfigPath],
+    [loggerMod, distLoggerPath],
+  ]) {
+    let entries = null;
+    if (Array.isArray(mod.CONFIG_KEYS)) {
+      entries = mod.CONFIG_KEYS;
+    } else if (Array.isArray(mod.LOGGER_CONFIG_KEYS)) {
+      entries = mod.LOGGER_CONFIG_KEYS;
+    } else if (typeof mod.configProvenance === "function") {
+      const provenance = mod.configProvenance();
+      if (provenance && Array.isArray(provenance.entries)) {
+        entries = provenance.entries;
+      }
+    }
+    if (entries === null) {
+      throw new Error(
+        `Could not load key metadata (CONFIG_KEYS, LOGGER_CONFIG_KEYS, or configProvenance) from ${modulePath}`,
+      );
+    }
+    for (const entry of entries) {
+      const spec = { key: entry.key, secret: Boolean(entry.secret) };
+      const existing = byKey.get(spec.key);
+      if (existing) {
+        existing.secret = existing.secret || spec.secret;
+      } else {
+        byKey.set(spec.key, spec);
+      }
     }
   }
-  throw new Error(
-    `Could not load key metadata (CONFIG_KEYS or configProvenance) from ${distConfigPath}`,
-  );
+
+  return [...byKey.values()];
 }
 
 /**

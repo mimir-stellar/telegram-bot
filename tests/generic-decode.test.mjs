@@ -22,6 +22,7 @@ import {
   MAX_GENERIC_STRING_CHARS,
   MAX_GENERIC_VEC_ITEMS,
   decodeGenericEvent,
+  explainGenericEvent,
   renderGenericScVal,
   renderScVal,
   renderTopics,
@@ -618,4 +619,26 @@ test("formatGenericEvent bounds output length under MAX_GENERIC_NOTIFICATION_LEN
     value: hugeValue,
   });
   assert.ok(formatted.length <= MAX_GENERIC_NOTIFICATION_LENGTH);
+});
+
+test("explainGenericEvent: reports selectedSchema, fieldChecks, and redacts/bounds diagnostics", () => {
+  const fakeBearer = "Bearer " + "x".repeat(40);
+  const ok = explainGenericEvent({
+    id: "1-0",
+    ledger: 100,
+    topic: [scSymbol("transfer")],
+    value: scString(`ok ${fakeBearer}`),
+  });
+  assert.equal(ok.selectedSchema, "generic:v1");
+  assert.equal(ok.accepted, true);
+  assert.equal(ok.eventName, "transfer");
+  assert.equal(ok.rejectionReason, null);
+  const valueCheck = ok.fieldChecks.find((c) => c.field === "value");
+  assert.ok(valueCheck);
+  assert.equal(valueCheck.observedPreview.includes(fakeBearer), false);
+
+  const bad = explainGenericEvent({ id: "2-0", ledger: 101, topic: [] });
+  assert.equal(bad.selectedSchema, "generic:v1");
+  assert.equal(bad.accepted, false);
+  assert.equal(bad.rejectionReason, "missing or empty topic array");
 });

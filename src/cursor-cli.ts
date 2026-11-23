@@ -22,6 +22,8 @@ import {
   appendCursorRecoveryHistory,
   parseAndMigrateCursorFile,
   snapshotCursorPositions,
+  writeBackupMetadata,
+  type CursorBackupMetadata,
   type CursorRecoveryPosition,
   type CursorRecoveryRecord,
 } from "./poller.js";
@@ -30,11 +32,21 @@ export interface BackupCursorOptions {
   cursorFile: string;
   backupFile: string;
   force?: boolean;
+  /** Optional CAS digest of the live cursor file from an earlier inspection. */
+  expectedDigest?: string;
+}
+
+export interface BackupCursorResult {
+  status: "backed_up";
+  version: number;
+  targets: number;
+  digest: string;
 }
 
 export interface RestoreCursorOptions extends BackupCursorOptions {
   lockFile: string;
   now?: () => Date;
+  ackReplay?: boolean;
 }
 
 export interface RecoveryPreviewOptions {
@@ -69,8 +81,9 @@ async function exists(filePath: string): Promise<boolean> {
     await access(filePath);
     return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw err;
+    const classified = classifyCursorFsError(err);
+    if (classified.kind === "not_found") return false;
+    throw toCursorFsDiagnostic(err, filePath, "checking");
   }
 }
 
@@ -121,13 +134,20 @@ export async function assertDifferentPaths(left: string, right: string): Promise
 function validateCursor(raw: string): ReturnType<typeof parseAndMigrateCursorFile> {
   try {
     return parseAndMigrateCursorFile(raw);
-  } catch {
+  } catch (err) {
+    if (err instanceof DuplicateCursorTargetError) {
+      throw err;
+    }
     throw new Error("cursor file is malformed or uses an unsupported schema");
   }
 }
 
 async function writeAtomic(filePath: string, contents: string, replace: boolean): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
+  try {
+    await mkdir(path.dirname(filePath), { recursive: true });
+  } catch (err) {
+    throw toCursorFsDiagnostic(err, path.dirname(filePath), "preparing directory for");
+  }
   const temporaryPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
 
   try {
@@ -141,27 +161,159 @@ async function writeAtomic(filePath: string, contents: string, replace: boolean)
         if ((err as NodeJS.ErrnoException).code === "EEXIST") {
           throw new Error(`destination already exists at ${filePath}; pass --force to overwrite`);
         }
-        throw err;
+        throw toCursorFsDiagnostic(err, filePath, "writing");
       }
     }
+  } catch (err) {
+    if (err instanceof CursorDiagnosticError) throw err;
+    if (err instanceof Error && err.message.includes("destination already exists")) throw err;
+    throw toCursorFsDiagnostic(err, filePath, "writing");
   } finally {
     await unlink(temporaryPath).catch(() => undefined);
   }
+}
+
+async function readOptionalFile(filePath: string): Promise<string | null> {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/** Inspect a cursor file and return its schema metadata and CAS digest without exposing cursor values. */
+export async function inspectCursor(options: InspectCursorOptions): Promise<InspectCursorResult> {
+  const raw = await readOptionalFile(options.cursorFile);
+  if (raw === null) {
+    return { exists: false, digest: null, version: null, targets: 0 };
+  }
+  const parsed = validateCursor(raw);
+  return {
+    exists: true,
+    digest: cursorDigest(raw),
+    version: parsed.file.version,
+    targets: Object.keys(parsed.file.targets).length,
+  };
 }
 
 /** Copy a validated supported cursor snapshot without exposing cursor values. */
 export async function backupCursor(options: BackupCursorOptions): Promise<void> {
   await assertDifferentPaths(options.cursorFile, options.backupFile);
   const raw = await readFile(options.cursorFile, "utf8");
+  const cas = checkCursorCas(raw, options.expectedDigest);
+  if (!cas.ok) {
+    throw new CursorConflictError("live", cas.expected, cas.actual, cas.reason);
+  }
   const parsed = validateCursor(raw);
   if (!options.force && (await exists(options.backupFile))) {
     throw new Error(`backup already exists at ${options.backupFile}; pass --force to overwrite`);
   }
   await writeAtomic(options.backupFile, raw, options.force === true);
+  const meta: CursorBackupMetadata = {
+    version: parsed.file.version,
+    recoveryGeneration: parsed.file.recoveryGeneration ?? 0,
+    updatedAt: parsed.file.updatedAt,
+    chainClockAt: parsed.file.chainClockAt,
+    targets: Object.fromEntries(
+      Object.entries(parsed.file.targets).map(([k, v]) => [
+        k,
+        { cursor: v.cursor, lastEventLedger: v.lastEventLedger },
+      ]),
+    ),
+  };
+  const metaFile = `${options.backupFile}.meta.json`;
+  await writeAtomic(metaFile, `${JSON.stringify(meta, null, 2)}\n`, options.force === true);
+  try {
+    await writeBackupMetadata(options.cursorFile, meta);
+  } catch {
+    // Non-fatal if cursor directory is read-only
+  }
   console.log(
-    `[cursor] backed up schema=v` + `${parsed.file.version} targets=${Object.keys(parsed.file.targets).length} ` +
+    `[cursor] backed up schema=v${version} targets=${targets} digest=${digest.slice(0, 12)} ` +
       `from ${options.cursorFile} to ${options.backupFile}`,
   );
+  return { status: "backed_up", version, targets, digest };
+}
+
+function validateBackupOwnership(
+  backup: ReturnType<typeof parseAndMigrateCursorFile>["file"],
+  liveRaw: string | null,
+  options: Pick<RestoreCursorOptions, "expectedTargets" | "expectedNetwork" | "expectedContractIds">,
+): void {
+  const backupSources = Object.keys(backup.targets);
+  if (backupSources.length === 0) {
+    throw new Error("backup cursor has no targets; refusing to overwrite live cursor");
+  }
+
+  if (options.expectedNetwork && backup.network && backup.network !== options.expectedNetwork) {
+    throw new Error(
+      `backup network (${backup.network}) does not match expected network (${options.expectedNetwork})`,
+    );
+  }
+
+  if (options.expectedTargets && options.expectedTargets.length > 0) {
+    const allowed = new Set(options.expectedTargets);
+    for (const source of backupSources) {
+      if (!allowed.has(source)) {
+        throw new Error(`backup target "${source}" is not owned by this configuration`);
+      }
+    }
+  }
+
+  if (options.expectedContractIds) {
+    for (const [source, target] of Object.entries(backup.targets)) {
+      const expectedCid = options.expectedContractIds[source];
+      if (expectedCid && target.contractId && target.contractId !== expectedCid) {
+        throw new Error(
+          `backup contractId for "${source}" (${target.contractId}) does not match expected (${expectedCid})`,
+        );
+      }
+    }
+  }
+
+  if (liveRaw === null) return;
+
+  let live: ReturnType<typeof parseAndMigrateCursorFile>["file"];
+  try {
+    live = parseAndMigrateCursorFile(liveRaw).file;
+  } catch {
+    // Live cursor is corrupt/unparseable: allow restoring a valid backup with --force.
+    return;
+  }
+
+  if (live.network && backup.network && live.network !== backup.network) {
+    throw new Error(
+      `backup network (${backup.network}) does not match live cursor network (${live.network})`,
+    );
+  }
+
+  const liveSources = new Set(Object.keys(live.targets));
+  if (liveSources.size > 0) {
+    for (const source of backupSources) {
+      if (!liveSources.has(source)) {
+        throw new Error(
+          `backup target "${source}" does not match live cursor targets (${[...liveSources].join(", ")})`,
+        );
+      }
+      const liveCid = live.targets[source]?.contractId;
+      const backupCid = backup.targets[source]?.contractId;
+      if (liveCid && backupCid && liveCid !== backupCid) {
+        throw new Error(
+          `backup contractId for "${source}" (${backupCid}) does not match live cursor (${liveCid})`,
+        );
+      }
+    }
+  }
+}
+
+function expectedFingerprints(
+  config: TargetFingerprintConfig,
+): Record<string, string> {
+  return {
+    market: computeCursorTargetFingerprint(config.networkPassphrase, config.marketContractId),
+    squad: computeCursorTargetFingerprint(config.networkPassphrase, config.squadContractId),
+  };
 }
 
 /** Restore a compatible cursor while holding the poller's exclusive lock. */
@@ -178,12 +330,27 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
 
     let before: Record<string, CursorRecoveryPosition> = {};
     let priorHistory: CursorRecoveryRecord[] = parsed.file.recoveryHistory ?? [];
+    let liveGeneration = 0;
     if (liveExists) {
       try {
         const liveRaw = await readFile(options.cursorFile, "utf8");
         const liveParsed = parseAndMigrateCursorFile(liveRaw);
         before = snapshotCursorPositions(liveParsed.file.targets);
         priorHistory = liveParsed.file.recoveryHistory ?? [];
+        liveGeneration = liveParsed.file.recoveryGeneration ?? 0;
+        const liveMeta: CursorBackupMetadata = {
+          version: liveParsed.file.version,
+          recoveryGeneration: liveGeneration,
+          updatedAt: liveParsed.file.updatedAt,
+          chainClockAt: liveParsed.file.chainClockAt,
+          targets: Object.fromEntries(
+            Object.entries(liveParsed.file.targets).map(([k, v]) => [
+              k,
+              { cursor: v.cursor, lastEventLedger: v.lastEventLedger },
+            ]),
+          ),
+        };
+        await writeBackupMetadata(options.cursorFile, liveMeta);
       } catch {
         // Unreadable or corrupt live cursor: record empty before-positions
         // without copying raw bytes or secrets into recovery history.
@@ -192,6 +359,7 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
       }
     }
 
+    const backupGeneration = parsed.file.recoveryGeneration ?? 0;
     const after = snapshotCursorPositions(parsed.file.targets);
     const recoveryHistory = appendCursorRecoveryHistory(priorHistory, {
       at: (options.now ?? (() => new Date()))().toISOString(),
@@ -202,14 +370,35 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
     const nextFile = {
       ...parsed.file,
       recoveryHistory,
+      ...(options.ackReplay
+        ? {
+            replayAcknowledged: true,
+            recoveryGeneration: Math.max(liveGeneration, backupGeneration) + 1,
+          }
+        : {
+            recoveryGeneration: backupGeneration,
+          }),
     };
+    if (!options.ackReplay && "replayAcknowledged" in nextFile) {
+      delete (nextFile as { replayAcknowledged?: boolean }).replayAcknowledged;
+    }
 
     const normalized = `${JSON.stringify(nextFile, null, 2)}\n`;
     await writeAtomic(options.cursorFile, normalized, options.force === true);
+    const digest = cursorDigest(normalized);
+    const version = parsed.file.version;
+    const targets = Object.keys(parsed.file.targets).length;
     console.log(
       `[cursor] restored schema=v${nextFile.version} targets=${Object.keys(nextFile.targets).length} ` +
-        `from ${options.backupFile} to ${options.cursorFile}`,
+        `from ${options.backupFile} to ${options.cursorFile}${options.ackReplay ? " (replay acknowledged)" : ""}`,
     );
+    return {
+      status: "restored",
+      version,
+      targets,
+      digest,
+      previousDigest: liveDigestBefore,
+    };
   } finally {
     await lock.release();
   }
@@ -411,6 +600,7 @@ interface CliOptions {
   squadContract?: string;
   force: boolean;
   json: boolean;
+  ackReplay?: boolean;
 }
 
 function parseOptions(args: string[]): CliOptions {
@@ -423,10 +613,14 @@ function parseOptions(args: string[]): CliOptions {
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] ?? "";
-    if (arg === "--force" || arg === "--json") {
+    if (arg === "--force" || arg === "--json" || arg === "--ack-replay" || arg === "--acknowledge-replay") {
       if (seen.has(arg)) throw new Error(`duplicate ${arg} option`);
       seen.add(arg);
-      options[arg.slice(2) as "force" | "json"] = true;
+      if (arg === "--ack-replay" || arg === "--acknowledge-replay") {
+        options.ackReplay = true;
+      } else {
+        options[arg.slice(2) as "force" | "json"] = true;
+      }
       continue;
     }
     if (!valued.has(arg)) {
@@ -457,13 +651,29 @@ function resolvePath(value: string): string {
   return path.resolve(process.cwd(), value);
 }
 
+function resolveTargetConfigFromEnv(): TargetFingerprintConfig | undefined {
+  const marketContractId = process.env.MARKET_CONTRACT_ID?.trim();
+  const squadContractId = process.env.SQUAD_CONTRACT_ID?.trim();
+  if (!marketContractId || !squadContractId) return undefined;
+
+  const network = process.env.STELLAR_NETWORK?.trim().toLowerCase();
+  const defaultPassphrase =
+    network === "mainnet" || network === "futurenet" || network === "testnet"
+      ? NETWORK_PASSPHRASES[network]
+      : NETWORK_PASSPHRASES.testnet;
+  const networkPassphrase =
+    process.env.STELLAR_NETWORK_PASSPHRASE?.trim() || defaultPassphrase;
+
+  return { networkPassphrase, marketContractId, squadContractId };
+}
+
 async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
   if (action !== "backup" && action !== "restore" && action !== "history" && action !== "preview" && action !== "check") {
     throw new Error(
       "usage: npm run cursor -- <backup|restore|history|preview|check> [--file PATH] [--out PATH|--from PATH] " +
-        "[--to LEDGER] [--target NAME] [--retained-start LEDGER --retained-end LEDGER] [--force] " +
+        "[--to LEDGER] [--target NAME] [--retained-start LEDGER --retained-end LEDGER] [--ack-replay] [--force] " +
         "[--archive PATH [--json] [--market-contract ID] [--squad-contract ID]]",
     );
   }
@@ -525,10 +735,31 @@ async function main(): Promise<void> {
     return;
   }
 
+  const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
+  if (action === "migrate") {
+    const targets = resolveTargetConfigFromEnv();
+    if (!targets) {
+      throw new Error("migrate requires MARKET_CONTRACT_ID and SQUAD_CONTRACT_ID");
+    }
+    await migrateCursor({
+      cursorFile,
+      lockFile,
+      force: options.force,
+      ...targets,
+    });
+    return;
+  }
+
   if (!options.from) throw new Error("restore requires --from PATH");
   const backupFile = resolvePath(options.from);
   const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
-  await restoreCursor({ cursorFile, backupFile, lockFile, force: options.force });
+  await restoreCursor({
+    cursorFile,
+    backupFile,
+    lockFile,
+    force: options.force,
+    ackReplay: options.ackReplay,
+  });
 }
 
 const invokedPath = process.argv[1];

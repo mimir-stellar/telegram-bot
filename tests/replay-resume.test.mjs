@@ -55,6 +55,15 @@ function fakeBotConfig(overrides = {}) {
   };
 }
 
+function marketPlanDigest({ from = "4000", to = null } = {}) {
+  return buildReplayPlan({
+    network: "testnet",
+    from,
+    to,
+    targets: [{ source: "market", contractId: MARKET_CONTRACT }],
+  }).digest;
+}
+
 function makeServer(health, pagesByContract = {}) {
   const indices = {};
   return {
@@ -120,6 +129,8 @@ test("page-boundary interruption and resume yields exactly-once deliveries", asy
         "--contract",
         "market",
         "--send",
+        "--plan-digest",
+        marketPlanDigest({ to: 5000 }),
         "--pages",
         "1",
         "--progress-file",
@@ -176,6 +187,8 @@ test("page-boundary interruption and resume yields exactly-once deliveries", asy
         "--contract",
         "market",
         "--send",
+        "--plan-digest",
+        marketPlanDigest({ to: 5000 }),
         "--progress-file",
         progressFile,
       ],
@@ -208,7 +221,7 @@ test("inclusive cursor boundary duplicate is correctly dropped on resume", async
     const send = async (text) => deliveries.push(text);
 
     await runReplayCli({
-      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--pages", "1", "--progress-file", progressFile],
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--plan-digest", marketPlanDigest(), "--pages", "1", "--progress-file", progressFile],
       deps: { config: fakeBotConfig(), server: server1, send },
     });
     assert.equal(deliveries.length, 1);
@@ -227,7 +240,7 @@ test("inclusive cursor boundary duplicate is correctly dropped on resume", async
     };
 
     const run2 = await runReplayCli({
-      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--progress-file", progressFile],
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--plan-digest", marketPlanDigest(), "--progress-file", progressFile],
       deps: { config: fakeBotConfig(), server: server2, send },
     });
 
@@ -285,7 +298,7 @@ test("failed sends are tracked in failedSends and skipped without crashing repla
     };
 
     const { report, exitCode } = await runReplayCli({
-      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--progress-file", progressFile],
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--plan-digest", marketPlanDigest(), "--progress-file", progressFile],
       deps: { config: fakeBotConfig(), server, send: failingSend },
     });
 

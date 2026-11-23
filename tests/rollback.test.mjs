@@ -315,7 +315,7 @@ test("poller treats a missing cursor file as a cold start (no crash)", async () 
   await poller.start();
   // Give the first cycle time to complete
   await new Promise((r) => setTimeout(r, 200));
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
 
   const status = poller.status();
   assert.ok(status.cycles >= 1,    "at least one cycle should have run");
@@ -339,7 +339,7 @@ test("poller treats a corrupt cursor file as a cold start (no crash)", async () 
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 200));
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
 
   // Should run at least one cycle despite corrupt cursor
   const status = poller.status();
@@ -387,7 +387,7 @@ test("poller resumes from a valid v1 cursor file written by the previous release
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 300));
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
 
   // Both contracts should have resumed from the saved cursor
   assert.equal(marketCursor, cursor, "market should resume from saved cursor");
@@ -408,7 +408,7 @@ test("cursor file written after a cycle is valid JSON with a version field", asy
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 300));
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
 
   const raw = await readFile(file, "utf8");
   const parsed = JSON.parse(raw);
@@ -450,7 +450,7 @@ test("an RPC failure in one cycle does not stop the poller", async () => {
   await poller.start();
   // Wait for multiple cycles
   await new Promise((r) => setTimeout(r, 400));
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
 
   const status = poller.status();
   // Should have recovered and run more cycles after the initial failure
@@ -482,7 +482,7 @@ test("RPC failure leaves the cursor unchanged so the next cycle resumes correctl
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 200));
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
 
   // The cursor file should still hold the original cursor (not cleared/zeroed)
   const raw    = JSON.parse(await readFile(file, "utf8"));
@@ -519,7 +519,7 @@ test("a Telegram send failure does not stop the poller or prevent cursor advance
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 300));
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
 
   const status = poller.status();
   // Poller ran more than one cycle; a failed send did not kill it.
@@ -591,7 +591,7 @@ test("cursor file schema is backward-compatible: extra unknown keys are ignored"
     async () => {
       await poller.start();
       await new Promise((r) => setTimeout(r, 200));
-      poller.stop();
+      await poller.shutdown({ timeoutMs: 1_000 });
     },
     "poller must not throw when reading a cursor file with extra fields",
   );
@@ -611,7 +611,7 @@ test("cursor file written by the bot is valid JSON that JSON.parse accepts witho
 
   await poller.start();
   await new Promise((r) => setTimeout(r, 300));
-  poller.stop();
+  await poller.shutdown({ timeoutMs: 1_000 });
 
   const raw = await readFile(file, "utf8");
   // If the file contains BigInt values or other non-serialisable types this

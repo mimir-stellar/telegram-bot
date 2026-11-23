@@ -4,7 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { backupCursor, restoreCursor } from "../dist/cursor-cli.js";
+import {
+  backupCursor,
+  CursorConflictError,
+  inspectCursor,
+  restoreCursor,
+  runCursorCli,
+} from "../dist/cursor-cli.js";
 
 async function withTempDir(run) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-cursor-backup-"));
@@ -95,12 +101,20 @@ test("restore normalizes supported legacy cursor files to version 1", async () =
   });
 });
 
-test("rejects backup and restore when symbolic-link aliases resolve to the same file", async () => {
+test("rejects backup and restore when symbolic-link aliases resolve to the same file", async (t) => {
   await withTempDir(async (directory) => {
     const realDir = path.join(directory, "real");
     const linkDir = path.join(directory, "alias");
     await mkdir(realDir);
-    await symlink(realDir, linkDir);
+    try {
+      await symlink(realDir, linkDir);
+    } catch (err) {
+      if (err.code === "EPERM") {
+        t.skip("symlink creation requires admin / developer privileges on Windows");
+        return;
+      }
+      throw err;
+    }
 
     const cursorFile = path.join(realDir, "cursor.json");
     const lockFile = path.join(realDir, "poller.lock");

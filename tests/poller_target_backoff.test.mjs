@@ -7,6 +7,44 @@ import { createPoller } from "../dist/poller.js";
 
 const MARKET_ID = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 const SQUAD_ID  = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBF4";
+const activePollers = new Set();
+const activeDirs = new Set();
+
+function trackedPoller(deps) {
+  const poller = createPoller(deps);
+  activePollers.add(poller);
+  return poller;
+}
+
+async function createTestDir(prefix) {
+  const dir = await mkdtemp(path.join(tmp.tmpdir(), prefix));
+  activeDirs.add(dir);
+  return dir;
+}
+
+async function waitForStatus(poller, predicate, label, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate(poller.status())) {
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${label}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+test.afterEach(async () => {
+  const pollers = [...activePollers];
+  const dirs = [...activeDirs];
+  activePollers.clear();
+  activeDirs.clear();
+  try {
+    await Promise.all(pollers.map((poller) => poller.shutdown({ timeoutMs: 1_000 })));
+  } finally {
+    await Promise.all(
+      dirs.map((dir) => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })),
+    );
+  }
+});
 
 function mockConfig(cursorFile) {
   return {
@@ -29,7 +67,7 @@ function makeCursor(ledger) {
 }
 
 test("per-target RPC backoff: failing market target enters backoff while squad target continues polling", async () => {
-  const dir = await mkdtemp(path.join(tmp.tmpdir(), "target-backoff-1-"));
+  const dir = await createTestDir("target-backoff-1-");
   const cursorFile = path.join(dir, "cursor.json");
   const config = mockConfig(cursorFile);
 
@@ -55,7 +93,7 @@ test("per-target RPC backoff: failing market target enters backoff while squad t
     },
   };
 
-  const poller = createPoller({
+  const poller = trackedPoller({
     config,
     server,
     send: async () => {},
@@ -65,8 +103,20 @@ test("per-target RPC backoff: failing market target enters backoff while squad t
   });
 
   await poller.start();
-  // Allow initial load to run
-  await new Promise((r) => setTimeout(r, 20));
+  await waitForStatus(
+    poller,
+    (status) => {
+      const market = status.targets.find((target) => target.source === "market");
+      const squad = status.targets.find((target) => target.source === "squad");
+      return (
+        marketScanCalls === 1 &&
+        squadScanCalls === 1 &&
+        market?.consecutiveFailures === 1 &&
+        squad?.cursor === makeCursor(2000)
+      );
+    },
+    "initial target scans",
+  );
 
   const status1 = poller.status();
   const market1 = status1.targets.find((t) => t.source === "market");
@@ -85,7 +135,13 @@ test("per-target RPC backoff: failing market target enters backoff while squad t
   // Trigger cycle by calling resume / cycle logic indirectly (e.g. pause + resume)
   poller.pause();
   poller.resume();
-  await new Promise((r) => setTimeout(r, 20));
+  await waitForStatus(
+    poller,
+    (status) =>
+      squadScanCalls === 2 &&
+      status.targets.find((target) => target.source === "market")?.consecutiveFailures === 1,
+    "squad scan while market is in backoff",
+  );
 
   const status2 = poller.status();
   const market2 = status2.targets.find((t) => t.source === "market");
@@ -95,13 +151,10 @@ test("per-target RPC backoff: failing market target enters backoff while squad t
   assert.equal(squadScanCalls, 2, "squad scan was attempted again");
   assert.equal(market2.consecutiveFailures, 1, "market failure count remains 1");
   assert.equal(squad2.cursor, makeCursor(2000), "squad cursor advanced");
-
-  poller.stop();
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("per-target RPC backoff: repeated failures exponentially increase delay up to maxBackoff", async () => {
-  const dir = await mkdtemp(path.join(tmp.tmpdir(), "target-backoff-2-"));
+  const dir = await createTestDir("target-backoff-2-");
   const cursorFile = path.join(dir, "cursor.json");
   const config = mockConfig(cursorFile);
 
@@ -119,7 +172,7 @@ test("per-target RPC backoff: repeated failures exponentially increase delay up 
     },
   };
 
-  const poller = createPoller({
+  const poller = trackedPoller({
     config,
     server,
     send: async () => {},
@@ -129,7 +182,11 @@ test("per-target RPC backoff: repeated failures exponentially increase delay up 
   });
 
   await poller.start();
-  await new Promise((r) => setTimeout(r, 20));
+  await waitForStatus(
+    poller,
+    (status) => status.targets.find((target) => target.source === "market")?.consecutiveFailures === 1,
+    "first market failure",
+  );
 
   // Failure 1 at t = 1_000_000 -> delay = min(1000 * 2^0, 5000) = 1000 -> nextEligibleAt = 1_001_000
   let m = poller.status().targets.find((t) => t.source === "market");
@@ -140,7 +197,11 @@ test("per-target RPC backoff: repeated failures exponentially increase delay up 
   currentTime = 1_001_005;
   poller.pause();
   poller.resume();
-  await new Promise((r) => setTimeout(r, 20));
+  await waitForStatus(
+    poller,
+    (status) => status.targets.find((target) => target.source === "market")?.consecutiveFailures === 2,
+    "second market failure",
+  );
 
   // Failure 2 at t = 1_001_005 -> delay = min(1000 * 2^1, 5000) = 2000 -> nextEligibleAt = 1_003_005
   m = poller.status().targets.find((t) => t.source === "market");
@@ -151,7 +212,11 @@ test("per-target RPC backoff: repeated failures exponentially increase delay up 
   currentTime = 1_003_010;
   poller.pause();
   poller.resume();
-  await new Promise((r) => setTimeout(r, 20));
+  await waitForStatus(
+    poller,
+    (status) => status.targets.find((target) => target.source === "market")?.consecutiveFailures === 3,
+    "third market failure",
+  );
 
   // Failure 3 at t = 1_003_010 -> delay = min(1000 * 2^2, 5000) = 4000 -> nextEligibleAt = 1_007_010
   m = poller.status().targets.find((t) => t.source === "market");
@@ -162,19 +227,20 @@ test("per-target RPC backoff: repeated failures exponentially increase delay up 
   currentTime = 1_007_015;
   poller.pause();
   poller.resume();
-  await new Promise((r) => setTimeout(r, 20));
+  await waitForStatus(
+    poller,
+    (status) => status.targets.find((target) => target.source === "market")?.consecutiveFailures === 4,
+    "fourth market failure",
+  );
 
   // Failure 4 at t = 1_007_015 -> delay = min(1000 * 2^3, 5000) = capped at 5000 -> nextEligibleAt = 1_012_015
   m = poller.status().targets.find((t) => t.source === "market");
   assert.equal(m.consecutiveFailures, 4);
   assert.equal(m.nextEligibleAt, 1_012_015);
-
-  poller.stop();
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("per-target RPC backoff: successful RPC scan resets backoff state for that target", async () => {
-  const dir = await mkdtemp(path.join(tmp.tmpdir(), "target-backoff-3-"));
+  const dir = await createTestDir("target-backoff-3-");
   const cursorFile = path.join(dir, "cursor.json");
   const config = mockConfig(cursorFile);
 
@@ -192,7 +258,7 @@ test("per-target RPC backoff: successful RPC scan resets backoff state for that 
     },
   };
 
-  const poller = createPoller({
+  const poller = trackedPoller({
     config,
     server,
     send: async () => {},
@@ -202,7 +268,11 @@ test("per-target RPC backoff: successful RPC scan resets backoff state for that 
   });
 
   await poller.start();
-  await new Promise((r) => setTimeout(r, 20));
+  await waitForStatus(
+    poller,
+    (status) => status.targets.find((target) => target.source === "market")?.consecutiveFailures === 1,
+    "initial market failure",
+  );
 
   let m = poller.status().targets.find((t) => t.source === "market");
   assert.equal(m.consecutiveFailures, 1);
@@ -214,19 +284,20 @@ test("per-target RPC backoff: successful RPC scan resets backoff state for that 
 
   poller.pause();
   poller.resume();
-  await new Promise((r) => setTimeout(r, 20));
+  await waitForStatus(
+    poller,
+    (status) => status.targets.find((target) => target.source === "market")?.consecutiveFailures === 0,
+    "successful market scan",
+  );
 
   m = poller.status().targets.find((t) => t.source === "market");
   assert.equal(m.consecutiveFailures, 0, "consecutive failures reset to 0 on success");
   assert.equal(m.nextEligibleAt, null, "nextEligibleAt reset to null on success");
   assert.equal(m.lastError, null, "lastError cleared on success");
-
-  poller.stop();
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("per-target RPC backoff: restart initializes fresh runtime backoff state while restoring persisted cursor", async () => {
-  const dir = await mkdtemp(path.join(tmp.tmpdir(), "target-backoff-4-"));
+  const dir = await createTestDir("target-backoff-4-");
   const cursorFile = path.join(dir, "cursor.json");
   const config = mockConfig(cursorFile);
 
@@ -243,7 +314,7 @@ test("per-target RPC backoff: restart initializes fresh runtime backoff state wh
     },
   };
 
-  const poller1 = createPoller({
+  const poller1 = trackedPoller({
     config,
     server,
     send: async () => {},
@@ -253,7 +324,13 @@ test("per-target RPC backoff: restart initializes fresh runtime backoff state wh
   });
 
   await poller1.start();
-  await new Promise((r) => setTimeout(r, 20));
+  await waitForStatus(
+    poller1,
+    (status) =>
+      status.targets.find((target) => target.source === "market")?.consecutiveFailures === 1 &&
+      status.targets.find((target) => target.source === "squad")?.cursor === makeCursor(1500),
+    "first poller scan",
+  );
 
   const status1 = poller1.status();
   const market1 = status1.targets.find((t) => t.source === "market");
@@ -263,10 +340,10 @@ test("per-target RPC backoff: restart initializes fresh runtime backoff state wh
   assert.equal(market1.nextEligibleAt, 1_010_000);
   assert.equal(squad1.cursor, makeCursor(1500));
 
-  poller1.stop();
+  await poller1.shutdown();
 
   // Restart poller with new instance
-  const poller2 = createPoller({
+  const poller2 = trackedPoller({
     config,
     server,
     send: async () => {},
@@ -287,6 +364,4 @@ test("per-target RPC backoff: restart initializes fresh runtime backoff state wh
   const squad2After = status2After.targets.find((t) => t.source === "squad");
   assert.equal(squad2After.cursor, makeCursor(1500), "persisted cursor was safely restored across restart");
 
-  poller2.stop();
-  await rm(dir, { recursive: true, force: true });
 });

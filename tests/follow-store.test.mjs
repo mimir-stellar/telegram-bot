@@ -29,18 +29,18 @@ test('follow / unfollow / list / followersOf basic flow', async () => {
     const { createFollowStore } = await importStore();
     const store = createFollowStore({ filePath: pathJoin(dir, 'follows.json') });
 
-    await store.follow('chat:1', 'market:abc');
-    await store.follow('chat:1', 'squad:m1');
-    await store.follow('chat:2', 'market:abc');
+    store.follow('chat:1', 'market:abc');
+    store.follow('chat:1', 'squad:m1');
+    store.follow('chat:2', 'market:abc');
 
-    assert.deepStrictEqual(await store.list('chat:1'), ['market:abc', 'squad:m1']);
-    assert.deepStrictEqual(await store.list('chat:2'), ['market:abc']);
-    assert.deepStrictEqual(await store.followersOf('market:abc'), ['chat:1', 'chat:2']);
-    assert.deepStrictEqual(await store.followersOf('squad:m1'), ['chat:1']);
+    assert.deepStrictEqual(store.list('chat:1'), ['market:abc', 'squad:m1']);
+    assert.deepStrictEqual(store.list('chat:2'), ['market:abc']);
+    assert.deepStrictEqual(store.followersOf('market:abc'), ['chat:1', 'chat:2']);
+    assert.deepStrictEqual(store.followersOf('squad:m1'), ['chat:1']);
 
-    await store.unfollow('chat:1', 'market:abc');
-    assert.deepStrictEqual(await store.list('chat:1'), ['squad:m1']);
-    assert.deepStrictEqual(await store.followersOf('market:abc'), ['chat:2']);
+    store.unfollow('chat:1', 'market:abc');
+    assert.deepStrictEqual(store.list('chat:1'), ['squad:m1']);
+    assert.deepStrictEqual(store.followersOf('market:abc'), ['chat:2']);
   });
 });
 
@@ -49,12 +49,12 @@ test('persistence across instances', async () => {
     const { createFollowStore } = await importStore();
     const filePath = pathJoin(dir, 'follows.json');
     const a = createFollowStore({ filePath });
-    await a.follow('chat:1', 'market:abc');
-    await a.follow('chat:1', 'squad:m1');
+    a.follow('chat:1', 'market:abc');
+    a.follow('chat:1', 'squad:m1');
 
     const b = createFollowStore({ filePath });
-    assert.deepStrictEqual(await b.list('chat:1'), ['market:abc', 'squad:m1']);
-    assert.deepStrictEqual(await b.followersOf('market:abc'), ['chat:1']);
+    assert.deepStrictEqual(b.list('chat:1'), ['market:abc', 'squad:m1']);
+    assert.deepStrictEqual(b.followersOf('market:abc'), ['chat:1']);
 
     const raw = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
     assert.strictEqual(typeof raw.version, 'number');
@@ -65,9 +65,9 @@ test('follow is idempotent', async () => {
   await withTempDir(async (dir) => {
     const { createFollowStore } = await importStore();
     const store = createFollowStore({ filePath: pathJoin(dir, 'follows.json') });
-    await store.follow('chat:1', 'market:abc');
-    await store.follow('chat:1', 'market:abc');
-    assert.deepStrictEqual(await store.list('chat:1'), ['market:abc']);
+    store.follow('chat:1', 'market:abc');
+    store.follow('chat:1', 'market:abc');
+    assert.deepStrictEqual(store.list('chat:1'), ['market:abc']);
   });
 });
 
@@ -79,7 +79,7 @@ test('rejects malformed refs', async () => {
     for (const ref of bad) {
       assert.throws(() => store.follow('chat:1', ref), { name: 'FollowStoreError' }, `ref ${JSON.stringify(ref)} should be rejected`);
     }
-    assert.deepStrictEqual(await store.list('chat:1'), []);
+    assert.deepStrictEqual(store.list('chat:1'), []);
   });
 });
 
@@ -90,13 +90,13 @@ test('enforces per-chat cap', async () => {
       filePath: pathJoin(dir, 'follows.json'),
       maxFollowsPerChat: 2,
     });
-    await store.follow('chat:1', 'market:a1');
-    await store.follow('chat:1', 'market:a2');
+    store.follow('chat:1', 'market:a1');
+    store.follow('chat:1', 'market:a2');
     assert.throws(() => store.follow('chat:1', 'market:a3'), /per-chat follow limit reached \(2\)/);
-    assert.deepStrictEqual(await store.list('chat:1'), ['market:a1', 'market:a2']);
+    assert.deepStrictEqual(store.list('chat:1'), ['market:a1', 'market:a2']);
     // Other chats unaffected.
-    await store.follow('chat:2', 'market:a1');
-    assert.deepStrictEqual(await store.list('chat:2'), ['market:a1']);
+    store.follow('chat:2', 'market:a1');
+    assert.deepStrictEqual(store.list('chat:2'), ['market:a1']);
   });
 });
 
@@ -107,14 +107,14 @@ test('enforces total cap', async () => {
       filePath: pathJoin(dir, 'follows.json'),
       maxTotalEntries: 3,
     });
-    await store.follow('chat:1', 'market:a1');
-    await store.follow('chat:1', 'market:a2');
-    await store.follow('chat:2', 'market:a3');
+    store.follow('chat:1', 'market:a1');
+    store.follow('chat:1', 'market:a2');
+    store.follow('chat:2', 'market:a3');
     assert.throws(() => store.follow('chat:2', 'market:a4'), /total follow limit reached \(3\)/);
     // Idempotent re-follow of existing entry is allowed even at cap.
-    await store.follow('chat:1', 'market:a1');
-    assert.deepStrictEqual(await store.list('chat:1'), ['market:a1', 'market:a2']);
-    assert.deepStrictEqual(await store.list('chat:2'), ['market:a3']);
+    store.follow('chat:1', 'market:a1');
+    assert.deepStrictEqual(store.list('chat:1'), ['market:a1', 'market:a2']);
+    assert.deepStrictEqual(store.list('chat:2'), ['market:a3']);
   });
 });
 
@@ -125,9 +125,9 @@ test('quarantines corrupt file and starts fresh', async () => {
     await fs.promises.writeFile(filePath, '{ not json ::', 'utf8');
 
     const store = createFollowStore({ filePath });
-    assert.deepStrictEqual(await store.list('chat:1'), []);
-    await store.follow('chat:1', 'market:abc');
-    assert.deepStrictEqual(await store.list('chat:1'), ['market:abc']);
+    assert.deepStrictEqual(store.list('chat:1'), []);
+    store.follow('chat:1', 'market:abc');
+    assert.deepStrictEqual(store.list('chat:1'), ['market:abc']);
 
     const files = await fs.promises.readdir(dir);
     const quarantined = files.filter((f) => f !== 'follows.json' && f.includes('follows.json'));
@@ -142,9 +142,9 @@ test('quarantines wrong shape file', async () => {
     await fs.promises.writeFile(filePath, JSON.stringify({ version: 1, follows: 'not-an-array' }), 'utf8');
 
     const store = createFollowStore({ filePath });
-    assert.deepStrictEqual(await store.list('chat:1'), []);
-    await store.follow('chat:1', 'market:abc');
-    assert.deepStrictEqual(await store.list('chat:1'), ['market:abc']);
+    assert.deepStrictEqual(store.list('chat:1'), []);
+    store.follow('chat:1', 'market:abc');
+    assert.deepStrictEqual(store.list('chat:1'), ['market:abc']);
   });
 });
 
@@ -153,9 +153,93 @@ test('writes atomically via temp + rename', async () => {
     const { createFollowStore } = await importStore();
     const filePath = pathJoin(dir, 'follows.json');
     const store = createFollowStore({ filePath });
-    await store.follow('chat:1', 'market:abc');
+    store.follow('chat:1', 'market:abc');
     const files = await fs.promises.readdir(dir);
     assert.deepStrictEqual(files, ['follows.json']);
+  });
+});
+
+test('expires inactive follows after the configured TTL and keeps active ones', async () => {
+  await withTempDir(async (dir) => {
+    const { createFollowStore } = await importStore();
+    let clock = 1_000_000;
+    const store = createFollowStore({
+      filePath: pathJoin(dir, 'follows.json'),
+      inactivityTtlMs: 100,
+      now: () => clock,
+    });
+    store.follow('chat:1', 'market:old');
+    store.follow('chat:1', 'market:active');
+
+    clock += 60;
+    assert.strictEqual(store.touch('chat:1', 'market:active'), true);
+
+    // At t+120: market:old (expires t+100) is pruned; market:active (expires t+160) survives.
+    clock += 60;
+    assert.deepStrictEqual(store.list('chat:1'), ['market:active']);
+    assert.deepStrictEqual(store.followersOf('market:old'), []);
+    assert.deepStrictEqual(store.followersOf('market:active'), ['chat:1']);
+  });
+});
+
+test('boundary: follow exactly at expiry is pruned; one ms earlier is kept', async () => {
+  await withTempDir(async (dir) => {
+    const { createFollowStore } = await importStore();
+    let clock = 0;
+    const store = createFollowStore({
+      filePath: pathJoin(dir, 'follows.json'),
+      inactivityTtlMs: 50,
+      now: () => clock,
+    });
+    store.follow('chat:1', 'market:edge');
+    clock = 49;
+    assert.deepStrictEqual(store.list('chat:1'), ['market:edge']);
+    clock = 50;
+    assert.deepStrictEqual(store.list('chat:1'), []);
+  });
+});
+
+test('touch returns false for unknown or expired follows and does not resurrect them', async () => {
+  await withTempDir(async (dir) => {
+    const { createFollowStore } = await importStore();
+    let clock = 0;
+    const store = createFollowStore({
+      filePath: pathJoin(dir, 'follows.json'),
+      inactivityTtlMs: 10,
+      now: () => clock,
+    });
+    assert.strictEqual(store.touch('chat:1', 'market:none'), false);
+    store.follow('chat:1', 'market:x');
+    clock = 20;
+    assert.strictEqual(store.touch('chat:1', 'market:x'), false);
+    assert.deepStrictEqual(store.list('chat:1'), []);
+  });
+});
+
+test('pruneExpiredFollows reports and persists removal without touching active follows', async () => {
+  await withTempDir(async (dir) => {
+    const { createFollowStore } = await importStore();
+    let clock = 0;
+    const filePath = pathJoin(dir, 'follows.json');
+    const store = createFollowStore({ filePath, inactivityTtlMs: 10, now: () => clock });
+    store.follow('chat:1', 'market:a');
+    clock = 5;
+    store.follow('chat:2', 'market:b');
+    clock = 12;
+    assert.strictEqual(store.pruneExpiredFollows(), 1);
+    const reopened = createFollowStore({ filePath, inactivityTtlMs: 10, now: () => clock });
+    assert.deepStrictEqual(reopened.list('chat:1'), []);
+    assert.deepStrictEqual(reopened.list('chat:2'), ['market:b']);
+  });
+});
+
+test('rejects non-positive inactivity TTL', async () => {
+  await withTempDir(async (dir) => {
+    const { createFollowStore } = await importStore();
+    assert.throws(
+      () => createFollowStore({ filePath: pathJoin(dir, 'f.json'), inactivityTtlMs: 0 }),
+      { name: 'FollowStoreError' },
+    );
   });
 });
 
@@ -172,8 +256,11 @@ test('retains corrupt follow file bytes and throws redacted actionable error whe
     Date.now = () => ts;
     try {
       const s = createFollowStore({ filePath, now: () => ts });
-      for (const op of [() => s.list('c'), () => s.followersOf('market:a'), () => s.follow('c', 'market:a'), () => s.unfollow('c', 'market:a')]) {
+      for (const op of [() => s.list('c'), () => s.followersOf('market:a')]) {
         assert.throws(op, (e) => e.name === 'FollowStoreError' && /quarantine.*retained in place/i.test(e.message));
+      }
+      for (const op of [() => s.follow('c', 'market:a'), () => s.unfollow('c', 'market:a')]) {
+        await assert.rejects(op, (e) => e.name === 'FollowStoreError' && /quarantine.*retained in place/i.test(e.message));
       }
     } finally {
       Date.now = realNow;
@@ -199,7 +286,7 @@ test('preserves unreadable follow file and redacts credentials when read and qua
         unlinkSync: () => { unlinked = true; },
       },
     });
-    assert.throws(() => s.follow('c', 'market:a'), (e) => e.name === 'FollowStoreError' && !e.message.includes('hunter2secret') && e.message.includes('[REDACTED]') && /EROFS/.test(e.message));
+    await assert.rejects(() => s.follow('c', 'market:a'), (e) => e.name === 'FollowStoreError' && !e.message.includes('hunter2secret') && e.message.includes('[REDACTED]') && /EROFS/.test(e.message));
     assert.strictEqual(unlinked, false);
     assert.strictEqual(Buffer.compare(await fs.promises.readFile(filePath), raw), 0);
   });

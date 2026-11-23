@@ -62,3 +62,11 @@ test("makeEntryId matches expected exact structure format", () => {
   // Text hash component is 8 hex characters
   assert.match(parts[3], /^[0-9a-f]{8}$/);
 });
+
+test("makeEntryId is stable across empty text and differs from non-empty text", () => {
+  const idEmpty1 = makeEntryId("market", 1, "evt", "");
+  const idEmpty2 = makeEntryId("market", 1, "evt", "");
+  const idNonEmpty = makeEntryId("market", 1, "evt", " ");
+  assert.equal(idEmpty1, idEmpty2);
+  assert.notEqual(idEmpty1, idNonEmpty);
+});

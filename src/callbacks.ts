@@ -17,8 +17,8 @@
  */
 
 import { InlineKeyboard, type Bot, type Context } from "grammy";
+import type { InlineKeyboardMarkup } from "grammy/types";
 
-import { safeErrorMessage } from "./notifications/format.js";
 import {
   handleBroadcastCallback,
   handleConfirmationsCallback,
@@ -32,43 +32,30 @@ import {
 } from "./commands/keyboards.js";
 import { helpMessage } from "./commands/help.js";
 import { contractsMessage } from "./commands/contracts.js";
+import { menuKeyboard, menuMessage } from "./commands/menu.js";
 import { pauseMessage } from "./commands/pause.js";
 import { resumeMessage } from "./commands/resume.js";
 import { statusMessage } from "./commands/status.js";
+import { eventsMessage, eventsPage, resolveRecentEvents } from "./commands/events.js";
+import { pageKeyboard, parsePaginationCallback } from "./notifications/pagination.js";
 import type { CommandDeps } from "./commands/registry.js";
-import {
-  TELEGRAM_OPTIONS,
-  classifyCallbackError,
-  extractCallbackLogIds,
-  formatCallbackErrorLog,
-  isOperator,
-  safeAnswerCallback,
-  type CallbackErrorLogParams,
-  type CallbackLogIds,
-} from "./commands/runtime.js";
-
-export {
-  classifyCallbackError,
-  extractCallbackLogIds,
-  formatCallbackErrorLog,
-  type CallbackErrorLogParams,
-  type CallbackLogIds,
-};
+import { TELEGRAM_OPTIONS, isChatAllowed, isOperator, safeAnswerCallback } from "./commands/runtime.js";
 
 // ── Callback payload validation ──────────────────────────────────────────────
 
 export type CallbackActionType =
+  | "menu"
   | "status"
   | "contracts"
   | "help"
   | "pause"
   | "resume"
-  | "broadcast"
-  | "confirmations";
+  | "broadcast";
 
 export interface ValidCallbackAction {
   type: CallbackActionType;
   raw: string;
+  page?: number;
 }
 
 export type CallbackValidationResult =
@@ -86,122 +73,10 @@ export const CALLBACK_UNAUTHORIZED_PAYLOAD =
 
 export const CALLBACK_FALLBACK_FEEDBACK = "Invalid or unrecognized action";
 export const CALLBACK_UNAUTHORIZED_FEEDBACK = "Unauthorized: operator only";
+export const CALLBACK_CHAT_UNAUTHORIZED_FEEDBACK = "Unauthorized: chat not allowed";
 
 function isKnownAction(val: string): val is CallbackActionType {
-  return [
-    "status",
-    "contracts",
-    "help",
-    "pause",
-    "resume",
-    "broadcast",
-    "confirmations",
-  ].includes(val);
-}
-
-/** Maximum digits for JavaScript Number.MAX_SAFE_INTEGER (9,007,199,254,740,991 has 16 digits). */
-export const MAX_CANONICAL_NUMERIC_DIGITS = 16;
-
-/**
- * Returns true if a value represents a canonical non-negative decimal numeric identifier:
- * - Pure decimal digits without leading signs ('+123' and '-123' are rejected)
- * - No redundant leading zeros ('0' is allowed; '01', '00' are rejected)
- * - Safe integer range: 0 <= n <= Number.MAX_SAFE_INTEGER (9,007,199,254,740,991)
- * - At most 16 decimal digits (avoiding overlong decimal IDs)
- */
-export function isCanonicalNumericId(value: unknown): boolean {
-  if (typeof value === "number") {
-    return Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0);
-  }
-  if (typeof value === "bigint") {
-    return value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER);
-  }
-  if (typeof value !== "string") {
-    return false;
-  }
-  if (!/^\d+$/.test(value)) {
-    return false;
-  }
-  if (value.length > 1 && value.startsWith("0")) {
-    return false;
-  }
-  if (value.length > MAX_CANONICAL_NUMERIC_DIGITS) {
-    return false;
-  }
-  const num = Number(value);
-  return Number.isSafeInteger(num) && num >= 0 && String(num) === value;
-}
-
-/**
- * Returns true if a value represents a noncanonical numeric identifier:
- * - Leading signs ('+123', '-123', '+0', '-0')
- * - Overlong decimal IDs with redundant leading zeros ('0123', '00')
- * - Unsafe integers exceeding Number.MAX_SAFE_INTEGER ('9007199254740992')
- * - Overlong decimal strings exceeding 16 digits ('99999999999999999999999999999')
- * - Non-decimal representations like scientific notation, hex, octal, binary, or floats
- *   ('1e5', '0x10', '1.5')
- *
- * Returns false for:
- * - Canonical decimal IDs ('0', '42', '9007199254740991')
- * - Non-numeric strings that do not represent numbers ('refresh', 'view', 'lx9abc_1_def')
- */
-export function isNoncanonicalNumericId(value: unknown): boolean {
-  if (typeof value === "number") {
-    return !Number.isSafeInteger(value) || value < 0 || Object.is(value, -0);
-  }
-  if (typeof value === "bigint") {
-    return value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER);
-  }
-  if (typeof value !== "string") {
-    return false;
-  }
-  if (value.length === 0) {
-    return false;
-  }
-  // Disallow leading signs (+ or -)
-  if (/^[+-]/.test(value)) {
-    return true;
-  }
-  // Pure digits: check if it violates canonical decimal rules
-  if (/^\d+$/.test(value)) {
-    return !isCanonicalNumericId(value);
-  }
-  // Disallow hex, octal, binary prefixes when digits/hex follow
-  if (/^0[xXbBoO][0-9a-zA-Z]+$/.test(value)) {
-    return true;
-  }
-  // Disallow floating point decimal representations
-  if (/^\d+\.\d+$/.test(value)) {
-    return true;
-  }
-  // Disallow scientific notation
-  if (/^\d+[eE][+-]?\d+$/.test(value)) {
-    return true;
-  }
-  return false;
-}
-
-/**
- * Recursively inspect an object or array for any noncanonical numeric identifier values.
- */
-export function hasNoncanonicalNumericField(obj: unknown): boolean {
-  if (obj === null || typeof obj !== "object") {
-    return false;
-  }
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      if (hasNoncanonicalNumericField(item)) return true;
-    }
-    return false;
-  }
-  for (const value of Object.values(obj as Record<string, unknown>)) {
-    if (typeof value === "number" || typeof value === "bigint" || typeof value === "string") {
-      if (isNoncanonicalNumericId(value)) return true;
-    } else if (typeof value === "object" && value !== null) {
-      if (hasNoncanonicalNumericField(value)) return true;
-    }
-  }
-  return false;
+  return ["menu", "status", "contracts", "help", "pause", "resume", "broadcast"].includes(val);
 }
 
 /**
@@ -284,7 +159,23 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
     }
   }
 
-  // 2. Colon-delimited: e.g. "status:refresh", "mimir:contracts", etc.
+  // 2. Pagination callback: "pg:v1:events:<page>"
+  const pagination = parsePaginationCallback(trimmed);
+  if (pagination !== null) {
+    if (pagination.kind === "events") {
+      return {
+        ok: true,
+        action: { type: "events_page", page: pagination.page, raw },
+      };
+    }
+    return {
+      ok: false,
+      reason: "unknown-action",
+      fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+    };
+  }
+
+  // 3. Colon-delimited: e.g. "status:refresh", "mimir:contracts", etc.
   if (trimmed.includes(":")) {
     const parts = trimmed.split(":");
     for (const part of parts) {
@@ -370,7 +261,7 @@ function isMessageNotModified(err: unknown): boolean {
 export async function updateOrReplyMessage(
   ctx: Context,
   text: string,
-  replyMarkup?: InlineKeyboard,
+  replyMarkup?: InlineKeyboard | InlineKeyboardMarkup,
 ): Promise<void> {
   const options = {
     ...TELEGRAM_OPTIONS,
@@ -499,11 +390,42 @@ export async function handleCallbackQuery(
       });
       return;
     }
+  } else {
+    // Enforce chat allowlist authorization on every navigation callback
+    const allowedChatIds = config.allowedChatIds;
+    if (allowedChatIds && allowedChatIds.length > 0) {
+      const chatId = ctx.chat?.id ?? ctx.callbackQuery?.message?.chat?.id;
+      if (chatId === undefined || !isChatAllowed(allowedChatIds, chatId)) {
+        console.warn(
+          `[bot] ignored unauthorized callback /${action.type} for chat ${chatId ?? "unknown"} (not in ALLOWED_CHAT_IDS) on update ${ctx.update.update_id}`,
+        );
+        await safeAnswerCallback(ctx, config, {
+          text: CALLBACK_CHAT_UNAUTHORIZED_FEEDBACK,
+          show_alert: true,
+        });
+        return;
+      }
+    }
   }
 
   // Execute validated action
   try {
     switch (action.type) {
+      case "menu": {
+        const text = menuMessage();
+        const keyboard = menuKeyboard();
+        if (ctx.callbackQuery?.message) {
+          await updateOrReplyMessage(ctx, text, keyboard);
+        } else {
+          await ctx.api.sendMessage(config.chatId, text, {
+            ...TELEGRAM_OPTIONS,
+            reply_markup: keyboard,
+          });
+        }
+        await safeAnswerCallback(ctx, config, { text: "Menu" });
+        break;
+      }
+
       case "broadcast": {
         await handleBroadcastCallback(ctx, deps, action.raw);
         break;
@@ -649,23 +571,34 @@ export async function handlePauseConfirmCallback(
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
   const ageMs = nowMs - messageDate * 1000;
   const actionName = action === CALLBACK_PAUSE_CONFIRM ? "pause_confirm" : "pause_cancel";
+  let answered = false;
   try {
     if (ageMs > PAUSE_CONFIRM_TTL_MS) {
-      await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
-      await ctx.editMessageText(
-        "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
-        TELEGRAM_OPTIONS,
-      );
+      answered = true;
+      const messages = messagesFor(config.locale).callbackMessages;
+      await ctx.answerCallbackQuery({ text: messages.pauseExpiredAlert, show_alert: true });
+      if (ctx.callbackQuery?.message) {
+        try {
+          await ctx.editMessageText(
+            messages.pauseExpiredMessage,
+            TELEGRAM_OPTIONS,
+          );
+        } catch {
+          // ignore edit failure (e.g. message deleted or cannot be edited)
+        }
+      }
       return;
     }
 
     if (action === CALLBACK_PAUSE_CONFIRM) {
       const result = pause();
+      answered = true;
       await ctx.answerCallbackQuery();
-      await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
+      await ctx.editMessageText(pauseMessage(result, config.locale), TELEGRAM_OPTIONS);
       return;
     }
 
+    answered = true;
     await ctx.answerCallbackQuery({ text: "Cancelled." });
     await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
   } catch (err) {
@@ -677,7 +610,9 @@ export async function handlePauseConfirmCallback(
         secrets: [config.botToken],
       }),
     );
-    await safeAnswerCallback(ctx, config, { text: "Action failed" });
+    if (!answered) {
+      await safeAnswerCallback(ctx, config, { text: "Action failed" });
+    }
   }
 }
 

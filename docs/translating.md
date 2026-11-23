@@ -15,6 +15,8 @@ This guide explains how user-facing strings are organized, formatted, and escape
 
 Region tags (`es-MX`, `en-GB`) are accepted and resolve to their base language. Any other value fails fast at startup, listing the accepted locales. The selected locale is carried on the config as `config.locale`; product code reads strings through `messagesFor(config.locale)` rather than importing the English constants directly.
 
+Individual notification routes (`TelegramRoute.locale` in `config.routes`) may also specify a per-route language preference. Notification renderers (MarkdownV2, plain text, HTML, and inline keyboards) resolve the route's locale through `resolveNotificationLocale()` before calling `messagesFor(...)`: supported route locales (including region tags) override `config.locale` for that route, while omitted or unsupported route locales fall back deterministically to `config.locale` and then to `DEFAULT_LOCALE` (`en`).
+
 The named exports in the table below (`HELP_TITLE`, `NOTIFICATION_MD`, ...) are the English reference strings. They remain exported for backwards compatibility and are also available as `messagesFor("en")`. Every locale registers a complete `Messages` object in `MESSAGES`, so TypeScript rejects a locale that omits a template.
 
 To add a language:
@@ -41,8 +43,10 @@ All user-facing localization templates live in [`src/i18n.ts`](../src/i18n.ts). 
 | `COMMAND_DESCRIPTIONS` | **Plain text** | Descriptions registered with Telegram's `setMyCommands` autocomplete menu and interpolated into `/help` (via `escapeMd`). |
 | `NOTIFICATION_MD` | **MarkdownV2** | Primary event notification templates (`claimCreated`, `claimChallenged`, etc.), fallback template (`fallbackEvent`), and preview headers (`previewModePrefix`, `channelPreviewMarket`, `channelPreviewSquad`). |
 | `NOTIFICATION_PLAIN` | **Plain text** | 1-to-1 plain-text mirror of `NOTIFICATION_MD` (plus `minimal`), sent without `parse_mode` if Telegram rejects the MarkdownV2 payload or when plain text is requested. |
+| `NOTIFICATION_HTML` | **HTML** | Telegram HTML mirror of `NOTIFICATION_MD` (plus `fallbackEvent` and `previewModePrefix`), restricted to `<b>`, `<i>`, `<code>`, and `<a>` tags for `formatEventHtml()` in [`src/notifications/html.ts`](../src/notifications/html.ts). |
 | `EXPLORER_BUTTON_TEXT` | **Plain text** | Label on the inline keyboard button linking to Stellar Expert (`"View on Explorer"`). Inline button labels do not parse Markdown. |
 | `MIMIR_APP_BUTTON_TEXT` | **Plain text** | Label on the inline keyboard button that opens the Mimir web app (`"Open in Mimir"`), present only when `MIMIR_APP_URL` is configured. |
+| `CALLBACK_MESSAGES` | **Mixed** | Operator callback expired alert and recovery messages (`pauseExpiredAlert`, `pauseExpiredMessage`, `broadcastExpiredAlert`, `broadcastExpiredMessage`). Alert texts are plain text for `ctx.answerCallbackQuery({ show_alert: true })`; message texts use MarkdownV2 (`pauseExpiredMessage`) or plain text (`broadcastExpiredMessage`) for editing the prompt. |
 
 ### Why Both `NOTIFICATION_MD` and `NOTIFICATION_PLAIN` Exist
 
@@ -206,7 +210,8 @@ export const COMMAND_DESCRIPTIONS = {
 Each entry in `COMMAND_DESCRIPTIONS` is used in two places in [`src/bot.ts`](../src/bot.ts):
 
 1. **Telegram UI Autocomplete Menu (`registerCommands`)**: Sent to Telegram via `bot.api.setMyCommands(...)` at startup so users see a command pop-up menu when they type `/` in the chat.
-   * When `OPERATOR_TELEGRAM_USER_ID` is unset (`null`), operator-only commands (`audit`, `pause`, `resume`) are filtered out by `visibleCommands()` and omitted from both the autocomplete menu and `/help`.
+   * `commandMenus()` builds a public default menu and, when `OPERATOR_TELEGRAM_USER_ID` is set, a second full menu scoped to that operator's private chat. Operator-only commands (`audit`, `pause`, `resume`) never appear in the default menu. Telegram caches menus per chat, so the runtime authorization gates remain the authority.
+   * When `OPERATOR_TELEGRAM_USER_ID` is unset (`null`), operator-only commands are omitted from both the autocomplete menu and `/help`.
 2. **`/help` and `/start` Replies (`helpMessage`)**: Rendered as `/command — description` and passed through `escapeMd(...)` before being sent in `MarkdownV2` mode.
 
 ### Rules & Constraints for `COMMAND_DESCRIPTIONS`

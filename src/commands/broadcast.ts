@@ -18,6 +18,7 @@ import * as path from "path";
 import { createHash, randomBytes } from "crypto";
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { BotConfig } from "../config.js";
+import { messagesFor } from "../i18n.js";
 import {
   extractCallbackLogIds,
   formatCallbackErrorLog,
@@ -312,19 +313,29 @@ export class BroadcastStore {
     const id = `${Date.now().toString(36)}_${this.counter}_${randomBytes(6).toString("hex")}`;
     const now = this.now();
     const expiresAt = now + (ttlMs ?? this.defaultTtlMs);
+    let fp = destinationFingerprint;
+    let effectiveChatId = chatId;
+    if (
+      destinationFingerprint !== undefined &&
+      chatId === operatorId &&
+      !/^[0-9a-f]{64}$/i.test(destinationFingerprint)
+    ) {
+      effectiveChatId = destinationFingerprint;
+      fp = undefined;
+    }
     const item: PendingBroadcast = {
       id,
       operatorId,
-      chatId,
+      chatId: effectiveChatId,
       message,
       createdAt: now,
       expiresAt,
       chats,
       confirmed: false,
-      ...(destinationFingerprint !== undefined ? { destinationFingerprint } : {}),
+      ...(fp !== undefined ? { destinationFingerprint: fp } : {}),
     };
     this.items.set(id, item);
-    this.persisted.push({ idHash: hashId(id), operatorId, chatId, expiresAt });
+    this.persisted.push({ idHash: hashId(id), operatorId, chatId: effectiveChatId, expiresAt });
     this.save();
     return item;
   }
@@ -965,9 +976,10 @@ export async function handleConfirmationsCallback(
     const res = store.cancelForOperator(targetId, actor, chatId);
     if (!res.ok) {
       const expired = res.reason === "expired";
+      const messages = messagesFor(config.locale).callbackMessages;
       await safeAnswerCallback(ctx, config, {
         text: expired
-          ? "Broadcast confirmation expired"
+          ? messages.broadcastExpiredAlert
           : "Broadcast expired or already processed",
         show_alert: true,
       });
@@ -975,7 +987,7 @@ export async function handleConfirmationsCallback(
         try {
           await ctx.editMessageText(
             expired
-              ? "⚠️ Broadcast confirmation expired."
+              ? messages.broadcastExpiredMessage
               : "⚠️ Broadcast confirmation expired or already processed.",
           );
         } catch {
@@ -1083,9 +1095,10 @@ export async function handleBroadcastCallback(
 
     if (!fallbackAllowed) {
       const expired = check.reason === "expired";
+      const messages = messagesFor(config.locale).callbackMessages;
       await safeAnswerCallback(ctx, config, {
         text: expired
-          ? "Broadcast confirmation expired"
+          ? messages.broadcastExpiredAlert
           : "Broadcast expired or already processed",
         show_alert: true,
       });
@@ -1093,7 +1106,7 @@ export async function handleBroadcastCallback(
         try {
           await ctx.editMessageText(
             expired
-              ? "⚠️ Broadcast confirmation expired."
+              ? messages.broadcastExpiredMessage
               : "⚠️ Broadcast confirmation expired or already processed.",
           );
         } catch {
@@ -1502,11 +1515,15 @@ export function registerBroadcastCommand(
 
         const isConfirm = data.startsWith("broadcast:confirm:");
         const token = data.slice(isConfirm ? "broadcast:confirm:".length : "broadcast:cancel:".length);
+        const messages = messagesFor(deps.config?.locale).callbackMessages;
 
         if (!isConfirm) {
           const cancelled = store.cancelForOperator(token, senderId);
           if (!cancelled) {
-            await ctx.answerCallbackQuery({ text: "Broadcast expired or already processed" });
+            await ctx.answerCallbackQuery({
+              text: messages.broadcastExpiredAlert,
+              show_alert: true,
+            });
             return;
           }
           await ctx.editMessageText("Broadcast cancelled.");
@@ -1516,7 +1533,10 @@ export function registerBroadcastCommand(
 
         const entry = store.consume(token);
         if (!entry || String(entry.operatorChatId) !== senderId) {
-          await ctx.answerCallbackQuery({ text: "Broadcast expired or already processed" });
+          await ctx.answerCallbackQuery({
+            text: messages.broadcastExpiredAlert,
+            show_alert: true,
+          });
           return;
         }
 

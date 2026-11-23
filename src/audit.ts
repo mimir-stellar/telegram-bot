@@ -40,6 +40,8 @@ export const AUDIT_KINDS = [
   "shutdown",
   "cursor_loaded",
   "cursor_persist_failed",
+  "cursor_rollback_rejected",
+  "cursor_rollback_acknowledged",
   "stale_cursor",
   "cycle_failed",
   "cycle_recovered",
@@ -55,6 +57,7 @@ export const AUDIT_ERROR_KINDS: readonly AuditKind[] = [
   "cycle_failed",
   "send_failed",
   "cursor_persist_failed",
+  "cursor_rollback_rejected",
   "stale_cursor",
 ];
 
