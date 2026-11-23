@@ -599,6 +599,32 @@ export function sanitizeReason(reason: unknown, maxLen: number = MAX_DIAGNOSTIC_
   return redactText(compact, { maxLen: Math.max(1, maxLen) });
 }
 
+/** Redact and bound any raw value for safe inclusion in explain diagnostics. */
+export function redactAndBoundValue(value: unknown, maxLen: number = 80): string {
+  const cap = Math.max(1, maxLen);
+  let raw: string;
+  if (value === undefined) {
+    raw = "undefined";
+  } else if (value === null) {
+    raw = "null";
+  } else if (typeof value === "bigint") {
+    raw = `${value.toString()}n`;
+  } else if (typeof value === "string") {
+    raw = value;
+  } else if (typeof value === "number" || typeof value === "boolean") {
+    raw = String(value);
+  } else if (Array.isArray(value)) {
+    raw = `[array(${value.length})]`;
+  } else if (typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>).slice(0, 8);
+    raw = `{${keys.join(",")}}`;
+  } else {
+    raw = String(value);
+  }
+  const compact = raw.replace(/[\r\n\t\x00-\x1f\x7f]+/g, " ").trim() || "(empty)";
+  return redactText(compact, { maxLen: cap });
+}
+
 // ── Per-contract version decoders ────────────────────────────────────────────
 
 export type MarketDecoderFn = (
@@ -1568,6 +1594,151 @@ export function decodeEvent(
       },
     };
   }
+}
+
+// ── Decoder explain mode ─────────────────────────────────────────────────────
+
+export interface DecodeExplainFieldCheck {
+  field: string;
+  passed: boolean;
+  expected?: string;
+  observedPreview: string;
+  reason?: string;
+}
+
+export interface DecodeExplainResult {
+  source: ContractSource;
+  selectedSchema: string;
+  version: string;
+  eventName: string;
+  accepted: boolean;
+  fieldChecks: DecodeExplainFieldCheck[];
+  rejectionReason: string | null;
+  decoded: DecodedEvent;
+}
+
+const MAX_EXPLAIN_FIELDS = 20;
+
+/**
+ * Explain how `decodeEvent` evaluates a single captured Soroban event.
+ *
+ * Reports the selected schema, ordered topic/field checks, and any rejection
+ * reason, while redacting and bounding all raw values in diagnostics. Never throws.
+ */
+export function explainDecodeEvent(
+  source: ContractSource,
+  event: rpc.Api.EventResponse,
+  versionOrOptions: string | DecodeOptions = DEFAULT_CONTRACT_VERSION,
+  options?: DecodeOptions,
+): DecodeExplainResult {
+  const version = typeof versionOrOptions === "string" ? versionOrOptions : DEFAULT_CONTRACT_VERSION;
+  const normVersion = normalizeContractVersion(version);
+  const decoded = decodeEvent(source, event, versionOrOptions, options);
+  const fieldChecks: DecodeExplainFieldCheck[] = [];
+
+  const hasTopicArray = Boolean(event && Array.isArray(event.topic));
+  fieldChecks.push({
+    field: "topic",
+    passed: hasTopicArray && event.topic.length > 0,
+    expected: "non-empty array",
+    observedPreview: hasTopicArray ? `[array(${event.topic.length})]` : redactAndBoundValue(event?.topic),
+    ...(!hasTopicArray
+      ? { reason: "missing or invalid topic array" }
+      : event.topic.length === 0
+        ? { reason: "empty topic array" }
+        : {}),
+  });
+
+  let eventName = "";
+  if (hasTopicArray && event.topic.length > 0) {
+    try {
+      eventName = peekEventName(event);
+    } catch {
+      eventName = "";
+    }
+    fieldChecks.push({
+      field: "topic[0]",
+      passed: eventName !== "",
+      expected: "event name string",
+      observedPreview: redactAndBoundValue(eventName || event.topic[0]),
+      ...(eventName === "" ? { reason: "topic[0] is not an event name string" } : {}),
+    });
+  }
+
+  if (hasTopicArray && eventName !== "") {
+    const topics = event.topic.map((t) => {
+      try {
+        return native(t as xdr.ScVal);
+      } catch {
+        return null;
+      }
+    });
+    const topicSchema = validateTopicSchema(source, eventName, topics);
+    fieldChecks.push({
+      field: "topics",
+      passed: topicSchema.valid,
+      observedPreview: `[${topics.slice(0, 6).map((t) => redactAndBoundValue(t, 32)).join(", ")}]`,
+      ...(!topicSchema.valid ? { reason: sanitizeReason(topicSchema.reason) } : {}),
+    });
+  }
+
+  const payload = decoded.payload as unknown as Record<string, unknown>;
+  const accepted = payload.name !== "unknown";
+
+  if (accepted) {
+    const keys = Object.keys(payload).filter((k) => k !== "name").slice(0, MAX_EXPLAIN_FIELDS);
+    for (const key of keys) {
+      fieldChecks.push({
+        field: `payload.${key}`,
+        passed: true,
+        observedPreview: redactAndBoundValue(payload[key]),
+      });
+    }
+  } else if (event && event.value !== undefined && event.value !== null) {
+    try {
+      const decodedValue = native(event.value);
+      if (isRecord(decodedValue)) {
+        const keys = Object.keys(decodedValue).slice(0, MAX_EXPLAIN_FIELDS);
+        for (const key of keys) {
+          fieldChecks.push({
+            field: `value.${key}`,
+            passed: true,
+            observedPreview: redactAndBoundValue(decodedValue[key]),
+          });
+        }
+      } else {
+        fieldChecks.push({
+          field: "value",
+          passed: true,
+          observedPreview: redactAndBoundValue(decodedValue),
+        });
+      }
+    } catch (err) {
+      fieldChecks.push({
+        field: "value",
+        passed: false,
+        observedPreview: redactAndBoundValue(event.value),
+        reason: sanitizeReason(err instanceof Error ? err.message : String(err)),
+      });
+    }
+  }
+
+  const schemaEvent = accepted ? String(payload.name) : eventName || "unknown";
+  const selectedSchema = `${source}:${normVersion}:${schemaEvent}`;
+  const rejectionReason = accepted
+    ? null
+    : sanitizeReason(typeof payload.reason === "string" ? payload.reason : "unknown event");
+
+  return {
+    source,
+    selectedSchema,
+    version: normVersion,
+    eventName: eventName || (typeof payload.eventName === "string" ? payload.eventName : ""),
+    accepted,
+    fieldChecks,
+    rejectionReason,
+    decoded,
+  };
 }
 
 // ── Ordering metadata (issue #48) ────────────────────────────────────────────

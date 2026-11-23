@@ -306,3 +306,39 @@ test("meetsThreshold: other events always pass regardless of thresholds (boundar
     );
   }
 });
+
+test("parseUsdcThreshold: errors include source ranges and stable machine-readable codes", () => {
+  const neg = "  -10.5 ";
+  assert.throws(
+    () => parseUsdcThreshold(neg),
+    (err) => {
+      assert.ok(err instanceof InvalidThresholdError);
+      assert.equal(err.code, "THRESHOLD_NEGATIVE");
+      assert.deepEqual(err.range, { start: 2, end: 7 });
+      assert.equal(neg.slice(err.range.start, err.range.end), "-10.5");
+      return true;
+    },
+  );
+
+  const prec = "1.12345678";
+  assert.throws(
+    () => parseUsdcThreshold(prec),
+    (err) => {
+      assert.ok(err instanceof InvalidThresholdError);
+      assert.equal(err.code, "THRESHOLD_PRECISION_EXCEEDED");
+      assert.deepEqual(err.range, { start: 9, end: 10 });
+      assert.equal(prec.slice(err.range.start, err.range.end), "8");
+      return true;
+    },
+  );
+
+  assert.throws(
+    () => parseUsdcThreshold("   "),
+    (err) => {
+      assert.ok(err instanceof InvalidThresholdError);
+      assert.equal(err.code, "THRESHOLD_EMPTY");
+      assert.deepEqual(err.range, { start: 0, end: 3 });
+      return true;
+    },
+  );
+});

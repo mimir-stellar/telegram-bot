@@ -180,6 +180,10 @@ export interface StellarConfig {
   marketContractVersion: string;
   squadContractVersion: string;
   rpcUrl: string;
+  /** Optional operator-configured RPC egress allowlist (hosts, wildcards, or origins). */
+  rpcEgressAllowlist?: string[];
+  /** Permit credential-free loopback RPC URLs (used in mock mode). */
+  allowLoopbackRpc?: boolean;
   horizonUrl: string;
   networkPassphrase: string;
   /** Optional override for stellar.expert (or compatible) explorer origin. */
@@ -193,6 +197,8 @@ export interface StellarConfig {
 }
 
 export interface TelegramRoute {
+  /** The contract source this route delivers; determines which events it carries. */
+  source: "market" | "squad" | "default";
   chatId: string;
   channelPreviewMode: boolean;
   /** Previous group chat id recorded when Telegram migrated the chat to a supergroup. */
@@ -294,6 +300,13 @@ export interface BotConfig extends StellarConfig {
   /** Optional per-contract destinations; absent values use `chatId`. */
   marketChatId?: string;
   squadChatId?: string;
+  /** Optional default Telegram forum topic (`message_thread_id`) for notifications. */
+  defaultForumTopicId?: number;
+  /**
+   * Optional per-category forum topic overrides (normalized category -> topic id,
+   * or `null` to explicitly disable topic routing for that category).
+   */
+  categoryForumTopics?: Record<string, number | null>;
   /** Chats allowed to use /status. Empty array means no restriction. */
   allowedChatIds: string[];
   /** Telegram user id allowed to run operator-only commands. Null disables them. */
@@ -375,6 +388,8 @@ export interface BotConfig extends StellarConfig {
   telegramSendTimeoutMs: number;
   /** Alias of `telegramSendTimeoutMs` accepted from hand-built configs. */
   sendTimeoutMs?: number;
+  /** Cooldown in milliseconds applied to a destination after a Telegram permission failure (`0` disables). */
+  routeCooldownMs?: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
   /** Show Telegram link previews on market notifications (LINK_PREVIEW_MARKET). */
@@ -414,6 +429,9 @@ export const DEFAULT_HEALTH_SHUTDOWN_GRACE_MS = 2_000;
 
 /** Fallback per-send budget when a config object predates `TELEGRAM_SEND_TIMEOUT_MS`. */
 export const DEFAULT_TELEGRAM_SEND_TIMEOUT_MS = 10_000;
+
+/** Default cooldown applied to a destination route after a Telegram permission failure. */
+export const DEFAULT_ROUTE_COOLDOWN_MS = 300_000;
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -467,6 +485,7 @@ const DEFAULTS = {
   // Bounded so one wedged Telegram send cannot stall the poll loop; long
   // enough for a normal API round-trip on a slow link.
   telegramSendTimeoutMs: DEFAULT_TELEGRAM_SEND_TIMEOUT_MS,
+  routeCooldownMs: DEFAULT_ROUTE_COOLDOWN_MS,
   channelPreviewMode: false,
   linkPreviewMarket: false,
   linkPreviewSquad: false,
@@ -780,6 +799,17 @@ function collector(profile: Record<string, string>) {
      * Parse an optional TCP port number. Returns `null` when the env var is
      * absent/empty (server disabled). Validates 1–65535 when present.
      */
+    optionalPositiveInt(name: string): number | undefined {
+      const raw = read(name);
+      if (raw === undefined) return undefined;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+        problems.push(`${name} must be a positive integer; got "${raw}"`);
+        return undefined;
+      }
+      return parsed;
+    },
+
     optionalPort(name: string): number | null {
       const raw = read(name);
       if (raw === undefined) return null;
@@ -793,6 +823,106 @@ function collector(profile: Record<string, string>) {
         return null;
       }
       return parsed;
+    },
+
+    /**
+     * Parse an optional positive integer Telegram forum topic (`message_thread_id`).
+     * Returns `undefined` when absent/empty.
+     */
+    optionalTopicId(name: string): number | undefined {
+      const raw = read(name);
+      if (raw === undefined) return undefined;
+      if (!/^\d+$/.test(raw)) {
+        problems.push(`${name} must be a positive integer forum topic id; got "${raw}"`);
+        return undefined;
+      }
+      const parsed = Number(raw);
+      if (!Number.isSafeInteger(parsed) || parsed < 1) {
+        problems.push(`${name} must be a positive integer forum topic id; got "${raw}"`);
+        return undefined;
+      }
+      return parsed;
+    },
+
+    /**
+     * Parse per-category forum topic overrides from either `cat:id,cat2:off`
+     * pairs or a JSON object `{ "cat": 123, "cat2": null }`.
+     */
+    categoryForumTopics(name: string): Record<string, number | null> {
+      const raw = read(name);
+      if (raw === undefined) return {};
+      const out: Record<string, number | null> = {};
+
+      const assignTopic = (rawKey: string, rawVal: unknown): void => {
+        const key = normalizeCategory(rawKey);
+        if (!key) {
+          problems.push(`${name} contains an empty category name`);
+          return;
+        }
+        if (rawVal === null) {
+          out[key] = null;
+          return;
+        }
+        if (typeof rawVal === "string") {
+          const trimmed = rawVal.trim().toLowerCase();
+          if (trimmed === "off" || trimmed === "none" || trimmed === "disabled" || trimmed === "0") {
+            out[key] = null;
+            return;
+          }
+          if (/^\d+$/.test(trimmed)) {
+            const parsed = Number(trimmed);
+            if (Number.isSafeInteger(parsed) && parsed >= 1) {
+              out[key] = parsed;
+              return;
+            }
+          }
+          problems.push(
+            `${name} topic for "${rawKey}" must be a positive integer or off/none/disabled/0; got "${rawVal}"`,
+          );
+          return;
+        }
+        if (typeof rawVal === "number") {
+          if (rawVal === 0) {
+            out[key] = null;
+            return;
+          }
+          if (Number.isSafeInteger(rawVal) && rawVal >= 1) {
+            out[key] = rawVal;
+            return;
+          }
+          problems.push(`${name} topic for "${rawKey}" must be a positive integer or 0/null; got ${rawVal}`);
+          return;
+        }
+        problems.push(`${name} topic for "${rawKey}" must be a positive integer or null`);
+      };
+
+      if (raw.startsWith("{")) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          problems.push(`${name} is not valid JSON`);
+          return {};
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          problems.push(`${name} JSON value must be an object mapping category to topic id`);
+          return {};
+        }
+        for (const [k, v] of Object.entries(parsed)) {
+          assignTopic(k, v);
+        }
+        return out;
+      }
+
+      for (const pair of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const sep = pair.indexOf(":");
+        if (sep === -1) {
+          problems.push(`${name} entry "${pair}" must be in "category:topicId" format`);
+          continue;
+        }
+        assignTopic(pair.slice(0, sep), pair.slice(sep + 1));
+      }
+      return out;
     },
 
     optionalChatId(name: string, fallback: string): string {
@@ -940,6 +1070,15 @@ function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
     passphrase: DEFAULTS.networkPassphrase,
   };
 
+  const rawAllowlist = c.get("STELLAR_RPC_EGRESS_ALLOWLIST");
+  const rpcEgressAllowlist =
+    rawAllowlist !== undefined
+      ? rawAllowlist
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0)
+      : undefined;
+
   return {
     // Left unset when only a passphrase was given, so labels infer from it.
     ...(namedNetwork !== undefined ? { network: namedNetwork } : {}),
@@ -1009,6 +1148,8 @@ export function loadConfig(): BotConfig {
     chatIds,
     marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
     squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
+    defaultForumTopicId: c.optionalTopicId("TELEGRAM_DEFAULT_TOPIC_ID"),
+    categoryForumTopics: c.categoryForumTopics("TELEGRAM_CATEGORY_TOPICS"),
     allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
@@ -1073,6 +1214,11 @@ export function loadConfig(): BotConfig {
       DEFAULTS.telegramSendTimeoutMs,
       0,
     ),
+    routeCooldownMs: c.int(
+      "TELEGRAM_ROUTE_COOLDOWN_MS",
+      DEFAULTS.routeCooldownMs,
+      0,
+    ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
     linkPreviewMarket: c.bool("LINK_PREVIEW_MARKET", DEFAULTS.linkPreviewMarket),
     linkPreviewSquad: c.bool("LINK_PREVIEW_SQUAD", DEFAULTS.linkPreviewSquad),
@@ -1089,6 +1235,81 @@ export function loadConfig(): BotConfig {
     mimirAppUrl: c.optionalHttpsUrl("MIMIR_APP_URL"),
     healthAuthToken: c.optionalSecret("HEALTH_AUTH_TOKEN"),
   };
+
+  // ── Build canonical routes and reject duplicates ───────────────────────────
+  //
+  // A route identity is (chatId, messageThreadId). Two different sources
+  // (market, squad) that share the exact same identity are a misconfiguration:
+  // they would deliver separate event streams to the same thread, making audit
+  // trails ambiguous and delivery behaviour surprising.
+  //
+  // Single-chat deployments are explicitly exempted: when neither
+  // TELEGRAM_MARKET_CHAT_ID nor TELEGRAM_SQUAD_CHAT_ID is set, all sources
+  // inherit the same chatId as the intended single-channel fallback, and no
+  // duplicate is reported. The check only fires when at least one per-contract
+  // destination was explicitly configured and both resolve to the same identity.
+  //
+  // The report names the conflicting sources and the shared identity, never
+  // the bot token.
+  const defaultChatId = config.chatId;
+  const marketExplicit = c.get("TELEGRAM_MARKET_CHAT_ID") !== undefined;
+  const squadExplicit = c.get("TELEGRAM_SQUAD_CHAT_ID") !== undefined;
+  const marketChatId = config.marketChatId ?? defaultChatId;
+  const squadChatId = config.squadChatId ?? defaultChatId;
+
+  const builtRoutes: TelegramRoute[] = [
+    {
+      source: "default",
+      chatId: defaultChatId,
+      channelPreviewMode: config.channelPreviewMode,
+    },
+    {
+      source: "market",
+      chatId: marketChatId,
+      channelPreviewMode: config.channelPreviewMode,
+      ...(config.marketMessageThreadId !== undefined
+        ? { messageThreadId: config.marketMessageThreadId }
+        : {}),
+    },
+    {
+      source: "squad",
+      chatId: squadChatId,
+      channelPreviewMode: config.channelPreviewMode,
+      ...(config.squadMessageThreadId !== undefined
+        ? { messageThreadId: config.squadMessageThreadId }
+        : {}),
+    },
+  ];
+
+  // Only check for duplicates when at least one per-contract destination was
+  // explicitly configured. If neither was set, the single-chat fallback is
+  // correct (all sources share one destination by design).
+  if (marketExplicit || squadExplicit) {
+    const seen = new Map<string, string>();
+    const explicitRoutes = builtRoutes.filter((r) => r.source !== "default");
+    for (const route of explicitRoutes) {
+      const identity = routeIdentity(route);
+      const prior = seen.get(identity);
+      if (prior !== undefined) {
+        // Report without the token: use the identity label (chat id + optional
+        // thread), which is a destination address, not a secret.
+        const label =
+          route.messageThreadId !== undefined
+            ? `chat ${route.chatId} topic ${route.messageThreadId}`
+            : `chat ${route.chatId}`;
+        c.problems.push(
+          `Duplicate notification route: ${prior} and ${route.source} both target ${label}. ` +
+            `Set TELEGRAM_MARKET_CHAT_ID / TELEGRAM_SQUAD_CHAT_ID to distinct destinations, ` +
+            `or use TELEGRAM_MARKET_MESSAGE_THREAD_ID / TELEGRAM_SQUAD_MESSAGE_THREAD_ID ` +
+            `to separate sources into different forum topics.`,
+        );
+      } else {
+        seen.set(identity, route.source);
+      }
+    }
+  }
+
+  config.routes = builtRoutes;
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
 
@@ -1272,6 +1493,8 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "TELEGRAM_CHAT_ID", secret: true },
   { key: "TELEGRAM_MARKET_CHAT_ID", secret: true, derivedFrom: { key: "TELEGRAM_CHAT_ID" } },
   { key: "TELEGRAM_SQUAD_CHAT_ID", secret: true, derivedFrom: { key: "TELEGRAM_CHAT_ID" } },
+  { key: "TELEGRAM_DEFAULT_TOPIC_ID", secret: false },
+  { key: "TELEGRAM_CATEGORY_TOPICS", secret: false },
   { key: "ALLOWED_CHAT_IDS", secret: true },
   { key: "OPERATOR_TELEGRAM_USER_ID", secret: true },
   { key: "POLL_INTERVAL_MS", secret: false, hasBuiltInDefault: true },
@@ -1314,6 +1537,7 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "STARTUP_HEALTH_RETRY_MS", secret: false, hasBuiltInDefault: true },
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "TELEGRAM_SEND_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
+  { key: "TELEGRAM_ROUTE_COOLDOWN_MS", secret: false, hasBuiltInDefault: true },
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_MARKET", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_SQUAD", secret: false, hasBuiltInDefault: true },

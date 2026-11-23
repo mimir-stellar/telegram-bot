@@ -74,6 +74,7 @@ export {
   commandArgumentAllowed,
   commandArgumentTooLongMessage,
   isChatAllowed,
+  isCommandForAnotherBot,
   isOperator,
   operatorAllowed,
   replyMarkdown,

@@ -386,7 +386,7 @@ export function formatLastEvent(
   const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
   return (
     `*Last observed event* — \`${escapeMd(clip(name, 120))}\`\n` +
-    `This event has no notification summary\.\n${footer(config, event)}`
+    `This event has no notification summary\\.\n${footer(config, event)}`
   );
 }
 

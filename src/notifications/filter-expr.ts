@@ -170,30 +170,91 @@ export const EVENT_PAYLOAD_SCHEMAS: Record<string, Record<string, FieldDefinitio
   },
 };
 
+/**
+ * Known non-payload metadata fields that may appear in event-less filter expressions.
+ */
+const METADATA_FIELD_SCHEMAS: Record<string, FieldDefinition> = {
+  ledger: { type: "number" },
+};
+
+/**
+ * Unified field lookup across all event payload schemas and metadata fields,
+ * used when a filter expression omits the event name.
+ */
+const GLOBAL_FIELD_SCHEMAS: Record<string, FieldDefinition> = (() => {
+  const combined: Record<string, FieldDefinition> = { ...METADATA_FIELD_SCHEMAS };
+  for (const schema of Object.values(EVENT_PAYLOAD_SCHEMAS)) {
+    for (const [field, def] of Object.entries(schema)) {
+      if (!(field in combined)) {
+        combined[field] = def;
+      }
+    }
+  }
+  return combined;
+})();
+
+function getFieldDefinition(eventName: string | undefined, field: string): FieldDefinition | undefined {
+  if (eventName) {
+    return EVENT_PAYLOAD_SCHEMAS[eventName]?.[field];
+  }
+  return GLOBAL_FIELD_SCHEMAS[field];
+}
+
 /** Maximum allowed non-EOF tokens in a single filter expression before parsing. */
 export const MAX_FILTER_TOKENS = 100;
 
 /** Maximum allowed nesting depth for parentheses in filter expressions. */
 export const MAX_FILTER_DEPTH = 10;
 
+/** 0-based character span [start, end) in the original filter input. */
+export interface SourceRange {
+  start: number;
+  end: number;
+}
+
+/** Stable machine-readable error codes for filter expression validation. */
+export type FilterErrorCode =
+  | "FILTER_SYNTAX_ERROR"
+  | "FILTER_UNKNOWN_EVENT"
+  | "FILTER_UNKNOWN_FIELD"
+  | "FILTER_TYPE_MISMATCH"
+  | "FILTER_OPERATOR_NOT_SUPPORTED"
+  | "FILTER_USDC_PRECISION"
+  | "FILTER_TOKEN_LIMIT"
+  | "FILTER_DEPTH_LIMIT";
+
+function boundedTokenLabel(text: string, maxLen = 32): string {
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, maxLen - 1)}…`;
+}
+
 /** Error thrown when a filter expression exceeds the maximum allowed token count. */
 export class FilterTokenLimitError extends Error {
+  public readonly code = "FILTER_TOKEN_LIMIT" as const;
   public readonly count: number;
   public readonly limit: number;
+  public readonly range: SourceRange;
 
-  constructor(count: number, limit: number = MAX_FILTER_TOKENS) {
+  constructor(
+    count: number,
+    limit: number = MAX_FILTER_TOKENS,
+    range: SourceRange = { start: 0, end: 0 },
+  ) {
     super(`Filter expression exceeds maximum token limit of ${limit} (got ${count})`);
     this.name = "FilterTokenLimitError";
     this.count = count;
     this.limit = limit;
+    this.range = range;
   }
 }
 
 /** Error thrown when a filter expression exceeds the maximum allowed nesting depth. */
 export class FilterDepthLimitError extends Error {
+  public readonly code = "FILTER_DEPTH_LIMIT" as const;
   public readonly depth: number;
   public readonly limit: number;
   public readonly position: number;
+  public readonly range: SourceRange;
 
   constructor(depth: number, limit: number = MAX_FILTER_DEPTH, position = 0) {
     super(`At character ${position}: Filter expression exceeds maximum nesting depth of ${limit} (depth ${depth})`);
@@ -201,17 +262,27 @@ export class FilterDepthLimitError extends Error {
     this.depth = depth;
     this.limit = limit;
     this.position = position;
+    this.range = { start: position, end: position + 1 };
   }
 }
 
-/** Parse / Validation Error with character position. */
+/** Parse / Validation Error with character position, source range, and machine-readable code. */
 export class FilterParseError extends Error {
   public readonly position: number;
+  public readonly range: SourceRange;
+  public readonly code: FilterErrorCode;
 
-  constructor(message: string, position: number) {
+  constructor(
+    message: string,
+    position: number,
+    end?: number,
+    code: FilterErrorCode = "FILTER_SYNTAX_ERROR",
+  ) {
     super(`At character ${position}: ${message}`);
     this.name = "FilterParseError";
     this.position = position;
+    this.range = { start: position, end: end !== undefined && end >= position ? end : position };
+    this.code = code;
   }
 }
 
@@ -230,15 +301,20 @@ export type ExprNode =
   | {
       type: "comparison";
       op: ComparisonOp;
+      opPos: number;
+      opEnd: number;
       field: string;
       fieldPos: number;
+      fieldEnd: number;
       value: LiteralValue;
       valuePos: number;
+      valueEnd: number;
     };
 
 export interface FilterRule {
   eventName?: string;
   eventNamePos?: number;
+  eventNameEnd?: number;
   condition?: ExprNode;
   rawExpression: string;
 }
@@ -264,6 +340,7 @@ export interface Token {
   type: TokenType;
   text: string;
   pos: number;
+  end: number;
   value?: unknown;
 }
 
@@ -279,22 +356,22 @@ class Lexer {
     this.skipWhitespace();
 
     if (this.pos >= this.input.length) {
-      return { type: "EOF", text: "", pos: this.pos };
+      return { type: "EOF", text: "", pos: this.pos, end: this.pos };
     }
 
     const start = this.pos;
     const ch = this.input[this.pos];
     if (ch === undefined) {
-      return { type: "EOF", text: "", pos: this.pos };
+      return { type: "EOF", text: "", pos: this.pos, end: this.pos };
     }
 
     if (ch === "(") {
       this.pos++;
-      return { type: "LPAREN", text: "(", pos: start };
+      return { type: "LPAREN", text: "(", pos: start, end: this.pos };
     }
     if (ch === ")") {
       this.pos++;
-      return { type: "RPAREN", text: ")", pos: start };
+      return { type: "RPAREN", text: ")", pos: start, end: this.pos };
     }
 
     // Comparison operators
@@ -302,29 +379,29 @@ class Lexer {
       this.pos++;
       if (this.pos < this.input.length && this.input[this.pos] === "=") {
         this.pos++;
-        return { type: "OP", text: "==", pos: start };
+        return { type: "OP", text: "==", pos: start, end: this.pos };
       }
-      return { type: "OP", text: "==", pos: start }; // normalize '=' to '=='
+      return { type: "OP", text: "==", pos: start, end: this.pos }; // normalize '=' to '=='
     }
     if (ch === "!" && this.pos + 1 < this.input.length && this.input[this.pos + 1] === "=") {
       this.pos += 2;
-      return { type: "OP", text: "!=", pos: start };
+      return { type: "OP", text: "!=", pos: start, end: this.pos };
     }
     if (ch === "<") {
       this.pos++;
       if (this.pos < this.input.length && this.input[this.pos] === "=") {
         this.pos++;
-        return { type: "OP", text: "<=", pos: start };
+        return { type: "OP", text: "<=", pos: start, end: this.pos };
       }
-      return { type: "OP", text: "<", pos: start };
+      return { type: "OP", text: "<", pos: start, end: this.pos };
     }
     if (ch === ">") {
       this.pos++;
       if (this.pos < this.input.length && this.input[this.pos] === "=") {
         this.pos++;
-        return { type: "OP", text: ">=", pos: start };
+        return { type: "OP", text: ">=", pos: start, end: this.pos };
       }
-      return { type: "OP", text: ">", pos: start };
+      return { type: "OP", text: ">", pos: start, end: this.pos };
     }
 
     // Quoted strings: '...' or "..."
@@ -335,21 +412,22 @@ class Lexer {
       while (this.pos < this.input.length) {
         const c = this.input[this.pos];
         if (c === "\\") {
+          const escStart = this.pos;
           this.pos++;
           if (this.pos >= this.input.length) {
-            throw new FilterParseError("Unterminated string escape", this.pos);
+            throw new FilterParseError("Unterminated string escape", escStart, this.pos);
           }
           str += this.input[this.pos] ?? "";
           this.pos++;
         } else if (c === quote) {
           this.pos++;
-          return { type: "STRING", text: str, pos: start, value: str };
+          return { type: "STRING", text: str, pos: start, end: this.pos, value: str };
         } else {
           str += c;
           this.pos++;
         }
       }
-      throw new FilterParseError(`Unterminated string starting with ${quote}`, start);
+      throw new FilterParseError(`Unterminated string starting with ${quote}`, start, start + 1);
     }
 
     // Dollar-prefixed USDC literal: e.g. $100, $5.50
@@ -357,13 +435,14 @@ class Lexer {
       this.pos++;
       const numStr = this.readNumberString();
       if (!numStr) {
-        throw new FilterParseError("Expected number after '$'", start);
+        throw new FilterParseError("Expected number after '$'", start, start + 1);
       }
       return {
         type: "USDC",
         text: "$" + numStr,
         pos: start,
-        value: parseUsdcStringToUnits(numStr, start),
+        end: this.pos,
+        value: parseUsdcStringToUnits(numStr, start, this.pos),
       };
     }
 
@@ -379,7 +458,8 @@ class Lexer {
           type: "USDC",
           text: numStr + " USDC",
           pos: start,
-          value: parseUsdcStringToUnits(numStr, start),
+          end: this.pos,
+          value: parseUsdcStringToUnits(numStr, start, this.pos),
         };
       }
       // Revert if not USDC
@@ -388,6 +468,7 @@ class Lexer {
         type: "NUMBER",
         text: numStr,
         pos: start,
+        end: this.pos,
         value: numStr.includes(".") ? parseFloat(numStr) : parseInt(numStr, 10),
       };
     }
@@ -397,18 +478,18 @@ class Lexer {
       const word = this.readWord();
       const lower = word.toLowerCase();
       if (lower === "where") {
-        return { type: "WHERE", text: word, pos: start };
+        return { type: "WHERE", text: word, pos: start, end: this.pos };
       }
       if (lower === "and") {
-        return { type: "AND", text: word, pos: start };
+        return { type: "AND", text: word, pos: start, end: this.pos };
       }
       if (lower === "or") {
-        return { type: "OR", text: word, pos: start };
+        return { type: "OR", text: word, pos: start, end: this.pos };
       }
-      return { type: "IDENTIFIER", text: word, pos: start };
+      return { type: "IDENTIFIER", text: word, pos: start, end: this.pos };
     }
 
-    throw new FilterParseError(`Unexpected character '${ch}'`, start);
+    throw new FilterParseError(`Unexpected character '${ch}'`, start, start + 1);
   }
 
   private skipWhitespace() {
@@ -482,6 +563,8 @@ export function parseUsdcStringToUnits(numStr: string, pos = 0): bigint {
     throw new FilterParseError(
       `USDC amount "${trimmed}" exceeds maximum precision of 7 decimals`,
       pos,
+      end ?? pos + numStr.length,
+      "FILTER_USDC_PRECISION",
     );
   }
 
@@ -528,7 +611,7 @@ export function countFilterTokens(input: string, maxTokens: number = MAX_FILTER_
     }
     count++;
     if (count > maxTokens) {
-      throw new FilterTokenLimitError(count, maxTokens);
+      throw new FilterTokenLimitError(count, maxTokens, { start: token.pos, end: token.end });
     }
   }
   return count;
@@ -562,7 +645,10 @@ export class FilterParser {
     if (this.currentToken.type !== "EOF") {
       this.tokenCount++;
       if (this.tokenCount > this.maxTokens) {
-        throw new FilterTokenLimitError(this.tokenCount, this.maxTokens);
+        throw new FilterTokenLimitError(this.tokenCount, this.maxTokens, {
+          start: this.currentToken.pos,
+          end: this.currentToken.end,
+        });
       }
     }
     return this.currentToken;
@@ -571,16 +657,23 @@ export class FilterParser {
   public parseRule(rawExpression: string): FilterRule {
     let eventName: string | undefined;
     let eventNamePos: number | undefined;
+    let eventNameEnd: number | undefined;
 
     // Check if expression starts with an event name (identifier not equal to 'where')
     if (this.currentToken.type === "IDENTIFIER") {
       eventName = this.currentToken.text;
       eventNamePos = this.currentToken.pos;
+      eventNameEnd = this.currentToken.end;
       this.advance();
 
       // Check if event name is known if schemas are defined
       if (EVENT_PAYLOAD_SCHEMAS && !(eventName in EVENT_PAYLOAD_SCHEMAS)) {
-        throw new FilterParseError(`Unknown event name "${eventName}"`, eventNamePos);
+        throw new FilterParseError(
+          `Unknown event name "${boundedTokenLabel(eventName)}"`,
+          eventNamePos,
+          eventNameEnd,
+          "FILTER_UNKNOWN_EVENT",
+        );
       }
     }
 
@@ -592,32 +685,36 @@ export class FilterParser {
     } else if (this.currentToken.type !== "EOF") {
       if (!eventName) {
         throw new FilterParseError(
-          `Unexpected token "${this.currentToken.text}". Expected event name or 'where'`,
+          `Unexpected token "${boundedTokenLabel(this.currentToken.text)}". Expected event name or 'where'`,
           this.currentToken.pos,
+          this.currentToken.end,
         );
       } else {
         throw new FilterParseError(
-          `Expected 'where' or end of expression, got "${this.currentToken.text}"`,
+          `Expected 'where' or end of expression, got "${boundedTokenLabel(this.currentToken.text)}"`,
           this.currentToken.pos,
+          this.currentToken.end,
         );
       }
     }
 
     if (this.currentToken.type !== "EOF") {
       throw new FilterParseError(
-        `Unexpected extra input "${this.currentToken.text}"`,
+        `Unexpected extra input "${boundedTokenLabel(this.currentToken.text)}"`,
         this.currentToken.pos,
+        this.currentToken.end,
       );
     }
 
-    // Validate fields against schema if eventName is specified
-    if (condition && eventName) {
+    // Validate fields and unit compatibility against schema
+    if (condition) {
       validateConditionAgainstSchema(condition, eventName);
     }
 
     return {
       eventName,
       eventNamePos,
+      eventNameEnd,
       condition,
       rawExpression,
     };
@@ -661,7 +758,11 @@ export class FilterParser {
       this.advance();
       const expr = this.parseExpression();
       if ((this.currentToken.type as TokenType) !== "RPAREN") {
-        throw new FilterParseError("Expected closing ')'", this.currentToken.pos);
+        throw new FilterParseError(
+          "Expected closing ')'",
+          this.currentToken.pos,
+          this.currentToken.end,
+        );
       }
       this.currentDepth--;
       this.advance();
@@ -674,35 +775,45 @@ export class FilterParser {
   private parseComparison(): ExprNode {
     if ((this.currentToken.type as TokenType) !== "IDENTIFIER") {
       throw new FilterParseError(
-        `Expected field name, found "${this.currentToken.text || "EOF"}"`,
+        `Expected field name, found "${boundedTokenLabel(this.currentToken.text || "EOF")}"`,
         this.currentToken.pos,
+        this.currentToken.end,
       );
     }
 
     const field = this.currentToken.text;
     const fieldPos = this.currentToken.pos;
+    const fieldEnd = this.currentToken.end;
     this.advance();
 
     if ((this.currentToken.type as TokenType) !== "OP") {
       throw new FilterParseError(
-        `Expected comparison operator (==, !=, <, <=, >, >=), found "${this.currentToken.text || "EOF"}"`,
+        `Expected comparison operator (==, !=, <, <=, >, >=), found "${boundedTokenLabel(this.currentToken.text || "EOF")}"`,
         this.currentToken.pos,
+        this.currentToken.end,
       );
     }
 
     const op = this.currentToken.text as ComparisonOp;
+    const opPos = this.currentToken.pos;
+    const opEnd = this.currentToken.end;
     this.advance();
 
     const valuePos = this.currentToken.pos;
+    const valueEnd = this.currentToken.end;
     const value = this.parseLiteral();
 
     return {
       type: "comparison",
       op,
+      opPos,
+      opEnd,
       field,
       fieldPos,
+      fieldEnd,
       value,
       valuePos,
+      valueEnd,
     };
   }
 
@@ -733,30 +844,56 @@ export class FilterParser {
     }
 
     throw new FilterParseError(
-      `Expected literal value (string, number, USDC amount, or boolean), got "${tok.text || "EOF"}"`,
+      `Expected literal value (string, number, USDC amount, or boolean), got "${boundedTokenLabel(tok.text || "EOF")}"`,
       tok.pos,
+      tok.end,
     );
   }
 }
 
-/** Validate fields and types in condition against the given event payload schema. */
-export function validateConditionAgainstSchema(condition: ExprNode, eventName: string): void {
-  const schema = EVENT_PAYLOAD_SCHEMAS[eventName];
-  if (!schema) return;
-  const currentSchema = schema;
+/** Validate a single comparison node against its resolved FieldDefinition. */
+function validateComparisonField(
+  node: Extract<ExprNode, { type: "comparison" }>,
+  fieldDef: FieldDefinition,
+): void {
+  switch (fieldDef.type) {
+    case "string":
+      if (node.value.kind !== "string") {
+        throw new FilterParseError(
+          `Field "${node.field}" is a string, but got ${node.value.kind} literal`,
+          node.valuePos,
+        );
+      }
+      if (node.op !== "==" && node.op !== "!=") {
+        throw new FilterParseError(
+          `Operator "${node.op}" cannot be used on string field "${node.field}" (only == and != are supported)`,
+          node.fieldPos,
+        );
+      }
+      break;
 
-  function traverse(node: ExprNode): void {
-    if (node.type === "logical") {
-      traverse(node.left);
-      traverse(node.right);
-      return;
-    }
+    case "boolean":
+      if (node.value.kind !== "boolean") {
+        throw new FilterParseError(
+          `Field "${node.field}" is a boolean, but got ${node.value.kind} literal`,
+          node.valuePos,
+        );
+      }
+      if (node.op !== "==" && node.op !== "!=") {
+        throw new FilterParseError(
+          `Operator "${node.op}" cannot be used on boolean field "${node.field}"`,
+          node.fieldPos,
+        );
+      }
+      break;
 
     const fieldDef = currentSchema[node.field];
     if (!fieldDef) {
       throw new FilterParseError(
-        `Unknown field "${node.field}" for event "${eventName}"`,
+        `Unknown field "${boundedTokenLabel(node.field)}" for event "${eventName}"`,
         node.fieldPos,
+        node.fieldEnd,
+        "FILTER_UNKNOWN_FIELD",
       );
     }
 
@@ -767,12 +904,16 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
           throw new FilterParseError(
             `Field "${node.field}" is a string, but got ${node.value.kind} literal`,
             node.valuePos,
+            node.valueEnd,
+            "FILTER_TYPE_MISMATCH",
           );
         }
         if (node.op !== "==" && node.op !== "!=") {
           throw new FilterParseError(
             `Operator "${node.op}" cannot be used on string field "${node.field}" (only == and != are supported)`,
-            node.fieldPos,
+            node.opPos,
+            node.opEnd,
+            "FILTER_OPERATOR_NOT_SUPPORTED",
           );
         }
         break;
@@ -782,12 +923,16 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
           throw new FilterParseError(
             `Field "${node.field}" is a boolean, but got ${node.value.kind} literal`,
             node.valuePos,
+            node.valueEnd,
+            "FILTER_TYPE_MISMATCH",
           );
         }
         if (node.op !== "==" && node.op !== "!=") {
           throw new FilterParseError(
             `Operator "${node.op}" cannot be used on boolean field "${node.field}"`,
-            node.fieldPos,
+            node.opPos,
+            node.opEnd,
+            "FILTER_OPERATOR_NOT_SUPPORTED",
           );
         }
         break;
@@ -796,8 +941,23 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
         // Bigint fields (like stake, amount) can be compared to usdc literals or numbers
         if (node.value.kind !== "usdc" && node.value.kind !== "number") {
           throw new FilterParseError(
-            `Field "${node.field}" is a numeric/USDC amount, but got ${node.value.kind} literal`,
+            `Field "${node.field}" is a USDC amount, but got ${node.value.kind} literal`,
             node.valuePos,
+          );
+        }
+      } else {
+        if (node.value.kind === "usdc") {
+          throw new FilterParseError(
+            `Mixed-unit comparison: field "${node.field}" is not a USDC amount, cannot compare with usdc literal`,
+            node.valuePos,
+          );
+        }
+        if (node.value.kind !== "number") {
+          throw new FilterParseError(
+            `Field "${node.field}" is an integer, but got ${node.value.kind} literal`,
+            node.valuePos,
+            node.valueEnd,
+            "FILTER_TYPE_MISMATCH",
           );
         }
         if (node.value.kind === "number") {
@@ -809,11 +969,63 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
       case "number":
         if (node.value.kind !== "number") {
           throw new FilterParseError(
-            `Field "${node.field}" is a number, but got ${node.value.kind} literal`,
+            `Field "${node.field}" is an integer, cannot compare with fractional number ${node.value.value}`,
             node.valuePos,
+            node.valueEnd,
+            "FILTER_TYPE_MISMATCH",
           );
         }
-        break;
+      }
+      break;
+
+    case "number":
+      if (node.value.kind === "usdc") {
+        throw new FilterParseError(
+          `Mixed-unit comparison: field "${node.field}" is a number (not a USDC amount), cannot compare with usdc literal`,
+          node.valuePos,
+        );
+      }
+      if (node.value.kind !== "number") {
+        throw new FilterParseError(
+          `Field "${node.field}" is a number, but got ${node.value.kind} literal`,
+          node.valuePos,
+        );
+      }
+      break;
+  }
+}
+
+/**
+ * Validate fields, types, and unit compatibility in condition against the event
+ * payload schema (or global known fields when eventName is omitted).
+ */
+export function validateConditionAgainstSchema(condition: ExprNode, eventName?: string): void {
+  const schema = eventName ? EVENT_PAYLOAD_SCHEMAS[eventName] : undefined;
+  if (eventName && !schema) return;
+
+  function traverse(node: ExprNode): void {
+    if (node.type === "logical") {
+      traverse(node.left);
+      traverse(node.right);
+      return;
+    }
+
+    if (schema) {
+      const fieldDef = schema[node.field];
+      if (!fieldDef) {
+        throw new FilterParseError(
+          `Unknown field "${node.field}" for event "${eventName}"`,
+          node.fieldPos,
+        );
+      }
+      validateComparisonField(node, fieldDef);
+      return;
+    }
+
+    // Event-less rule: validate any known schema/metadata field to catch mixed-unit comparisons early.
+    const knownFieldDef = GLOBAL_FIELD_SCHEMAS[node.field];
+    if (knownFieldDef) {
+      validateComparisonField(node, knownFieldDef);
     }
   }
 
@@ -836,7 +1048,7 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
  * @throws {@link FilterParseError} on invalid syntax, unknown fields, or type mismatches.
  */
 export function parseFilterExpression(input: string, options?: FilterParserOptions): FilterRule {
-  const parser = new FilterParser(input.trim(), options);
+  const parser = new FilterParser(input, options);
   return parser.parseRule(input);
 }
 
@@ -1001,8 +1213,9 @@ function compareValues(
   actual: unknown,
   op: ComparisonOp,
   literal: LiteralValue,
+  isUsdcAmount = false,
 ): boolean {
-  // BigInt actual value comparison (e.g. stake, amount in DecodedEvent)
+  // BigInt actual value comparison (USDC atomic amounts or integer counts like shares)
   if (typeof actual === "bigint") {
     let targetBigInt: bigint;
     if (literal.kind === "usdc") {
@@ -1011,7 +1224,10 @@ function compareValues(
       const raw = literal.raw ?? String(literal.value);
       targetBigInt = parseUsdcStringToUnits(raw);
     } else {
-      return false;
+      if (literal.kind !== "number" || !Number.isInteger(literal.value)) {
+        return false;
+      }
+      targetBigInt = BigInt(literal.value);
     }
 
     switch (op) {
@@ -1030,16 +1246,12 @@ function compareValues(
     }
   }
 
-  // Number actual value comparison (e.g. claimId, confidence, side)
+  // Number actual value comparison (e.g. claimId, confidence, side, ledger)
   if (typeof actual === "number") {
-    let targetNum: number;
-    if (literal.kind === "number") {
-      targetNum = literal.value;
-    } else if (literal.kind === "usdc") {
-      targetNum = Number(literal.atomic) / Number(USDC_SCALE);
-    } else {
+    if (literal.kind !== "number") {
       return false;
     }
+    const targetNum = literal.value;
 
     switch (op) {
       case "==":

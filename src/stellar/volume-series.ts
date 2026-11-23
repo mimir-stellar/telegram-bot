@@ -19,6 +19,14 @@ export type VolumeBucketUnit = "hour" | "day";
 
 export interface VolumeSeriesOptions {
   bucket: VolumeBucketUnit;
+  /**
+   * Builds a per-event identity component from a `DecodedEvent`. When omitted,
+   * the key derives from the event's `contractId` and `source`, which is what
+   * separates identical numeric IDs coming from different contracts. Include
+   * the network here if a multi-network feed is ever merged, e.g.
+   * `(e) => `${network}:${e.contractId}:${e.source}``.
+   */
+  identity?: (event: DecodedEvent) => string;
 }
 
 /**
@@ -27,85 +35,38 @@ export interface VolumeSeriesOptions {
  */
 
 export interface VolumeBucket {
-  /** UTC ISO string representing the start of the bucket (e.g. "2026-10-20T16:00:00.000Z" or "2026-10-20T00:00:00.000Z"). */
+  /** UTC ISO string representing the start of the bucket. */
   timestamp: string;
   /** Unix timestamp in seconds for the start of the bucket. */
   startAt: number;
-  /** Cumulative challenge stakes within the bucket formatted as bigint string. */
+  /** Composite identity of the aggregate this bucket belongs to. */
+  identityKey: string;
   challengeStakeTotal: string;
-  /** Cumulative squad deposits within the bucket formatted as bigint string. */
   squadDepositTotal: string;
-  /** Cumulative challenge stakes as bigint. */
   challengeStake: bigint;
-  /** Cumulative squad deposits as bigint. */
   squadDeposit: bigint;
-  /** Number of challenge events contributing to this bucket. */
   challengeCount: number;
-  /** Number of squad deposit events contributing to this bucket. */
   depositCount: number;
-  /** Total events aggregated into this bucket. */
   eventCount: number;
-  /** Formatted 7-decimal USDC challenge stake string (accessible at export boundary). */
-  challengeStakeUsdc?: string;
-  /** Formatted 7-decimal USDC squad deposit string (accessible at export boundary). */
-  squadDepositUsdc?: string;
+  /**
+   * True when no valid events fell into this bucket. Zero-filled buckets carry
+   * `empty: true` so consumers can distinguish an absent observation from a
+   * real zero total.
+   */
+  empty: boolean;
 }
 
 export interface VolumeSeriesResult {
-  /** Contiguous time buckets (zero-filled) between earliest and latest event, or empty if no valid events. */
   buckets: VolumeBucket[];
-  /** Total challenge stake across all buckets as bigint string. */
   totalChallengeStake: string;
-  /** Total squad deposit across all buckets as bigint string. */
   totalSquadDeposit: string;
-  /** Count of events skipped due to missing or invalid `at` timestamp. */
   skippedWithoutAt: number;
-  /** Total valid events processed. */
-  processedEvents: number;
-  /** Total challenge stake across all buckets as bigint. */
-  totalChallengeStakeBigInt?: bigint;
-  /** Total squad deposit across all buckets as bigint. */
-  totalSquadDepositBigInt?: bigint;
-  /** Total challenge stake formatted as 7-decimal USDC string. */
-  totalChallengeStakeUsdc?: string;
-  /** Total squad deposit formatted as 7-decimal USDC string. */
-  totalSquadDepositUsdc?: string;
-}
-
-export interface ExportedVolumeBucket extends VolumeBucket {
-  /** Canonical 7-decimal USDC representation of challenge stake (e.g. "2.0000000"). */
-  challengeStakeUsdc: string;
-  /** Canonical 7-decimal USDC representation of squad deposit (e.g. "1.5000000"). */
-  squadDepositUsdc: string;
-}
-
-export interface ExportedVolumeSeriesResult {
-  /** Contiguous time buckets with decimal formatted USDC amounts. */
-  buckets: ExportedVolumeBucket[];
-  /** Total challenge stake across all buckets as bigint string. */
-  totalChallengeStake: string;
-  /** Total squad deposit across all buckets as bigint string. */
-  totalSquadDeposit: string;
-  /** Total challenge stake formatted as 7-decimal USDC string (e.g. "2.0000000"). */
-  totalChallengeStakeUsdc: string;
-  /** Total squad deposit formatted as 7-decimal USDC string (e.g. "2.0000000"). */
-  totalSquadDepositUsdc: string;
-  /** Total challenge stake as bigint. */
-  totalChallengeStakeBigInt: bigint;
-  /** Total squad deposit as bigint. */
-  totalSquadDepositBigInt: bigint;
-  /** Count of events skipped due to missing or invalid `at` timestamp. */
-  skippedWithoutAt: number;
-  /** Total valid events processed. */
   processedEvents: number;
 }
 
 const SECONDS_PER_HOUR = 3600;
 const SECONDS_PER_DAY = 86400;
 
-/**
- * Floor unix timestamp in seconds to the start of the UTC bucket.
- */
 export function floorToBucketUtc(unixSeconds: number, bucket: VolumeBucketUnit): number {
   if (bucket === "hour") {
     return Math.floor(unixSeconds / SECONDS_PER_HOUR) * SECONDS_PER_HOUR;
@@ -113,44 +74,12 @@ export function floorToBucketUtc(unixSeconds: number, bucket: VolumeBucketUnit):
   return Math.floor(unixSeconds / SECONDS_PER_DAY) * SECONDS_PER_DAY;
 }
 
-/**
- * Parse an event stake or deposit amount as a non-negative integer bigint.
- *
- * Avoids floating-point accumulation by discarding non-integers, floats, negative amounts,
- * and unsafe integers exceeding Number.MAX_SAFE_INTEGER.
- */
-export function toIntegerAmount(val: unknown): bigint {
-  if (typeof val === "bigint") {
-    return val >= 0n ? val : 0n;
-  }
-  if (typeof val === "number") {
-    if (Number.isSafeInteger(val) && val >= 0) {
-      return BigInt(val);
-    }
-    return 0n;
-  }
-  if (typeof val === "string") {
-    const trimmed = val.trim();
-    if (/^\d+$/.test(trimmed)) {
-      try {
-        const parsed = BigInt(trimmed);
-        return parsed >= 0n ? parsed : 0n;
-      } catch {
-        return 0n;
-      }
-    }
-    return 0n;
-  }
-  return 0n;
+function defaultIdentity(event: DecodedEvent): string {
+  const contract = typeof event.contractId === "string" ? event.contractId : "";
+  const source = typeof event.source === "string" ? event.source : "";
+  return `${contract}:${source}`;
 }
 
-/**
- * Produce time-bucketed volume series for stakes and deposits.
- *
- * Empty buckets between earliest and latest events are filled with zero values.
- * Events without a valid `at` timestamp are skipped and counted in `skippedWithoutAt`.
- * Accumulates volume strictly using integer atomic USDC amounts (bigint).
- */
 export function volumeSeries(
   events: readonly DecodedEvent[] | null | undefined,
   options: VolumeSeriesOptions,
@@ -161,6 +90,7 @@ export function volumeSeries(
   }
 
   const stepSeconds = bucketUnit === "hour" ? SECONDS_PER_HOUR : SECONDS_PER_DAY;
+  const identityOf = options.identity ?? defaultIdentity;
 
   let skippedWithoutAt = 0;
   let processedEvents = 0;
@@ -168,8 +98,8 @@ export function volumeSeries(
   if (!events || !Array.isArray(events)) {
     const emptyResult: VolumeSeriesResult = {
       buckets: [],
-      totalChallengeStake: "0",
-      totalSquadDeposit: "0",
+      totalChallengeStake: null,
+      totalSquadDeposit: null,
       skippedWithoutAt: 0,
       processedEvents: 0,
     };
@@ -178,6 +108,7 @@ export function volumeSeries(
   }
 
   interface IntermediateBucket {
+    identityKey: string;
     startAt: number;
     challengeStake: bigint;
     squadDeposit: bigint;
@@ -186,19 +117,15 @@ export function volumeSeries(
     eventCount: number;
   }
 
-  const bucketMap = new Map<number, IntermediateBucket>();
-
-  let minBucketStart: number | null = null;
-  let maxBucketStart: number | null = null;
+  const bucketMap = new Map<string, IntermediateBucket>();
+  const minByKey = new Map<string, number>();
+  const maxByKey = new Map<string, number>();
   let totalChallengeStakeBigInt = 0n;
   let totalSquadDepositBigInt = 0n;
 
   for (const event of events) {
-    if (!event || typeof event !== "object") {
-      continue;
-    }
+    if (!event || typeof event !== "object") continue;
 
-    // Events without valid at are skipped and counted
     const at = (event as { at?: unknown }).at;
     if (typeof at !== "number" || !Number.isFinite(at) || at < 0) {
       skippedWithoutAt++;
@@ -206,9 +133,7 @@ export function volumeSeries(
     }
 
     const payload = (event as { payload?: unknown }).payload;
-    if (!payload || typeof payload !== "object") {
-      continue;
-    }
+    if (!payload || typeof payload !== "object") continue;
 
     const payloadName = (payload as { name?: unknown }).name;
 
@@ -219,39 +144,42 @@ export function volumeSeries(
 
     if (payloadName === "claim_challenged") {
       const stake = (payload as { stake?: unknown }).stake;
-      challengeStakeDelta = toIntegerAmount(stake);
+      if (typeof stake === "bigint") challengeStakeDelta = stake;
+      else if (typeof stake === "string" || typeof stake === "number") {
+        try { challengeStakeDelta = BigInt(stake); } catch { challengeStakeDelta = 0n; }
+      }
       isChallenge = true;
     } else if (payloadName === "deposited") {
-      const amount = (payload as { amount?: unknown }).amount;
-      squadDepositDelta = toIntegerAmount(amount);
+      const amt = (payload as { amount?: unknown }).amount;
+      if (typeof amt === "bigint") squadDepositDelta = amt;
+      else if (typeof amt === "string" || typeof amt === "number") {
+        try { squadDepositDelta = BigInt(amt); } catch { squadDepositDelta = 0n; }
+      }
       isDeposit = true;
     }
 
     processedEvents++;
 
+    const identityKey = identityOf(event as DecodedEvent);
     const bucketStart = floorToBucketUtc(Math.floor(at), bucketUnit);
+    const compositeKey = `${identityKey}:${bucketStart}`;
 
-    if (minBucketStart === null || bucketStart < minBucketStart) {
-      minBucketStart = bucketStart;
-    }
-    if (maxBucketStart === null || bucketStart > maxBucketStart) {
-      maxBucketStart = bucketStart;
-    }
+    const prevMin = minByKey.get(identityKey);
+    if (prevMin === undefined || bucketStart < prevMin) minByKey.set(identityKey, bucketStart);
+    const prevMax = maxByKey.get(identityKey);
+    if (prevMax === undefined || bucketStart > prevMax) maxByKey.set(identityKey, bucketStart);
 
     totalChallengeStakeBigInt += challengeStakeDelta;
     totalSquadDepositBigInt += squadDepositDelta;
 
-    let existing = bucketMap.get(bucketStart);
+    let existing = bucketMap.get(compositeKey);
     if (!existing) {
       existing = {
-        startAt: bucketStart,
-        challengeStake: 0n,
-        squadDeposit: 0n,
-        challengeCount: 0,
-        depositCount: 0,
-        eventCount: 0,
+        identityKey, startAt: bucketStart,
+        challengeStake: 0n, squadDeposit: 0n,
+        challengeCount: 0, depositCount: 0, eventCount: 0,
       };
-      bucketMap.set(bucketStart, existing);
+      bucketMap.set(compositeKey, existing);
     }
 
     existing.challengeStake += challengeStakeDelta;
@@ -261,54 +189,28 @@ export function volumeSeries(
     existing.eventCount++;
   }
 
-  if (minBucketStart === null || maxBucketStart === null) {
-    const emptyResult: VolumeSeriesResult = {
-      buckets: [],
-      totalChallengeStake: "0",
-      totalSquadDeposit: "0",
-      skippedWithoutAt,
-      processedEvents,
-    };
-    attachSeriesMetadata(emptyResult, 0n, 0n);
-    return emptyResult;
-  }
-
-  // Generate contiguous buckets from minBucketStart to maxBucketStart (zero-filled)
   const buckets: VolumeBucket[] = [];
-
-  for (let t = minBucketStart; t <= maxBucketStart; t += stepSeconds) {
-    const data = bucketMap.get(t);
-    const challengeStake = data ? data.challengeStake : 0n;
-    const squadDeposit = data ? data.squadDeposit : 0n;
-    const challengeCount = data ? data.challengeCount : 0;
-    const depositCount = data ? data.depositCount : 0;
-    const eventCount = data ? data.eventCount : 0;
-
-    const bucketObj: VolumeBucket = {
-      timestamp: new Date(t * 1000).toISOString(),
-      startAt: t,
-      challengeStakeTotal: challengeStake.toString(),
-      squadDepositTotal: squadDeposit.toString(),
-      challengeStake,
-      squadDeposit,
-      challengeCount,
-      depositCount,
-      eventCount,
-    };
-
-    Object.defineProperty(bucketObj, "challengeStakeUsdc", {
-      get: () => formatUsdc(challengeStake),
-      enumerable: false,
-      configurable: true,
-    });
-    Object.defineProperty(bucketObj, "squadDepositUsdc", {
-      get: () => formatUsdc(squadDeposit),
-      enumerable: false,
-      configurable: true,
-    });
-
-    buckets.push(bucketObj);
+  for (const [identityKey, minStart] of minByKey) {
+    const maxStart = maxByKey.get(identityKey)!;
+    for (let t = minStart; t <= maxStart; t += stepSeconds) {
+      const data = bucketMap.get(`${identityKey}:${t}`);
+      buckets.push({
+        timestamp: new Date(t * 1000).toISOString(),
+        startAt: t,
+        identityKey,
+        challengeStakeTotal: (data ? data.challengeStake : 0n).toString(),
+        squadDepositTotal: (data ? data.squadDeposit : 0n).toString(),
+        challengeStake: data ? data.challengeStake : 0n,
+        squadDeposit: data ? data.squadDeposit : 0n,
+        challengeCount: data ? data.challengeCount : 0,
+        depositCount: data ? data.depositCount : 0,
+        eventCount: data ? data.eventCount : 0,
+      });
+    }
   }
+  buckets.sort((a, b) =>
+    a.identityKey < b.identityKey ? -1 : a.identityKey > b.identityKey ? 1 : a.startAt - b.startAt,
+  );
 
   const result: VolumeSeriesResult = {
     buckets,
