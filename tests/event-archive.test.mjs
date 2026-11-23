@@ -8,7 +8,8 @@ import {
   createEventArchive,
   MalformedArchiveRecordError,
   readArchive,
-  validateArchiveMetadata,
+  writeArchiveManifest,
+  verifyArchiveManifest,
 } from "../dist/stellar/archive.js";
 import { withTempDataDir } from "./helpers/temp-data.mjs";
 
@@ -217,6 +218,64 @@ test("archive reports malformed record line without payload and retains valid pr
   });
 });
 
+test("manifest verification accepts an intact hash-chained archive", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-archive");
+    const archive = createEventArchive({ dir: archiveDir });
+    await archive.append([makeDummyEvent(1), makeDummyEvent(2), makeDummyEvent(3)]);
+    await archive.close();
+
+    const manifest = await writeArchiveManifest(archiveDir, {
+      network: "testnet",
+      ledgerMin: 101,
+      ledgerMax: 103,
+    });
+    assert.equal(manifest.recordCount, 3);
+    assert.equal(manifest.network, "testnet");
+
+    const result = await verifyArchiveManifest(archiveDir);
+    assert.equal(result.ok, true);
+    assert.equal(result.recordCount, 3);
+  });
+});
+
+test("manifest verification rejects altered, reordered and missing records", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-archive");
+    const archive = createEventArchive({ dir: archiveDir });
+    await archive.append([makeDummyEvent(1), makeDummyEvent(2), makeDummyEvent(3)]);
+    await archive.close();
+    await writeArchiveManifest(archiveDir, {
+      network: "testnet",
+      ledgerMin: 101,
+      ledgerMax: 103,
+    });
+
+    const files = (await import("node:fs/promises"))
+      .readdir(archiveDir)
+      .then((names) => names.filter((n) => n.endsWith(".jsonl")));
+    const [fileName] = await files;
+    const filePath = path.join(archiveDir, fileName);
+    const original = (await import("node:fs/promises")).readFile(filePath, "utf8");
+    const lines = (await original).split("\n").filter(Boolean);
+
+    // Altered record
+    await writeFile(filePath, lines.map((l, i) => (i === 1 ? l.replace("event-2", "event-X") : l)).join("\n") + "\n", "utf8");
+    const altered = await verifyArchiveManifest(archiveDir);
+    assert.equal(altered.ok, false);
+
+    // Reordered records
+    await writeFile(filePath, [lines[1], lines[0], lines[2]].join("\n") + "\n", "utf8");
+    const reordered = await verifyArchiveManifest(archiveDir);
+    assert.equal(reordered.ok, false);
+
+    // Missing record
+    await writeFile(filePath, [lines[0], lines[2]].join("\n") + "\n", "utf8");
+    const missing = await verifyArchiveManifest(archiveDir);
+    assert.equal(missing.ok, false);
+  });
+});
+
 test("archive accepts LF and CRLF input without changing record identities and writes canonical LF", async () => {
   await withTempDataDir(async (tmp) => {
     const lfDir = tmp.file("events-lf");
@@ -275,92 +334,5 @@ test("archive reports exact line number for malformed record in CRLF input", asy
     assert.ok(caught instanceof MalformedArchiveRecordError);
     assert.equal(caught.fileName, fileName);
     assert.equal(caught.lineNumber, 3);
-  });
-});
-
-test("archive validates network and contract metadata before event iteration begins", async () => {
-  await withTempDataDir(async (tmp) => {
-    const archiveDir = tmp.file("events-archive-meta");
-    const archive = createEventArchive({
-      dir: archiveDir,
-      metadata: { network: "testnet", contractId: "C1234567890" },
-    });
-
-    await archive.append([makeDummyEvent(1), makeDummyEvent(2)]);
-    await archive.close();
-
-    const meta = await validateArchiveMetadata(archiveDir, {
-      expectedNetwork: "testnet",
-      expectedContractId: "C1234567890",
-    });
-    assert.deepEqual(meta, { network: "testnet", contractId: "C1234567890" });
-
-    const validEvents = [];
-    for await (const ev of readArchive(archiveDir, {
-      expectedNetwork: "testnet",
-      expectedContractId: "C1234567890",
-    })) {
-      validEvents.push(ev);
-    }
-    assert.equal(validEvents.length, 2);
-
-    // Contradictory expectedNetwork must reject before yielding any events, even with retainCommitted
-    const yieldedOnConflict = [];
-    let networkError;
-    try {
-      for await (const ev of readArchive(archiveDir, {
-        retainCommitted: true,
-        expectedNetwork: "mainnet",
-      })) {
-        yieldedOnConflict.push(ev);
-      }
-    } catch (err) {
-      networkError = err;
-    }
-    assert.ok(networkError instanceof ArchiveMetadataConflictError);
-    assert.equal(yieldedOnConflict.length, 0);
-
-    // Contradictory expectedContractId must reject before yielding any events
-    await assert.rejects(
-      async () => {
-        for await (const _ of readArchive(archiveDir, { expectedContractId: "COTHER" })) {
-          // should not yield
-        }
-      },
-      ArchiveMetadataConflictError,
-    );
-  });
-});
-
-test("archive conflict in a later file prevents any earlier event from being yielded, including retainCommitted: true", async () => {
-  await withTempDataDir(async (tmp) => {
-    const archiveDir = tmp.file("events-archive-conflict");
-    await mkdir(archiveDir, { recursive: true });
-
-    await writeFile(
-      path.join(archiveDir, "events-2026-01-01T00-00-00-000Z-000001.jsonl"),
-      `${JSON.stringify({ type: "metadata", network: "testnet", contractId: "C1234567890" })}\n` +
-        `${JSON.stringify({ ...makeDummyEvent(1), payload: { name: "claim_created" } })}\n`,
-      "utf8",
-    );
-    await writeFile(
-      path.join(archiveDir, "events-2026-01-01T00-00-01-000Z-000002.jsonl"),
-      `${JSON.stringify({ type: "metadata", network: "mainnet", contractId: "C1234567890" })}\n` +
-        `${JSON.stringify({ ...makeDummyEvent(2), payload: { name: "claim_created" } })}\n`,
-      "utf8",
-    );
-
-    const yielded = [];
-    let caught;
-    try {
-      for await (const ev of readArchive(archiveDir, { retainCommitted: true })) {
-        yielded.push(ev);
-      }
-    } catch (error) {
-      caught = error;
-    }
-
-    assert.ok(caught instanceof ArchiveMetadataConflictError);
-    assert.equal(yielded.length, 0);
   });
 });

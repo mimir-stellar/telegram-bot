@@ -1,7 +1,11 @@
-import { open, mkdir, readdir, unlink, chmod } from "node:fs/promises";
+import { createHash, type Hash } from "node:crypto";
+import { open, mkdir, readdir, readFile, rename, rm, unlink, chmod, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
+import { validateLedgerRange, type LedgerRange } from "./ledger-range.js";
+
+export { validateLedgerRange, type LedgerRange };
 
 export interface ArchiveMetadata {
   network?: string;
@@ -191,94 +195,191 @@ async function listArchiveFiles(dir: string): Promise<string[]> {
   }
 }
 
-function isMetadataRecord(
-  value: unknown,
-): value is { type: "metadata"; network?: unknown; contractId?: unknown } {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as { type?: unknown }).type === "metadata"
-  );
+export interface CompactArchiveOptions {
+  /** Maximum bytes per output file. Defaults to the archive's 10 MiB rotation size. */
+  maxBytes?: number;
+}
+
+export interface CompactArchiveResult {
+  /** Events retained because their ledger fell inside the requested range. */
+  retained: number;
+  /** Events dropped because their ledger fell outside the requested range. */
+  dropped: number;
+  /** Number of JSONL files in the compacted archive. */
+  files: number;
+  /** SHA-256 of the compacted archive's canonical JSONL records, for evidence. */
+  digest: string;
+}
+
+let compactSequence = 0;
+
+/** Hash one record exactly as `createEventArchive` serializes it. */
+function hashArchiveRecord(hash: Hash, event: DecodedEvent): void {
+  hash.update(JSON.stringify(event, scanJsonReplacer) + "\n");
 }
 
 /**
- * Validate archive metadata across all files in `dir` before event iteration begins.
- * Rejects archives with contradictory network or contractId metadata.
+ * Read a compacted archive back and prove that it contains exactly the
+ * retained records: same count, same content digest, every ledger in range.
  */
-export async function validateArchiveMetadata(
+async function verifyCompactedArchive(
   dir: string,
-  options: Pick<ReadArchiveOptions, "expectedNetwork" | "expectedContractId"> = {},
-): Promise<ArchiveMetadata> {
-  const files = await listArchiveFiles(dir);
-  let observedNetwork: string | undefined;
-  let observedContractId: string | undefined;
+  range: LedgerRange,
+  expectedCount: number,
+  expectedDigest: string,
+): Promise<string> {
+  const { firstLedger, lastLedger } = range;
+  const hash = createHash("sha256");
+  let count = 0;
 
-  for (const file of files) {
-    const filePath = path.join(dir, file);
-    const handle = await open(filePath, "r");
+  for await (const event of readArchive(dir)) {
+    if (
+      !Number.isSafeInteger(event.ledger) ||
+      event.ledger < firstLedger ||
+      event.ledger > lastLedger
+    ) {
+      throw new Error(
+        `Compaction verification failed: ledger ${event.ledger} is outside ` +
+          `[${firstLedger}, ${lastLedger}]`,
+      );
+    }
+    hashArchiveRecord(hash, event);
+    count += 1;
+  }
+
+  if (count !== expectedCount) {
+    throw new Error(
+      `Compaction verification failed: wrote ${expectedCount} records but read back ${count}`,
+    );
+  }
+
+  const digest = hash.digest("hex");
+  if (digest !== expectedDigest) {
+    throw new Error(
+      "Compaction verification failed: compacted records do not match the retained records",
+    );
+  }
+  return digest;
+}
+
+/**
+ * Move the verified compacted directory into place, restoring the source if
+ * the swap cannot complete. The source is only touched after verification.
+ */
+async function swapArchiveDirectory(
+  tmpDir: string,
+  dir: string,
+  oldDir: string,
+  hasContent: boolean,
+): Promise<void> {
+  await rename(dir, oldDir);
+  try {
+    if (hasContent) {
+      await rename(tmpDir, dir);
+    } else {
+      // An empty range leaves a valid, empty archive directory behind.
+      await mkdir(dir, { recursive: true });
+    }
+  } catch (err) {
     try {
-      const content = await handle.readFile({ encoding: "utf8" });
-      const lines = content.split(/\r?\n/);
-      for (let index = 0; index < lines.length; index += 1) {
-        const trimmed = lines[index]!.trim();
-        if (!trimmed) continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(trimmed);
-        } catch {
-          // Malformed JSON lines are handled during iteration so retainCommitted continues to work.
-          continue;
-        }
+      await rename(oldDir, dir);
+    } catch {
+      // best-effort restore; the original error is the actionable one
+    }
+    throw err;
+  }
 
-        if (isMetadataRecord(parsed)) {
-          const net = typeof parsed.network === "string" ? parsed.network : undefined;
-          const cid = typeof parsed.contractId === "string" ? parsed.contractId : undefined;
+  try {
+    await rm(oldDir, { recursive: true, force: true });
+  } catch {
+    // The compacted archive is already in place; a leftover backup is harmless.
+  }
+}
 
-          if (options.expectedNetwork !== undefined && net !== undefined && net !== options.expectedNetwork) {
-            throw new ArchiveMetadataConflictError(
-              `Archive network "${net}" contradicts expected network "${options.expectedNetwork}"`,
-            );
-          }
-          if (options.expectedContractId !== undefined && cid !== undefined && cid !== options.expectedContractId) {
-            throw new ArchiveMetadataConflictError(
-              `Archive contractId "${cid}" contradicts expected contractId "${options.expectedContractId}"`,
-            );
-          }
-          if (observedNetwork !== undefined && net !== undefined && net !== observedNetwork) {
-            throw new ArchiveMetadataConflictError(
-              `Contradictory archive network metadata: "${observedNetwork}" vs "${net}"`,
-            );
-          }
-          if (observedContractId !== undefined && cid !== undefined && cid !== observedContractId) {
-            throw new ArchiveMetadataConflictError(
-              `Contradictory archive contractId metadata: "${observedContractId}" vs "${cid}"`,
-            );
-          }
-          if (net !== undefined) observedNetwork = net;
-          if (cid !== undefined) observedContractId = cid;
-        } else if (typeof parsed === "object" && parsed !== null) {
-          const eventContractId = (parsed as { contractId?: unknown }).contractId;
-          const expectedCid = options.expectedContractId ?? observedContractId;
-          if (
-            expectedCid !== undefined &&
-            typeof eventContractId === "string" &&
-            eventContractId !== expectedCid
-          ) {
-            throw new ArchiveMetadataConflictError(
-              `Event contractId "${eventContractId}" contradicts expected contractId "${expectedCid}"`,
-            );
-          }
+/**
+ * Atomically compact an archive directory to an inclusive ledger range.
+ *
+ * Steps:
+ * 1. Stream every record from `dir` and write in-range records to a temporary
+ *    sibling directory (outside `dir`, so the source is untouched).
+ * 2. Read the temporary directory back and verify the record count, a SHA-256
+ *    digest of the canonical JSONL records, and that every retained ledger is
+ *    in range.
+ * 3. Only after verification, swap the compacted directory into place
+ *    (rename source aside, rename compacted copy in, remove the backup).
+ *
+ * A malformed source record, an I/O error, or a failed verification aborts the
+ * compaction with `dir` unchanged. Existing archive behavior is unaffected;
+ * this is an explicit maintenance operation over a settled capture.
+ */
+export async function compactArchive(
+  dir: string,
+  range: LedgerRange,
+  options: CompactArchiveOptions = {},
+): Promise<CompactArchiveResult> {
+  validateLedgerRange(range);
+
+  try {
+    await readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`Archive directory does not exist: ${dir}`);
+    }
+    throw err;
+  }
+
+  const { firstLedger, lastLedger } = range;
+  const suffix = `${process.pid}-${Date.now()}-${(compactSequence += 1)}`;
+  const tmpDir = `${dir}.compact-${suffix}`;
+  const oldDir = `${dir}.old-${suffix}`;
+
+  let retained = 0;
+  let dropped = 0;
+
+  try {
+    // --- Filter into a temporary sibling directory ---
+    const tmpArchive = createEventArchive({
+      dir: tmpDir,
+      maxBytes: options.maxBytes,
+      maxFiles: Number.MAX_SAFE_INTEGER,
+    });
+    const writeHash = createHash("sha256");
+
+    try {
+      for await (const event of readArchive(dir, { retainCommitted: true })) {
+        if (event.ledger >= firstLedger && event.ledger <= lastLedger) {
+          await tmpArchive.append([event]);
+          hashArchiveRecord(writeHash, event);
+          retained += 1;
+        } else {
+          dropped += 1;
         }
       }
     } finally {
-      await handle.close();
+      await tmpArchive.close();
     }
-  }
 
-  return {
-    ...(observedNetwork !== undefined ? { network: observedNetwork } : {}),
-    ...(observedContractId !== undefined ? { contractId: observedContractId } : {}),
-  };
+    // --- Verify before touching the source ---
+    const digest = await verifyCompactedArchive(
+      tmpDir,
+      range,
+      retained,
+      writeHash.digest("hex"),
+    );
+    const files = (await listArchiveFiles(tmpDir)).length;
+
+    // --- Swap the verified copy into place ---
+    await swapArchiveDirectory(tmpDir, dir, oldDir, files > 0);
+
+    return { retained, dropped, files, digest };
+  } catch (err) {
+    try {
+      await rm(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup failure; the original error is the actionable one
+    }
+    throw err;
+  }
 }
 
 /**
@@ -332,4 +433,147 @@ export async function* readArchive(
   for (const event of stagedEvents) {
     yield event;
   }
+}
+/** File name of the hash-chained manifest stored alongside archive files. */
+export const ARCHIVE_MANIFEST_FILENAME = "archive.manifest.json";
+
+const MANIFEST_GENESIS_HASH = "0".repeat(64);
+
+/**
+ * Hash-chained manifest binding an archive's ordered records, network and
+ * ledger bounds to a single digest. Each record hash commits to the previous
+ * one, so missing, reordered or altered records fail verification.
+ */
+export interface ArchiveManifest {
+  type: "archive-manifest";
+  version: 1;
+  network: string;
+  ledgerMin: number | null;
+  ledgerMax: number | null;
+  recordCount: number;
+  recordHashes: string[];
+  chainHead: string;
+}
+
+export interface ArchiveManifestBounds {
+  network: string;
+  ledgerMin: number | null;
+  ledgerMax: number | null;
+}
+
+export interface VerifyArchiveManifestResult {
+  ok: boolean;
+  recordCount: number;
+  reason?: string;
+}
+
+function manifestChainStep(prevHash: string, recordLine: string): string {
+  return createHash("sha256").update(`${prevHash}\n${recordLine}`, "utf8").digest("hex");
+}
+
+/** Read every non-blank record line of the archive in chronological order (LF-normalised). */
+async function readArchiveRecordLines(dir: string): Promise<string[]> {
+  const records: string[] = [];
+  for (const file of await listArchiveFiles(dir)) {
+    const content = await readFile(path.join(dir, file), "utf8");
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed) records.push(trimmed);
+    }
+  }
+  return records;
+}
+
+function chainRecords(records: readonly string[]): { recordHashes: string[]; chainHead: string } {
+  const recordHashes: string[] = [];
+  let head = MANIFEST_GENESIS_HASH;
+  for (const record of records) {
+    head = manifestChainStep(head, record);
+    recordHashes.push(head);
+  }
+  return { recordHashes, chainHead: head };
+}
+
+/**
+ * Write a hash-chained manifest for the archive in `dir`, atomically
+ * (`<manifest>.tmp` then rename). Returns the manifest written.
+ */
+export async function writeArchiveManifest(
+  dir: string,
+  bounds: ArchiveManifestBounds,
+): Promise<ArchiveManifest> {
+  const records = await readArchiveRecordLines(dir);
+  const { recordHashes, chainHead } = chainRecords(records);
+  const manifest: ArchiveManifest = {
+    type: "archive-manifest",
+    version: 1,
+    network: bounds.network,
+    ledgerMin: bounds.ledgerMin,
+    ledgerMax: bounds.ledgerMax,
+    recordCount: records.length,
+    recordHashes,
+    chainHead,
+  };
+  const target = path.join(dir, ARCHIVE_MANIFEST_FILENAME);
+  const tmp = `${target}.tmp`;
+  await writeFile(tmp, JSON.stringify(manifest, null, 2) + "\n", { encoding: "utf8", mode: FILE_MODE });
+  await rename(tmp, target);
+  return manifest;
+}
+
+/**
+ * Verify the archive in `dir` against its manifest. Fails closed when the
+ * manifest is missing or unparseable, and when any record is missing,
+ * reordered, altered, or outside the recorded ledger bounds.
+ */
+export async function verifyArchiveManifest(dir: string): Promise<VerifyArchiveManifestResult> {
+  let manifest: ArchiveManifest;
+  try {
+    manifest = JSON.parse(
+      await readFile(path.join(dir, ARCHIVE_MANIFEST_FILENAME), "utf8"),
+    ) as ArchiveManifest;
+  } catch (err) {
+    const missing = (err as NodeJS.ErrnoException)?.code === "ENOENT";
+    return { ok: false, recordCount: 0, reason: missing ? "manifest missing" : "manifest parse error" };
+  }
+  if (
+    manifest === null ||
+    typeof manifest !== "object" ||
+    manifest.type !== "archive-manifest" ||
+    !Array.isArray(manifest.recordHashes)
+  ) {
+    return { ok: false, recordCount: 0, reason: "manifest parse error" };
+  }
+
+  const records = await readArchiveRecordLines(dir);
+  if (records.length !== manifest.recordCount || records.length !== manifest.recordHashes.length) {
+    return { ok: false, recordCount: records.length, reason: "record count mismatch" };
+  }
+  let head = MANIFEST_GENESIS_HASH;
+  for (let i = 0; i < records.length; i += 1) {
+    head = manifestChainStep(head, records[i]!);
+    if (head !== manifest.recordHashes[i]) {
+      return { ok: false, recordCount: records.length, reason: `record ${i + 1} altered, reordered or missing` };
+    }
+  }
+  if (head !== manifest.chainHead) {
+    return { ok: false, recordCount: records.length, reason: "chain head mismatch" };
+  }
+  for (const record of records) {
+    let ledger: unknown;
+    try {
+      ledger = (JSON.parse(record) as { ledger?: unknown }).ledger;
+    } catch {
+      return { ok: false, recordCount: records.length, reason: "malformed record" };
+    }
+    if (typeof ledger === "number") {
+      if (
+        (manifest.ledgerMin !== null && ledger < manifest.ledgerMin) ||
+        (manifest.ledgerMax !== null && ledger > manifest.ledgerMax)
+      ) {
+        return { ok: false, recordCount: records.length, reason: "ledger bounds mismatch" };
+      }
+    }
+  }
+  return { ok: true, recordCount: records.length };
 }

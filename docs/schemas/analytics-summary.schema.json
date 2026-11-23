@@ -1,0 +1,469 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "analytics-summary.v1.schema.json",
+  "title": "Analytics summary v1",
+  "description": "Version 1 of the analytics export (npm run analytics:export, buildAnalyticsSummary). Fields in this schema are required and typed; additional fields are compatible additions. Removing or changing a declared field's type is breaking and requires a new schemaVersion. The document carries no wall-clock time: identical input events serialize to identical bytes.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema",
+    "schemaVersion",
+    "units",
+    "input",
+    "volume",
+    "latency",
+    "complete"
+  ],
+  "properties": {
+    "schema": {
+      "enum": [
+        "mimir.analytics-summary"
+      ]
+    },
+    "schemaVersion": {
+      "enum": [
+        1
+      ]
+    },
+    "units": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "amount",
+        "timestamp",
+        "duration",
+        "bucket",
+        "percentile"
+      ],
+      "properties": {
+        "amount": {
+          "enum": [
+            "base_units"
+          ]
+        },
+        "timestamp": {
+          "enum": [
+            "unix_seconds"
+          ]
+        },
+        "duration": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "seconds",
+              "ledgers"
+            ]
+          }
+        },
+        "bucket": {
+          "enum": [
+            "hour",
+            "day"
+          ]
+        },
+        "percentile": {
+          "enum": [
+            "nearest_rank"
+          ]
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "records",
+        "malformed",
+        "missingTime",
+        "timeBounds",
+        "ledgerBounds"
+      ],
+      "properties": {
+        "records": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "malformed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "missingTime": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timeBounds": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "required": [
+            "firstAt",
+            "lastAt",
+            "firstAtIso",
+            "lastAtIso"
+          ],
+          "properties": {
+            "firstAt": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lastAt": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "firstAtIso": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "lastAtIso": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        "ledgerBounds": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "required": [
+            "firstLedger",
+            "lastLedger"
+          ],
+          "properties": {
+            "firstLedger": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lastLedger": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "volume": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "bounds",
+        "totals",
+        "buckets",
+        "completeness"
+      ],
+      "properties": {
+        "bounds": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "startAt inclusive, endAt exclusive, unix seconds.",
+          "additionalProperties": true,
+          "required": [
+            "startAt",
+            "endAt",
+            "bucketCount"
+          ],
+          "properties": {
+            "startAt": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "endAt": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bucketCount": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "totals": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "challengeStake",
+            "squadDeposit"
+          ],
+          "properties": {
+            "challengeStake": {
+              "type": "string",
+              "description": "Integer amount in base units of the contract token, as a decimal string (never a JSON number, so i128 values keep full precision)."
+            },
+            "squadDeposit": {
+              "type": "string",
+              "description": "Integer amount in base units of the contract token, as a decimal string (never a JSON number, so i128 values keep full precision)."
+            }
+          }
+        },
+        "buckets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "startAt",
+              "startAtIso",
+              "challengeStake",
+              "squadDeposit",
+              "challengeCount",
+              "depositCount",
+              "eventCount"
+            ],
+            "properties": {
+              "startAt": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "startAtIso": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "challengeStake": {
+                "type": "string",
+                "description": "Integer amount in base units of the contract token, as a decimal string (never a JSON number, so i128 values keep full precision)."
+              },
+              "squadDeposit": {
+                "type": "string",
+                "description": "Integer amount in base units of the contract token, as a decimal string (never a JSON number, so i128 values keep full precision)."
+              },
+              "challengeCount": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "depositCount": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "eventCount": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "completeness": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "processedEvents",
+            "skippedWithoutAt",
+            "complete"
+          ],
+          "properties": {
+            "processedEvents": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "skippedWithoutAt": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "complete": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "latency": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "resolved",
+        "cancelled",
+        "completeness"
+      ],
+      "properties": {
+        "resolved": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "count",
+            "p50",
+            "p90",
+            "max"
+          ],
+          "properties": {
+            "count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "p50": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true,
+              "required": [
+                "seconds",
+                "ledgers"
+              ],
+              "properties": {
+                "seconds": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "ledgers": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "p90": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true,
+              "required": [
+                "seconds",
+                "ledgers"
+              ],
+              "properties": {
+                "seconds": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "ledgers": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "max": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true,
+              "required": [
+                "seconds",
+                "ledgers"
+              ],
+              "properties": {
+                "seconds": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "ledgers": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        },
+        "cancelled": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "count",
+            "p50",
+            "p90",
+            "max"
+          ],
+          "properties": {
+            "count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "p50": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true,
+              "required": [
+                "seconds",
+                "ledgers"
+              ],
+              "properties": {
+                "seconds": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "ledgers": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "p90": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true,
+              "required": [
+                "seconds",
+                "ledgers"
+              ],
+              "properties": {
+                "seconds": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "ledgers": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "max": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true,
+              "required": [
+                "seconds",
+                "ledgers"
+              ],
+              "properties": {
+                "seconds": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "ledgers": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        },
+        "completeness": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "pairedClaims",
+            "excludedClaims",
+            "complete"
+          ],
+          "properties": {
+            "pairedClaims": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "excludedClaims": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "complete": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "complete": {
+      "type": "boolean",
+      "description": "True when no record was malformed or missing time, every usable event was bucketed, and every claim seen was paired."
+    }
+  }
+}
