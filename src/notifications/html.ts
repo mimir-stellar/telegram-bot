@@ -9,7 +9,6 @@
  * Every interpolated dynamic value goes through escapeHtml or escapeHtmlAttr.
  */
 
-import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
   shortAddress,
@@ -18,7 +17,19 @@ import {
   type DecodedEvent,
 } from "../stellar/decode.js";
 import { confidenceIndicator } from "./confidence.js";
-import { clip, eventExplorerUrl, eventAllowedByCategory, safeErrorMessage } from "./format.js";
+import { sanitizeUserText } from "./sanitize.js";
+import {
+  clip,
+  clipUtf16,
+  eventExplorerUrl,
+  eventAllowedByCategory,
+  eventTxHash,
+  safeErrorMessage,
+  isolateAmount,
+  TELEGRAM_MAX_MESSAGE_LENGTH,
+  utf16Length,
+} from "./format.js";
+import { safeLinkUrl } from "./link-safety.js";
 import type { StellarConfig } from "../config.js";
 
 /**
@@ -52,18 +63,33 @@ export function escapeHtmlAttr(url: string): string {
 }
 
 function usdcHtml(units: bigint): string {
-  return escapeHtml(`${formatUsdc(units)} USDC`);
+  return escapeHtml(isolateAmount(`${formatUsdc(units)} USDC`));
 }
 
 function whoHtml(address: string): string {
   return `<code>${escapeHtml(shortAddress(address))}</code>`;
 }
 
+/**
+ * Render `label` as an `<a>` link when `url` passes the shared link policy
+ * (`link-safety.ts`), otherwise as inert escaped text with no `href`.
+ */
+export function linkHtml(label: string, url: string | null | undefined): string {
+  const safe = safeLinkUrl(url);
+  if (!safe) return escapeHtml(label);
+  return `<a href="${escapeHtmlAttr(safe)}">${escapeHtml(label)}</a>`;
+}
+
+function txLinkHtml(config: StellarConfig, event: DecodedEvent): string | null {
+  const url = eventExplorerUrl(config, event);
+  if (url) return linkHtml("tx", url);
+  return eventTxHash(event) !== null ? escapeHtml("tx") : null;
+}
+
 function footerHtml(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeHtml(`ledger ${event.ledger}`);
-  const url = eventExplorerUrl(config, event);
-  if (!url) return `<i>${ledger}</i>`;
-  return `<i>${ledger}</i> · <a href="${escapeHtmlAttr(url)}">tx</a>`;
+  const tx = txLinkHtml(config, event);
+  return tx ? `<i>${ledger}</i> · ${tx}` : `<i>${ledger}</i>`;
 }
 
 /**
@@ -77,7 +103,7 @@ function headlineHtml(event: DecodedEvent): string | null {
     case "claim_created":
       return (
         `🆕 <b>New claim</b> #${escapeHtml(String(p.claimId))}\n` +
-        `Category: ${escapeHtml(clip(p.category))}\n` +
+        `Category: ${escapeHtml(clip(sanitizeUserText(p.category)))}\n` +
         `Creator: ${whoHtml(p.creator)}`
       );
 
@@ -89,7 +115,7 @@ function headlineHtml(event: DecodedEvent): string | null {
       );
 
     case "claim_resolved": {
-      const summaryPart = p.summary ? `\n<i>${escapeHtml(clip(p.summary))}</i>` : "";
+      const summaryPart = p.summary ? `\n<i>${escapeHtml(clip(sanitizeUserText(p.summary)))}</i>` : "";
       return (
         `⚖️ <b>Claim #${escapeHtml(String(p.claimId))} resolved</b> — winner: <b>${escapeHtml(winnerSideLabel(p.winnerSide))}</b>\n` +
         `Confidence: ${escapeHtml(confidenceIndicator(p.confidence))}` +
@@ -127,7 +153,7 @@ function headlineHtml(event: DecodedEvent): string | null {
     case "market_created":
       return (
         `🆕 <b>New squad market</b> #${escapeHtml(String(p.marketId))}\n` +
-        `${escapeHtml(clip(p.question))}\n` +
+        `${escapeHtml(clip(sanitizeUserText(p.question)))}\n` +
         `Captain: ${whoHtml(p.captain)} · fee ${escapeHtml(String(p.feeBps))} bps · deadline ${escapeHtml(new Date(p.deadline * 1000).toISOString())}`
       );
 
@@ -187,14 +213,16 @@ export function formatFallbackEventHtml(
   const contract = escapeHtml(shortAddress(event.contractId ?? "unknown"));
   const ledger = escapeHtml(String(event.ledger ?? "unknown"));
   const safeReason = escapeHtml(safeErrorMessage(reason));
-  const txPart = event.txHash
-    ? ` · <a href="${escapeHtmlAttr(txExplorerUrl(config, event.txHash))}">tx</a>`
-    : "";
-  return (
+  // Never an `<a href="">`: an unusable hash or unsafe origin renders inert text.
+  const tx = event.txHash ? (txLinkHtml(config, event) ?? escapeHtml("tx")) : null;
+  const txPart = tx ? ` · ${tx}` : "";
+  const message =
     `⚠️ <b>Event Notification Fallback</b> (${source})\n` +
     `Contract: <code>${contract}</code> · Ledger: ${ledger}${txPart}\n` +
-    `Reason: <i>${safeReason}</i>`
-  );
+    `Reason: <i>${safeReason}</i>`;
+  return utf16Length(message) <= TELEGRAM_MAX_MESSAGE_LENGTH
+    ? message
+    : clipUtf16(message, TELEGRAM_MAX_MESSAGE_LENGTH);
 }
 
 /**
@@ -213,10 +241,15 @@ export function formatEventHtml(
     const head = headlineHtml(event);
     if (head === null) return null;
     const body = `${head}\n${footerHtml(config, event)}`;
-    if (config.channelPreviewMode) {
-      return `🧪 <b>[PREVIEW MODE]</b>\n${body}`;
-    }
-    return body;
+    const withPrefix = config.channelPreviewMode
+      ? `🧪 <b>[PREVIEW MODE]</b>\n${body}`
+      : body;
+    // Telegram measures the 4096 limit in UTF-16 units AFTER entity handling.
+    // The string we send is the source the API parses, so measure that source
+    // and truncate on a safe boundary rather than let the API reject us.
+    return utf16Length(withPrefix) <= TELEGRAM_MAX_MESSAGE_LENGTH
+      ? withPrefix
+      : clipUtf16(withPrefix, TELEGRAM_MAX_MESSAGE_LENGTH);
   } catch (err) {
     return formatFallbackEventHtml(config, event, safeErrorMessage(err));
   }

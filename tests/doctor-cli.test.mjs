@@ -7,11 +7,14 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import {
+  findCaseCollisions,
   formatCheckLine,
   parseSemver,
   runDoctor,
+  runRedactionSelfCheck,
   satisfiesNodeEngine,
 } from "../dist/doctor-cli.js";
+import { Logger } from "../dist/logger.js";
 
 const execFileP = promisify(execFile);
 
@@ -327,6 +330,159 @@ test("CLI execution exits 0 on valid configuration", async () => {
     );
 
     assert.match(stdout, /\[OK\]/);
+    assert.match(stdout, /Redaction policy self-check passed/);
     assert.doesNotMatch(stdout, /\[FAIL\]/);
+  });
+});
+
+// ── Case-collision helper unit tests ─────────────────────────────────────────
+
+test("findCaseCollisions returns empty array when no files collide", () => {
+  const files = ["src/foo.ts", "src/bar.ts", "src/baz/qux.ts"];
+  assert.deepEqual(findCaseCollisions(files), []);
+});
+
+test("findCaseCollisions detects a simple two-file collision", () => {
+  const files = ["src/Foo.ts", "src/foo.ts"];
+  const result = findCaseCollisions(files);
+  assert.equal(result.length, 1);
+  assert.deepEqual(result[0], ["src/Foo.ts", "src/foo.ts"]);
+});
+
+test("findCaseCollisions detects collisions across directories", () => {
+  const files = ["src/Utils.ts", "src/utils.ts", "src/index.ts"];
+  const result = findCaseCollisions(files);
+  assert.equal(result.length, 1);
+  assert.deepEqual(result[0], ["src/Utils.ts", "src/utils.ts"]);
+  // non-colliding file is not reported
+  assert.ok(!result.flat().includes("src/index.ts"));
+});
+
+test("findCaseCollisions detects multiple independent collision groups", () => {
+  const files = ["src/Foo.ts", "src/foo.ts", "lib/Bar.ts", "lib/bar.ts", "readme.md"];
+  const result = findCaseCollisions(files);
+  assert.equal(result.length, 2);
+  // groups are sorted by first member
+  assert.deepEqual(result[0], ["lib/Bar.ts", "lib/bar.ts"]);
+  assert.deepEqual(result[1], ["src/Foo.ts", "src/foo.ts"]);
+});
+
+test("findCaseCollisions normalises Windows backslash separators", () => {
+  const files = ["src\\Foo.ts", "src\\foo.ts"];
+  const result = findCaseCollisions(files);
+  assert.equal(result.length, 1);
+  assert.deepEqual(result[0], ["src/Foo.ts", "src/foo.ts"]);
+});
+
+test("findCaseCollisions handles an empty file list", () => {
+  assert.deepEqual(findCaseCollisions([]), []);
+});
+
+test("findCaseCollisions result is independent of input order", () => {
+  const forward = findCaseCollisions(["src/Foo.ts", "src/foo.ts"]);
+  const reversed = findCaseCollisions(["src/foo.ts", "src/Foo.ts"]);
+  assert.deepEqual(forward, reversed);
+});
+
+// ── Case-collision integration tests (via runDoctor + sourceFiles injection) ──
+
+test("runDoctor reports OK for case-collisions when no collisions exist", async () => {
+  await withTempDir(async (dir) => {
+    const report = await runDoctor({
+      cwd: dir,
+      nodeVersion: "v20.18.0",
+      packageJsonPath: path.resolve("package.json"),
+      sourceFiles: ["src/index.ts", "src/bot.ts", "src/config.ts"],
+    });
+    const check = report.checks.find((c) => c.name === "case-collisions");
+    assert.ok(check, "case-collisions check must be present");
+    assert.equal(check.status, "OK");
+    assert.match(check.message, /No case-insensitive filename collisions/);
+  });
+});
+
+test("runDoctor reports FAIL for case-collisions when collision exists", async () => {
+  await withTempDir(async (dir) => {
+    const report = await runDoctor({
+      cwd: dir,
+      nodeVersion: "v20.18.0",
+      packageJsonPath: path.resolve("package.json"),
+      sourceFiles: ["src/Foo.ts", "src/foo.ts", "src/bar.ts"],
+    });
+    const check = report.checks.find((c) => c.name === "case-collisions");
+    assert.ok(check, "case-collisions check must be present");
+    assert.equal(check.status, "FAIL");
+    assert.match(check.message, /Case-insensitive filename collisions detected/);
+    assert.match(check.message, /src\/Foo\.ts/);
+    assert.match(check.message, /src\/foo\.ts/);
+    // A FAIL check makes the overall report not ok
+    assert.equal(report.ok, false);
+  });
+});
+
+test("runDoctor reports FAIL for case-collisions and ok=false overrides passing env checks", async () => {
+  await withTempDir(async (dir) => {
+    const envFile = path.join(dir, ".env");
+    await writeFile(
+      envFile,
+      [
+        `MARKET_CONTRACT_ID=${VALID_MARKET_ID}`,
+        `SQUAD_CONTRACT_ID=${VALID_SQUAD_ID}`,
+        `BOT_TOKEN=${validTestAuth}`,
+        `TELEGRAM_CHAT_ID=-1001234567890`,
+      ].join("\n"),
+    );
+
+    const report = await runDoctor({
+      cwd: dir,
+      nodeVersion: "v20.18.0",
+      packageJsonPath: path.resolve("package.json"),
+      sourceFiles: ["src/Handler.ts", "src/handler.ts"],
+    });
+
+    // All env checks pass
+    assert.equal(report.checks.find((c) => c.name === "BOT_TOKEN")?.status, "OK");
+    // But the case-collision check fails
+    const check = report.checks.find((c) => c.name === "case-collisions");
+    assert.equal(check.status, "FAIL");
+    // So the overall report is not ok
+    assert.equal(report.ok, false);
+  });
+});
+
+test("runDoctor reports WARN for case-collisions when git ls-files is unavailable", async () => {
+  await withTempDir(async (dir) => {
+    // dir has no git repo; listTrackedFiles will fail.
+    // We simulate this by NOT passing sourceFiles (so the real git path runs)
+    // and running in a directory outside any git repo.
+    const report = await runDoctor({
+      cwd: dir,
+      nodeVersion: "v20.18.0",
+      packageJsonPath: path.resolve("package.json"),
+      // no sourceFiles -> falls through to listTrackedFiles(dir)
+      // dir is a fresh tmpdir with no git repo -> git exits non-zero
+    });
+    const check = report.checks.find((c) => c.name === "case-collisions");
+    assert.ok(check, "case-collisions check must be present");
+    assert.equal(check.status, "WARN");
+    assert.match(check.message, /Case-collision check skipped/);
+  });
+});
+
+test("runDoctor case-collisions check reports each colliding pair in the message", async () => {
+  await withTempDir(async (dir) => {
+    const report = await runDoctor({
+      cwd: dir,
+      nodeVersion: "v20.18.0",
+      packageJsonPath: path.resolve("package.json"),
+      sourceFiles: ["src/Alpha.ts", "src/alpha.ts", "src/Beta.ts", "src/beta.ts"],
+    });
+    const check = report.checks.find((c) => c.name === "case-collisions");
+    assert.equal(check.status, "FAIL");
+    // Both collision groups must appear in the message
+    assert.match(check.message, /Alpha/);
+    assert.match(check.message, /alpha/);
+    assert.match(check.message, /Beta/);
+    assert.match(check.message, /beta/);
   });
 });

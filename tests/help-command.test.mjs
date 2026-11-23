@@ -15,6 +15,7 @@ const PUBLIC_LINES = [
   "/contracts — Contract ids and explorer links",
   "/health — Health assessment and operational readiness",
   "/preview — Preview channel notification formatting",
+  "/categories — Observed claim categories and counts",
 ];
 const ALL_LINES = [
   ...PUBLIC_LINES.slice(0, 4),
@@ -53,7 +54,7 @@ for (const operatorId of [null, "42"]) {
       assert.ok(handlers.has(command), `${command} has a handler`);
       assert.ok(description.length >= 1 && description.length <= 256);
     }
-    assert.equal(handlers.size, 11, "disabled operator handlers still enforce authorization");
+    assert.equal(handlers.size, 13, "disabled operator handlers still enforce authorization");
   });
 }
 

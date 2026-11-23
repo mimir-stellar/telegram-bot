@@ -489,3 +489,116 @@ test("registerCommands registers /health command with setMyCommands", async () =
   assert.ok(healthCmd);
   assert.equal(healthCmd.description, "Health assessment and operational readiness");
 });
+
+test("buildHealthReport marks ready false during shutdown drain while keeping status ok", () => {
+  const healthy = buildHealthReport(baseConfig(), baseStatus(), 5_500);
+  assert.equal(healthy.ok, true);
+  assert.equal(healthy.ready, true);
+
+  const preStopDrain = buildHealthReport(baseConfig(), baseStatus(), 5_500, undefined, { draining: true });
+  assert.equal(preStopDrain.ok, true);
+  assert.equal(preStopDrain.status, "ok");
+  assert.equal(preStopDrain.ready, false);
+
+  const pollerStopping = buildHealthReport(baseConfig(), baseStatus({ stopping: true }), 5_500);
+  assert.equal(pollerStopping.ok, true);
+  assert.equal(pollerStopping.status, "ok");
+  assert.equal(pollerStopping.ready, false);
+});
+
+test("startHealthServer shutdown readiness transition marks readiness 503, keeps liveness 200, and rejects webhook work before close", async () => {
+  let current = baseStatus();
+  let webhookCalls = 0;
+  const server = startHealthServer({
+    config: baseConfig({ healthPort: 18788 }),
+    status: () => current,
+    now: () => 5_500,
+    webhookHandler: (_req, res) => {
+      webhookCalls += 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+
+  try {
+    assert.equal(server.isShuttingDown(), false);
+
+    // Before shutdown: readiness is 200, liveness is 200, webhook work is accepted.
+    const readyBefore = await fetch(`${server.url}/health`);
+    assert.equal(readyBefore.status, 200);
+    assert.equal((await readyBefore.json()).ready, true);
+
+    const webhookBefore = await fetch(`${server.url}/telegram-webhook`, { method: "POST" });
+    assert.equal(webhookBefore.status, 200);
+    assert.equal(webhookCalls, 1);
+
+    // Transition into shutdown drain BEFORE stopping the poller.
+    server.beginShutdown();
+    server.beginShutdown(); // idempotent
+    assert.equal(server.isShuttingDown(), true);
+
+    // Readiness immediately returns 503 with ready: false.
+    const readyDuring = await fetch(`${server.url}/health`);
+    assert.equal(readyDuring.status, 503);
+    const bodyDuring = await readyDuring.json();
+    assert.equal(bodyDuring.ready, false);
+    assert.equal(bodyDuring.status, "ok");
+
+    const healthzDuring = await fetch(`${server.url}/healthz`);
+    assert.equal(healthzDuring.status, 503);
+
+    // Liveness stays 200 during drain until server.close().
+    const liveDuring = await fetch(`${server.url}/health/live`);
+    assert.equal(liveDuring.status, 200);
+    assert.equal((await liveDuring.json()).status, "live");
+
+    const livezDuring = await fetch(`${server.url}/livez`);
+    assert.equal(livezDuring.status, 200);
+
+    // Operational HTTP work (webhook) is rejected before closing the HTTP server.
+    const webhookDuring = await fetch(`${server.url}/telegram-webhook`, { method: "POST" });
+    assert.equal(webhookDuring.status, 503);
+    assert.deepEqual(await webhookDuring.json(), { ok: false, ready: false, error: "shutting_down" });
+    assert.equal(webhookCalls, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("startHealthServer boundary: poller.stopping alone marks readiness 503 while liveness stays 200", async () => {
+  const server = startHealthServer({
+    config: baseConfig({ healthPort: 18789 }),
+    status: () => baseStatus({ stopping: true }),
+    now: () => 5_500,
+    webhookHandler: (_req, res) => {
+      res.writeHead(200);
+      res.end();
+    },
+  });
+
+  try {
+    const ready = await fetch(`${server.url}/health`);
+    assert.equal(ready.status, 503);
+    assert.equal((await ready.json()).ready, false);
+
+    const live = await fetch(`${server.url}/health/live`);
+    assert.equal(live.status, 200);
+
+    const webhook = await fetch(`${server.url}/telegram-webhook`, { method: "POST" });
+    assert.equal(webhook.status, 503);
+  } finally {
+    await server.close();
+  }
+});
+
+test("disabled health server (HEALTH_PORT=0) supports idempotent beginShutdown", async () => {
+  const server = startHealthServer({
+    config: baseConfig({ healthPort: 0 }),
+    status: () => baseStatus(),
+  });
+  assert.equal(server.isShuttingDown(), false);
+  server.beginShutdown();
+  server.beginShutdown();
+  assert.equal(server.isShuttingDown(), true);
+  await server.close();
+});

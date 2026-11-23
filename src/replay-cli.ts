@@ -12,15 +12,21 @@
  *   npm run replay -- --from 4226500 --json        # machine-readable report
  *   npm run replay -- --from 4226500 --mock        # local mock profile
  *   npm run replay -- --from 4226500 --progress-file progress.json # resumable
+ *   npm run replay -- --from 4226500 --max-events 100 # bounded event budget
  *   npm run replay -- --from 4226500 --rpm 120     # rate-limited RPC budget
  *
  * Needs no Telegram credentials in dry-run mode (the default). Pass --send to
  * load a full bot config (BOT_TOKEN + TELEGRAM_CHAT_ID) and deliver events.
  *
+ * Replay output and progress paths must refer to different files. If both
+ * resolve to the same file, the CLI rejects the configuration with a usage
+ * error before opening either file, so existing bytes are preserved.
+ *
  * Exit codes:
- *   0 — scan completed (even if some events were skipped or capped)
- *   1 — fatal runtime error (RPC failure, config error)
- *   2 — usage error (bad flags)
+ *   0   — scan completed (even if some events were skipped or capped)
+ *   1   — fatal runtime error (RPC failure, config error)
+ *   2   — usage error (bad flags)
+ *   130 — replay cancelled via SIGINT (committed progress flushed, resumable)
  */
 
 import { pathToFileURL } from "node:url";
@@ -29,10 +35,12 @@ import { runReplayCli } from "./stellar/replay.js";
 
 const invokedPath = process.argv[1];
 if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {
-  void runReplayCli().then(({ exitCode }) => {
-    if (exitCode !== 0) process.exit(exitCode);
-  }).catch((err: unknown) => {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exit(1);
-  });
+  void runReplayCli()
+    .then(({ exitCode }) => {
+      if (exitCode !== 0) process.exit(exitCode);
+    })
+    .catch((err: unknown) => {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    });
 }

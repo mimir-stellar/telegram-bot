@@ -1,0 +1,798 @@
+{
+  "schemaVersion": "v1",
+  "generatedFrom": "tests/fixtures/events.mjs",
+  "fixtures": {
+    "generic:claim_created": {
+      "id": "generic:claim_created",
+      "kind": "generic",
+      "version": "v1",
+      "fingerprint": "v1:generic:03553a8c475f04a306ff083f7b55747491865b8ea45d7d8c929356eecae186c3",
+      "hash": "03553a8c475f04a306ff083f7b55747491865b8ea45d7d8c929356eecae186c3",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "generic",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122"
+        },
+        "payload": {
+          "eventName": "claim_created",
+          "name": "generic",
+          "topics": [
+            "symbol:claim_created",
+            "u64:7",
+            "address:GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"
+          ],
+          "value": "map:{symbol:category: string:\"crypto\"}"
+        }
+      }
+    },
+    "generic:empty_topics": {
+      "id": "generic:empty_topics",
+      "kind": "generic",
+      "version": "v1",
+      "fingerprint": "v1:generic:eab683c992da7300fb389e140e118405566d0b068493c42a984349ba0a1edd1b",
+      "hash": "eab683c992da7300fb389e140e118405566d0b068493c42a984349ba0a1edd1b",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "generic",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122"
+        },
+        "payload": {
+          "eventName": "unknown",
+          "name": "generic",
+          "topics": [],
+          "value": "map:{}"
+        }
+      }
+    },
+    "generic:squad_market_created": {
+      "id": "generic:squad_market_created",
+      "kind": "generic",
+      "version": "v1",
+      "fingerprint": "v1:generic:55ac2ca1129bd6768a9c004602bed4610293ae2d5cc05d677398e09029a0a077",
+      "hash": "55ac2ca1129bd6768a9c004602bed4610293ae2d5cc05d677398e09029a0a077",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "generic",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122"
+        },
+        "payload": {
+          "eventName": "market_created",
+          "name": "generic",
+          "topics": [
+            "symbol:market_created",
+            "u64:1",
+            "address:GDWUSKGGFDI4FRXK5EBTRECZSVQSSWJHHJOGH6JWG3AUMFFMQ435DIAG"
+          ],
+          "value": "map:{symbol:deadline: u64:1800000000, symbol:fee_bps: u32:200, symbol:question: string:\"Will BTC exceed $100k by end of 2026?\"}"
+        }
+      }
+    },
+    "typed:admin:agent_attributed": {
+      "id": "typed:admin:agent_attributed",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:15665fe70147653f6e3f720adbbd0d77421d81218485037b2d7a164bc75b0912",
+      "hash": "15665fe70147653f6e3f720adbbd0d77421d81218485037b2d7a164bc75b0912",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "agent": "GDWUSKGGFDI4FRXK5EBTRECZSVQSSWJHHJOGH6JWG3AUMFFMQ435DIAG",
+          "details": {
+            "agent": "GDWUSKGGFDI4FRXK5EBTRECZSVQSSWJHHJOGH6JWG3AUMFFMQ435DIAG"
+          },
+          "name": "agent_attributed"
+        }
+      }
+    },
+    "typed:admin:fee_accrued": {
+      "id": "typed:admin:fee_accrued",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:082462d39a38cf6b1f436078e26b16089b19b3d29527d607ff958d5e52f8098d",
+      "hash": "082462d39a38cf6b1f436078e26b16089b19b3d29527d607ff958d5e52f8098d",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "amount": {
+            "$bigint": "5000000"
+          },
+          "details": {
+            "amount": "5000000",
+            "recipient": "GDFJHLAXAUMHA4OWPOB4P7YO72AQR2HMIUYFOXLXE2DZGM633K7HZDQP"
+          },
+          "name": "fee_accrued",
+          "recipient": "GDFJHLAXAUMHA4OWPOB4P7YO72AQR2HMIUYFOXLXE2DZGM633K7HZDQP"
+        }
+      }
+    },
+    "typed:admin:fee_policy_set": {
+      "id": "typed:admin:fee_policy_set",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:79771f35f85cf60cfc127ba241fc3d93ee5b567cf619ed1d27d0b9946ff44bcb",
+      "hash": "79771f35f85cf60cfc127ba241fc3d93ee5b567cf619ed1d27d0b9946ff44bcb",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "details": {
+            "feeBps": 500,
+            "fee_bps": 500
+          },
+          "feeBps": 500,
+          "name": "fee_policy_set"
+        }
+      }
+    },
+    "typed:admin:oracle_changed": {
+      "id": "typed:admin:oracle_changed",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:342c27feb5fe70478dd877f2e75c399d862eb4d8821275707f8e1513bc742ff1",
+      "hash": "342c27feb5fe70478dd877f2e75c399d862eb4d8821275707f8e1513bc742ff1",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "details": {
+            "newOracle": "GDFJHLAXAUMHA4OWPOB4P7YO72AQR2HMIUYFOXLXE2DZGM633K7HZDQP"
+          },
+          "name": "oracle_changed",
+          "newOracle": "GDFJHLAXAUMHA4OWPOB4P7YO72AQR2HMIUYFOXLXE2DZGM633K7HZDQP"
+        }
+      }
+    },
+    "typed:admin:ownership_transferred": {
+      "id": "typed:admin:ownership_transferred",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:250178b50d3685228a268e92fb62907a0640b2317d37d528b70df693a297c645",
+      "hash": "250178b50d3685228a268e92fb62907a0640b2317d37d528b70df693a297c645",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "details": {
+            "newOwner": "GDFJHLAXAUMHA4OWPOB4P7YO72AQR2HMIUYFOXLXE2DZGM633K7HZDQP",
+            "new_owner": "GDFJHLAXAUMHA4OWPOB4P7YO72AQR2HMIUYFOXLXE2DZGM633K7HZDQP",
+            "previousOwner": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+            "previous_owner": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"
+          },
+          "name": "ownership_transferred",
+          "newOwner": "GDFJHLAXAUMHA4OWPOB4P7YO72AQR2HMIUYFOXLXE2DZGM633K7HZDQP",
+          "previousOwner": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"
+        }
+      }
+    },
+    "typed:market:challenger_paid": {
+      "id": "typed:market:challenger_paid",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:bb1a66b2bd8437f34d60077e12ae87e5a49b9ad7182736cdba0320f4e4a3e59b",
+      "hash": "bb1a66b2bd8437f34d60077e12ae87e5a49b9ad7182736cdba0320f4e4a3e59b",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "challenger": "GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U",
+          "claimId": 7,
+          "fee": {
+            "$bigint": "1900000"
+          },
+          "gross": {
+            "$bigint": "38000000"
+          },
+          "name": "challenger_paid",
+          "net": {
+            "$bigint": "36100000"
+          },
+          "stake": {
+            "$bigint": "20000000"
+          }
+        }
+      }
+    },
+    "typed:market:claim_cancelled": {
+      "id": "typed:market:claim_cancelled",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:c07b97760d85ba0166bf2ab04a4f900beadda15d0ad401a36521f0cce5c8ffa8",
+      "hash": "c07b97760d85ba0166bf2ab04a4f900beadda15d0ad401a36521f0cce5c8ffa8",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "claimId": 7,
+          "name": "claim_cancelled"
+        }
+      }
+    },
+    "typed:market:claim_challenged": {
+      "id": "typed:market:claim_challenged",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:74184f9248c99eac5a40da210e14aedb40f0fa639938befd0992bdfb118501b8",
+      "hash": "74184f9248c99eac5a40da210e14aedb40f0fa639938befd0992bdfb118501b8",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "challenger": "GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U",
+          "claimId": 7,
+          "name": "claim_challenged",
+          "stake": {
+            "$bigint": "20000000"
+          }
+        }
+      }
+    },
+    "typed:market:claim_created": {
+      "id": "typed:market:claim_created",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:c24e0939e8b75bce1b56e118220128c8d2759afa3c587e6fd5fe0fbe6be9bc84",
+      "hash": "c24e0939e8b75bce1b56e118220128c8d2759afa3c587e6fd5fe0fbe6be9bc84",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "category": "crypto",
+          "claimId": 7,
+          "creator": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+          "name": "claim_created"
+        }
+      }
+    },
+    "typed:market:claim_resolved": {
+      "id": "typed:market:claim_resolved",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:83b00643ff84751f7ba5a5642aaedf56f9c45067b56ef36f781017573129a052",
+      "hash": "83b00643ff84751f7ba5a5642aaedf56f9c45067b56ef36f781017573129a052",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "claimId": 7,
+          "confidence": 100,
+          "evidenceHash": "deadbeefcafebabe00112233445566778899aabbccddeeff0011223344556677",
+          "name": "claim_resolved",
+          "summary": "Onchain smoke — challengers awarded so the payout pull can be exercised",
+          "winnerSide": 2
+        }
+      }
+    },
+    "typed:market:fee_claimed": {
+      "id": "typed:market:fee_claimed",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:83c7b68f563bbfbb45ba52d87e971c6644856d0fc79e68534d3adf087f9e65b4",
+      "hash": "83c7b68f563bbfbb45ba52d87e971c6644856d0fc79e68534d3adf087f9e65b4",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "amount": {
+            "$bigint": "2000000"
+          },
+          "name": "fee_claimed",
+          "recipient": "GDFJHLAXAUMHA4OWPOB4P7YO72AQR2HMIUYFOXLXE2DZGM633K7HZDQP"
+        }
+      }
+    },
+    "typed:market:market_settled": {
+      "id": "typed:market:market_settled",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:1d8b0c22dc3b8175554f95b8f0e58fa6ff2557d1ceca5b5f133eeacf7f588fff",
+      "hash": "1d8b0c22dc3b8175554f95b8f0e58fa6ff2557d1ceca5b5f133eeacf7f588fff",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "claimId": 7,
+          "dust": {
+            "$bigint": "0"
+          },
+          "name": "market_settled",
+          "owedToChallengers": {
+            "$bigint": "38000000"
+          },
+          "totalFees": {
+            "$bigint": "2000000"
+          },
+          "totalPaid": {
+            "$bigint": "40000000"
+          }
+        }
+      }
+    },
+    "typed:market:withdrawal": {
+      "id": "typed:market:withdrawal",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:6796abe6fa37a7353cb1e1f32f7c719aad6548c2377afd070a1445e395acc9c6",
+      "hash": "6796abe6fa37a7353cb1e1f32f7c719aad6548c2377afd070a1445e395acc9c6",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "amount": {
+            "$bigint": "10000000"
+          },
+          "name": "withdrawal",
+          "to": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"
+        }
+      }
+    },
+    "typed:market:withdrawal_pending": {
+      "id": "typed:market:withdrawal_pending",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:f81146116af557147e2f7fd5ae77897253e004ce2648ce6011af6bc6d961b3ea",
+      "hash": "f81146116af557147e2f7fd5ae77897253e004ce2648ce6011af6bc6d961b3ea",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "amount": {
+            "$bigint": "10000000"
+          },
+          "name": "withdrawal_pending",
+          "to": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"
+        }
+      }
+    },
+    "typed:squad:claimed": {
+      "id": "typed:squad:claimed",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:fed7b41adf490077ce32d71d4cd67075cb9690a7efa2b4617c0b91c6f369b722",
+      "hash": "fed7b41adf490077ce32d71d4cd67075cb9690a7efa2b4617c0b91c6f369b722",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "squad",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "fee": {
+            "$bigint": "1600000"
+          },
+          "gross": {
+            "$bigint": "80000000"
+          },
+          "marketId": 1,
+          "name": "claimed",
+          "net": {
+            "$bigint": "78400000"
+          },
+          "participant": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"
+        }
+      }
+    },
+    "typed:squad:deposited": {
+      "id": "typed:squad:deposited",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:b5df915a111deda72d3868cc274250c17b98a8a02eb7621ad73f75fc794e877d",
+      "hash": "b5df915a111deda72d3868cc274250c17b98a8a02eb7621ad73f75fc794e877d",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "squad",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "amount": {
+            "$bigint": "50000000"
+          },
+          "marketId": 1,
+          "name": "deposited",
+          "participant": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+          "shares": {
+            "$bigint": "50000000"
+          },
+          "side": 1
+        }
+      }
+    },
+    "typed:squad:fees_claimed": {
+      "id": "typed:squad:fees_claimed",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:74b7f77fff424cbf04e9eb4451997213f03e2e67620c432c554f3e67c1f6f24e",
+      "hash": "74b7f77fff424cbf04e9eb4451997213f03e2e67620c432c554f3e67c1f6f24e",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "squad",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "amount": {
+            "$bigint": "3600000"
+          },
+          "name": "fees_claimed",
+          "recipient": "GDFJHLAXAUMHA4OWPOB4P7YO72AQR2HMIUYFOXLXE2DZGM633K7HZDQP"
+        }
+      }
+    },
+    "typed:squad:market_created": {
+      "id": "typed:squad:market_created",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:008998b98e6930718067b8b8aea34c0aab6ae1d52fa14c0bee01d4c6c3451d6c",
+      "hash": "008998b98e6930718067b8b8aea34c0aab6ae1d52fa14c0bee01d4c6c3451d6c",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "squad",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "captain": "GDWUSKGGFDI4FRXK5EBTRECZSVQSSWJHHJOGH6JWG3AUMFFMQ435DIAG",
+          "deadline": 1800000000,
+          "feeBps": 200,
+          "marketId": 1,
+          "name": "market_created",
+          "question": "Will BTC exceed $100k by end of 2026?"
+        }
+      }
+    },
+    "typed:squad:resolved": {
+      "id": "typed:squad:resolved",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:3c6560c020098b780f455719612afd7d785b67c01a547c9e0883f3acc99bfd02",
+      "hash": "3c6560c020098b780f455719612afd7d785b67c01a547c9e0883f3acc99bfd02",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "squad",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "marketId": 1,
+          "name": "resolved",
+          "poolA": {
+            "$bigint": "50000000"
+          },
+          "poolB": {
+            "$bigint": "30000000"
+          },
+          "result": 1
+        }
+      }
+    },
+    "typed:squad:withdrawn": {
+      "id": "typed:squad:withdrawn",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:9c1ca244e4faa80ed999e463e4b22a5d97e4bcd8efb426e8b53cb080817e473b",
+      "hash": "9c1ca244e4faa80ed999e463e4b22a5d97e4bcd8efb426e8b53cb080817e473b",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "squad",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "amount": {
+            "$bigint": "50000000"
+          },
+          "marketId": 1,
+          "name": "withdrawn",
+          "participant": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+          "side": 1
+        }
+      }
+    },
+    "typed:unknown:empty_topics": {
+      "id": "typed:unknown:empty_topics",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:c2365bb16a602c0179978e5235a43423b2d4a95bda3e3df8642ba80470759a27",
+      "hash": "c2365bb16a602c0179978e5235a43423b2d4a95bda3e3df8642ba80470759a27",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "eventName": "",
+          "name": "unknown"
+        }
+      }
+    },
+    "typed:unknown:truncated_topics": {
+      "id": "typed:unknown:truncated_topics",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:d1c0dcdc5f1abc4623bea2f37837f0489cca256129d421c621fb2e46ee1f146e",
+      "hash": "d1c0dcdc5f1abc4623bea2f37837f0489cca256129d421c621fb2e46ee1f146e",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "eventName": "claim_created",
+          "name": "unknown"
+        }
+      }
+    },
+    "typed:unknown:wrong_field_type": {
+      "id": "typed:unknown:wrong_field_type",
+      "kind": "typed",
+      "version": "v1",
+      "fingerprint": "v1:typed:e8faf5b418590326fc952ac602469d5fb51362e94b4dc1bd215fb06e0bbd823d",
+      "hash": "e8faf5b418590326fc952ac602469d5fb51362e94b4dc1bd215fb06e0bbd823d",
+      "canonical": {
+        "meta": {
+          "at": 1788220800,
+          "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+          "eventId": "0018276211125911551-4294967295",
+          "eventType": "contract",
+          "inSuccessfulContractCall": true,
+          "ledger": 4226691,
+          "operationIndex": 0,
+          "source": "market",
+          "transactionIndex": 0,
+          "txHash": "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc001122",
+          "version": "v1"
+        },
+        "payload": {
+          "eventName": "claim_challenged",
+          "name": "unknown"
+        }
+      }
+    }
+  }
+}
