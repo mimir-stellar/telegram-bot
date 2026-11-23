@@ -15,6 +15,7 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
+import { assertRpcEndpointUrl } from "./rpc-guard.js";
 
 export class RpcPassphraseError extends Error {
   constructor(expected: string, actual: string) {
@@ -27,19 +28,73 @@ export class RpcPassphraseError extends Error {
 }
 
 /**
+ * Normalize a Soroban RPC URL into a bounded, secret-free endpoint key suitable
+ * for per-endpoint circuit-breaker state and logs. Strips credentials, query
+ * parameters, and fragments; falls back to `"default"` when empty or invalid.
+ */
+export function normalizeRpcEndpoint(rpcUrl: string): string {
+  const trimmed = typeof rpcUrl === "string" ? rpcUrl.trim() : "";
+  if (!trimmed) return "default";
+  try {
+    const parsed = new URL(trimmed);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.protocol}//${parsed.host.toLowerCase()}${pathname}`;
+  } catch {
+    return trimmed.replace(/\/+$/, "").slice(0, 128) || "default";
+  }
+}
+
+/**
  * Create an RPC server. Construction is offline; the network passphrase is
  * verified separately at boot by {@link validateNetworkPassphrase}.
+ * When `config.rpcEgressAllowlist` is configured, validates `config.rpcUrl`
+ * (retaining a credential-free loopback exception for mock mode).
  */
 export function createRpcServer(config: StellarConfig): rpc.Server {
+  assertRpcEndpointUrl(config.rpcUrl, "STELLAR_RPC_URL");
   return new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
     timeout: 15000,
   });
+  server.httpClient.defaults.maxContentLength = maxResponseBytes;
+  server.httpClient.interceptors.response.use(
+    (response) => response,
+    (err: unknown) => {
+      throw wrapOversizedResponseError(err, maxResponseBytes);
+    },
+  );
+  return server;
 }
 
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */
 export const DEFAULT_EXPLORER_BASE_URL = "https://stellar.expert/explorer";
+
+/** Default authoritative ceiling (ms) for RPC retry / backoff delays. */
+export const DEFAULT_RPC_MAX_BACKOFF_MS = 60_000;
+
+/**
+ * Resolve the authoritative maximum RPC backoff in milliseconds.
+ *
+ * Returns {@link DEFAULT_RPC_MAX_BACKOFF_MS} when `configuredMaxBackoffMs` is
+ * omitted; throws a bounded `RangeError` if a configured value is negative,
+ * non-finite, or not a number so a bad config cannot disable the cap.
+ */
+export function resolveMaxBackoffMs(configuredMaxBackoffMs?: number): number {
+  if (configuredMaxBackoffMs === undefined) {
+    return DEFAULT_RPC_MAX_BACKOFF_MS;
+  }
+  if (
+    typeof configuredMaxBackoffMs !== "number" ||
+    !Number.isFinite(configuredMaxBackoffMs) ||
+    configuredMaxBackoffMs < 0
+  ) {
+    throw new RangeError(
+      `maxBackoffMs must be a finite non-negative number; got ${typeof configuredMaxBackoffMs}`,
+    );
+  }
+  return configuredMaxBackoffMs;
+}
 
 /**
  * Resolve the explorer network path segment from the configured network name.
@@ -113,6 +168,14 @@ export interface LedgerWindow {
   latestLedger: number;
 }
 
+/** A closed ledger range `[startLedger, endLedger]` used for event queries and provider comparisons. */
+export interface ScanLedgerWindow {
+  /** Inclusive start ledger of the scanned window. */
+  startLedger: number;
+  /** Inclusive end ledger of the scanned window. */
+  endLedger: number;
+}
+
 /** Why a ledger window, start ledger, or resume cursor cannot be scanned. */
 export type LedgerWindowProblem =
   | "malformed-window"
@@ -174,21 +237,81 @@ export async function validateNetworkPassphrase(
     );
   }
 
-  const rpcPassphrase = (network as Record<string, unknown> | null)?.passphrase;
-  if (typeof rpcPassphrase !== "string") {
-    throw new NetworkPassphraseMismatchError(
-      "malformed",
-      `RPC getNetwork returned a malformed passphrase (expected a string; got ${typeof rpcPassphrase})`,
+  try {
+    assertNetworkIdentity(network, config.networkPassphrase);
+  } catch (err) {
+    if (err instanceof RpcNetworkIdentityError) {
+      const problem: NetworkPassphraseProblem =
+        err.problem === "passphrase-mismatch" ? "mismatch" : "malformed";
+      throw new NetworkPassphraseMismatchError(problem, err.message);
+    }
+    throw err;
+  }
+}
+
+/** Minimal RPC provider surface required for admission validation. */
+export interface RpcProviderCandidate {
+  getHealth: () => Promise<{
+    status?: unknown;
+    oldestLedger?: unknown;
+    latestLedger?: unknown;
+  }>;
+  getNetwork: () => Promise<unknown>;
+}
+
+/** An RPC provider that has passed both health and network identity checks. */
+export interface AdmittedRpcProvider<
+  T extends RpcProviderCandidate = RpcProviderCandidate,
+> {
+  server: T;
+  health: LedgerWindow & { status: string };
+  network: { passphrase: string };
+}
+
+/**
+ * Validate endpoint health and network identity before admitting an RPC provider.
+ *
+ * Checks `getHealth()` (including retained ledger window bounds) and then
+ * verifies `getNetwork()` against `config.networkPassphrase`. A healthy
+ * provider serving another network is rejected with
+ * {@link NetworkPassphraseMismatchError} before it can be admitted for event
+ * ingestion.
+ *
+ * @param server Candidate RPC provider to validate.
+ * @param config Stellar configuration supplying `networkPassphrase`.
+ * @returns The admitted provider alongside its verified health and network identity.
+ */
+export async function admitRpcProvider<T extends RpcProviderCandidate>(
+  server: T,
+  config: Pick<StellarConfig, "networkPassphrase">,
+): Promise<AdmittedRpcProvider<T>> {
+  const rawHealth = await server.getHealth();
+  const status = typeof rawHealth?.status === "string" ? rawHealth.status.trim() : "";
+  if (status !== "healthy") {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `RPC provider health status is not healthy (got ${boundedLedgerValue(rawHealth?.status)})`,
     );
   }
 
-  if (rpcPassphrase !== config.networkPassphrase) {
-    throw new NetworkPassphraseMismatchError(
-      "mismatch",
-      `RPC network passphrase does not match the configured value ` +
-        `(configured=${config.networkPassphrase.length} chars, received=${rpcPassphrase.length} chars)`,
-    );
-  }
+  const window = validateLedgerWindow(rawHealth);
+
+  await validateNetworkPassphrase(
+    server as unknown as Pick<rpc.Server, "getNetwork">,
+    config,
+  );
+
+  return {
+    server,
+    health: {
+      status,
+      oldestLedger: window.oldestLedger,
+      latestLedger: window.latestLedger,
+    },
+    network: {
+      passphrase: config.networkPassphrase,
+    },
+  };
 }
 
 /**
@@ -334,6 +457,37 @@ export function validateLedgerWindow(health: {
   }
 
   return { oldestLedger, latestLedger };
+}
+
+/**
+ * Validate a closed scan/comparison ledger window `[startLedger, endLedger]`.
+ *
+ * Throws a bounded {@link LedgerWindowError} when either bound is missing,
+ * negative, non-integer, or inverted (`startLedger > endLedger`).
+ */
+export function validateScanWindow(window: {
+  startLedger?: unknown;
+  endLedger?: unknown;
+}): ScanLedgerWindow {
+  const startLedger = window?.startLedger;
+  const endLedger = window?.endLedger;
+
+  if (!isLedgerSequence(startLedger) || !isLedgerSequence(endLedger)) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `scan ledger window is malformed ` +
+        `(start=${boundedLedgerValue(startLedger)}, end=${boundedLedgerValue(endLedger)})`,
+    );
+  }
+  if (startLedger > endLedger) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `scan ledger window is inverted ` +
+        `(start ${startLedger} > end ${endLedger})`,
+    );
+  }
+
+  return { startLedger, endLedger };
 }
 
 /**

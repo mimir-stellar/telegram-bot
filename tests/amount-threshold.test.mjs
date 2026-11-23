@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   InvalidThresholdError,
   meetsThreshold,
+  normalizeUsdcThreshold,
   parseUsdcThreshold,
 } from "../dist/notifications/amount-threshold.js";
 
@@ -71,6 +72,35 @@ test("parseUsdcThreshold: rejects precision beyond 7 decimals (negative)", () =>
   );
   assert.throws(
     () => parseUsdcThreshold("1.12345678"),
+    (err) => err instanceof InvalidThresholdError && /precision/.test(err.message),
+  );
+  assert.throws(
+    () => parseUsdcThreshold("1.00000000"),
+    (err) => err instanceof InvalidThresholdError && /precision/.test(err.message),
+  );
+});
+
+test("normalizeUsdcThreshold & parseUsdcThreshold: treats canonical equivalent decimal strings identically", () => {
+  const equivalentOnes = ["1", "01", "001", "1.0", "1.00", "1.0000000", " 01.00 "];
+  for (const input of equivalentOnes) {
+    assert.equal(normalizeUsdcThreshold(input), "1.0000000", `normalize failed for "${input}"`);
+    assert.equal(parseUsdcThreshold(input), 10_000_000n, `parse failed for "${input}"`);
+  }
+
+  const equivalentZeros = ["0", "00", "0.0", "0.00", "0.0000000"];
+  for (const input of equivalentZeros) {
+    assert.equal(normalizeUsdcThreshold(input), "0.0000000", `normalize failed for "${input}"`);
+    assert.equal(parseUsdcThreshold(input), 0n, `parse failed for "${input}"`);
+  }
+
+  const equivalentFractions = ["10.5", "010.5", "10.50", "10.5000000", " 010.500 "];
+  for (const input of equivalentFractions) {
+    assert.equal(normalizeUsdcThreshold(input), "10.5000000", `normalize failed for "${input}"`);
+    assert.equal(parseUsdcThreshold(input), 105_000_000n, `parse failed for "${input}"`);
+  }
+
+  assert.throws(
+    () => normalizeUsdcThreshold("1.00000000"),
     (err) => err instanceof InvalidThresholdError && /precision/.test(err.message),
   );
 });
@@ -275,4 +305,40 @@ test("meetsThreshold: other events always pass regardless of thresholds (boundar
       `Event "${event.payload.name}" should always pass threshold`,
     );
   }
+});
+
+test("parseUsdcThreshold: errors include source ranges and stable machine-readable codes", () => {
+  const neg = "  -10.5 ";
+  assert.throws(
+    () => parseUsdcThreshold(neg),
+    (err) => {
+      assert.ok(err instanceof InvalidThresholdError);
+      assert.equal(err.code, "THRESHOLD_NEGATIVE");
+      assert.deepEqual(err.range, { start: 2, end: 7 });
+      assert.equal(neg.slice(err.range.start, err.range.end), "-10.5");
+      return true;
+    },
+  );
+
+  const prec = "1.12345678";
+  assert.throws(
+    () => parseUsdcThreshold(prec),
+    (err) => {
+      assert.ok(err instanceof InvalidThresholdError);
+      assert.equal(err.code, "THRESHOLD_PRECISION_EXCEEDED");
+      assert.deepEqual(err.range, { start: 9, end: 10 });
+      assert.equal(prec.slice(err.range.start, err.range.end), "8");
+      return true;
+    },
+  );
+
+  assert.throws(
+    () => parseUsdcThreshold("   "),
+    (err) => {
+      assert.ok(err instanceof InvalidThresholdError);
+      assert.equal(err.code, "THRESHOLD_EMPTY");
+      assert.deepEqual(err.range, { start: 0, end: 3 });
+      return true;
+    },
+  );
 });

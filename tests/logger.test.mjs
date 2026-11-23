@@ -215,3 +215,72 @@ test("reset restores the defaults and drops registered secrets", () => {
   // Text default, and the shape regex still catches it.
   assert.equal(lines[0].line, "[REDACTED]");
 });
+
+test("unsupported types and circular references are replaced with bounded sentinels", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+
+  const circularObj = { name: "parent" };
+  circularObj.child = { parent: circularObj };
+
+  const circularArr = ["first"];
+  circularArr.push(circularArr);
+
+  Logger.warn("poller", "cycle_details", {
+    circularObj,
+    circularArr,
+    sym: Symbol("debug-symbol"),
+    fnArr: [() => "ignored"],
+    fn: () => "ignored",
+  });
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].level, "warn");
+  const record = JSON.parse(lines[0].line);
+  assert.equal(record.level, "warn");
+  assert.equal(record.component, "poller");
+  assert.equal(record.msg, "cycle_details");
+  assert.equal(record.circularObj.name, "parent");
+  assert.equal(record.circularObj.child.parent.child.parent, "[depth-limit]");
+  assert.equal(record.circularArr[0], "first");
+  assert.equal(record.circularArr[1][1][1][1], "[depth-limit]");
+  assert.equal(record.sym, "[unsupported:symbol]");
+  assert.equal(record.fnArr[0], "[unsupported:function]");
+});
+
+test("serialization failure preserves event level and stable message", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+
+  const poisoned = {};
+  Object.defineProperty(poisoned, "blowup", {
+    enumerable: true,
+    get() {
+      throw new Error("unexpected serialization crash");
+    },
+  });
+
+  assert.doesNotThrow(() => {
+    Logger.error("poller", "polling failed due to transient network error", {
+      detail: poisoned,
+    });
+  });
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].level, "error");
+  assert.equal(lines[0].line, "polling failed due to transient network error");
+});
+
+test("throwing log sink does not terminate caller", () => {
+  Logger.configure({
+    format: "json",
+    sink: () => {
+      throw new Error("sink stream write error");
+    },
+  });
+
+  assert.doesNotThrow(() => {
+    Logger.info("poller", "cycle_complete", { cycle: 1 });
+  });
+});
+

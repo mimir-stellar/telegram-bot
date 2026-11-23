@@ -14,6 +14,10 @@ function count(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+function presentCount(value: number | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "n/a";
+}
+
 function formatUptime(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const days = Math.floor(totalSeconds / 86400);
@@ -34,11 +38,11 @@ function formatUptime(ms: number): string {
 }
 
 export function statsMessage(snapshot: StatsSnapshot, nowMs: number): string {
-  const sent = count(snapshot.notificationsSent);
-  const failed = count(snapshot.notificationsFailed);
-  const skipped = count(snapshot.notificationsSkipped);
-  const rpcCalls = count(snapshot.rpcCalls);
-  const rpcErrors = count(snapshot.rpcErrors);
+  const sent = presentCount(snapshot.notificationsSent);
+  const failed = presentCount(snapshot.notificationsFailed);
+  const skipped = presentCount(snapshot.notificationsSkipped);
+  const rpcCalls = presentCount(snapshot.rpcCalls);
+  const rpcErrors = presentCount(snapshot.rpcErrors);
   const startedAtMs = count(snapshot.startedAtMs);
   const uptime = formatUptime(nowMs - startedAtMs);
 

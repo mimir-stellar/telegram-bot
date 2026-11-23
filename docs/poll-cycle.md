@@ -106,7 +106,7 @@ Within [`src/poller.ts`](../src/poller.ts), each execution of `cycle()` executes
 1. **Cycle Tracking and Initialization**
    - Verifies that no previous cycle is `inFlight`.
    - Generates a cycle correlation ID (`randomUUID()`).
-   - Checks the RPC circuit breaker (`status.circuitBreaker.open`). If open and the cooldown hasn't expired, the cycle terminates early.
+   - Checks the endpoint-specific RPC circuit breaker (`status.circuitBreaker`, backed by `RpcCircuitBreaker` in `src/stellar/rpc-guard.ts`). If `open` and the cooldown hasn't expired, or if `half-open` with a recovery probe already in flight, the cycle terminates early. Once cooldown elapses, the breaker transitions to `half-open` and admits **one bounded recovery probe** (at most one target and `maxPages: 1`) so a recovering endpoint does not receive full poller load. A successful probe closes the circuit; a failed probe immediately re-opens it for a fresh cooldown.
    - Resets the per-cycle ledger cache with `ledgerCache.reset()`.
 
 2. **Dead-Letter Queue Drain**
@@ -154,7 +154,7 @@ The notifier follows ADR 0001: **lossy notification delivery by design**. The bl
 
 ### 1. RPC Failure
 - **What happens**: If `getHealth()` or `getEvents()` throws an RPC network or HTTP error, the exception is caught in the target scan loop.
-- **Circuit Breaker & Backoff**: Exponential backoff is applied to the failed target (`current.nextEligibleAt`). Target consecutive failure counters and the circuit breaker tally are updated.
+- **Circuit Breaker & Backoff**: Exponential backoff is applied to the failed target (`current.nextEligibleAt`). Target consecutive failure counters and the endpoint-specific circuit breaker tally are updated. Once open, the endpoint waits for its cooldown and then enters `half-open` with a single bounded recovery probe (1 target, 1 page); if that probe fails, the circuit re-opens immediately instead of exposing the endpoint to full poller load.
 - **Cursor Impact**: Because `scan.cursor` was never returned, the target's in-memory cursor **remains unchanged**. The next cycle retries from the previous cursor position. Isolation ensures that a failure in one contract (e.g. `squad`) does not prevent other contracts (e.g. `market`) from scanning.
 
 ### 2. Telegram Delivery Failure

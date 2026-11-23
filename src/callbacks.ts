@@ -9,7 +9,9 @@
  *
  * Two families of callbacks share this module:
  *  - navigation/operator actions (`status`, `contracts`, `help`, `pause`,
- *    `resume`, `broadcast`), handled by {@link handleCallbackQuery}
+ *    `resume`, `broadcast`, `confirmations`), handled by {@link handleCallbackQuery}.
+ *    Broadcast confirmations are bound to a fingerprint of the reviewed destination
+ *    set and cancel if route configuration changes before confirmation.
  *  - the `/pause` confirmation buttons, which carry their own payloads and a
  *    TTL, handled by {@link handlePauseConfirmCallback}
  */
@@ -17,7 +19,10 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 
 import { safeErrorMessage } from "./notifications/format.js";
-import { handleBroadcastCallback } from "./commands/broadcast.js";
+import {
+  handleBroadcastCallback,
+  handleConfirmationsCallback,
+} from "./commands/broadcast.js";
 import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
@@ -31,11 +36,35 @@ import { pauseMessage } from "./commands/pause.js";
 import { resumeMessage } from "./commands/resume.js";
 import { statusMessage } from "./commands/status.js";
 import type { CommandDeps } from "./commands/registry.js";
-import { TELEGRAM_OPTIONS, isOperator, safeAnswerCallback } from "./commands/runtime.js";
+import {
+  TELEGRAM_OPTIONS,
+  classifyCallbackError,
+  extractCallbackLogIds,
+  formatCallbackErrorLog,
+  isOperator,
+  safeAnswerCallback,
+  type CallbackErrorLogParams,
+  type CallbackLogIds,
+} from "./commands/runtime.js";
+
+export {
+  classifyCallbackError,
+  extractCallbackLogIds,
+  formatCallbackErrorLog,
+  type CallbackErrorLogParams,
+  type CallbackLogIds,
+};
 
 // ── Callback payload validation ──────────────────────────────────────────────
 
-export type CallbackActionType = "status" | "contracts" | "help" | "pause" | "resume" | "broadcast";
+export type CallbackActionType =
+  | "status"
+  | "contracts"
+  | "help"
+  | "pause"
+  | "resume"
+  | "broadcast"
+  | "confirmations";
 
 export interface ValidCallbackAction {
   type: CallbackActionType;
@@ -59,7 +88,120 @@ export const CALLBACK_FALLBACK_FEEDBACK = "Invalid or unrecognized action";
 export const CALLBACK_UNAUTHORIZED_FEEDBACK = "Unauthorized: operator only";
 
 function isKnownAction(val: string): val is CallbackActionType {
-  return ["status", "contracts", "help", "pause", "resume", "broadcast"].includes(val);
+  return [
+    "status",
+    "contracts",
+    "help",
+    "pause",
+    "resume",
+    "broadcast",
+    "confirmations",
+  ].includes(val);
+}
+
+/** Maximum digits for JavaScript Number.MAX_SAFE_INTEGER (9,007,199,254,740,991 has 16 digits). */
+export const MAX_CANONICAL_NUMERIC_DIGITS = 16;
+
+/**
+ * Returns true if a value represents a canonical non-negative decimal numeric identifier:
+ * - Pure decimal digits without leading signs ('+123' and '-123' are rejected)
+ * - No redundant leading zeros ('0' is allowed; '01', '00' are rejected)
+ * - Safe integer range: 0 <= n <= Number.MAX_SAFE_INTEGER (9,007,199,254,740,991)
+ * - At most 16 decimal digits (avoiding overlong decimal IDs)
+ */
+export function isCanonicalNumericId(value: unknown): boolean {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0);
+  }
+  if (typeof value === "bigint") {
+    return value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER);
+  }
+  if (typeof value !== "string") {
+    return false;
+  }
+  if (!/^\d+$/.test(value)) {
+    return false;
+  }
+  if (value.length > 1 && value.startsWith("0")) {
+    return false;
+  }
+  if (value.length > MAX_CANONICAL_NUMERIC_DIGITS) {
+    return false;
+  }
+  const num = Number(value);
+  return Number.isSafeInteger(num) && num >= 0 && String(num) === value;
+}
+
+/**
+ * Returns true if a value represents a noncanonical numeric identifier:
+ * - Leading signs ('+123', '-123', '+0', '-0')
+ * - Overlong decimal IDs with redundant leading zeros ('0123', '00')
+ * - Unsafe integers exceeding Number.MAX_SAFE_INTEGER ('9007199254740992')
+ * - Overlong decimal strings exceeding 16 digits ('99999999999999999999999999999')
+ * - Non-decimal representations like scientific notation, hex, octal, binary, or floats
+ *   ('1e5', '0x10', '1.5')
+ *
+ * Returns false for:
+ * - Canonical decimal IDs ('0', '42', '9007199254740991')
+ * - Non-numeric strings that do not represent numbers ('refresh', 'view', 'lx9abc_1_def')
+ */
+export function isNoncanonicalNumericId(value: unknown): boolean {
+  if (typeof value === "number") {
+    return !Number.isSafeInteger(value) || value < 0 || Object.is(value, -0);
+  }
+  if (typeof value === "bigint") {
+    return value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER);
+  }
+  if (typeof value !== "string") {
+    return false;
+  }
+  if (value.length === 0) {
+    return false;
+  }
+  // Disallow leading signs (+ or -)
+  if (/^[+-]/.test(value)) {
+    return true;
+  }
+  // Pure digits: check if it violates canonical decimal rules
+  if (/^\d+$/.test(value)) {
+    return !isCanonicalNumericId(value);
+  }
+  // Disallow hex, octal, binary prefixes when digits/hex follow
+  if (/^0[xXbBoO][0-9a-zA-Z]+$/.test(value)) {
+    return true;
+  }
+  // Disallow floating point decimal representations
+  if (/^\d+\.\d+$/.test(value)) {
+    return true;
+  }
+  // Disallow scientific notation
+  if (/^\d+[eE][+-]?\d+$/.test(value)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Recursively inspect an object or array for any noncanonical numeric identifier values.
+ */
+export function hasNoncanonicalNumericField(obj: unknown): boolean {
+  if (obj === null || typeof obj !== "object") {
+    return false;
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      if (hasNoncanonicalNumericField(item)) return true;
+    }
+    return false;
+  }
+  for (const value of Object.values(obj as Record<string, unknown>)) {
+    if (typeof value === "number" || typeof value === "bigint" || typeof value === "string") {
+      if (isNoncanonicalNumericId(value)) return true;
+    } else if (typeof value === "object" && value !== null) {
+      if (hasNoncanonicalNumericField(value)) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -102,11 +244,27 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
     };
   }
 
+  // Reject top-level noncanonical numeric identifiers
+  if (isNoncanonicalNumericId(trimmed)) {
+    return {
+      ok: false,
+      reason: "noncanonical-numeric-id",
+      fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+    };
+  }
+
   // 1. JSON payload: e.g. {"action":"status"}
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
     try {
-      const parsed = JSON.parse(trimmed) as { action?: unknown };
+      const parsed = JSON.parse(trimmed) as { action?: unknown; [key: string]: unknown };
       if (typeof parsed?.action === "string" && isKnownAction(parsed.action)) {
+        if (hasNoncanonicalNumericField(parsed)) {
+          return {
+            ok: false,
+            reason: "noncanonical-numeric-id",
+            fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+          };
+        }
         return {
           ok: true,
           action: { type: parsed.action, raw },
@@ -129,6 +287,15 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
   // 2. Colon-delimited: e.g. "status:refresh", "mimir:contracts", etc.
   if (trimmed.includes(":")) {
     const parts = trimmed.split(":");
+    for (const part of parts) {
+      if (isNoncanonicalNumericId(part)) {
+        return {
+          ok: false,
+          reason: "noncanonical-numeric-id",
+          fallbackText: CALLBACK_FALLBACK_FEEDBACK,
+        };
+      }
+    }
     if (parts[0] === "mimir" && parts[1] && isKnownAction(parts[1])) {
       return {
         ok: true,
@@ -164,6 +331,35 @@ export function validateCallbackData(raw: unknown): CallbackValidationResult {
 }
 
 // ── Message helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Detects errors indicating that the Telegram message being edited or deleted
+ * no longer exists on Telegram's servers (error_code 400 or matching message).
+ */
+export function isDeletedMessageError(err: unknown): boolean {
+  if (err === null || typeof err !== "object") {
+    return false;
+  }
+  const errorObj = err as Record<string, unknown>;
+  if (typeof errorObj.error_code === "number" && errorObj.error_code !== 400) {
+    return false;
+  }
+  const text =
+    typeof errorObj.description === "string"
+      ? errorObj.description
+      : typeof errorObj.message === "string"
+      ? errorObj.message
+      : undefined;
+  if (!text) {
+    return false;
+  }
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("message to edit not found") ||
+    lower.includes("message can't be edited") ||
+    lower.includes("message to delete not found")
+  );
+}
 
 function isMessageNotModified(err: unknown): boolean {
   if (!err) return false;
@@ -205,10 +401,59 @@ export async function updateOrReplyMessage(
 
 // ── Action callbacks ─────────────────────────────────────────────────────────
 
+export interface HandleCallbackQueryOptions {
+  deletedToast?: string;
+  deletedFallbackReply?: string;
+}
+
 export async function handleCallbackQuery(
   ctx: Context,
   deps: CommandDeps,
+): Promise<void>;
+export async function handleCallbackQuery(
+  ctx: Context,
+  handler: (data: string) => Promise<void>,
+  opts?: HandleCallbackQueryOptions,
+): Promise<void>;
+export async function handleCallbackQuery(
+  ctx: Context,
+  depsOrHandler: CommandDeps | ((data: string) => Promise<void>),
+  opts?: HandleCallbackQueryOptions,
 ): Promise<void> {
+  if (typeof depsOrHandler === "function") {
+    const rawData = ctx.callbackQuery?.data ?? "";
+    try {
+      await depsOrHandler(rawData);
+    } catch (err) {
+      if (isDeletedMessageError(err)) {
+        try {
+          let toast = opts?.deletedToast ?? "The original message was deleted.";
+          if (Array.from(toast).length > 200) {
+            toast = Array.from(toast).slice(0, 199).join("") + "…";
+          }
+          await ctx.answerCallbackQuery({
+            text: toast,
+            show_alert: false,
+          });
+        } catch {
+          // swallow answerCallbackQuery failure
+        }
+
+        if (opts?.deletedFallbackReply) {
+          let replyText = opts.deletedFallbackReply;
+          if (Array.from(replyText).length > 4000) {
+            replyText = Array.from(replyText).slice(0, 4000).join("");
+          }
+          await ctx.reply(replyText);
+        }
+        return;
+      }
+      throw err;
+    }
+    return;
+  }
+
+  const deps = depsOrHandler;
   const { config, status } = deps;
   const pause = deps.pause ?? (() => "stopped");
   const resume = deps.resume ?? (() => "stopped");
@@ -223,8 +468,9 @@ export async function handleCallbackQuery(
   const validation = validateCallbackData(rawData);
 
   if (!validation.ok) {
+    const ids = extractCallbackLogIds(ctx, [config.botToken]);
     console.warn(
-      `[bot] rejected invalid callback query (${validation.reason}) on update ${ctx.update.update_id}`,
+      `[bot] rejected invalid callback query (${validation.reason}) update_id=${ids.updateId} callback_query_id=${ids.callbackQueryId}`,
     );
     await safeAnswerCallback(ctx, config, {
       text: validation.fallbackText,
@@ -236,10 +482,16 @@ export async function handleCallbackQuery(
   const { action } = validation;
 
   // Enforce operator role authorization
-  if (action.type === "pause" || action.type === "resume" || action.type === "broadcast") {
+  if (
+    action.type === "pause" ||
+    action.type === "resume" ||
+    action.type === "broadcast" ||
+    action.type === "confirmations"
+  ) {
     if (!isOperator(ctx, config)) {
+      const ids = extractCallbackLogIds(ctx, [config.botToken]);
       console.warn(
-        `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
+        `[bot] ignored unauthorized callback action=${action.type} update_id=${ids.updateId} callback_query_id=${ids.callbackQueryId}`,
       );
       await safeAnswerCallback(ctx, config, {
         text: CALLBACK_UNAUTHORIZED_FEEDBACK,
@@ -254,6 +506,11 @@ export async function handleCallbackQuery(
     switch (action.type) {
       case "broadcast": {
         await handleBroadcastCallback(ctx, deps, action.raw);
+        break;
+      }
+
+      case "confirmations": {
+        await handleConfirmationsCallback(ctx, deps, action.raw);
         break;
       }
 
@@ -323,7 +580,12 @@ export async function handleCallbackQuery(
     }
   } catch (err) {
     console.error(
-      `[bot] callback error on action ${action.type}: ${safeErrorMessage(err, [config.botToken])}`,
+      formatCallbackErrorLog({
+        ctx,
+        action: action.type,
+        error: err,
+        secrets: [config.botToken],
+      }),
     );
     await safeAnswerCallback(ctx, config, { text: "Action failed" });
   }
@@ -386,24 +648,37 @@ export async function handlePauseConfirmCallback(
   // Reject stale confirmations so an old message cannot stop the poller later.
   const messageDate = ctx.callbackQuery?.message?.date ?? 0;
   const ageMs = nowMs - messageDate * 1000;
-  if (ageMs > PAUSE_CONFIRM_TTL_MS) {
-    await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
-    await ctx.editMessageText(
-      "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
-      TELEGRAM_OPTIONS,
+  const actionName = action === CALLBACK_PAUSE_CONFIRM ? "pause_confirm" : "pause_cancel";
+  try {
+    if (ageMs > PAUSE_CONFIRM_TTL_MS) {
+      await ctx.answerCallbackQuery({ text: "Confirmation expired.", show_alert: true });
+      await ctx.editMessageText(
+        "⏱ *Pause confirmation expired\\.* Run /pause again\\.",
+        TELEGRAM_OPTIONS,
+      );
+      return;
+    }
+
+    if (action === CALLBACK_PAUSE_CONFIRM) {
+      const result = pause();
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Cancelled." });
+    await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
+  } catch (err) {
+    console.error(
+      formatCallbackErrorLog({
+        ctx,
+        action: actionName,
+        error: err,
+        secrets: [config.botToken],
+      }),
     );
-    return;
+    await safeAnswerCallback(ctx, config, { text: "Action failed" });
   }
-
-  if (action === CALLBACK_PAUSE_CONFIRM) {
-    const result = pause();
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageText(pauseMessage(result), TELEGRAM_OPTIONS);
-    return;
-  }
-
-  await ctx.answerCallbackQuery({ text: "Cancelled." });
-  await ctx.editMessageText("*Pause cancelled\\.* Polling continues\\.", TELEGRAM_OPTIONS);
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
