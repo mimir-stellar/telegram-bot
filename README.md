@@ -1073,8 +1073,8 @@ proxy requirements, secret lifecycle, verification, and rollback steps.
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
-| `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
+| `GET` / `HEAD /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped, draining, or degraded (repeated RPC failures or a stale success window). `GET` returns the JSON report (including `poller.paused` and `poller.suppressedLogs`); `HEAD` returns the same status and headers without a response body or full report serialization. |
+| `GET` / `HEAD /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening (`HEAD` omits the response body). |
 | `GET /health/diag` | The same report `/export` produces in the chat, as plain text. `404` when log capture is off. For an operator with host access but no seat in the chat. |
 
 **Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:

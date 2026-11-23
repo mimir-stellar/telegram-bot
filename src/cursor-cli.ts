@@ -30,6 +30,15 @@ export interface BackupCursorOptions {
   cursorFile: string;
   backupFile: string;
   force?: boolean;
+  /** Optional CAS digest of the live cursor file from an earlier inspection. */
+  expectedDigest?: string;
+}
+
+export interface BackupCursorResult {
+  status: "backed_up";
+  version: number;
+  targets: number;
+  digest: string;
 }
 
 export interface RestoreCursorOptions extends BackupCursorOptions {
@@ -149,19 +158,131 @@ async function writeAtomic(filePath: string, contents: string, replace: boolean)
   }
 }
 
+async function readOptionalFile(filePath: string): Promise<string | null> {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/** Inspect a cursor file and return its schema metadata and CAS digest without exposing cursor values. */
+export async function inspectCursor(options: InspectCursorOptions): Promise<InspectCursorResult> {
+  const raw = await readOptionalFile(options.cursorFile);
+  if (raw === null) {
+    return { exists: false, digest: null, version: null, targets: 0 };
+  }
+  const parsed = validateCursor(raw);
+  return {
+    exists: true,
+    digest: cursorDigest(raw),
+    version: parsed.file.version,
+    targets: Object.keys(parsed.file.targets).length,
+  };
+}
+
 /** Copy a validated supported cursor snapshot without exposing cursor values. */
 export async function backupCursor(options: BackupCursorOptions): Promise<void> {
   await assertDifferentPaths(options.cursorFile, options.backupFile);
   const raw = await readFile(options.cursorFile, "utf8");
+  const cas = checkCursorCas(raw, options.expectedDigest);
+  if (!cas.ok) {
+    throw new CursorConflictError("live", cas.expected, cas.actual, cas.reason);
+  }
   const parsed = validateCursor(raw);
   if (!options.force && (await exists(options.backupFile))) {
     throw new Error(`backup already exists at ${options.backupFile}; pass --force to overwrite`);
   }
   await writeAtomic(options.backupFile, raw, options.force === true);
+  const digest = cursorDigest(raw);
+  const version = parsed.file.version;
+  const targets = Object.keys(parsed.file.targets).length;
   console.log(
-    `[cursor] backed up schema=v` + `${parsed.file.version} targets=${Object.keys(parsed.file.targets).length} ` +
+    `[cursor] backed up schema=v${version} targets=${targets} digest=${digest.slice(0, 12)} ` +
       `from ${options.cursorFile} to ${options.backupFile}`,
   );
+  return { status: "backed_up", version, targets, digest };
+}
+
+function validateBackupOwnership(
+  backup: ReturnType<typeof parseAndMigrateCursorFile>["file"],
+  liveRaw: string | null,
+  options: Pick<RestoreCursorOptions, "expectedTargets" | "expectedNetwork" | "expectedContractIds">,
+): void {
+  const backupSources = Object.keys(backup.targets);
+  if (backupSources.length === 0) {
+    throw new Error("backup cursor has no targets; refusing to overwrite live cursor");
+  }
+
+  if (options.expectedNetwork && backup.network && backup.network !== options.expectedNetwork) {
+    throw new Error(
+      `backup network (${backup.network}) does not match expected network (${options.expectedNetwork})`,
+    );
+  }
+
+  if (options.expectedTargets && options.expectedTargets.length > 0) {
+    const allowed = new Set(options.expectedTargets);
+    for (const source of backupSources) {
+      if (!allowed.has(source)) {
+        throw new Error(`backup target "${source}" is not owned by this configuration`);
+      }
+    }
+  }
+
+  if (options.expectedContractIds) {
+    for (const [source, target] of Object.entries(backup.targets)) {
+      const expectedCid = options.expectedContractIds[source];
+      if (expectedCid && target.contractId && target.contractId !== expectedCid) {
+        throw new Error(
+          `backup contractId for "${source}" (${target.contractId}) does not match expected (${expectedCid})`,
+        );
+      }
+    }
+  }
+
+  if (liveRaw === null) return;
+
+  let live: ReturnType<typeof parseAndMigrateCursorFile>["file"];
+  try {
+    live = parseAndMigrateCursorFile(liveRaw).file;
+  } catch {
+    // Live cursor is corrupt/unparseable: allow restoring a valid backup with --force.
+    return;
+  }
+
+  if (live.network && backup.network && live.network !== backup.network) {
+    throw new Error(
+      `backup network (${backup.network}) does not match live cursor network (${live.network})`,
+    );
+  }
+
+  const liveSources = new Set(Object.keys(live.targets));
+  if (liveSources.size > 0) {
+    for (const source of backupSources) {
+      if (!liveSources.has(source)) {
+        throw new Error(
+          `backup target "${source}" does not match live cursor targets (${[...liveSources].join(", ")})`,
+        );
+      }
+      const liveCid = live.targets[source]?.contractId;
+      const backupCid = backup.targets[source]?.contractId;
+      if (liveCid && backupCid && liveCid !== backupCid) {
+        throw new Error(
+          `backup contractId for "${source}" (${backupCid}) does not match live cursor (${liveCid})`,
+        );
+      }
+    }
+  }
+}
+
+function expectedFingerprints(
+  config: TargetFingerprintConfig,
+): Record<string, string> {
+  return {
+    market: computeCursorTargetFingerprint(config.networkPassphrase, config.marketContractId),
+    squad: computeCursorTargetFingerprint(config.networkPassphrase, config.squadContractId),
+  };
 }
 
 /** Restore a compatible cursor while holding the poller's exclusive lock. */
@@ -206,10 +327,20 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
 
     const normalized = `${JSON.stringify(nextFile, null, 2)}\n`;
     await writeAtomic(options.cursorFile, normalized, options.force === true);
+    const digest = cursorDigest(normalized);
+    const version = parsed.file.version;
+    const targets = Object.keys(parsed.file.targets).length;
     console.log(
       `[cursor] restored schema=v${nextFile.version} targets=${Object.keys(nextFile.targets).length} ` +
         `from ${options.backupFile} to ${options.cursorFile}`,
     );
+    return {
+      status: "restored",
+      version,
+      targets,
+      digest,
+      previousDigest: liveDigestBefore,
+    };
   } finally {
     await lock.release();
   }
@@ -457,6 +588,22 @@ function resolvePath(value: string): string {
   return path.resolve(process.cwd(), value);
 }
 
+function resolveTargetConfigFromEnv(): TargetFingerprintConfig | undefined {
+  const marketContractId = process.env.MARKET_CONTRACT_ID?.trim();
+  const squadContractId = process.env.SQUAD_CONTRACT_ID?.trim();
+  if (!marketContractId || !squadContractId) return undefined;
+
+  const network = process.env.STELLAR_NETWORK?.trim().toLowerCase();
+  const defaultPassphrase =
+    network === "mainnet" || network === "futurenet" || network === "testnet"
+      ? NETWORK_PASSPHRASES[network]
+      : NETWORK_PASSPHRASES.testnet;
+  const networkPassphrase =
+    process.env.STELLAR_NETWORK_PASSPHRASE?.trim() || defaultPassphrase;
+
+  return { networkPassphrase, marketContractId, squadContractId };
+}
+
 async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
@@ -522,6 +669,21 @@ async function main(): Promise<void> {
       options.out ?? `${cursorFile}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`,
     );
     await backupCursor({ cursorFile, backupFile, force: options.force });
+    return;
+  }
+
+  const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
+  if (action === "migrate") {
+    const targets = resolveTargetConfigFromEnv();
+    if (!targets) {
+      throw new Error("migrate requires MARKET_CONTRACT_ID and SQUAD_CONTRACT_ID");
+    }
+    await migrateCursor({
+      cursorFile,
+      lockFile,
+      force: options.force,
+      ...targets,
+    });
     return;
   }
 

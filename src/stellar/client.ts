@@ -152,6 +152,14 @@ export interface LedgerWindow {
   latestLedger: number;
 }
 
+/** A closed ledger range `[startLedger, endLedger]` used for event queries and provider comparisons. */
+export interface ScanLedgerWindow {
+  /** Inclusive start ledger of the scanned window. */
+  startLedger: number;
+  /** Inclusive end ledger of the scanned window. */
+  endLedger: number;
+}
+
 /** Why a ledger window, start ledger, or resume cursor cannot be scanned. */
 export type LedgerWindowProblem =
   | "malformed-window"
@@ -433,6 +441,37 @@ export function validateLedgerWindow(health: {
   }
 
   return { oldestLedger, latestLedger };
+}
+
+/**
+ * Validate a closed scan/comparison ledger window `[startLedger, endLedger]`.
+ *
+ * Throws a bounded {@link LedgerWindowError} when either bound is missing,
+ * negative, non-integer, or inverted (`startLedger > endLedger`).
+ */
+export function validateScanWindow(window: {
+  startLedger?: unknown;
+  endLedger?: unknown;
+}): ScanLedgerWindow {
+  const startLedger = window?.startLedger;
+  const endLedger = window?.endLedger;
+
+  if (!isLedgerSequence(startLedger) || !isLedgerSequence(endLedger)) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `scan ledger window is malformed ` +
+        `(start=${boundedLedgerValue(startLedger)}, end=${boundedLedgerValue(endLedger)})`,
+    );
+  }
+  if (startLedger > endLedger) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `scan ledger window is inverted ` +
+        `(start ${startLedger} > end ${endLedger})`,
+    );
+  }
+
+  return { startLedger, endLedger };
 }
 
 /**
