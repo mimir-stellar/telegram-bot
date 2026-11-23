@@ -10,6 +10,7 @@
  */
 
 import { compareEvents, sortEvents, type DecodedEvent } from "../stellar/decode.js";
+import { DEFAULT_ALWAYS_SEND_EVENTS, resolveEventName } from "./quiet-hours.js";
 
 export interface DigestGroup {
   /**

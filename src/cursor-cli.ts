@@ -164,6 +164,77 @@ export async function backupCursor(options: BackupCursorOptions): Promise<void> 
   );
 }
 
+function validateBackupOwnership(
+  backup: ReturnType<typeof parseAndMigrateCursorFile>["file"],
+  liveRaw: string | null,
+  options: Pick<RestoreCursorOptions, "expectedTargets" | "expectedNetwork" | "expectedContractIds">,
+): void {
+  const backupSources = Object.keys(backup.targets);
+  if (backupSources.length === 0) {
+    throw new Error("backup cursor has no targets; refusing to overwrite live cursor");
+  }
+
+  if (options.expectedNetwork && backup.network && backup.network !== options.expectedNetwork) {
+    throw new Error(
+      `backup network (${backup.network}) does not match expected network (${options.expectedNetwork})`,
+    );
+  }
+
+  if (options.expectedTargets && options.expectedTargets.length > 0) {
+    const allowed = new Set(options.expectedTargets);
+    for (const source of backupSources) {
+      if (!allowed.has(source)) {
+        throw new Error(`backup target "${source}" is not owned by this configuration`);
+      }
+    }
+  }
+
+  if (options.expectedContractIds) {
+    for (const [source, target] of Object.entries(backup.targets)) {
+      const expectedCid = options.expectedContractIds[source];
+      if (expectedCid && target.contractId && target.contractId !== expectedCid) {
+        throw new Error(
+          `backup contractId for "${source}" (${target.contractId}) does not match expected (${expectedCid})`,
+        );
+      }
+    }
+  }
+
+  if (liveRaw === null) return;
+
+  let live: ReturnType<typeof parseAndMigrateCursorFile>["file"];
+  try {
+    live = parseAndMigrateCursorFile(liveRaw).file;
+  } catch {
+    // Live cursor is corrupt/unparseable: allow restoring a valid backup with --force.
+    return;
+  }
+
+  if (live.network && backup.network && live.network !== backup.network) {
+    throw new Error(
+      `backup network (${backup.network}) does not match live cursor network (${live.network})`,
+    );
+  }
+
+  const liveSources = new Set(Object.keys(live.targets));
+  if (liveSources.size > 0) {
+    for (const source of backupSources) {
+      if (!liveSources.has(source)) {
+        throw new Error(
+          `backup target "${source}" does not match live cursor targets (${[...liveSources].join(", ")})`,
+        );
+      }
+      const liveCid = live.targets[source]?.contractId;
+      const backupCid = backup.targets[source]?.contractId;
+      if (liveCid && backupCid && liveCid !== backupCid) {
+        throw new Error(
+          `backup contractId for "${source}" (${backupCid}) does not match live cursor (${liveCid})`,
+        );
+      }
+    }
+  }
+}
+
 /** Restore a compatible cursor while holding the poller's exclusive lock. */
 export async function restoreCursor(options: RestoreCursorOptions): Promise<void> {
   await assertDifferentPaths(options.cursorFile, options.backupFile);
