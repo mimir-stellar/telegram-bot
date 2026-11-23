@@ -305,6 +305,17 @@ test("parseUsdcStringToUnits: atomic unit conversion utility", () => {
   assert.equal(parseUsdcStringToUnits("100"), 1_000_000_000n);
   assert.equal(parseUsdcStringToUnits("0.0000001"), 1n);
   assert.equal(parseUsdcStringToUnits("2.5"), 25_000_000n);
+
+  // Canonical equivalent decimal strings normalize identically
+  for (const equivalent of ["10.5", "010.5", "10.50", "10.5000000", " 010.50 "]) {
+    assert.equal(parseUsdcStringToUnits(equivalent), 105_000_000n);
+  }
+
+  // Values exceeding 7 fractional digits (including trailing zeros) are rejected
+  assert.throws(
+    () => parseUsdcStringToUnits("1.00000000"),
+    (err) => err instanceof FilterParseError && /exceeds maximum precision of 7 decimals/.test(err.message),
+  );
 });
 
 // ----------------------------------------------------

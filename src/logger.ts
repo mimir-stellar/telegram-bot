@@ -30,6 +30,7 @@
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import { redactInlineUrls, registeredSecrets } from "./redact.js";
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -47,6 +48,19 @@ export interface LogLine {
   text: string;
 }
 
+export interface LogCaptureStats {
+  /** Number of lines currently retained in the ring buffer. */
+  retained: number;
+  /** Number of older lines evicted from the ring buffer due to capacity. */
+  omitted: number;
+  /** Configured ring buffer capacity (0 = capture disabled). */
+  capacity: number;
+  /** Timestamp (`ms` since epoch) of the oldest retained line, or `null` if empty. */
+  oldestAt: number | null;
+  /** Timestamp (`ms` since epoch) of the newest retained line, or `null` if empty. */
+  newestAt: number | null;
+}
+
 export interface LogCapture {
   /** Redact and append one line. Drops the oldest when the ring is full. */
   add(level: LogLine["level"], text: string): void;
@@ -56,6 +70,8 @@ export interface LogCapture {
   size(): number;
   /** Configured capacity (0 = capture disabled). */
   capacity(): number;
+  /** Capture retention/truncation counts and time bounds. */
+  stats?(): LogCaptureStats;
 }
 
 /**
@@ -72,6 +88,14 @@ export function redactLine(text: string, secrets: string[]): string {
   for (const secret of secrets) {
     if (secret) out = out.split(secret).join(REDACTED);
   }
+  out = redactInlineUrls(out, {
+    secrets,
+    placeholder: REDACTED,
+    includeRegisteredSecrets: false,
+  });
+  out = out
+    .replace(/\b(?:bot)?\d{5,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, REDACTED)
+    .replace(/\bS[A-Z2-7]{55}\b/g, REDACTED);
   // Full-precision Stellar strkeys (G…/C…, 56 chars) -> first 4 + … + last 4.
   // Shortened display forms like `CDV6…LPKZI` are left alone; the ellipsis
   // means there is nothing more to hide.
@@ -88,16 +112,20 @@ export function secretsFor(config: BotConfig): string[] {
  * Create the ring buffer. Capacity 0 means capture is disabled: `add` is a
  * no-op and `lines()` is always empty, so callers need no special casing.
  */
-export function createLogCapture(capacity: number): LogCapture {
+export function createLogCapture(capacity: number, now: () => number = Date.now): LogCapture {
   const cap = Math.max(0, Math.floor(capacity));
   const ring: LogLine[] = [];
   let nextSeq = 0;
+  let omitted = 0;
 
   return {
     add(level, text) {
       if (cap === 0) return;
-      const line: LogLine = { seq: nextSeq++, at: Date.now(), level, text };
-      if (ring.length >= cap) ring.shift();
+      const line: LogLine = { seq: nextSeq++, at: now(), level, text };
+      if (ring.length >= cap) {
+        ring.shift();
+        omitted += 1;
+      }
       ring.push(line);
     },
     lines() {
@@ -108,6 +136,15 @@ export function createLogCapture(capacity: number): LogCapture {
     },
     capacity() {
       return cap;
+    },
+    stats() {
+      return {
+        retained: ring.length,
+        omitted,
+        capacity: cap,
+        oldestAt: ring[0]?.at ?? null,
+        newestAt: ring[ring.length - 1]?.at ?? null,
+      };
     },
   };
 }
@@ -186,10 +223,25 @@ export function renderLogExport(
   if (status.lastError) {
     lines.push(`last error (${agoShort(status.lastError.at, now)} ago): ${status.lastError.message}`);
   }
+  const logs = capture.lines();
+  const stats: LogCaptureStats = capture.stats?.() ?? {
+    retained: logs.length,
+    omitted: 0,
+    capacity: capture.capacity(),
+    oldestAt: logs[0]?.at ?? null,
+    newestAt: logs[logs.length - 1]?.at ?? null,
+  };
+  const timeBounds =
+    stats.oldestAt !== null && stats.newestAt !== null
+      ? `${new Date(stats.oldestAt).toISOString()}..${new Date(stats.newestAt).toISOString()}`
+      : "none";
+  lines.push(
+    `log capture: retained ${stats.retained} · omitted ${stats.omitted} · ` +
+      `truncated: ${stats.omitted > 0 ? "yes" : "no"} · window: ${timeBounds}`,
+  );
   lines.push("");
   lines.push(`recent logs (${capture.size()} lines, redacted):`);
 
-  const logs = capture.lines();
   if (logs.length === 0) {
     lines.push("(no log lines captured)");
   }
@@ -244,7 +296,8 @@ export const MAX_LOG_FIELD_CHARS = 1_000;
 const LOG_REDACTED = "[REDACTED]";
 const MAX_FIELD_DEPTH = 4;
 const LEVEL_RANK: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40, fatal: 50 };
-const TELEGRAM_TOKEN_SHAPE = /\b\d{5,}:[A-Za-z0-9_-]{20,}/g;
+const TELEGRAM_TOKEN_SHAPE = /\b(?:bot)?\d{5,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g;
+const STELLAR_SECRET_SEED_SHAPE = /\bS[A-Z2-7]{55}\b/g;
 
 export function parseLogLevel(value: unknown): LogLevel {
   if (typeof value !== "string") return DEFAULT_LOG_LEVEL;
@@ -262,6 +315,18 @@ const consoleSink: LogSink = (level, line) => {
   else if (level === "warn") console.warn(line);
   else console.log(line);
 };
+
+function safeInvokeSink(sink: LogSink, level: LogLevel, line: string, fallbackLine: string): void {
+  try {
+    sink(level, line);
+  } catch {
+    try {
+      consoleSink(level, fallbackLine);
+    } catch {
+      // Never let a sink failure terminate the caller or polling loop.
+    }
+  }
+}
 
 interface LoggerState {
   level: LogLevel;
@@ -285,10 +350,20 @@ let state = defaultState();
 
 function redactLogText(text: string): string {
   let out = text;
-  for (const secret of state.secrets) {
-    if (secret.length > 0) out = out.split(secret).join(LOG_REDACTED);
+  const secrets = [...state.secrets, ...registeredSecrets()]
+    .filter((secret) => secret.length > 0)
+    .sort((a, b) => b.length - a.length);
+  for (const secret of secrets) {
+    if (out.includes(secret)) out = out.split(secret).join(LOG_REDACTED);
   }
-  return out.replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED);
+  out = redactInlineUrls(out, {
+    secrets,
+    placeholder: LOG_REDACTED,
+    includeRegisteredSecrets: false,
+  });
+  return out
+    .replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED)
+    .replace(STELLAR_SECRET_SEED_SHAPE, LOG_REDACTED);
 }
 
 function boundField(text: string): string {
@@ -298,6 +373,8 @@ function boundField(text: string): string {
 function sanitize(value: unknown, depth: number): unknown {
   if (typeof value === "string") return boundField(redactLogText(value));
   if (typeof value === "bigint") return value.toString();
+  if (typeof value === "symbol") return "[unsupported:symbol]";
+  if (typeof value === "function") return "[unsupported:function]";
   if (value === null || typeof value !== "object") return value;
   if (depth >= MAX_FIELD_DEPTH) return "[depth-limit]";
   if (Array.isArray(value)) return value.map((item) => sanitize(item, depth + 1));
@@ -313,7 +390,7 @@ function emit(level: LogLevel, component: string, message: string, fields?: LogF
   if (LEVEL_RANK[level] < LEVEL_RANK[state.level]) return;
   const msg = redactLogText(message);
   if (state.format === "text") {
-    state.sink(level, msg);
+    safeInvokeSink(state.sink, level, msg, msg);
     return;
   }
   let line: string;
@@ -328,7 +405,7 @@ function emit(level: LogLevel, component: string, message: string, fields?: LogF
     // Never let a hostile field take the log call (or the caller) down.
     line = msg;
   }
-  state.sink(level, line);
+  safeInvokeSink(state.sink, level, line, msg);
 }
 
 export const Logger = {
@@ -344,6 +421,15 @@ export const Logger = {
   },
   reset(): void {
     state = defaultState();
+  },
+  runWithConfig<T>(options: Partial<LoggerState>, fn: () => T): T {
+    const previous = { ...state, secrets: [...state.secrets] };
+    state = { ...state, ...options };
+    try {
+      return fn();
+    } finally {
+      state = previous;
+    }
   },
   getLevel(): LogLevel {
     return state.level;

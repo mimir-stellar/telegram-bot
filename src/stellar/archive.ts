@@ -1,12 +1,46 @@
-import { open, mkdir, readdir, unlink, chmod } from "node:fs/promises";
+import { open, mkdir, readdir, unlink, chmod, readFile, writeFile, rename } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  ARCHIVE_SCHEMA_FORMAT,
+  DEFAULT_ARCHIVE_SCHEMA_VERSION,
+  SUPPORTED_ARCHIVE_READER_VERSIONS,
+  SUPPORTED_ARCHIVE_WRITER_VERSIONS,
+  UnsupportedArchiveSchemaError,
+  getSupportedArchiveSchemaVersions,
+  negotiateArchiveSchemaVersion,
+  type ArchiveSchemaCapabilities,
+  type ArchiveSchemaErrorCode,
+  type SchemaNegotiationRequest,
+} from "./scan-jsonl.js";
+
+export {
+  ARCHIVE_SCHEMA_FORMAT,
+  DEFAULT_ARCHIVE_SCHEMA_VERSION,
+  SUPPORTED_ARCHIVE_READER_VERSIONS,
+  SUPPORTED_ARCHIVE_WRITER_VERSIONS,
+  UnsupportedArchiveSchemaError,
+  getSupportedArchiveSchemaVersions,
+  negotiateArchiveSchemaVersion,
+  type ArchiveSchemaCapabilities,
+  type ArchiveSchemaErrorCode,
+  type SchemaNegotiationRequest,
+};
+
+export const ARCHIVE_SCHEMA_FILENAME = "archive-schema.json" as const;
+
+export interface ArchiveSchemaFile {
+  format: typeof ARCHIVE_SCHEMA_FORMAT;
+  schemaVersion: number;
+}
 
 export interface EventArchiveOptions {
   dir: string;
   maxBytes?: number;
   maxFiles?: number;
+  schemaVersion?: number;
 }
 
 export interface EventArchive {
@@ -17,6 +51,8 @@ export interface EventArchive {
 export interface ReadArchiveOptions {
   /** Yield valid records before a malformed record instead of discarding them. Defaults to false. */
   retainCommitted?: boolean;
+  acceptedVersions?: readonly number[];
+  requireExplicitVersion?: boolean;
 }
 
 export class MalformedArchiveRecordError extends Error {
@@ -46,18 +82,148 @@ function formatArchiveFilename(index: number, timestamp: number): string {
   return `events-${ts}-${idx}.jsonl`;
 }
 
+export interface InspectedArchiveSchema {
+  schemaVersion: number;
+  explicitVersionFound: boolean;
+}
+
+async function readArchiveSchema(
+  dir: string,
+  acceptedVersions?: readonly number[],
+): Promise<InspectedArchiveSchema> {
+  const filePath = path.join(dir, ARCHIVE_SCHEMA_FILENAME);
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return {
+        schemaVersion: negotiateArchiveSchemaVersion({
+          format: ARCHIVE_SCHEMA_FORMAT,
+          mode: "read",
+          requestedVersion: DEFAULT_ARCHIVE_SCHEMA_VERSION,
+          acceptedVersions,
+        }),
+        explicitVersionFound: false,
+      };
+    }
+    throw error;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    throw new UnsupportedArchiveSchemaError({
+      code: "INVALID_SCHEMA_VERSION",
+      message: `Malformed JSON in ${ARCHIVE_SCHEMA_FILENAME}`,
+    });
+  }
+
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    typeof (parsed as Record<string, unknown>).format !== "string"
+  ) {
+    throw new UnsupportedArchiveSchemaError({
+      code: "INCOMPATIBLE_SCHEMA_FORMAT",
+      message: `${ARCHIVE_SCHEMA_FILENAME} must contain a format and schemaVersion`,
+    });
+  }
+
+  const metadata = parsed as Record<string, unknown>;
+  if (metadata.schemaVersion === undefined) {
+    throw new UnsupportedArchiveSchemaError({
+      code: "INVALID_SCHEMA_VERSION",
+      message: `${ARCHIVE_SCHEMA_FILENAME} must declare a schemaVersion`,
+    });
+  }
+  const schemaVersion = negotiateArchiveSchemaVersion({
+    format: metadata.format as string,
+    mode: "read",
+    requestedVersion: metadata.schemaVersion,
+    acceptedVersions,
+  });
+  if (metadata.format !== ARCHIVE_SCHEMA_FORMAT) {
+    throw new UnsupportedArchiveSchemaError({
+      code: "INCOMPATIBLE_SCHEMA_FORMAT",
+      foundVersion: metadata.format,
+      message: `Incompatible archive schema format "${metadata.format}"`,
+    });
+  }
+  return { schemaVersion, explicitVersionFound: true };
+}
+
+async function writeArchiveSchema(dir: string, schemaVersion: number): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  const targetPath = path.join(dir, ARCHIVE_SCHEMA_FILENAME);
+  const temporaryPath = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
+  const schema: ArchiveSchemaFile = {
+    format: ARCHIVE_SCHEMA_FORMAT,
+    schemaVersion,
+  };
+  await writeFile(temporaryPath, `${JSON.stringify(schema, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: FILE_MODE,
+  });
+  try {
+    await chmod(temporaryPath, FILE_MODE);
+  } catch {
+    // chmod might not be fully supported on some OS/filesystems.
+  }
+  try {
+    await rename(temporaryPath, targetPath);
+  } catch (error) {
+    try {
+      await unlink(temporaryPath);
+    } catch (cleanupError) {
+      if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") throw cleanupError;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Create an append-only event archive that writes the canonical JSONL export
+ * format: UTF-8 encoded, one JSON record per line, delimited by LF (`\n`)
+ * regardless of host operating system.
+ */
 export function createEventArchive(options: EventArchiveOptions): EventArchive {
-  const { dir } = options;
+  const { dir, metadata } = options;
   const maxBytes = Math.max(1, options.maxBytes ?? DEFAULT_MAX_BYTES);
   const maxFiles = Math.max(1, options.maxFiles ?? DEFAULT_MAX_FILES);
+  const writerVersion = negotiateArchiveSchemaVersion({
+    format: ARCHIVE_SCHEMA_FORMAT,
+    mode: "write",
+    requestedVersion: options.schemaVersion,
+  });
 
   let currentHandle: any = null;
   let currentFilePath: string | null = null;
   let currentSize = 0;
   let fileIndex = 0;
   let closed = false;
+  let schemaVerified = false;
 
   let queue: Promise<void> = Promise.resolve();
+
+  async function ensureWriterSchema(): Promise<void> {
+    if (schemaVerified) return;
+    const existing = await readArchiveSchema(dir);
+    if (existing.explicitVersionFound && existing.schemaVersion !== writerVersion) {
+      throw new UnsupportedArchiveSchemaError({
+        code: "UNSUPPORTED_SCHEMA_VERSION",
+        foundVersion: existing.schemaVersion,
+        supportedVersions: SUPPORTED_ARCHIVE_WRITER_VERSIONS,
+        message: `Archive directory schema v${existing.schemaVersion} conflicts with writer v${writerVersion}`,
+      });
+    }
+    if (!existing.explicitVersionFound) {
+      await writeArchiveSchema(dir, writerVersion);
+    }
+    schemaVerified = true;
+  }
 
   async function rotateIfNeeded(additionalBytes: number): Promise<void> {
     if (currentHandle && currentSize + additionalBytes <= maxBytes) {
@@ -102,12 +268,21 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
 
     const st = await currentHandle.stat();
     currentSize = st.size;
+
+    if (hasMetadata && currentSize === 0) {
+      const header = JSON.stringify({ type: "metadata", ...metadata }) + "\n";
+      const headerBuf = Buffer.from(header, "utf8");
+      await currentHandle.write(headerBuf);
+      await currentHandle.sync();
+      currentSize += headerBuf.byteLength;
+    }
   }
 
   async function doAppend(events: readonly DecodedEvent[]): Promise<void> {
     if (closed) {
       throw new Error("Event archive is closed");
     }
+    await ensureWriterSchema();
     if (!events || events.length === 0) return;
 
     for (const event of events) {
@@ -138,12 +313,14 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
 
   return {
     async append(events: readonly DecodedEvent[]): Promise<void> {
-      queue = queue.then(() => doAppend(events));
-      return queue;
+      const operation = queue.then(() => doAppend(events));
+      queue = operation.catch(() => {});
+      return operation;
     },
     async close(): Promise<void> {
-      queue = queue.then(() => doClose());
-      return queue;
+      const operation = queue.then(() => doClose());
+      queue = operation.catch(() => {});
+      return operation;
     },
   };
 }
@@ -159,10 +336,210 @@ async function listArchiveFiles(dir: string): Promise<string[]> {
   }
 }
 
+export interface CompactArchiveOptions {
+  /** Maximum bytes per output file. Defaults to the archive's 10 MiB rotation size. */
+  maxBytes?: number;
+}
+
+export interface CompactArchiveResult {
+  /** Events retained because their ledger fell inside the requested range. */
+  retained: number;
+  /** Events dropped because their ledger fell outside the requested range. */
+  dropped: number;
+  /** Number of JSONL files in the compacted archive. */
+  files: number;
+  /** SHA-256 of the compacted archive's canonical JSONL records, for evidence. */
+  digest: string;
+}
+
+let compactSequence = 0;
+
+/** Hash one record exactly as `createEventArchive` serializes it. */
+function hashArchiveRecord(hash: Hash, event: DecodedEvent): void {
+  hash.update(JSON.stringify(event, scanJsonReplacer) + "\n");
+}
+
+/**
+ * Read a compacted archive back and prove that it contains exactly the
+ * retained records: same count, same content digest, every ledger in range.
+ */
+async function verifyCompactedArchive(
+  dir: string,
+  range: LedgerRange,
+  expectedCount: number,
+  expectedDigest: string,
+): Promise<string> {
+  const { firstLedger, lastLedger } = range;
+  const hash = createHash("sha256");
+  let count = 0;
+
+  for await (const event of readArchive(dir)) {
+    if (
+      !Number.isSafeInteger(event.ledger) ||
+      event.ledger < firstLedger ||
+      event.ledger > lastLedger
+    ) {
+      throw new Error(
+        `Compaction verification failed: ledger ${event.ledger} is outside ` +
+          `[${firstLedger}, ${lastLedger}]`,
+      );
+    }
+    hashArchiveRecord(hash, event);
+    count += 1;
+  }
+
+  if (count !== expectedCount) {
+    throw new Error(
+      `Compaction verification failed: wrote ${expectedCount} records but read back ${count}`,
+    );
+  }
+
+  const digest = hash.digest("hex");
+  if (digest !== expectedDigest) {
+    throw new Error(
+      "Compaction verification failed: compacted records do not match the retained records",
+    );
+  }
+  return digest;
+}
+
+/**
+ * Move the verified compacted directory into place, restoring the source if
+ * the swap cannot complete. The source is only touched after verification.
+ */
+async function swapArchiveDirectory(
+  tmpDir: string,
+  dir: string,
+  oldDir: string,
+  hasContent: boolean,
+): Promise<void> {
+  await rename(dir, oldDir);
+  try {
+    if (hasContent) {
+      await rename(tmpDir, dir);
+    } else {
+      // An empty range leaves a valid, empty archive directory behind.
+      await mkdir(dir, { recursive: true });
+    }
+  } catch (err) {
+    try {
+      await rename(oldDir, dir);
+    } catch {
+      // best-effort restore; the original error is the actionable one
+    }
+    throw err;
+  }
+
+  try {
+    await rm(oldDir, { recursive: true, force: true });
+  } catch {
+    // The compacted archive is already in place; a leftover backup is harmless.
+  }
+}
+
+/**
+ * Atomically compact an archive directory to an inclusive ledger range.
+ *
+ * Steps:
+ * 1. Stream every record from `dir` and write in-range records to a temporary
+ *    sibling directory (outside `dir`, so the source is untouched).
+ * 2. Read the temporary directory back and verify the record count, a SHA-256
+ *    digest of the canonical JSONL records, and that every retained ledger is
+ *    in range.
+ * 3. Only after verification, swap the compacted directory into place
+ *    (rename source aside, rename compacted copy in, remove the backup).
+ *
+ * A malformed source record, an I/O error, or a failed verification aborts the
+ * compaction with `dir` unchanged. Existing archive behavior is unaffected;
+ * this is an explicit maintenance operation over a settled capture.
+ */
+export async function compactArchive(
+  dir: string,
+  range: LedgerRange,
+  options: CompactArchiveOptions = {},
+): Promise<CompactArchiveResult> {
+  validateLedgerRange(range);
+
+  try {
+    await readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`Archive directory does not exist: ${dir}`);
+    }
+    throw err;
+  }
+
+  const { firstLedger, lastLedger } = range;
+  const suffix = `${process.pid}-${Date.now()}-${(compactSequence += 1)}`;
+  const tmpDir = `${dir}.compact-${suffix}`;
+  const oldDir = `${dir}.old-${suffix}`;
+
+  let retained = 0;
+  let dropped = 0;
+
+  try {
+    // --- Filter into a temporary sibling directory ---
+    const tmpArchive = createEventArchive({
+      dir: tmpDir,
+      maxBytes: options.maxBytes,
+      maxFiles: Number.MAX_SAFE_INTEGER,
+    });
+    const writeHash = createHash("sha256");
+
+    try {
+      for await (const event of readArchive(dir, { retainCommitted: true })) {
+        if (event.ledger >= firstLedger && event.ledger <= lastLedger) {
+          await tmpArchive.append([event]);
+          hashArchiveRecord(writeHash, event);
+          retained += 1;
+        } else {
+          dropped += 1;
+        }
+      }
+    } finally {
+      await tmpArchive.close();
+    }
+
+    // --- Verify before touching the source ---
+    const digest = await verifyCompactedArchive(
+      tmpDir,
+      range,
+      retained,
+      writeHash.digest("hex"),
+    );
+    const files = (await listArchiveFiles(tmpDir)).length;
+
+    // --- Swap the verified copy into place ---
+    await swapArchiveDirectory(tmpDir, dir, oldDir, files > 0);
+
+    return { retained, dropped, files, digest };
+  } catch (err) {
+    try {
+      await rm(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup failure; the original error is the actionable one
+    }
+    throw err;
+  }
+}
+
+/**
+ * Read decoded events from an archive directory in chronological file order.
+ * Accepts both LF (`\n`) and CRLF (`\r\n`) line endings without altering record
+ * identities, skipping blank lines.
+ */
 export async function* readArchive(
   dir: string,
   options: ReadArchiveOptions = {},
 ): AsyncGenerator<DecodedEvent, void, unknown> {
+  const archiveSchema = await readArchiveSchema(dir, options.acceptedVersions);
+  if (options.requireExplicitVersion && !archiveSchema.explicitVersionFound) {
+    throw new UnsupportedArchiveSchemaError({
+      code: "MISSING_SCHEMA_VERSION",
+      message: `Archive "${dir}" does not declare an explicit schema version`,
+    });
+  }
+
   const files = await listArchiveFiles(dir);
   const stagedEvents: DecodedEvent[] = [];
   const retainCommitted = options.retainCommitted === true;
@@ -172,22 +549,36 @@ export async function* readArchive(
     const handle = await open(filePath, "r");
     try {
       const content = await handle.readFile({ encoding: "utf8" });
-      const lines = content.split("\n");
+      const lines = content.split(/\r?\n/);
       for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index]!;
         const trimmed = line.trim();
         if (!trimmed) continue;
-        let parsed: DecodedEvent;
+        let parsed: unknown;
         try {
-          parsed = JSON.parse(trimmed) as DecodedEvent;
+          const value: unknown = JSON.parse(trimmed);
+          if (
+            value !== null &&
+            typeof value === "object" &&
+            "type" in value &&
+            value.type === "schema"
+          ) {
+            throw new Error("schema headers belong in archive-schema.json");
+          }
+          parsed = value as DecodedEvent;
         } catch {
           throw new MalformedArchiveRecordError(file, index + 1);
         }
 
+        if (isMetadataRecord(parsed)) {
+          continue;
+        }
+
+        const event = parsed as DecodedEvent;
         if (retainCommitted) {
-          yield parsed;
+          yield event;
         } else {
-          stagedEvents.push(parsed);
+          stagedEvents.push(event);
         }
       }
     } finally {
@@ -198,4 +589,11 @@ export async function* readArchive(
   for (const event of stagedEvents) {
     yield event;
   }
+}
+
+export async function inspectArchiveSchema(
+  dir: string,
+  options: Pick<ReadArchiveOptions, "acceptedVersions"> = {},
+): Promise<InspectedArchiveSchema> {
+  return readArchiveSchema(dir, options.acceptedVersions);
 }

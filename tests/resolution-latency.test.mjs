@@ -41,6 +41,7 @@ test("resolutionLatency: handles resolved claims with duration and summary stats
   const report = resolutionLatency(events);
 
   assert.equal(report.excludedCount, 0);
+  assert.deepEqual(report.conflicts, []);
   assert.equal(report.resolved.claims.length, 2);
   assert.equal(report.cancelled.claims.length, 0);
 
@@ -100,6 +101,7 @@ test("resolutionLatency: excludes incomplete claims missing either end and count
 
   // 3 claims are missing either creation or resolution/cancellation
   assert.equal(report.excludedCount, 3);
+  assert.deepEqual(report.conflicts, []);
   assert.equal(report.resolved.claims.length, 1);
   assert.equal(report.resolved.claims[0].claimId, 4);
   assert.equal(report.cancelled.claims.length, 0);
@@ -109,6 +111,7 @@ test("resolutionLatency: empty input returns empty groups and zero exclusions", 
   const report = resolutionLatency([]);
 
   assert.equal(report.excludedCount, 0);
+  assert.deepEqual(report.conflicts, []);
   assert.equal(report.resolved.claims.length, 0);
   assert.equal(report.resolved.summary, null);
   assert.equal(report.cancelled.claims.length, 0);
@@ -153,4 +156,47 @@ test("resolutionLatency: computes percentiles deterministically with multiple da
   assert.deepEqual(report.resolved.summary.p50, { seconds: 50, ledgers: 5 });
   assert.deepEqual(report.resolved.summary.p90, { seconds: 90, ledgers: 9 });
   assert.deepEqual(report.resolved.summary.max, { seconds: 100, ledgers: 10 });
+});
+
+test("resolutionLatency: resolved and cancelled for same claim is an explicit conflict", () => {
+  const events = [
+    mockEvent({ name: "claim_created", claimId: 7, ledger: 100, at: 1000 }),
+    mockEvent({ name: "claim_resolved", claimId: 7, ledger: 120, at: 1040 }),
+    mockEvent({ name: "claim_cancelled", claimId: 7, ledger: 130, at: 1080 }),
+  ];
+
+  const report = resolutionLatency(events);
+
+  assert.deepEqual(report.conflicts, [
+    {
+      claimId: 7,
+      resolutionLedgers: [120],
+      cancellationLedgers: [130],
+      reason: "resolved_and_cancelled",
+    },
+  ]);
+  assert.equal(report.excludedCount, 1);
+  assert.equal(report.resolved.claims.length, 0);
+  assert.equal(report.cancelled.claims.length, 0);
+});
+
+test("resolutionLatency: multiple resolutions for same claim is an explicit conflict", () => {
+  const events = [
+    mockEvent({ name: "claim_created", claimId: 8, ledger: 100, at: 1000 }),
+    mockEvent({ name: "claim_resolved", claimId: 8, ledger: 110, at: 1010 }),
+    mockEvent({ name: "claim_resolved", claimId: 8, ledger: 115, at: 1015 }),
+  ];
+
+  const report = resolutionLatency(events);
+
+  assert.deepEqual(report.conflicts, [
+    {
+      claimId: 8,
+      resolutionLedgers: [110, 115],
+      cancellationLedgers: [],
+      reason: "multiple_resolutions",
+    },
+  ]);
+  assert.equal(report.excludedCount, 1);
+  assert.equal(report.resolved.claims.length, 0);
 });
