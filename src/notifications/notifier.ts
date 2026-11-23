@@ -9,20 +9,43 @@
  *   - {@link isMarkdownParseError} — classifier for Telegram entity-parse failures
  *   - {@link notifierSkips}    — counters for suppressed sends
  *   - {@link createNotifier}   — factory that returns the poller's send function
+ *   - {@link previewRouting}   — read-only routing preview (no Telegram calls)
+ *   - {@link routeStatus}      — actionable status when zero routes are active
  */
 
+import { createHash } from "node:crypto";
 import type { Bot } from "grammy";
 
-import type { BotConfig } from "../config.js";
+import { applyChatMigration, type BotConfig } from "../config.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
+  isTimeoutError,
   safeErrorMessage,
   splitTelegramMessage,
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+import type { SendJournal } from "./send-journal.js";
+
+// Re-export isTimeoutError so callers that only import from notifier.ts
+// can classify timeout errors without also depending on format.ts directly.
+export { isTimeoutError } from "./format.js";
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
+
+/** A Telegram destination: a chat id plus an optional forum topic (thread) id. */
+export interface NotificationDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
+
+/** Optional dependencies for {@link createNotifier}. */
+export interface NotifierOptions {
+  /** Optional send journal for persisting per-destination delivery outcomes. */
+  sendJournal?: SendJournal | undefined;
+  /** Clock override for journal timestamps (defaults to `Date.now`). */
+  now?: (() => number) | undefined;
+}
 
 /** Extra Telegram send options the poller may attach to a notification. */
 export interface SendExtra {
@@ -46,6 +69,17 @@ export interface SendExtra {
   replyToMessageId?: number | undefined;
   /** Decoded contract event name used to apply silent-notification policy. */
   eventName?: string | undefined;
+  /**
+   * Optional callback invoked when the send timed out before Telegram
+   * responded. The notification may or may not have been accepted — this is an
+   * **unknown outcome**, distinct from a confirmed rejection (4xx error).
+   * Callers that maintain a send journal should call `journal.recordTimeout(id)`
+   * inside this hook to flag the pending intent as a confirmed-unknown outcome
+   * so recovery tooling can distinguish it from a plain crash-recovery intent.
+   * The error that triggered the timeout is passed for bounded logging; never
+   * re-throw from this callback.
+   */
+  onTimeout?: ((err: unknown) => void) | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -74,6 +108,36 @@ export function isMarkdownParseError(err: unknown): boolean {
   return true;
 }
 
+/**
+ * Extract `parameters.migrate_to_chat_id` from a Telegram Bot API 400 error
+ * when a group chat has been upgraded to a supergroup. Returns `null` for any
+ * other error or invalid migration target.
+ */
+export function extractMigrateToChatId(err: unknown): string | null {
+  if (!err || typeof err !== "object") return null;
+  const record = err as {
+    error_code?: unknown;
+    parameters?: { migrate_to_chat_id?: unknown } | undefined;
+  };
+  if (typeof record.error_code === "number" && record.error_code !== 400) {
+    return null;
+  }
+  const raw = record.parameters?.migrate_to_chat_id;
+  if (typeof raw === "number") {
+    return Number.isSafeInteger(raw) && raw !== 0 ? String(raw) : null;
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    return /^-?\d+$/.test(trimmed) && trimmed !== "0" ? trimmed : null;
+  }
+  return null;
+}
+
+export interface NotifierOptions {
+  /** Optional callback invoked when a route is updated via `migrate_to_chat_id`. */
+  onRouteMigrated?: ((fromChatId: string, toChatId: string) => void) | undefined;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Bounded log fragment identifying which event a fallback send belongs to. */
@@ -88,6 +152,59 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
   return parts.length > 0 ? ` (${parts.join(" ")})` : "";
 }
 
+/** Resolves the destination chat id for a contract source. */
+function resolveChatId(
+  config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId"> & Partial<Pick<BotConfig, "chatIds">>,
+  source: ContractSource | undefined,
+): string {
+  const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
+  if (source === "market") return config.marketChatId || defaultChat;
+  if (source === "squad") return config.squadChatId || defaultChat;
+  return defaultChat;
+}
+
+/** Resolves whether link previews are disabled for a contract source. */
+function resolveLinkPreviewDisabled(
+  config: Partial<Pick<BotConfig, "linkPreviewMarket" | "linkPreviewSquad">>,
+  source: ContractSource | undefined,
+): boolean {
+  if (source === "market") return !config.linkPreviewMarket;
+  if (source === "squad") return !config.linkPreviewSquad;
+  return true;
+}
+
+// ── routeStatus ──────────────────────────────────────────────────────────────
+
+/** Outcome of checking which configured notification routes are active. */
+export type RouteStatus =
+  | { state: "active"; activeRoutes: number }
+  | {
+      state: "no-active-routes";
+      activeRoutes: 0;
+      /** Human-readable, actionable explanation. Never claims delivery. */
+      message: string;
+    };
+
+/**
+ * Report whether any notification route is active. A zero-active-route result
+ * is reported distinctly from healthy delivery, and it never implies that a
+ * notification was delivered.
+ *
+ * `activeRoutes` is the count of routes the caller considers enabled; when it
+ * is zero the result is `no-active-routes` with an actionable message.
+ */
+export function routeStatus(activeRoutes: number): RouteStatus {
+  if (Number.isFinite(activeRoutes) && activeRoutes > 0) {
+    return { state: "active", activeRoutes: Math.floor(activeRoutes) };
+  }
+  return {
+    state: "no-active-routes",
+    activeRoutes: 0,
+    message:
+      "No notification routes are enabled: every configured route is disabled, so no notifications will be sent. Enable at least one route in the chat configuration (chatId, marketChatId, squadChatId) to receive notifications. No delivery has been attempted or confirmed.",
+  };
+}
+
 // ── notifierSkips ────────────────────────────────────────────────────────────
 
 /**
@@ -95,6 +212,59 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
  * empty-text tests) can prove a blank render never reached the Telegram API.
  */
 export const notifierSkips = { emptyText: 0 };
+
+// ── previewRouting ───────────────────────────────────────────────────────────
+
+/** Result of previewing where a notification would be delivered. */
+export interface RoutingPreview {
+  /** Destinations that will receive the message. */
+  matched: Array<{ chatId: string; source: ContractSource | undefined }>;
+  /** Destinations suppressed by policy (empty render, blank chat id). */
+  filtered: Array<{ source: ContractSource | undefined; reason: "empty-text" | "no-chat-id" }>;
+  /** Destinations that cannot be reached (no chat configured for the source). */
+  unavailable: Array<{ source: ContractSource | undefined; reason: "no-chat-id" }>;
+  /** Whether the message would be sent silently. */
+  silent: boolean;
+  /** Link preview disabled flag used for the destination. */
+  linkPreviewDisabled: boolean;
+}
+
+/**
+ * Previews the routing decision for a notification without calling Telegram.
+ * Uses the same chat resolution, empty-text guard, and silent/link-preview
+ * policy as {@link createNotifier}, so the preview cannot drift from delivery.
+ */
+export function previewRouting(
+  text: string | null,
+  config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId"> &
+    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  source?: ContractSource,
+  extra?: Pick<SendExtra, "eventName">,
+): RoutingPreview {
+  const preview: RoutingPreview = {
+    matched: [],
+    filtered: [],
+    unavailable: [],
+    silent: Boolean(
+      extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS),
+    ),
+    linkPreviewDisabled: resolveLinkPreviewDisabled(config, source),
+  };
+
+  if (typeof text !== "string" || text.trim() === "") {
+    preview.filtered.push({ source, reason: "empty-text" });
+    return preview;
+  }
+
+  const chatId = resolveChatId(config, source);
+  if (chatId.trim() === "") {
+    preview.unavailable.push({ source, reason: "no-chat-id" });
+    return preview;
+  }
+
+  preview.matched.push({ chatId, source });
+  return preview;
+}
 
 // ── createNotifier ───────────────────────────────────────────────────────────
 
@@ -116,12 +286,137 @@ export const notifierSkips = { emptyText: 0 };
  * 400, and a formatters' `null` must never turn into a doomed send. The skip
  * is counted in {@link notifierSkips} and logged with bounded metadata.
  */
+export type Notifier = ((
+  text: string | null,
+  source?: ContractSource,
+  extra?: SendExtra,
+) => Promise<void>) & {
+  migrateRoute: (fromChatId: string, toChatId: string) => boolean;
+  resolveChatId: (chatId: string) => string;
+};
+
 export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
-    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
-) {
-  return async (
+    Partial<
+      Pick<
+        BotConfig,
+        "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents" | "routes"
+      >
+    >,
+  options?: NotifierOptions,
+): Notifier {
+  const migrations = new Map<string, string>();
+  const secrets = typeof config.botToken === "string" ? [config.botToken] : [];
+
+  function resolveMigratedChatId(chatId: string): string {
+    let current = chatId;
+    const seen = new Set<string>();
+    while (migrations.has(current) && !seen.has(current)) {
+      seen.add(current);
+      current = migrations.get(current)!;
+    }
+    return current;
+  }
+
+  function migrateRoute(fromChatId: string, toChatId: string): boolean {
+    const from = fromChatId.trim();
+    const to = toChatId.trim();
+    if (!from || !to || from === to) return false;
+    // Prevent cyclic migrations (e.g. to -> ... -> from).
+    if (resolveMigratedChatId(to) === from) return false;
+    if (migrations.get(from) === to) return false;
+
+    migrations.set(from, to);
+    applyChatMigration(config, from, to);
+    console.warn(`[notifier] route migrated to supergroup chat id`);
+    options?.onRouteMigrated?.(from, to);
+    return true;
+  }
+
+  async function sendToChat(
+    chatId: string,
+    text: string,
+    notificationOptions: {
+      parse_mode: "MarkdownV2";
+      link_preview_options: { is_disabled: boolean };
+      disable_notification?: boolean;
+    },
+    silentOption: { disable_notification?: boolean },
+    extra?: SendExtra,
+    omitReplyTo = false,
+  ): Promise<void> {
+    const replyToMessageId = omitReplyTo ? undefined : extra?.replyToMessageId;
+
+    // Oversized payloads go out as ordered chunks under Telegram's limit. The
+    // thread reply rides on the first chunk and the explorer button on the
+    // last, so the message reads exactly like the unsplit one.
+    const parts = splitTelegramMessage(text);
+    if (parts.length > 1) {
+      for (const [index, part] of parts.entries()) {
+        await bot.api.sendMessage(chatId, part, {
+          ...notificationOptions,
+          ...threadOption,
+          ...(index === parts.length - 1 && extra?.reply_markup
+            ? { reply_markup: extra.reply_markup }
+            : {}),
+          ...(index === 0 && replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
+            : {}),
+        });
+      }
+      return;
+    }
+
+    try {
+      await bot.api.sendMessage(chatId, text, {
+        ...notificationOptions,
+        ...threadOption,
+        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
+          : {}),
+      });
+      return;
+    } catch (err) {
+      // When the HTTP call timed out, the notification may have been accepted
+      // by Telegram even though the client received no response. Notify the
+      // caller so it can flag the pending journal intent as an unknown outcome
+      // rather than a confirmed rejection, before the error propagates.
+      if (isTimeoutError(err) && typeof extra?.onTimeout === "function") {
+        try {
+          extra.onTimeout(err);
+        } catch {
+          // onTimeout must never interrupt the error path.
+        }
+      }
+      // A blank fallback is no fallback: sending whitespace-only text would
+      // just draw the same 400, so the original parse error propagates.
+      const fallback = extra?.plainText;
+      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
+        throw err;
+      }
+      // Only bounded metadata is logged: the fallback outcome, the safe error
+      // category, and the caller-supplied event reference — never message
+      // text, tokens, or remote payloads.
+      console.warn(
+        `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
+          `retrying as plain text: ${safeErrorMessage(err, secrets)}`,
+      );
+      // Plain text (no parse mode), same per-source link preview setting.
+      await bot.api.sendMessage(chatId, fallback, {
+        link_preview_options: notificationOptions.link_preview_options,
+        ...silentOption,
+        ...threadOption,
+        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
+          : {}),
+      });
+    }
+  }
+
+  const notify = async (
     text: string | null,
     source?: ContractSource,
     extra?: SendExtra,
@@ -138,20 +433,11 @@ export function createNotifier(
       return;
     }
 
-    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
-    const chatId = source === "market"
-      ? config.marketChatId || defaultChat
-      : source === "squad"
-        ? config.squadChatId || defaultChat
-        : defaultChat;
+    const chatId = resolveChatId(config, source);
 
     // Select link preview settings based on the contract source.
     // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
-    const linkPreviewDisabled = source === "market"
-      ? !config.linkPreviewMarket
-      : source === "squad"
-        ? !config.linkPreviewSquad
-        : true;
+    const linkPreviewDisabled = resolveLinkPreviewDisabled(config, source);
 
     const silentOption = extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS)
       ? { disable_notification: true }
@@ -162,60 +448,17 @@ export function createNotifier(
       ...silentOption,
     };
 
-    // Oversized payloads go out as ordered chunks under Telegram's limit. The
-    // thread reply rides on the first chunk and the explorer button on the
-    // last, so the message reads exactly like the unsplit one.
-    const parts = splitTelegramMessage(text);
-    if (parts.length > 1) {
-      for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
-          ...notificationOptions,
-          ...(index === parts.length - 1 && extra?.reply_markup
-            ? { reply_markup: extra.reply_markup }
-            : {}),
-          ...(index === 0 && extra?.replyToMessageId !== undefined
-            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-            : {}),
-        });
-      }
-      return;
-    }
-
     try {
-      await bot.api.sendMessage(chatId, text, {
-        ...notificationOptions,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(extra?.replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-          : {}),
-      });
-      return;
+      await sendToChat(chatId, text, notificationOptions, silentOption, extra);
     } catch (err) {
-      // A blank fallback is no fallback: sending whitespace-only text would
-      // just draw the same 400, so the original parse error propagates.
-      const fallback = extra?.plainText;
-      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
-        throw err;
+      const migratedTo = extractMigrateToChatId(err);
+      if (migratedTo && migrateRoute(chatId, migratedTo)) {
+        await sendToChat(migratedTo, text, notificationOptions, silentOption, extra, true);
+        return;
       }
-      // Only bounded metadata is logged: the fallback outcome, the safe error
-      // category, and the caller-supplied event reference — never message
-      // text, tokens, or remote payloads.
-      console.warn(
-        `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
-          `retrying as plain text: ${safeErrorMessage(
-            err,
-            typeof config.botToken === "string" ? [config.botToken] : [],
-          )}`,
-      );
-      // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
-        link_preview_options: notificationOptions.link_preview_options,
-        ...silentOption,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(extra?.replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-          : {}),
-      });
+      throw err;
     }
   };
+
+  return Object.assign(notify, { migrateRoute, resolveChatId: resolveMigratedChatId });
 }

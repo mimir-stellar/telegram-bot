@@ -1,5 +1,17 @@
 # Notification Filters
 
+## Previewing Routing Decisions
+
+Operators can preview how a notification would be routed without calling Telegram `sendMessage`. The preview uses the same decision path as live notification delivery (feature flags, category allowlist, and destination configuration), and returns three buckets for each candidate destination:
+
+- **matched**: destinations that would receive the notification.
+- **filtered**: destinations skipped by a feature flag or category filter, with the reason.
+- **unavailable**: destinations that are not configured or cannot currently receive messages.
+
+No network call to Telegram is made during a preview, and no state is mutated.
+
+---
+
 The Mimir Telegram bot reads eight environment variables that gate or filter outbound Telegram notifications. Because several of their names look similar, this document specifies what each variable filters, its default value, how multiple variables interact, and how to configure common scenarios.
 
 ---
@@ -153,3 +165,53 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_created` events**: Muted by `eventAllowedByCategory` because `config.notificationCategories` is non-empty (`["__none__"]`) and no real on-chain claim category matches `"__none__"`.
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
+
+---
+
+## 4. Per-Route Notification Filter Overrides
+
+For multi-route deployments that combine typed filter expressions ([`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts)) and USDC amount thresholds ([`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts)), [`src/notifications/route-filters.ts`](../src/notifications/route-filters.ts) provides per-route filter overrides via `compileRouteFilters(config, options?)`.
+
+Equivalent decimal USDC thresholds (for example `"1"`, `"01"`, `"1.0"`, `"1.00"`, and `"1.0000000"`) are normalized identically to 7-decimal atomic units before comparison in `parseUsdcThreshold` / `normalizeUsdcThreshold` and in filter expression comparisons (including explicit `USDC` / `$` literals and bare decimal literals such as `stake >= 10.50`). Values exceeding seven fractional digits (such as `"1.00000000"` or `"0.00000001"`) are rejected with `InvalidThresholdError` or `FilterParseError`.
+
+### 4.1 Precedence Rules
+
+When `registry.evaluate(routeId, event)` runs for a route:
+
+1. **Invalid override isolation**: If the route's override failed validation at compile time, it is isolated in `registry.invalidRoutes` and never affects other routes or the global policy.
+   - Under the default `invalidRouteFallback: "global"`, the affected route falls back to the compiled global policy (`overrideStatus: "invalid_fallback_global"`).
+   - Under `invalidRouteFallback: "deny"`, the affected route fails closed (`allowed: false`, `reason: "invalid_override_denied"`).
+2. **Route kill switch (`enabled: false`)**: Suppresses all events for that route regardless of global rules (`reason: "route_disabled"`).
+3. **Effective thresholds**:
+   - `mode: "merge"` *(default)*: Route threshold fields (`marketChallenge`, `squadDeposit`) override the corresponding global threshold fields when explicitly set (including `"0"` / `0n` to disable a global threshold for that route). Unspecified fields inherit from the global policy.
+   - `mode: "replace"`: Route thresholds completely replace global thresholds for that route.
+4. **Effective filter expressions**:
+   - `mode: "merge"` *(default)*: Global expressions (if non-empty) **and** route expressions (if non-empty) must both match. Within a single expression list, matching any rule satisfies that list (OR semantics).
+   - `mode: "replace"`: Route expressions completely replace global expressions for that route.
+
+### 4.2 Example Configuration
+
+```ts
+import { compileRouteFilters } from "./notifications/route-filters.js";
+
+const registry = compileRouteFilters({
+  global: {
+    thresholds: { marketChallenge: "20", squadDeposit: "50" },
+    expressions: ["claim_challenged", "deposited", "claim_created where category == 'crypto'"],
+  },
+  routes: {
+    "whale-chat": {
+      // mode: "merge" (default) — raises marketChallenge to 100 USDC, inherits squadDeposit = 50 USDC
+      thresholds: { marketChallenge: "100" },
+    },
+    "firehose": {
+      // mode: "replace" — ignores global thresholds and expressions for this route
+      mode: "replace",
+    },
+    "muted-chat": {
+      enabled: false,
+    },
+  },
+});
+```
+

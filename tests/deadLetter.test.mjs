@@ -406,3 +406,83 @@ test("makeEntryId is stable for identical payloads and differs on content", () =
   assert.notEqual(a, c);
   assert.notEqual(a, d);
 });
+
+test("flush rejects replay of an entry from another network and leaves it unchanged", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-dlq-net-"));
+  const filePath = path.join(directory, "dead-letter.json");
+  try {
+    const testnetQueue = createDeadLetterQueue({
+      filePath,
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      now: () => 1_700_000_000_000,
+    });
+    await testnetQueue.load();
+    await testnetQueue.enqueue({
+      source: "market",
+      ledger: 42,
+      eventName: "claim_created",
+      text: "testnet notification",
+      error: new Error("Telegram 429"),
+    });
+
+    // Switch active configuration to mainnet and also add a legacy entry without networkPassphrase
+    // plus a mainnet entry to verify budget & compatibility.
+    const rawOnDisk = JSON.parse(await readFile(filePath, "utf8"));
+    rawOnDisk.entries.push({
+      id: "market:43:claim_created:11111111",
+      enqueuedAt: "2026-10-18T10:00:00.000Z",
+      source: "market",
+      ledger: 43,
+      eventName: "claim_created",
+      text: "legacy entry",
+      attempts: 1,
+      lastError: "Telegram 429",
+    });
+    await writeFile(filePath, JSON.stringify(rawOnDisk, null, 2), "utf8");
+
+    const mainnetQueue = createDeadLetterQueue({
+      filePath,
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Public Global Stellar Network ; September 2015",
+      now: () => 1_700_000_005_000,
+    });
+    await mainnetQueue.load();
+    await mainnetQueue.enqueue({
+      source: "market",
+      ledger: 44,
+      eventName: "claim_created",
+      text: "mainnet notification",
+      error: new Error("Telegram 503"),
+    });
+
+    const sentLedgers = [];
+    const result = await mainnetQueue.flush(async (_text, entry) => {
+      sentLedgers.push(entry.ledger);
+    }, 2);
+
+    // Legacy (43) and matching mainnet (44) replayed; testnet (42) rejected and left untouched.
+    assert.deepEqual(sentLedgers, [43, 44]);
+    assert.equal(result.sent, 2);
+    assert.equal(result.remaining, 1);
+    assert.equal(result.rejectedNetworkMismatch, 1);
+
+    const persisted = JSON.parse(await readFile(filePath, "utf8"));
+    assert.equal(persisted.entries.length, 1);
+    assert.deepEqual(persisted.entries[0], {
+      id: rawOnDisk.entries[0].id,
+      enqueuedAt: rawOnDisk.entries[0].enqueuedAt,
+      source: "market",
+      ledger: 42,
+      eventName: "claim_created",
+      text: "testnet notification",
+      attempts: 1,
+      lastError: "Telegram 429",
+      networkPassphrase: "Test SDF Network ; September 2015",
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});

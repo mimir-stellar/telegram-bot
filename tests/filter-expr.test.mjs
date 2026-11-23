@@ -294,6 +294,70 @@ test("parseUsdcStringToUnits: atomic unit conversion utility", () => {
   assert.equal(parseUsdcStringToUnits("100"), 1_000_000_000n);
   assert.equal(parseUsdcStringToUnits("0.0000001"), 1n);
   assert.equal(parseUsdcStringToUnits("2.5"), 25_000_000n);
+
+  // Canonical equivalent decimal strings normalize identically
+  for (const equivalent of ["10.5", "010.5", "10.50", "10.5000000", " 010.50 "]) {
+    assert.equal(parseUsdcStringToUnits(equivalent), 105_000_000n);
+  }
+
+  // Values exceeding 7 fractional digits (including trailing zeros) are rejected
+  assert.throws(
+    () => parseUsdcStringToUnits("1.00000000"),
+    (err) => err instanceof FilterParseError && /exceeds maximum precision of 7 decimals/.test(err.message),
+  );
+});
+
+test("evaluateFilterRule: normalizes equivalent decimal USDC thresholds before comparison", () => {
+  const equivalentExpressions = [
+    "claim_challenged where stake >= 10.5",
+    "claim_challenged where stake >= 10.50",
+    "claim_challenged where stake >= 010.5000000",
+    "claim_challenged where stake >= 10.5 USDC",
+    "claim_challenged where stake >= $10.50",
+  ];
+
+  const belowEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    stake: 104_999_999n, // 10.4999999 USDC
+  });
+  const exactEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    stake: 105_000_000n, // 10.5000000 USDC
+  });
+  const aboveEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    stake: 105_000_001n, // 10.5000001 USDC
+  });
+
+  for (const expr of equivalentExpressions) {
+    const rule = parseFilterExpression(expr);
+    assert.equal(evaluateFilterRule(rule, belowEvent), false, `belowEvent failed for: ${expr}`);
+    assert.equal(evaluateFilterRule(rule, exactEvent), true, `exactEvent failed for: ${expr}`);
+    assert.equal(evaluateFilterRule(rule, aboveEvent), true, `aboveEvent failed for: ${expr}`);
+  }
+});
+
+test("parseFilterExpression: rejects bare and explicit decimal USDC thresholds exceeding 7 fractional digits", () => {
+  const invalidExpressions = [
+    "claim_challenged where stake >= 1.12345678",
+    "deposited where amount >= 1.00000000",
+    "claim_challenged where stake >= $1.00000000",
+    "deposited where amount == 0.00000001 USDC",
+  ];
+
+  for (const expr of invalidExpressions) {
+    assert.throws(
+      () => parseFilterExpression(expr),
+      (err) => err instanceof FilterParseError && /exceeds maximum precision of 7 decimals/.test(err.message),
+      `Expected FilterParseError for: ${expr}`,
+    );
+  }
 });
 
 // ----------------------------------------------------
@@ -413,5 +477,123 @@ test("parseFilterExpression: respects custom maxDepth option", () => {
 
   const rule = parseFilterExpression(expr, { maxDepth: 2 });
   assert.ok(rule.condition);
+});
+
+// ----------------------------------------------------
+// Mixed-Unit Comparison Rejection & Non-USDC BigInt Fields
+// ----------------------------------------------------
+
+test("parseFilterExpression: rejects mixed-unit comparisons on identifiers and ledger numbers", () => {
+  const mixedCases = [
+    "claim_created where claimId >= 100 USDC",
+    "market_created where marketId == $5",
+    "market_created where deadline > 1000 USDC",
+    "market_created where feeBps <= 50 USDC",
+    "claim_resolved where confidence > 0.5 USDC",
+    "where claimId >= 100 USDC",
+    "where marketId == $10",
+    "where ledger >= 100 USDC",
+  ];
+
+  for (const expr of mixedCases) {
+    assert.throws(
+      () => parseFilterExpression(expr),
+      (err) => {
+        assert.ok(err instanceof FilterParseError, `Expected FilterParseError for: ${expr}`);
+        assert.match(err.message, /Mixed-unit comparison|is a number/);
+        return true;
+      },
+      `Should reject mixed-unit expression: ${expr}`,
+    );
+  }
+});
+
+test("parseFilterExpression: rejects mixed-unit and fractional comparisons on non-USDC bigint fields (shares)", () => {
+  for (const expr of [
+    "deposited where shares >= 100 USDC",
+    "deposited where shares >= $10",
+    "where shares >= 100 USDC",
+  ]) {
+    assert.throws(
+      () => parseFilterExpression(expr),
+      (err) => {
+        assert.ok(err instanceof FilterParseError);
+        assert.match(err.message, /Mixed-unit comparison.*shares.*not a USDC amount/);
+        return true;
+      },
+      `Should reject USDC literal on shares: ${expr}`,
+    );
+  }
+
+  assert.throws(
+    () => parseFilterExpression("deposited where shares >= 1.5"),
+    (err) => {
+      assert.ok(err instanceof FilterParseError);
+      assert.match(err.message, /Field "shares" is an integer, cannot compare with fractional number/);
+      return true;
+    },
+  );
+});
+
+test("evaluateFilterRule: evaluates non-USDC bigint field (shares) without USDC scaling", () => {
+  const rule = parseFilterExpression("deposited where shares >= 100");
+
+  const makeDeposit = (shares) =>
+    mockEvent("squad", {
+      name: "deposited",
+      marketId: 42,
+      side: 1,
+      participant: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      amount: 500_000_000n,
+      shares,
+    });
+
+  assert.equal(evaluateFilterRule(rule, makeDeposit(99n)), false);
+  assert.equal(evaluateFilterRule(rule, makeDeposit(100n)), true);
+  assert.equal(evaluateFilterRule(rule, makeDeposit(150n)), true);
+});
+
+test("evaluateFilterRule: refuses mixed-unit coercion on manually constructed ASTs", () => {
+  const mixedIdRule = {
+    eventName: "claim_created",
+    rawExpression: "claim_created where claimId >= 1 USDC",
+    condition: {
+      type: "comparison",
+      op: ">=",
+      field: "claimId",
+      fieldPos: 20,
+      value: { kind: "usdc", atomic: 10_000_000n, rawDecimal: "1 USDC" },
+      valuePos: 31,
+    },
+  };
+  const claimEvent = mockEvent("market", {
+    name: "claim_created",
+    claimId: 5,
+    creator: "G...",
+    category: "crypto",
+  });
+  assert.equal(evaluateFilterRule(mixedIdRule, claimEvent), false);
+
+  const mixedSharesRule = {
+    eventName: "deposited",
+    rawExpression: "deposited where shares >= 1 USDC",
+    condition: {
+      type: "comparison",
+      op: ">=",
+      field: "shares",
+      fieldPos: 16,
+      value: { kind: "usdc", atomic: 10_000_000n, rawDecimal: "1 USDC" },
+      valuePos: 26,
+    },
+  };
+  const depositEvent = mockEvent("squad", {
+    name: "deposited",
+    marketId: 1,
+    side: 1,
+    participant: "G...",
+    amount: 50_000_000n,
+    shares: 50_000_000n,
+  });
+  assert.equal(evaluateFilterRule(mixedSharesRule, depositEvent), false);
 });
 

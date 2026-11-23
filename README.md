@@ -134,6 +134,7 @@ looks healthy but notifies nobody.
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
 | `npm run cursor -- backup` | Backs up the validated cursor file without contacting Stellar or Telegram |
 | `npm run cursor -- restore --from PATH` | Restores a validated backup while holding the poller lock; replacing an existing cursor requires `--force` |
+| `npm run cursor -- check --archive PATH` | Read-only: compares the cursor with a scan archive and reports identity mismatches, ledger gaps and contradictions; exits non-zero on errors |
 
 `/start`, `/help`, and Telegram's command menu are generated from the same
 command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
@@ -148,6 +149,11 @@ response and cannot mutate poller state — this includes `/audit`, whose report
 is operator-only. Repeated `/pause` or `/resume` commands
 are idempotent. Control state is process-local: a restart resumes polling and
 loads the existing version-1 cursor file.
+
+Slash-command arguments are bounded to 256 UTF-8 bytes (`MAX_COMMAND_ARGUMENT_BYTES`)
+by a shared gate before individual command handlers run. Oversized arguments are
+rejected with a fixed, bounded reply and a warning log that records only the command
+name, update id, and byte count (never the user's input).
 
 ## Machine-readable status snapshot
 
@@ -213,6 +219,8 @@ checkout; the Docker image already includes the compiled CLI.
 npm run cursor -- backup
 npm run cursor -- backup --out /safe-storage/cursor-before-deploy.json
 npm run cursor -- restore --from /safe-storage/cursor-before-deploy.json --force
+npm run cursor -- history
+npm run cursor -- check --archive ./data/archive
 ```
 
 Restore validates and normalizes the backup to the current version-1 cursor
@@ -223,6 +231,47 @@ command fail; stale locks are handled by the same PID check used at startup.
 Restoring an existing cursor requires `--force`; malformed or future-version
 files are always rejected. The command prints only paths, schema version, and
 target count, never opaque cursor contents.
+
+Cursor recovery actions (automatic floor rewinds, operator restores, and
+corrupt-file quarantines) append a bounded entry to `recoveryHistory` (at most
+20 most-recent entries) inside `CURSOR_FILE`. Each entry records the UTC
+timestamp, reason, and before/after target positions (`cursor`,
+`lastEventLedger`, and optional `rewindFromLedger`) — never event payloads,
+event IDs, or secrets. Run `npm run cursor -- history` to inspect a summary of
+retained recovery entries without printing opaque cursor strings.
+
+### Cursor consistency check
+
+`npm run cursor -- check --archive PATH` compares `CURSOR_FILE` with a scan
+archive: an event archive directory (`events-*.jsonl`, as written by
+`createEventArchive`) or a single `npm run scan -- --jsonl` export file. It is
+strictly read-only — no instance lock, no temp files, and neither the cursor
+nor the archive is ever advanced, rewound, or rewritten — so it is safe to run
+next to a live poller. Comparisons are per target (`market`, `squad`) and at
+ledger granularity:
+
+| Finding | Severity | Meaning |
+| --- | --- | --- |
+| `archive-target-untracked` | warning | Archive has records for a target the cursor does not track |
+| `cursor-target-unarchived` | warning | Cursor has a position for a target the archive has no records for |
+| `mixed-contract-ids` | error | One target's records carry more than one contract id |
+| `contract-mismatch` | error | Records belong to a contract other than `--market-contract`/`--squad-contract` (default `MARKET_CONTRACT_ID`/`SQUAD_CONTRACT_ID`) |
+| `archive-behind-cursor` | error | Gap: the cursor processed events past the archive's last ledger |
+| `archive-beyond-cursor` | error | Contradiction: archived events lie past the cursor's resume position (skipped while a floor rewind is pending) |
+| `processed-events-missing` | error | Gap: event ids in the cursor's dedup window, inside the archived ledger span, are missing from the archive |
+| `cursor-ledger-contradiction` | error | The resume cursor sits behind the cursor's own `lastEventLedger` |
+| `event-ledger-mismatch` / `conflicting-duplicate` | error | A record's ledger contradicts its event id, or one event id was archived with different identities |
+| `malformed-record` | error | A record lacks a source, contract id, positive ledger, or event id |
+| `duplicate-event` / `out-of-order` | warning | Overlapping captures, or records stored out of chain order |
+| `rewind-pending` / `recorded-gap` | warning | A floor rewind is in progress, or `recoveryHistory` records ledgers lost to one |
+| `cursor-unreadable` / `cursor-unpositioned` | warning | No ledger can be read from the cursor, or the target has no position yet |
+
+The text report prints ledgers and counts only, never opaque cursor strings or
+event ids; `--json` prints the same report as JSON. Exit code `0` means no
+error findings (warnings allowed), `1` means at least one error finding or an
+unreadable cursor/archive. The cursor file does not record a network, so
+network identity is out of scope; point the check at the archive captured for
+the same deployment.
 
 Keep backups on persistent storage separate from the deployment's writable
 cursor when possible. On Railway, a one-off command must use the same attached
@@ -625,9 +674,11 @@ The decoder is deliberately forward-compatible at the event boundary:
 - Events that are valid on-chain but unknown to this version are retained as
   `unknown` for bounded logs and are skipped for Telegram. They are not
   invented, retried, or treated as current contract state.
-- Amounts remain `bigint` atomic USDC values until formatting; no floating-point
-  conversion is used. Contract strings are clipped at the notification and
-  diagnostic boundaries, and scanner output is bounded.
+- Amounts remain `bigint` atomic USDC values until formatting; large integers
+  are represented as decimal strings or `bigint`, and lossy floating-point or
+  unsafe number conversions in IDs, amounts, and generic event decoding are
+  rejected. Contract strings are clipped at the notification and diagnostic
+  boundaries, and scanner output is bounded.
 
 The compatibility promise is for the deployed event wire shape and the public
 decoded payload names above, not for arbitrary XDR or future contract fields.
@@ -641,6 +692,8 @@ endpoint, and `STELLAR_NETWORK_PASSPHRASE` controls network labeling for
 explorer links. The client sends no signing material and creates no wallet.
 Explorer path components are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL`
 values are supported without changing cursor or decoder compatibility.
+Notifications only link `https:` URLs; any other explorer or app origin renders
+the `tx` label as inert text (see [docs/notification-links.md](docs/notification-links.md)).
 
 ## Cursor persistence
 
@@ -1020,8 +1073,8 @@ proxy requirements, secret lifecycle, verification, and rollback steps.
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
-| `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
+| `GET` / `HEAD /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped, draining, or degraded (repeated RPC failures or a stale success window). `GET` returns the JSON report (including `poller.paused` and `poller.suppressedLogs`); `HEAD` returns the same status and headers without a response body or full report serialization. |
+| `GET` / `HEAD /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening (`HEAD` omits the response body). |
 | `GET /health/diag` | The same report `/export` produces in the chat, as plain text. `404` when log capture is off. For an operator with host access but no seat in the chat. |
 
 **Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:
@@ -1097,6 +1150,7 @@ Configuration (see `.env.example`):
 - `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
+- `HEALTH_AUTH_TOKEN` — optional bearer token for all health/metrics routes; an Authorization header over 4096 UTF-8 bytes (including `Bearer `) is rejected with the same empty `401` as any malformed value
 - A stale cursor rejection independently makes `GET /health` return `503` until its target scans successfully; `HEALTH_STALE_MS` does not disable this cursor alert.
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)

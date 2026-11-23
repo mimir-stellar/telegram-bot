@@ -75,7 +75,7 @@ test("formatFallbackEvent renders admin events without dumping their payload", (
   assertBoundedWithoutPayload(result);
 });
 
-test("formatFallbackEvent keeps an unusable transaction hash out of the URL", () => {
+test("formatFallbackEvent renders an unusable transaction hash as inert text, never an empty link", () => {
   const result = formatFallbackEvent(
     config,
     event({ name: "unknown", raw: payloadSentinel }, "not-a-valid-hash"),
@@ -85,7 +85,7 @@ test("formatFallbackEvent keeps an unusable transaction hash out of the URL", ()
   assert.equal(
     result,
     "⚠️ *Event Notification Fallback* \\(market\\)\n" +
-      "Contract: `contract` · Ledger: 55 · [tx]()\n" +
+      "Contract: `contract` · Ledger: 55 · tx\n" +
       "Reason: _no decoder_",
   );
   assertBoundedWithoutPayload(result);
