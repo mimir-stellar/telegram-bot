@@ -11,22 +11,21 @@ The Mimir notifier listens to events emitted by the `mimir-market` and `mimir-sq
 ### 1.1 Soroban Wire Format (`#[contractevent]`)
 
 Soroban contracts use the `#[contractevent]` macro, which standardizes event wire layout into topics and values:
-
 ```text
 topic[0]   snake_case event name symbol (e.g. "claim_created", "market_settled")
-topic[1..] #[topic]-annotated fields, in declaration order (u64 IDs, Address strkeys, etc.)
+topic[1..] #[topic]-annotated fields, in declaration order (u64 IDs, Address strkers, etc.)
 value      ScVal map containing all remaining non-topic fields keyed by symbol name
 ```
 
 For example, a `ClaimChallenged` contract event with `#[topic] id: u64`, `#[topic] challenger: Address`, and `stake: i128` arrives over RPC as:
 * `topic[0]`: Symbol `"claim_challenged"`
 * `topic[1]`: U64 `1`
-* `topic[2]`: Address `"GABC..."`
+* `topic[2]`: Address `"GBAC..."`
 * `value`: Map `{ "stake": 50000000n }`
 
 ### 1.2 The Never-Throw Invariant
 
-The decoding entry point [`decodeEvent`](../src/stellar/decode.ts) in `src/stellar/decode.ts` **never throws**. Any unexpected condition—missing topics, oversized XDR, malformed values, unknown event names, or scalar parsing mismatches—safely returns a typed `UnknownPayload`:
+The decoding entry point [`ecodeEvent`](../src/stellar/decode.ts) in `src/stellar/decode.ts` **never throws**. Any unexpected condition&mdash;missing topics, oversized XDR, malformed values, unknown event names, or scalar parsing mismatches&mdash;safely returns a typed `UnknownPayload`:
 
 ```ts
 export interface UnknownPayload {
@@ -37,6 +36,17 @@ export interface UnknownPayload {
 ```
 
 A live notifier daemon must never crash because an unhandled or future contract event appeared on-chain.
+
+### 1.3 Unknown Event Names vs. Malformed Known Events
+
+Decoders distinguish two distinct failure modes, and each is counted separately for observability:
+
+| Case | When it occurs | Status code | Counter |
+| ---- | ---- | ---- | ---- |
+| **Unknown event name** | Topic[0] is not a known event for the contract source and version (e.g. a future event not yet supported) | `unknown_event` | `unknownEventCount` |
+| **Malformed known event** | Topic[0] is a known event name, but its topics or value fail schema/scalar validation | `malformed_event` | `malformedEventCount` |
+
+Both cases return an `UnknownPayload` with a distinct `reason` string and are nonfatal to event polling: the scanner continues to the next event and the cursor advances normally. The corresponding counter is incremented so operators can alert on either condition independently.
 
 ---
 
@@ -49,12 +59,12 @@ The bot dispatches decoders according to per-contract version settings configure
 ```text
 Environment (.env)
   MARKET_CONTRACT_VERSION="v2"
-  SQUAD_CONTRACT_VERSION="v1"
+  QUAD_CONTRACT_VERSION="v1"
         │
         ▼
 Configuration Loader (src/config.ts)
   c.contractVersion("MARKET_CONTRACT_VERSION", "v1")
-  c.contractVersion("SQUAD_CONTRACT_VERSION", "v1")
+  c.contractVersion("QUAD_CONTRACT_VERSION", "v1")
   - Validates against /^[a-z0-9_.-]+$/; lowercases and trims.
   - Stored on StellarConfig as marketContractVersion and squadContractVersion.
         │
@@ -82,6 +92,7 @@ Decoder Registry Dispatch (src/stellar/decode.ts)
 1. **Normalization:** [`normalizeContractVersion`](../src/stellar/decode.ts) trims whitespace, converts input to lowercase, and falls back to `DEFAULT_CONTRACT_VERSION` (`"v1"`) when given an empty or undefined string.
 2. **Unsupported Versions:** When an unmapped or future version string (e.g., `"v99"`) is passed, `decoderMap[normVersion]` returns `undefined`. The lookup immediately falls back to `decoderMap[DEFAULT_CONTRACT_VERSION]`, which points to `decodeMarketV1` or `decodeSquadV1`.
 3. **No Rejection:** Unsupported version strings are **not** rejected with a thrown error. The event is safely processed through the baseline v1 decoder, and `event.version` records the normalized version string for observability.
+4. **Startup Validation & Unsupported Version Flagging:** Before live polling begins, [`validateDecoderCombinations`](../src/stellar/decode.ts) inspects all configured targets. Any unsupported version combinations are warned in structured logs (`action: 'unsupported_contract_version'`) and recorded on `target.supportedVersion` and `status.unsupportedVersions`. Live polling continues safely using the baseline fallback.
 
 ---
 
@@ -140,9 +151,9 @@ Similarly, `decodeSquadV2` only intercepts `market_created` when `fields.categor
 
 ### 3.3 Nature of the Extension Pattern & Fallback Boundaries
 
-Inspecting `fields.<field> !== undefined` is an application-level pattern used in `decodeMarketV2` and `decodeSquadV2` to accommodate backward-compatible contract changes:
+Inspecting `fields.<field> !== undefined` an application-level pattern used in `decodeMarketV2` and `decodeSquadV2` to accommodate backward-compatible contract changes:
 * **Fallback is conditional:** Falling through to the prior decoder (`decodeMarketV1` or `decodeSquadV1`) succeeds **only if** the event without the new field conforms to what that prior decoder expects.
-* **Required fields still apply:** If any baseline topic or field required by the prior decoder (such as `category` on `claim_created`, or valid strkey addresses) is missing or malformed, the prior decoder will throw a `DecodeError`, and `decodeEvent` will return an `unknown` payload.
+* **Required fields still apply:** If any baseline topic or field required by the prior decoder (such as `category` on `claim_created`, or valid strkey addresses) is missing or malformed, the prior decoder will throw a `DecodeError`, and `decodeEvent` will return a `malformed_event` payload (see &sect;1.3).
 * **Breaking changes:** If a new contract version fundamentally changes existing field types or topic order, delegation alone is insufficient; that event must be explicitly decoded in the newer decoder without delegating to the old one.
 
 ---
@@ -198,7 +209,7 @@ When a contract introduces a completely new event (e.g., `claim_escalated`):
    };
    ```
 4. **Implement Decoder Case:**
-   Add `case "claim_escalated":` to the decoder function using scalar helpers:
+   Add `case "claim_escalated":  to the decoder function using scalar helpers:
    ```ts
    case "claim_escalated":
      return {
@@ -209,7 +220,7 @@ When a contract introduces a completely new event (e.g., `claim_escalated`):
      };
    ```
 5. **Admin Event Routing:**
-   Events that represent administrative operations (such as oracle changes or fee adjustments) route through `decodeAdmin`. Unrecognized event names fall through `switch (name)` to `default: return decodeAdmin(name, topics, fields)`. If `decodeAdmin` also returns `null`, `decodeEvent` yields `{ name: "unknown", eventName, reason: "no decoder" }`.
+   Events that represent administrative operations (such as oracle changes or fee adjustments) route through `decodeAdmin`. Unrecognized event names fall through `switch (name)` to `default: return decodeAdmin(name, topics, fields)`. If `decodeAdmin` also returns `null`, `decodeEvent` yields `{ name: "unknown", eventName, reason: "unknown_event" }`.
 
 ---
 
@@ -226,24 +237,11 @@ To introduce a new contract version:
    export const DEFAULT_CONTRACT_VERSION: ContractVersion = "v1";
    export const SUPPORTED_CONTRACT_VERSIONS: ContractVersion[] = ["v1", "v2"];
    ```
-   Notice that `ContractVersion` ends with `| string`, so TypeScript already permits any arbitrary string value. However:
+   Notice that `ContractVersion` ends with ` | string`, so TypeScript already permits any arbitrary string value. However:
    - `SUPPORTED_CONTRACT_VERSIONS` is the runtime array of officially recognized versions; update it when adding support (e.g. `["v1", "v2", "v3"]`).
    - More crucially, runtime version dispatch relies on the `MARKET_DECODERS` and `SQUAD_DECODERS` registries. A version string will only execute its specific decoder if registered in these maps.
 2. **Author the Hypothetical Decoder:**
-   Implement `decodeMarketV3` (or `decodeSquadV3`) following the delegation pattern:
-   ```ts
-   export function decodeMarketV3(
-     name: string,
-     topics: unknown[],
-     fields: Record<string, unknown>,
-   ): MarketPayload | AdminPayload | null {
-     if (name === "new_v3_event") {
-       // decode v3 specific event
-     }
-     // Delegate everything else to v2
-     return decodeMarketV2(name, topics, fields);
-   }
-   ```
+   Implement `decodeMarketV3` (or `decodeSquadV3`) following the delegation pattern described in &sect;3.
 3. **Register in Decoder Registry:**
    Export the decoder in `MARKET_DECODERS` or `SQUAD_DECODERS`:
    ```ts
@@ -276,6 +274,7 @@ Failure detection in `decodeEvent` follows a strict sequence:
      - Individual topic XDR $\le$ `MAX_EVENT_TOPIC_XDR_BYTES` (1,024 bytes / 1 KiB).
      - Thrown before `scValToNative(event.value)` allocates JavaScript objects.
 3. **Value Deserialization (Guarded Catch):**
+   - [`findDuplicateMapKey`](../src/stellar/generic-decode.ts) inspects `ScVal` maps (and nested vectors/maps) for conflicting duplicate keys (including cross-type JS property key collisions such as `scvSymbol("stake")` vs `scvString("stake")`) **before** conversion to JavaScript objects. Both `decodeEvent` and `decodeGenericEvent` reject colliding maps with a bounded `unknown` event diagnostic (`reason` $\le 200$ chars).
    - Deserialization errors from `scValToNative(event.value)` return `{ name: "unknown", eventName, reason: "malformed XDR value: ..." }`.
 4. **Field-Level Validation Errors (Caught by Outer Catch):**
    - Thrown by scalar helpers when a field is missing, has an unexpected type, or exceeds bounds. Caught by the outer `try/catch` and formatted using `diagnostic(err)`.
@@ -288,9 +287,9 @@ Always parse fields using the tested helpers in `src/stellar/decode.ts`:
 
 | Helper | Input Type | Validation & Bounds | Throws |
 | :--- | :--- | :--- | :--- |
-| `num(val, what)` | `number \| bigint` | Non-negative integer $\le \text{Number.MAX\_SAFE\_INTEGER}$. | `DecodeError` |
-| `big(val, what)` | `bigint \| number` | Valid integer. | `DecodeError` |
-| `amount(val, what)` | `bigint \| number` | Non-negative integer `bigint`. Never converted to floating-point `number`. | `DecodeError` |
+| `num(val, what)` | `number \| bigint \| string` | Non-negative integer $\le \text{Number.MAX\_SAFE\_INTEGER}$. Rejects unsafe numbers and lossy coercion. | `DecodeError` |
+| `big(val, what)` | `bigint \| number \| string` | Valid integer. Rejects unsafe floating-point numbers outside safe integer range. | `DecodeError` |
+| `amount(val, what)` | `bigint \| number \| string` | Non-negative integer `bigint`. Rejects unsafe numbers and lossy number coercion. Large integers must be represented as `bigint` or decimal strings. | `DecodeError` |
 | `str(val, what)` | `string \| Uint8Array` | String trimmed and capped at `MAX_DECODED_STRING_CHARS` (2,048 chars). | `DecodeError` |
 | `optStr(val, what)` | `unknown` | Returns trimmed string $\le 2048$ chars, or `undefined` if nullish. | `DecodeError` |
 | `addr(val, what)` | `string` | 56-character Stellar strkey (`/^[GC][A-Z2-7]{55}$/`). | `DecodeError` |
@@ -298,11 +297,12 @@ Always parse fields using the tested helpers in `src/stellar/decode.ts`:
 | `hex(val, what)` | `Uint8Array \| string` | 32-byte hash formatted as lowercase hex string. | `DecodeError` |
 | `topicAt(topics, idx, what)` | `unknown[]` | Bounds-checked index retrieval from topic array. | `DecodeError` |
 
-### 6.3 Preserving Token Amounts as `bigint`
+### 6.3 Preserving Token Amounts as `bigint` and Rejecting Lossy Numeric Coercion
 
 All Mimir contract currency is atomic USDC with 7 decimal places (`USDC_UNIT = 10_000_000n`), represented on-chain as an `i128`.
 
-* **Rule:** Decoders must never cast token amounts to JavaScript `number` (float). Floating-point conversion causes precision loss on amounts over $2^{53}-1$ atomic units.
+* **Rule:** Decoders must never cast token amounts to JavaScript `number` (float), nor accept unsafe numbers exceeding `Number.MAX_SAFE_INTEGER`. Floating-point conversion causes precision loss on amounts over $2^{53}-1$ atomic units.
+* **Large Integers as Decimal Strings:** Amounts and IDs that exceed JavaScript's safe integer range must be provided as exact decimal strings or `bigint` types. Lossy number coercion (e.g. floats or integers $> \text{Number.MAX\_SAFE\_INTEGER}$) is rejected with a `DecodeError`.
 * **Storage:** Store token amounts as `bigint` in payload types.
 * **Formatting:** Defer formatting to the presentation layer via `formatUsdc(amount: bigint)`.
 
@@ -312,6 +312,7 @@ When an error occurs during decoding:
 * [`diagnostic(err)`](../src/stellar/decode.ts) and [`sanitizeReason(reason)`](../src/stellar/decode.ts) redact bot tokens, API keys, and sensitive credential patterns.
 * Diagnostic reasons are capped at `MAX_DIAGNOSTIC_LENGTH` (200 characters) to prevent log bloat.
 * Error messages state expectations without echoing raw attacker-controlled payloads.
+* [`explainDecodeEvent(source, event, versionOrOptions)`](../src/stellar/decode.ts) and [`explainGenericEvent(rawEvent, source, options)`](../src/stellar/generic-decode.ts) expose single-event explain mode returning `selectedSchema`, `fieldChecks`, and `rejectionReason` with raw values redacted and bounded.
 
 ---
 
@@ -342,6 +343,14 @@ Every decoder PR must add or update tests in [`tests/version-decoders.test.mjs`]
 
 * **`tests/version-decoders.test.mjs`:** **Mandatory.** Construct focused synthetic `ScVal` events inline using `@stellar/stellar-sdk` (`xdr.ScVal.scvSymbol`, `xdr.ScVal.scvMap`, etc.).
 * **`tests/fixtures/events.mjs` and `tests/decode-fixtures.test.mjs`:** **Optional for incremental fields.** Only update these golden fixtures if introducing a brand new top-level event type that belongs in the general end-to-end event fixture suite.
+
+### 7.4 Semantic Fingerprint & Drift Detection
+
+Decoder output drift is tracked with a versioned SHA-256 semantic fingerprint in [`src/stellar/decoder-fingerprint.ts`](../src/stellar/decoder-fingerprint.ts) (re-exported from `src/stellar/decode.ts` and `src/stellar/generic-decode.ts`):
+
+* **Canonical hashing (`DECODER_FINGERPRINT_VERSION = "v1"`):** `fingerprintDecodedEvent`, `fingerprintGenericEvent`, and `fingerprintDecoderOutput` hash only canonical metadata and payload fields with sorted keys and explicit type tags (`$bigint`, `$bytes`, `$nonFinite`). Presentation-only text—such as `GenericDecodedEvent.summary`, `topicSummary`, `valueSummary`, `payload.summary`, and `UnknownPayload.reason`—is excluded so formatting or diagnostic prose tweaks do not cause false-positive drift.
+* **Reviewed fixture baseline:** [`tests/fixtures/decoder-fingerprints.v1.json`](../tests/fixtures/decoder-fingerprints.v1.json) stores the reviewed semantic fingerprints for typed (`market`, `squad`, `admin`, `unknown`) and generic decoder fixtures.
+* **Breaking-change reporting:** `compareFixtureFingerprints` and `formatDriftReport` classify removed fields, value changes, type changes, version mismatches, and missing fixtures as **breaking** (`hasBreakingChanges: true`), while additive optional fields are reported as **non-breaking**. Run `node --test tests/decoder-fingerprint.test.mjs` to verify decoder output stability against the reviewed fixtures.
 
 ---
 

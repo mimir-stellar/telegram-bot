@@ -26,10 +26,13 @@ import {
   CALLBACK_PAUSE_CANCEL,
   CALLBACK_PAUSE_CONFIRM,
   chatAllowed,
+  commandArgumentAllowed,
   commandMetadata,
+  isCommandForAnotherBot,
   isOperator,
   operatorAllowed,
   registeredCommands,
+  validateCommandCatalogue,
   visibleCommandMetadata,
   type CommandDeps,
   type CommandModule,
@@ -38,6 +41,7 @@ import {
   handlePauseConfirmCallback,
   registerCallbackHandlers,
   validatePauseConfirmData,
+  formatCallbackErrorLog,
 } from "./callbacks.js";
 import { registerBroadcastHandlers } from "./commands/broadcast.js";
 import { pauseConfirmKeyboard } from "./commands/keyboards.js";
@@ -63,9 +67,18 @@ export {
   pauseConfirmKeyboard,
   statusKeyboard,
 } from "./commands/keyboards.js";
-export { TELEGRAM_OPTIONS, isChatAllowed, isOperator } from "./commands/runtime.js";
+export {
+  MAX_COMMAND_ARGUMENT_BYTES,
+  TELEGRAM_OPTIONS,
+  checkCommandArgumentLength,
+  commandArgumentTooLongMessage,
+  isChatAllowed,
+  isOperator,
+  type CommandArgumentCheck,
+} from "./commands/runtime.js";
 export {
   aboutMessage,
+  categoriesMessage,
   helpMessage,
   contractsMessage,
   healthMessage,
@@ -81,23 +94,39 @@ export {
   CALLBACK_UNAUTHORIZED_PAYLOAD,
   PAUSE_CONFIRM_TTL_MS,
   TELEGRAM_CALLBACK_DATA_MAX_BYTES,
+  classifyCallbackError,
+  extractCallbackLogIds,
+  formatCallbackErrorLog,
   handleCallbackQuery,
   handlePauseConfirmCallback,
   registerCallbackHandlers,
   updateOrReplyMessage,
   validateCallbackData,
   validatePauseConfirmData,
+  isCanonicalNumericId,
+  isNoncanonicalNumericId,
+  MAX_CANONICAL_NUMERIC_DIGITS,
   type CallbackActionType,
+  type CallbackErrorLogParams,
+  type CallbackLogIds,
   type CallbackValidationResult,
   type ValidCallbackAction,
 } from "./callbacks.js";
 export {
   handleBroadcastCallback,
+  handleConfirmationsCallback,
+  handleConfirmationsCommand,
   registerBroadcastHandlers,
   handleBroadcastCommand,
   getConfiguredBroadcastChats,
+  fingerprintDestinationSet,
+  formatPendingConfirmations,
+  pendingConfirmationsKeyboard,
+  MAX_PENDING_CONFIRMATIONS,
+  BROADCAST_NO_PENDING_MESSAGE,
   BroadcastStore,
   sendBroadcast,
+  type PendingConfirmationSummary,
 } from "./commands/broadcast.js";
 export { clearHintState } from "./commands/unknown.js";
 
@@ -238,6 +267,7 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
   const modules = registeredCommands();
   for (const module of modules) {
     registrar.command(module.command, async (ctx) => {
+      if (isCommandForAnotherBot(ctx)) return;
       if (!withinRateLimit(ctx, module.command)) return;
       await dispatch(module, ctx, deps);
     });
@@ -264,22 +294,27 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
 }
 
 /**
- * Run one command module: apply the authorization its metadata declares, then
- * the handler. Gating here — instead of inside each handler — means a new
- * operator-only or allowlisted command cannot forget its check.
+ * Run one command module: apply the authorization its metadata declares and
+ * the shared argument byte bound, then the handler. Gating here — instead of
+ * inside each handler — means a new operator-only or allowlisted command
+ * cannot forget its check, and oversized arguments are rejected before any
+ * handler runs.
  */
-function dispatch(
+async function dispatch(
   module: CommandModule,
   ctx: CommandContext<Context>,
   deps: BotDeps,
 ): Promise<void> {
   if (module.operatorOnly === true && !operatorAllowed(ctx, deps.config, module.command)) {
-    return Promise.resolve();
+    return;
   }
   if (module.chatAllowlist === true && !chatAllowed(ctx, deps.config, module.command)) {
-    return Promise.resolve();
+    return;
   }
-  return module.handler(ctx, deps);
+  if (!(await commandArgumentAllowed(ctx, module.command))) {
+    return;
+  }
+  await module.handler(ctx, deps);
 }
 
 /**
@@ -307,13 +342,9 @@ function registerUnknownCommandFallback(
     const raw = text.slice(1, cmdEntity.length);
     const atIndex = raw.indexOf("@");
     const cmdName = atIndex === -1 ? raw : raw.slice(0, atIndex);
-    const mention = atIndex === -1 ? null : raw.slice(atIndex + 1);
 
     // If it targets another bot, ignore.
-    if (mention !== null) {
-      const myUsername = (ctx as unknown as { me?: { username?: string } }).me?.username;
-      if (myUsername && mention.toLowerCase() !== myUsername.toLowerCase()) return;
-    }
+    if (isCommandForAnotherBot(ctx)) return;
 
     // Already handled by a known-command handler — do nothing.
     if (knownCommandNames.includes(cmdName)) return;
@@ -333,6 +364,7 @@ function registerUnknownCommandFallback(
 }
 
 export function createBot(deps: BotDeps): Bot {
+  validateCommandCatalogue();
   const clientOptions =
     deps.config.telegramApiRoot !== undefined && deps.config.telegramApiRoot !== null
       ? { client: { apiRoot: deps.config.telegramApiRoot } }
@@ -355,6 +387,18 @@ export function createBot(deps: BotDeps): Bot {
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.
   bot.catch((err) => {
+    if (err.ctx?.callbackQuery) {
+      console.error(
+        formatCallbackErrorLog({
+          ctx: err.ctx,
+          action: "callback_query",
+          prefix: "[bot] handler error",
+          error: err.error,
+          secrets: [deps.config.botToken],
+        }),
+      );
+      return;
+    }
     console.error(
       `[bot] handler error on update ${err.ctx.update.update_id}: ` +
         safeErrorMessage(err.error, [deps.config.botToken]),
@@ -367,11 +411,27 @@ export function createBot(deps: BotDeps): Bot {
 // Notifier moved to src/notifications/notifier.ts — re-exported here so all
 // existing imports from "bot.js" keep resolving without modification.
 export {
+  classifyPermanentSendError,
   createNotifier,
+  createSendLimiter,
+  DEFAULT_MAX_CONCURRENT_SENDS,
   isMarkdownParseError,
+  isForumTopicClosed,
   notifierSkips,
+  SendLimiterClosedError,
+  type Notifier,
+  type NotifierOptions,
   type SendExtra,
+  type SendLimiter,
+  type SendLimiterOptions,
+  type SendLimiterShutdownMode,
+  type SendLimiterStats,
 } from "./notifications/notifier.js";
+export {
+  verifyRoutes,
+  type NotificationRoute,
+  type VerifyRoutesOptions,
+} from "./notifications/verify-routes.js";
 
 /** Registers the command list so Telegram's UI offers autocompletion. */
 export async function registerCommands(bot: Bot, config?: BotConfig): Promise<void> {
