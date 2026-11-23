@@ -22,7 +22,10 @@ export interface LatencySummary {
 
 export interface LatencyGroup {
   claims: ClaimLatency[];
+  /** Null when no claims exist; absent samples are never reported as zero percentiles. */
   summary: LatencySummary | null;
+  /** True when the group has no claims, so the summary is an absent observation. */
+  empty: boolean;
 }
 
 /**
@@ -51,9 +54,6 @@ export interface ResolutionLatencyReport {
  * For p=0, returns values[0].
  */
 function nearestRank(sortedValues: number[], p: number): number {
-  if (sortedValues.length === 0) {
-    return 0;
-  }
   const rank = Math.ceil((p / 100) * sortedValues.length);
   const index = Math.max(0, Math.min(sortedValues.length - 1, rank - 1));
   return sortedValues[index]!;
@@ -83,13 +83,12 @@ function computeSummary(claims: ClaimLatency[]): LatencySummary | null {
   };
 }
 
-interface Marker {
-  at: number;
-  ledger: number;
-}
-
-function earlier(a: Marker, b: Marker): boolean {
-  return a.ledger < b.ledger || (a.ledger === b.ledger && a.at < b.at);
+function buildGroup(claims: ClaimLatency[]): LatencyGroup {
+  return {
+    claims,
+    summary: computeSummary(claims),
+    empty: claims.length === 0,
+  };
 }
 
 /**
@@ -104,7 +103,8 @@ function earlier(a: Marker, b: Marker): boolean {
  * explicitly in `conflicts` and the claim is excluded from both groups, rather
  * than silently selecting one of the events.
  *
- * Uses integer math only.
+ * Uses integer math only. Groups with no claims report `summary: null` and
+ * `empty: true` rather than zero percentiles.
  */
 export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLatencyReport {
   const creations = new Map<number, Marker>();
@@ -232,14 +232,8 @@ export function resolutionLatency(events: readonly DecodedEvent[]): ResolutionLa
   conflicts.sort((a, b) => a.claimId - b.claimId);
 
   return {
-    resolved: {
-      claims: resolvedClaims,
-      summary: computeSummary(resolvedClaims),
-    },
-    cancelled: {
-      claims: cancelledClaims,
-      summary: computeSummary(cancelledClaims),
-    },
+    resolved: buildGroup(resolvedClaims),
+    cancelled: buildGroup(cancelledClaims),
     excludedCount,
     conflicts,
   };

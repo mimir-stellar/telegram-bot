@@ -113,6 +113,49 @@ export function nextRun(schedule: Schedule, nowMs: number): number {
   return candidate > nowMs ? candidate : candidate + MS_PER_WEEK;
 }
 
+/**
+ * Return the next UTC timestamp (ms) at or after `nowMs` that is outside
+ * `policy`'s quiet-hours window. Returns `nowMs` unchanged when no quiet-hours
+ * window is active at `nowMs`.
+ */
+export function nextAllowedWindowStart(
+  policy: QuietHoursPolicy | undefined,
+  nowMs: number,
+): number {
+  if (!Number.isFinite(nowMs)) {
+    throw new ScheduleParseError("nowMs must be a finite number");
+  }
+  if (!policy || !isInQuietHours(policy, nowMs)) {
+    return nowMs;
+  }
+  const win = extractWindow(policy);
+  if (!win || win.startMinutes === win.endMinutes) {
+    return nowMs;
+  }
+  const dayStart = startOfUtcDay(nowMs);
+  const currentMinutes = getUtcMinutesOfDay(nowMs);
+  if (win.startMinutes < win.endMinutes) {
+    return dayStart + win.endMinutes * 60 * 1000;
+  }
+  if (currentMinutes >= win.startMinutes) {
+    return dayStart + MS_PER_DAY + win.endMinutes * 60 * 1000;
+  }
+  return dayStart + win.endMinutes * 60 * 1000;
+}
+
+/**
+ * Compute the next scheduled run timestamp (ms), deferring it to the end of
+ * `quietHours` if the scheduled time falls inside quiet hours.
+ */
+export function nextAllowedRun(
+  schedule: Schedule,
+  nowMs: number,
+  quietHours?: QuietHoursPolicy,
+): number {
+  const candidate = nextRun(schedule, nowMs);
+  return quietHours ? nextAllowedWindowStart(quietHours, candidate) : candidate;
+}
+
 export interface LastRunStore {
   read(): Promise<number | null>;
   write(timestampMs: number): Promise<void>;
@@ -184,15 +227,18 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       ? parseSchedule(options.schedule)
       : options.schedule;
   const clock = options.clock ?? systemClock;
-  const { run, lastRunStore } = options;
+  const { run, lastRunStore, quietHours } = options;
 
   let timer: unknown = null;
   let stopped = true;
   let chain = Promise.resolve();
 
-  const scheduleNext = () => {
+  const scheduleNext = (deferredAtMs?: number) => {
     const now = clock.now();
-    const next = nextRun(schedule, now);
+    const next =
+      deferredAtMs !== undefined && quietHours
+        ? nextAllowedWindowStart(quietHours, deferredAtMs)
+        : nextAllowedRun(schedule, now, quietHours);
     const delay = Math.max(0, next - now);
     timer = clock.setTimeout(() => {
       void tick(true);
@@ -204,6 +250,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
   const tick = async (atBoundary: boolean) => {
     if (stopped) return;
     timer = null;
+    let deferredAtMs: number | undefined;
     try {
       const now = clock.now();
       const last = await lastRunStore.read();
@@ -226,7 +273,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       console.error("[scheduler] run failed:", err);
     } finally {
       if (!stopped) {
-        scheduleNext();
+        scheduleNext(deferredAtMs);
       }
     }
   };

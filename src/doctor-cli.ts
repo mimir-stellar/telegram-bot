@@ -6,6 +6,7 @@
  * and without leaking secrets in the console output.
  */
 
+import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -53,92 +54,13 @@ export interface DoctorOptions {
   envPath?: string;
   nodeVersion?: string;
   packageJsonPath?: string;
-  logFormats?: readonly LogFormat[];
-  redactionProbes?: readonly RedactionProbe[];
-}
-
-export function defaultRedactionProbes(): RedactionProbe[] {
-  const registeredSecret = ["mimir-probe-", "registered-secret-01"].join("");
-  const botToken = ["123456789:", "AAFakeProbeTokenValue0123456789"].join("");
-  const stellarSeed = `S${"A".repeat(55)}`;
-  const userinfoSecret = ["probe", "pass", "123456"].join("");
-  const querySecret = ["probe", "query", "secret98765"].join("");
-  const bearerSecret = ["probe", "Bearer", "TokenValue12345"].join("");
-  const kvSecret = ["probe", "Kv", "SecretValue98765"].join("");
-
-  return [
-    { field: "registered_secret", value: registeredSecret, register: true },
-    { field: "bot_token", value: botToken },
-    { field: "stellar_seed", value: stellarSeed },
-    {
-      field: "rpc_url_userinfo",
-      value: `https://probeuser:${userinfoSecret}@rpc.example.invalid`,
-      canary: userinfoSecret,
-    },
-    {
-      field: "rpc_url_query",
-      value: `https://rpc.example.invalid/soroban${["?", "api_key", "="].join("")}${querySecret}`,
-      canary: querySecret,
-    },
-    {
-      field: "bearer_token",
-      value: `Bearer ${bearerSecret}`,
-      canary: bearerSecret,
-    },
-    {
-      field: "env_kv_secret",
-      value: `BOT_SECRET=${kvSecret}`,
-      canary: kvSecret,
-    },
-  ];
-}
-
-export function runRedactionSelfCheck(options: RedactionSelfCheckOptions = {}): CheckResult {
-  const formats = options.formats && options.formats.length > 0 ? options.formats : LOG_FORMATS;
-  const probes = options.probes ?? defaultRedactionProbes();
-  const leakedFields = new Set<string>();
-  const registeredSecrets = probes.filter((probe) => probe.register).map((probe) => probe.value);
-
-  for (const format of formats) {
-    const captured: string[] = [];
-    Logger.runWithConfig(
-      {
-        level: "debug",
-        format,
-        secrets: registeredSecrets,
-        sink: (_level, line) => {
-          captured.push(line);
-        },
-      },
-      () => {
-        for (const probe of probes) {
-          captured.length = 0;
-          Logger.info("doctor", `redaction self-check ${probe.field}=${probe.value}`, {
-            [probe.field]: probe.value,
-            nested: { [probe.field]: probe.value },
-          });
-          const canary = probe.canary ?? probe.value;
-          if (canary.length > 0 && captured.some((line) => line.includes(canary))) {
-            leakedFields.add(probe.field);
-          }
-        }
-      },
-    );
-  }
-
-  if (leakedFields.size > 0) {
-    return {
-      name: "redaction-policy",
-      status: "FAIL",
-      message: `Redaction policy self-check failed; leaked fields: ${[...leakedFields].join(", ")}`,
-    };
-  }
-
-  return {
-    name: "redaction-policy",
-    status: "OK",
-    message: `Redaction policy self-check passed (${probes.length} probes across ${formats.join(", ")} log formats)`,
-  };
+  /**
+   * Override the list of tracked source file paths for the case-collision
+   * check. Each entry is a slash-separated path relative to `cwd`. When
+   * omitted the check runs `git ls-files` in `cwd`. Injected by tests so
+   * the check is exercisable without a real git repository.
+   */
+  sourceFiles?: string[];
 }
 
 export function parseSemver(v: string): [number, number, number] | null {
@@ -201,6 +123,59 @@ export function satisfiesNodeEngine(currentVersion: string, requirement: string)
   }
 
   return false;
+}
+
+/**
+ * Return pairs of tracked paths that collide on a case-insensitive filesystem.
+ *
+ * Two paths collide when they are identical after `toLowerCase()` but differ
+ * in their original casing. The check is independent of checkout order: it
+ * operates entirely on the sorted path list produced by `git ls-files`, so the
+ * result is the same regardless of which variant was checked out first.
+ *
+ * @param files - tracked paths relative to the repository root (one per entry).
+ *   Backslash separators (Windows git output) are normalised to forward slashes
+ *   before comparison so the detection is consistent across platforms.
+ * @returns An array of collision groups; each group is the set of paths (two or
+ *   more) that share the same case-folded key.
+ */
+export function findCaseCollisions(files: string[]): string[][] {
+  const byLower = new Map<string, string[]>();
+  for (const f of files) {
+    const normalised = f.replace(/\\/g, "/");
+    const key = normalised.toLowerCase();
+    const bucket = byLower.get(key);
+    if (bucket) {
+      bucket.push(normalised);
+    } else {
+      byLower.set(key, [normalised]);
+    }
+  }
+  const collisions: string[][] = [];
+  for (const group of byLower.values()) {
+    if (group.length > 1) {
+      collisions.push(group.slice().sort());
+    }
+  }
+  return collisions.sort((a, b) => (a[0] ?? "").localeCompare(b[0] ?? ""));
+}
+
+/**
+ * List the files tracked by git in `cwd`. Returns an empty array and a
+ * diagnostic string on failure (missing git, not a repository, etc.).
+ */
+function listTrackedFiles(cwd: string): { files: string[]; error?: string } {
+  try {
+    const out = execSync("git ls-files", { cwd, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] });
+    const files = out
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    return { files };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
+    return { files: [], error: msg };
+  }
 }
 
 function findPackageEngines(cwd: string, explicitPath?: string): { enginesNode?: string; error?: string } {
@@ -422,13 +397,43 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     }
   }
 
-  // 7. Redaction policy self-check across all configured log formats
-  checks.push(
-    runRedactionSelfCheck({
-      formats: options.logFormats,
-      probes: options.redactionProbes,
-    }),
-  );
+  // 7. Case-insensitive source-file collision check
+  {
+    let trackedFiles: string[];
+    let listError: string | undefined;
+
+    if (options.sourceFiles !== undefined) {
+      trackedFiles = options.sourceFiles;
+    } else {
+      const result = listTrackedFiles(cwd);
+      trackedFiles = result.files;
+      listError = result.error;
+    }
+
+    if (listError !== undefined) {
+      checks.push({
+        name: "case-collisions",
+        status: "WARN",
+        message: `Case-collision check skipped: could not list tracked files (${listError})`,
+      });
+    } else {
+      const collisions = findCaseCollisions(trackedFiles);
+      if (collisions.length === 0) {
+        checks.push({
+          name: "case-collisions",
+          status: "OK",
+          message: "No case-insensitive filename collisions among tracked source files",
+        });
+      } else {
+        const summary = collisions.map((group) => group.join(" vs ")).join("; ");
+        checks.push({
+          name: "case-collisions",
+          status: "FAIL",
+          message: `Case-insensitive filename collisions detected (${collisions.length}): ${summary}`,
+        });
+      }
+    }
+  }
 
   const ok = !checks.some((c) => c.status === "FAIL");
   return { ok, checks };

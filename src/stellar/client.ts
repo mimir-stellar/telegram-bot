@@ -31,8 +31,38 @@ export class RpcPassphraseError extends Error {
 }
 
 /**
+ * Build RPC egress allowlist options from a {@link StellarConfig}.
+ * Retains a credential-free loopback exception when `allowLoopbackRpc` is set
+ * or when `MIMIR_PROFILE=mock` is active.
+ */
+export function rpcEgressOptionsForConfig(
+  config: Pick<StellarConfig, "rpcEgressAllowlist" | "allowLoopbackRpc">,
+): RpcEgressAllowlistOptions {
+  return {
+    allowlist: config.rpcEgressAllowlist,
+    allowLoopback: config.allowLoopbackRpc ?? process.env.MIMIR_PROFILE === "mock",
+  };
+}
+
+/**
+ * Create an egress-guarded `fetch` function bound to `config`'s RPC allowlist
+ * (validating both initial URLs and HTTP redirect destinations).
+ */
+export function createRpcEgressFetch(
+  config: Pick<StellarConfig, "rpcEgressAllowlist" | "allowLoopbackRpc">,
+  fetchImpl?: typeof fetch,
+): typeof fetch {
+  return createEgressGuardedFetch({
+    ...rpcEgressOptionsForConfig(config),
+    fetchImpl,
+  });
+}
+
+/**
  * Create an RPC server. Construction is offline; the network passphrase is
  * verified separately at boot by {@link validateNetworkPassphrase}.
+ * When `config.rpcEgressAllowlist` is configured, validates `config.rpcUrl`
+ * (retaining a credential-free loopback exception for mock mode).
  */
 export function createRpcServer(config: StellarConfig): rpc.Server {
   const maxResponseBytes = config.rpcMaxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
@@ -150,6 +180,14 @@ export interface LedgerWindow {
   oldestLedger: number;
   /** Current chain tip. Requests above it are errors. */
   latestLedger: number;
+}
+
+/** A closed ledger range `[startLedger, endLedger]` used for event queries and provider comparisons. */
+export interface ScanLedgerWindow {
+  /** Inclusive start ledger of the scanned window. */
+  startLedger: number;
+  /** Inclusive end ledger of the scanned window. */
+  endLedger: number;
 }
 
 /** Why a ledger window, start ledger, or resume cursor cannot be scanned. */
@@ -433,6 +471,37 @@ export function validateLedgerWindow(health: {
   }
 
   return { oldestLedger, latestLedger };
+}
+
+/**
+ * Validate a closed scan/comparison ledger window `[startLedger, endLedger]`.
+ *
+ * Throws a bounded {@link LedgerWindowError} when either bound is missing,
+ * negative, non-integer, or inverted (`startLedger > endLedger`).
+ */
+export function validateScanWindow(window: {
+  startLedger?: unknown;
+  endLedger?: unknown;
+}): ScanLedgerWindow {
+  const startLedger = window?.startLedger;
+  const endLedger = window?.endLedger;
+
+  if (!isLedgerSequence(startLedger) || !isLedgerSequence(endLedger)) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `scan ledger window is malformed ` +
+        `(start=${boundedLedgerValue(startLedger)}, end=${boundedLedgerValue(endLedger)})`,
+    );
+  }
+  if (startLedger > endLedger) {
+    throw new LedgerWindowError(
+      "malformed-window",
+      `scan ledger window is inverted ` +
+        `(start ${startLedger} > end ${endLedger})`,
+    );
+  }
+
+  return { startLedger, endLedger };
 }
 
 /**

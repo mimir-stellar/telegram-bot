@@ -24,6 +24,7 @@ import test from "node:test";
 import { nativeToScVal, Address, Keypair, xdr } from "@stellar/stellar-sdk";
 import {
   decodeEvent,
+  explainDecodeEvent,
   formatUsdc,
   shortAddress,
   winnerSideLabel,

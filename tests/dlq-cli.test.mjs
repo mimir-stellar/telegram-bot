@@ -16,12 +16,13 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { createDeadLetterQueue } from "../dist/deadLetter.js";
+import { classifyDeadLetterReason, createDeadLetterQueue } from "../dist/deadLetter.js";
 import {
   DLQ_EXIT_CODES,
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
+  recoverDeadLetters,
   runDlqCli,
   showDeadLetter,
   USAGE,
