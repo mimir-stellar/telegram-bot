@@ -23,9 +23,10 @@
  * error before opening either file, so existing bytes are preserved.
  *
  * Exit codes:
- *   0 — scan completed (even if some events were skipped or capped)
- *   1 — fatal runtime error (RPC failure, config error)
- *   2 — usage error (bad flags)
+ *   0   — scan completed (even if some events were skipped or capped)
+ *   1   — fatal runtime error (RPC failure, config error)
+ *   2   — usage error (bad flags)
+ *   130 — replay cancelled via SIGINT (committed progress flushed, resumable)
  */
 
 import { pathToFileURL } from "node:url";

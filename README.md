@@ -506,6 +506,23 @@ Oversized or malformed events never crash the poller and are never re-logged as
 raw remote bytes — only a truncated reason string is kept. No configuration
 change is required; existing cursors remain valid.
 
+### Event archive & JSONL streaming bounds
+
+Rotating event archives (`src/stellar/archive.ts`) and JSONL streams
+(`src/stellar/scan-jsonl.ts`) are read incrementally with a fixed-size chunk
+buffer and a bounded line buffer so memory usage stays independent of total
+archive size:
+
+| Constant / Option | Default | Failure mode |
+|---|---|---|
+| `DEFAULT_MAX_JSONL_LINE_BYTES` / `maxLineBytes` | 64 KiB (`65536`) | Throws `JsonlLineTooLongError` **before** UTF-8 decoding or `JSON.parse` (error message is bounded and never echoes raw record bytes) |
+| `DEFAULT_JSONL_CHUNK_BYTES` / `chunkBytes` | 64 KiB (`65536`) | Throws `RangeError` if not a positive finite integer |
+
+`readArchive(dir, options?)` remains backward-compatible when called without
+options; `readArchiveFile(filePath, options?)`, `parseJsonlStream(chunks, options?)`,
+and `streamBoundedJsonlLines(chunks, options?)` expose the same bounded
+streaming interface for single files and arbitrary async chunk streams.
+
 ## How the polling works
 
 Soroban's `getEvents` is **not** `eth_getLogs`, and the difference is the whole
@@ -1073,8 +1090,8 @@ proxy requirements, secret lifecycle, verification, and rollback steps.
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
-| `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
+| `GET` / `HEAD /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped, draining, or degraded (repeated RPC failures or a stale success window). `GET` returns the JSON report (including `poller.paused` and `poller.suppressedLogs`); `HEAD` returns the same status and headers without a response body or full report serialization. |
+| `GET` / `HEAD /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening (`HEAD` omits the response body). |
 | `GET /health/diag` | The same report `/export` produces in the chat, as plain text. `404` when log capture is off. For an operator with host access but no seat in the chat. |
 
 **Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:

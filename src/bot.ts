@@ -415,6 +415,7 @@ export function createBot(deps: BotDeps): Bot {
 export {
   createNotifier,
   isMarkdownParseError,
+  isForumTopicClosed,
   notifierSkips,
   type SendExtra,
 } from "./notifications/notifier.js";
