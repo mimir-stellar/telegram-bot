@@ -9,7 +9,7 @@ This guide explains the example Prometheus alerting rules shipped in [`deploy/pr
 The bot exposes Prometheus text-format (`0.0.4`) metrics from two built-in endpoints:
 
 1. **Health & Readiness Server (`GET /metrics` on `HEALTH_PORT`, default `8787`)** — rendered by `buildMetricsReport` in [`src/health.ts`](../src/health.ts). Every metric is labeled with `network` (and per-target ledger metrics include `source` and `contract`).
-2. **Optional Standalone Metrics Server (`GET /metrics` on `METRICS_PORT`)** — rendered by `createMetrics` in [`src/metrics.ts`](../src/metrics.ts) with the `mimir_bot_` prefix when `METRICS_PORT` is explicitly configured.
+2. **Optional Standalone Metrics Server (`GET /metrics` and `GET /service-level` on `METRICS_PORT`)** — rendered by `createMetrics` in [`src/metrics.ts`](../src/metrics.ts) with the `mimir_bot_` prefix when `METRICS_PORT` is explicitly configured. `GET /service-level` returns a machine-readable JSON service-level window report (`schema: "mimir.service-level-window"`, `schemaVersion: 1`) computed from a bounded rolling window of local samples, covering delivery success (`delivery`), end-to-end lag (`lag`), data-gap indicators (`dataGap`), and explicit window completeness (`complete`, `incomplete`, `completeness.reasons`).
 
 The alert rules in [`deploy/prometheus/alerts.yml`](../deploy/prometheus/alerts.yml) target the default health server's `mimir_telegram_*` metrics so operators only need a single scrape job against `HEALTH_PORT`.
 
@@ -34,6 +34,22 @@ Both endpoints also export a comparison of the latest **complete** poll cycle wi
 | `mimir_telegram_activity_baseline_events` / `mimir_bot_activity_baseline_events` | Mean events per cycle in the rolling baseline (0 while warming up). |
 | `mimir_telegram_activity_deviation` | z-score of the latest cycle against the baseline (0 while warming up). |
 | `mimir_telegram_activity_anomalies_total` / `mimir_bot_activity_anomalies_total` | Complete cycles classified as a spike (z ≥ 3) or drop (z ≤ −3). |
+
+### RPC latency histogram
+
+Both endpoints also export `mimir_telegram_rpc_request_latency_ms` /
+`mimir_bot_rpc_request_latency_ms` with `_bucket`, `_sum`, and `_count` series.
+The buckets are fixed (`5`–`15_000` ms, plus `+Inf`) and the only partitions are
+`network`, `provider="soroban-rpc"`, and `operation` (`health`, `events`,
+`other`). The RPC URL is deliberately not a label, so changing
+`STELLAR_RPC_URL` (or adding a query string) cannot create a new series.
+
+```promql
+# Approximate p95 getEvents latency over the last 15 minutes.
+histogram_quantile(0.95, sum by (le) (
+  rate(mimir_telegram_rpc_request_latency_ms_bucket{operation="events"}[15m])
+))
+```
 
 The same snapshot is available from `curl -s http://127.0.0.1:8787/health | jq .poller.activity`. A spike is not a fault by itself — a genuinely busy chain should not page anyone — so read it as context next to `eventsSkipped`, the notification cap, and `poller.error`. A sustained *drop* on an otherwise active contract more often means a broken filter, a cursor problem, or an upstream outage:
 

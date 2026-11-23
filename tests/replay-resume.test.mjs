@@ -20,7 +20,11 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
-import { runReplayCli } from "../dist/stellar/replay.js";
+import {
+  computeReplayFilterFingerprint,
+  loadAndValidateProgressFile,
+  runReplayCli,
+} from "../dist/stellar/replay.js";
 import {
   MARKET_CONTRACT,
   SQUAD_CONTRACT,
@@ -49,6 +53,15 @@ function fakeBotConfig(overrides = {}) {
     dedupWindow: 256,
     ...overrides,
   };
+}
+
+function marketPlanDigest({ from = "4000", to = null } = {}) {
+  return buildReplayPlan({
+    network: "testnet",
+    from,
+    to,
+    targets: [{ source: "market", contractId: MARKET_CONTRACT }],
+  }).digest;
 }
 
 function makeServer(health, pagesByContract = {}) {
@@ -116,6 +129,8 @@ test("page-boundary interruption and resume yields exactly-once deliveries", asy
         "--contract",
         "market",
         "--send",
+        "--plan-digest",
+        marketPlanDigest({ to: 5000 }),
         "--pages",
         "1",
         "--progress-file",
@@ -172,6 +187,8 @@ test("page-boundary interruption and resume yields exactly-once deliveries", asy
         "--contract",
         "market",
         "--send",
+        "--plan-digest",
+        marketPlanDigest({ to: 5000 }),
         "--progress-file",
         progressFile,
       ],
@@ -204,7 +221,7 @@ test("inclusive cursor boundary duplicate is correctly dropped on resume", async
     const send = async (text) => deliveries.push(text);
 
     await runReplayCli({
-      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--pages", "1", "--progress-file", progressFile],
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--plan-digest", marketPlanDigest(), "--pages", "1", "--progress-file", progressFile],
       deps: { config: fakeBotConfig(), server: server1, send },
     });
     assert.equal(deliveries.length, 1);
@@ -223,7 +240,7 @@ test("inclusive cursor boundary duplicate is correctly dropped on resume", async
     };
 
     const run2 = await runReplayCli({
-      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--progress-file", progressFile],
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--plan-digest", marketPlanDigest(), "--progress-file", progressFile],
       deps: { config: fakeBotConfig(), server: server2, send },
     });
 
@@ -281,7 +298,7 @@ test("failed sends are tracked in failedSends and skipped without crashing repla
     };
 
     const { report, exitCode } = await runReplayCli({
-      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--progress-file", progressFile],
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--contract", "market", "--send", "--plan-digest", marketPlanDigest(), "--progress-file", progressFile],
       deps: { config: fakeBotConfig(), server, send: failingSend },
     });
 
@@ -553,4 +570,144 @@ test("backward compatibility: replay without --progress-file or --rpm runs clean
   assert.equal(exitCode, 0);
   assert.ok(report !== null);
   assert.equal(report.totals.events, 0);
+});
+
+test("computeReplayFilterFingerprint normalizes equivalent filter sets and distinguishes differences", () => {
+  const cfg = fakeBotConfig();
+  const base = computeReplayFilterFingerprint({
+    from: "4000",
+    to: 5000,
+    contracts: ["market", "squad"],
+    network: "testnet",
+    config: cfg,
+  });
+
+  // Normalized equivalents produce identical fingerprint
+  assert.equal(
+    computeReplayFilterFingerprint({
+      from: " 4000 ",
+      to: 5000,
+      contracts: ["squad", "market", "market"],
+      network: " TestNet ",
+      config: fakeBotConfig({
+        marketContractId: ` ${MARKET_CONTRACT} `,
+        squadContractId: ` ${SQUAD_CONTRACT} `,
+      }),
+    }),
+    base,
+    "reordered/duplicate contracts and surrounding whitespace must normalize to the same fingerprint",
+  );
+
+  // Undefined vs null `to` normalize identically
+  assert.equal(
+    computeReplayFilterFingerprint({ from: "4000", to: undefined, contracts: ["market"], network: "testnet", config: cfg }),
+    computeReplayFilterFingerprint({ from: "4000", to: null, contracts: ["market"], network: "testnet", config: cfg }),
+  );
+
+  // Different contract subset produces a different fingerprint
+  assert.notEqual(
+    computeReplayFilterFingerprint({ from: "4000", to: 5000, contracts: ["market"], network: "testnet", config: cfg }),
+    base,
+  );
+
+  // Different contractId produces a different fingerprint
+  assert.notEqual(
+    computeReplayFilterFingerprint({
+      from: "4000",
+      to: 5000,
+      contracts: ["market", "squad"],
+      network: "testnet",
+      config: fakeBotConfig({ squadContractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }),
+    }),
+    base,
+  );
+});
+
+test("progress file records filterFingerprint and rejects incompatible filter sets with an actionable message", async () => {
+  await withTempDataDir(async (tmp) => {
+    const progressFile = tmp.file("progress.json");
+    const cursor1 = makeCursor(4100, 1);
+    const ev1 = claimCreatedEvent({ ledger: 4100, claimId: 601, id: cursor1, pagingToken: cursor1 });
+
+    // Run 1: both contracts requested, interrupted after 1 page on market (squad not yet in targets)
+    const server1 = makeServer({ oldestLedger: 3000, latestLedger: 5000 }, {
+      [MARKET_CONTRACT]: [{ events: [ev1], cursor: cursor1, latestLedger: 5000 }],
+      [SQUAD_CONTRACT]: [{ events: [], cursor: "", latestLedger: 5000 }],
+    });
+
+    const cfg = fakeBotConfig();
+    const run1 = await runReplayCli({
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--to", "5000", "--pages", "1", "--progress-file", progressFile],
+      deps: { config: cfg, server: server1 },
+    });
+    assert.equal(run1.exitCode, 0);
+
+    const saved = JSON.parse(await readFile(progressFile, "utf8"));
+    const expectedFp = computeReplayFilterFingerprint({
+      from: "4000",
+      to: 5000,
+      contracts: ["market", "squad"],
+      network: "testnet",
+      config: cfg,
+    });
+    assert.equal(saved.filterFingerprint, expectedFp, "progress file must persist normalized filterFingerprint");
+
+    // Resume with a different contract filter (--contract market) must fail with an actionable error
+    await assert.rejects(
+      () =>
+        loadAndValidateProgressFile(progressFile, {
+          from: "4000",
+          to: 5000,
+          contracts: ["market"],
+          network: "testnet",
+          config: cfg,
+        }),
+      (err) => {
+        assert.match(err.message, /different filter set/i);
+        assert.match(err.message, /contracts/i);
+        assert.match(err.message, /--progress-file/i);
+        return true;
+      },
+    );
+
+    // Resume with a changed squadContractId (even if squad had no target checkpoint) must also be rejected
+    const changedSquadCfg = fakeBotConfig({
+      squadContractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+    const run2 = await runReplayCli({
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--to", "5000", "--progress-file", progressFile],
+      deps: { config: changedSquadCfg },
+    });
+    assert.equal(run2.exitCode, 2);
+    assert.equal(run2.report, null);
+  });
+});
+
+test("invalid or empty filterFingerprint in progress file rejects with exit code 2", async () => {
+  await withTempDataDir(async (tmp) => {
+    const progressFile = tmp.file("bad-fp.json");
+    await writeFile(
+      progressFile,
+      JSON.stringify({
+        format: "mimir-replay-progress-v1",
+        version: 1,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        network: "testnet",
+        rpcUrl: "http://fake-rpc.invalid",
+        range: { from: "4000", to: 5000 },
+        contracts: ["market"],
+        filterFingerprint: "   ",
+        targets: {},
+      }),
+      "utf8",
+    );
+
+    const { report, exitCode } = await runReplayCli({
+      argv: ["node", "replay-cli.ts", "--from", "4000", "--to", "5000", "--contract", "market", "--progress-file", progressFile],
+      deps: { config: fakeBotConfig() },
+    });
+    assert.equal(exitCode, 2);
+    assert.equal(report, null);
+  });
 });

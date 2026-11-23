@@ -11,7 +11,11 @@ import test from "node:test";
 
 import { Address, Keypair, nativeToScVal } from "@stellar/stellar-sdk";
 
-import { createSendJournal } from "../dist/notifications/send-journal.js";
+import { createNotifier } from "../dist/notifications/notifier.js";
+import {
+  createSendJournal,
+  SEND_JOURNAL_DIAGNOSTIC_MAX_CHARS,
+} from "../dist/notifications/send-journal.js";
 import { createPoller } from "../dist/poller.js";
 import { createTempDataDir } from "./helpers/temp-data.mjs";
 
@@ -240,6 +244,7 @@ test("poller: a crash mid-send leaves an intent without a done, recoverable on r
 
     // The intent must be durable before the send returns.
     await waitFor(async () => {
+      if (sendCalls < 1) return false;
       const raw = await readFile(journalFile, "utf8").catch(() => "");
       return raw.includes('"kind":"intent"');
     });
@@ -258,6 +263,64 @@ test("poller: a crash mid-send leaves an intent without a done, recoverable on r
   } finally {
     // Unblock the dangling cycle so nothing lingers after the test.
     if (sendResolve) sendResolve();
+    await dir.cleanup();
+  }
+});
+
+test("poller + notifier: response missing message_id is not confirmed and retains bounded recoverable journal entry", async () => {
+  const dir = await createTempDataDir("mimir-journal-missing-msgid-");
+  const journalFile = dir.file("send-journal.jsonl");
+  try {
+    const fakeBot = {
+      api: {
+        // Simulates a Telegram API / proxy response missing message_id.
+        sendMessage: async () => ({ ok: true }),
+      },
+    };
+    const notifier = createNotifier(
+      fakeBot,
+      { chatId: "-1001234567890", botToken: BOT_TOKEN },
+      { requireMessageId: true },
+    );
+
+    const poller = createPoller({
+      config: {
+        ...baseConfig(dir),
+        sendJournalFile: journalFile,
+      },
+      server: makeServer(),
+      send: notifier,
+      ...FAST_SEND,
+    });
+
+    await poller.runCycle();
+
+    const status = poller.status();
+    assert.equal(status.notificationsSent, 0, "missing message_id must not count as confirmed send");
+    assert.equal(status.notificationsFailed, 1, "missing message_id must count as failed delivery");
+
+    const raw = await readFile(journalFile, "utf8");
+    assert.ok(raw.includes('"kind":"intent"'), "intent is recorded");
+    assert.ok(!raw.includes('"kind":"done"'), "done must not be recorded");
+
+    const journal = createSendJournal({ filePath: journalFile });
+    const pending = await journal.loadPending();
+    assert.equal(pending.length, 1, "unresolved intent remains recoverable");
+    assert.equal(pending[0].id, "5001-0");
+    assert.match(pending[0].diagnostic ?? "", /message_id/);
+    assert.ok((pending[0].diagnostic ?? "").length <= SEND_JOURNAL_DIAGNOSTIC_MAX_CHARS + 1);
+
+    // Compaction keeps the unresolved entry and its bounded diagnostic, and
+    // recordInvalidResult bounds oversized diagnostics.
+    await journal.recordInvalidResult("5001-0", `overflow-${"x".repeat(500)}`);
+    await journal.compact();
+    const afterCompact = await journal.loadPending();
+    assert.equal(afterCompact.length, 1);
+    assert.ok(
+      (afterCompact[0].diagnostic ?? "").length <= SEND_JOURNAL_DIAGNOSTIC_MAX_CHARS + 1,
+      "diagnostic must remain bounded",
+    );
+  } finally {
     await dir.cleanup();
   }
 });

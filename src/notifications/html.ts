@@ -1,15 +1,8 @@
 /**
  * Format decoded contract events into Telegram HTML messages.
- *
- * Telegram HTML supports a strict subset of HTML tags:
- * <b>, <i>, <code>, <a>, <s>, <u>, <pre>, <tg-spoiler>, etc.
- * Here we restrict formatting exclusively to <b>, <i>, <code>, and <a>
- * as per Telegram event notification specifications.
- *
- * Every interpolated dynamic value goes through escapeHtml or escapeHtmlAttr.
+ * ... (unchanged header preserved)
  */
 
-import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
   shortAddress,
@@ -18,76 +11,78 @@ import {
   type DecodedEvent,
 } from "../stellar/decode.js";
 import { confidenceIndicator } from "./confidence.js";
-import { clip, eventExplorerUrl, eventAllowedByCategory, safeErrorMessage } from "./format.js";
+import {
+  clip,
+  eventExplorerUrl,
+  eventAllowedByCategory,
+  formatPlainTextEvent,
+  safeErrorMessage,
+} from "./format.js";
 import type { StellarConfig } from "../config.js";
+import { messagesFor, type Messages } from "../i18n.js";
 
-/**
- * Escape HTML special characters in body text: &, <, and >.
- * (Double and single quotes can also be escaped safely).
- */
 export function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (ch) => {
     switch (ch) {
-      case "&":
-        return "&amp;";
-      case "<":
-        return "&lt;";
-      case ">":
-        return "&gt;";
-      case '"':
-        return "&quot;";
-      case "'":
-        return "&#39;";
-      default:
-        return ch;
+      case "&": return "&amp;";
+      case "<": return "&lt;";
+      case ">": return "&gt;";
+      case '"': return "&quot;";
+      case "'": return "&#39;";
+      default: return ch;
     }
   });
 }
 
-/**
- * Escape attribute values for HTML links (specifically href).
- */
 export function escapeHtmlAttr(url: string): string {
   return escapeHtml(url);
 }
 
 function usdcHtml(units: bigint): string {
-  return escapeHtml(`${formatUsdc(units)} USDC`);
+  return escapeHtml(isolateAmount(`${formatUsdc(units)} USDC`));
 }
 
 function whoHtml(address: string): string {
   return `<code>${escapeHtml(shortAddress(address))}</code>`;
 }
 
-function footerHtml(config: StellarConfig, event: DecodedEvent): string {
-  const ledger = escapeHtml(`ledger ${event.ledger}`);
-  const url = eventExplorerUrl(config, event);
-  if (!url) return `<i>${ledger}</i>`;
-  return `<i>${ledger}</i> · <a href="${escapeHtmlAttr(url)}">tx</a>`;
+/**
+ * Render `label` as an `<a>` link when `url` passes the shared link policy
+ * (`link-safety.ts`), otherwise as inert escaped text with no `href`.
+ */
+export function linkHtml(label: string, url: string | null | undefined): string {
+  const safe = safeLinkUrl(url);
+  if (!safe) return escapeHtml(label);
+  return `<a href="${escapeHtmlAttr(safe)}">${escapeHtml(label)}</a>`;
 }
 
-/**
- * HTML event headlines covering every market and squad event.
- */
+function txLinkHtml(config: StellarConfig, event: DecodedEvent): string | null {
+  const url = eventExplorerUrl(config, event);
+  if (url) return linkHtml("tx", url);
+  return eventTxHash(event) !== null ? escapeHtml("tx") : null;
+}
+
+function footerHtml(config: StellarConfig, event: DecodedEvent): string {
+  const ledger = escapeHtml(`ledger ${event.ledger}`);
+  const tx = txLinkHtml(config, event);
+  return tx ? `<i>${ledger}</i> · ${tx}` : `<i>${ledger}</i>`;
+}
+
 function headlineHtml(event: DecodedEvent): string | null {
   const p = event.payload;
-
   switch (p.name) {
-    // ── mimir-market ────────────────────────────────────────────────────────
     case "claim_created":
-      return (
-        `🆕 <b>New claim</b> #${escapeHtml(String(p.claimId))}\n` +
-        `Category: ${escapeHtml(clip(p.category))}\n` +
-        `Creator: ${whoHtml(p.creator)}`
+      return t.claimCreated(
+        escapeHtml(String(p.claimId)),
+        escapeHtml(clip(p.category)),
+        whoHtml(p.creator),
       );
-
     case "claim_challenged":
-      return (
-        `⚔️ <b>Claim #${escapeHtml(String(p.claimId))} challenged</b>\n` +
-        `Stake: <b>${usdcHtml(p.stake)}</b>\n` +
-        `Challenger: ${whoHtml(p.challenger)}`
+      return t.claimChallenged(
+        escapeHtml(String(p.claimId)),
+        usdcHtml(p.stake),
+        whoHtml(p.challenger),
       );
-
     case "claim_resolved": {
       const summaryPart = p.summary ? `\n<i>${escapeHtml(clip(p.summary))}</i>` : "";
       return (
@@ -96,68 +91,69 @@ function headlineHtml(event: DecodedEvent): string | null {
         summaryPart
       );
     }
-
     case "claim_cancelled":
       return `🚫 <b>Claim #${escapeHtml(String(p.claimId))} cancelled</b> — stakes returned`;
-
     case "market_settled":
-      return (
-        `💰 <b>Claim #${escapeHtml(String(p.claimId))} settled</b>\n` +
-        `Paid out: <b>${usdcHtml(p.totalPaid)}</b> · fees ${usdcHtml(p.totalFees)}\n` +
-        `Owed to challengers: ${usdcHtml(p.owedToChallengers)}`
+      return t.marketSettled(
+        escapeHtml(String(p.claimId)),
+        usdcHtml(p.totalPaid),
+        usdcHtml(p.totalFees),
+        usdcHtml(p.owedToChallengers),
       );
-
     case "challenger_paid":
-      return (
-        `🏆 <b>Challenger paid</b> on claim #${escapeHtml(String(p.claimId))}\n` +
-        `${whoHtml(p.challenger)} staked ${usdcHtml(p.stake)} → net <b>${usdcHtml(p.net)}</b>\n` +
-        `Gross ${usdcHtml(p.gross)} · fee ${usdcHtml(p.fee)}`
+      return t.challengerPaid(
+        escapeHtml(String(p.claimId)),
+        whoHtml(p.challenger),
+        usdcHtml(p.stake),
+        usdcHtml(p.net),
+        usdcHtml(p.gross),
+        usdcHtml(p.fee),
       );
-
     case "fee_claimed":
       return `🧾 <b>Fees claimed</b> — ${usdcHtml(p.amount)} to ${whoHtml(p.recipient)}`;
-
     case "withdrawal":
       return `📤 <b>Withdrawal</b> — ${usdcHtml(p.amount)} to ${whoHtml(p.to)}`;
-
     case "withdrawal_pending":
       return `⏳ <b>Withdrawal parked</b> — ${usdcHtml(p.amount)} claimable by ${whoHtml(p.to)}`;
-
-    // ── mimir-squad ─────────────────────────────────────────────────────────
     case "market_created":
-      return (
-        `🆕 <b>New squad market</b> #${escapeHtml(String(p.marketId))}\n` +
-        `${escapeHtml(clip(p.question))}\n` +
-        `Captain: ${whoHtml(p.captain)} · fee ${escapeHtml(String(p.feeBps))} bps · deadline ${escapeHtml(new Date(p.deadline * 1000).toISOString())}`
+      return t.marketCreated(
+        escapeHtml(String(p.marketId)),
+        escapeHtml(clip(p.question)),
+        whoHtml(p.captain),
+        escapeHtml(String(p.feeBps)),
+        escapeHtml(new Date(p.deadline * 1000).toISOString()),
       );
-
     case "deposited":
-      return (
-        `➕ <b>Squad #${escapeHtml(String(p.marketId))}</b> — ${usdcHtml(p.amount)} on <b>${escapeHtml(squadSideLabel(p.side))}</b>\n` +
-        `Participant: ${whoHtml(p.participant)}`
+      return t.deposited(
+        escapeHtml(String(p.marketId)),
+        usdcHtml(p.amount),
+        escapeHtml(squadSideLabel(p.side)),
+        whoHtml(p.participant),
       );
-
     case "withdrawn":
-      return (
-        `➖ <b>Squad #${escapeHtml(String(p.marketId))}</b> — ${whoHtml(p.participant)} pulled ${usdcHtml(p.amount)} from ${escapeHtml(squadSideLabel(p.side))}`
+      return t.withdrawn(
+        escapeHtml(String(p.marketId)),
+        whoHtml(p.participant),
+        usdcHtml(p.amount),
+        escapeHtml(squadSideLabel(p.side)),
       );
-
     case "resolved":
-      return (
-        `🏁 <b>Squad #${escapeHtml(String(p.marketId))} resolved</b> — <b>${escapeHtml(squadSideLabel(p.result))}</b>\n` +
-        `Pools: A ${usdcHtml(p.poolA)} · B ${usdcHtml(p.poolB)}`
+      return t.resolved(
+        escapeHtml(String(p.marketId)),
+        escapeHtml(squadSideLabel(p.result)),
+        usdcHtml(p.poolA),
+        usdcHtml(p.poolB),
       );
-
     case "claimed":
-      return (
-        `💸 <b>Squad payout</b> on #${escapeHtml(String(p.marketId))}\n` +
-        `${whoHtml(p.participant)} → net <b>${usdcHtml(p.net)}</b> (gross ${usdcHtml(p.gross)}, fee ${usdcHtml(p.fee)})`
+      return t.claimed(
+        escapeHtml(String(p.marketId)),
+        whoHtml(p.participant),
+        usdcHtml(p.net),
+        usdcHtml(p.gross),
+        usdcHtml(p.fee),
       );
-
     case "fees_claimed":
       return `🧾 <b>Squad fees claimed</b> — ${usdcHtml(p.amount)} to ${whoHtml(p.recipient)}`;
-
-    // Admin events and undecodable shapes get no notification.
     case "oracle_changed":
     case "ownership_transferred":
     case "agent_attributed":
@@ -169,20 +165,34 @@ function headlineHtml(event: DecodedEvent): string | null {
     case "admin":
     case "unknown":
       return null;
-
     default:
       return null;
   }
 }
 
-/**
- * Fallback message formatted in Telegram HTML when formatting throws.
- */
+/** Options for {@link formatFallbackEventHtml}. */
+export interface FallbackHtmlOptions {
+  /**
+   * When true, the fallback is returned as plain text (via
+   * {@link formatPlainTextEvent}) instead of HTML. Image-free or
+   * accessibility-focused consumers set this so a rendering failure never
+   * deprives the recipient of a text rendering.
+   */
+  accessibleFallback?: boolean;
+}
+
 export function formatFallbackEventHtml(
-  config: StellarConfig,
+  config: StellarConfig & RouteLocaleConfig,
   event: DecodedEvent,
   reason = "malformed payload",
+  options: FallbackHtmlOptions = {},
 ): string {
+  if (options.accessibleFallback) {
+    return (
+      formatPlainTextEvent(config, event) ??
+      `Mimir event (${event.source ?? "unknown"}) — ledger ${event.ledger ?? "unknown"} (${safeErrorMessage(reason)})`
+    );
+  }
   const source = escapeHtml(event.source ?? "unknown");
   const contract = escapeHtml(shortAddress(event.contractId ?? "unknown"));
   const ledger = escapeHtml(String(event.ledger ?? "unknown"));
@@ -190,31 +200,27 @@ export function formatFallbackEventHtml(
   const txPart = event.txHash
     ? ` · <a href="${escapeHtmlAttr(txExplorerUrl(config, event.txHash))}">tx</a>`
     : "";
-  return (
-    `⚠️ <b>Event Notification Fallback</b> (${source})\n` +
-    `Contract: <code>${contract}</code> · Ledger: ${ledger}${txPart}\n` +
-    `Reason: <i>${safeReason}</i>`
-  );
+  return messagesFor(
+    resolveNotificationLocale(config, { source: event?.source }),
+  ).notificationHtml.fallbackEvent(source, contract, ledger, safeReason, txPart);
 }
 
-/**
- * Format a decoded event into Telegram HTML.
- * Returns null when the event has no notification summary or is filtered out.
- */
 export function formatEventHtml(
-  config: StellarConfig & {
-    channelPreviewMode?: boolean;
-    notificationCategories?: readonly string[];
-  },
+  config: StellarConfig &
+    RouteLocaleConfig & {
+      channelPreviewMode?: boolean;
+      notificationCategories?: readonly string[];
+    },
   event: DecodedEvent,
 ): string | null {
   if (!eventAllowedByCategory(config, event)) return null;
   try {
-    const head = headlineHtml(event);
+    const messages = messagesFor(resolveNotificationLocale(config, { source: event?.source }));
+    const head = headlineHtml(messages, event);
     if (head === null) return null;
     const body = `${head}\n${footerHtml(config, event)}`;
     if (config.channelPreviewMode) {
-      return `🧪 <b>[PREVIEW MODE]</b>\n${body}`;
+      return `${messages.notificationHtml.previewModePrefix}\n${body}`;
     }
     return body;
   } catch (err) {

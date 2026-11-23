@@ -46,13 +46,14 @@ The dead-letter file is written atomically (via a write-to-temporary-file and re
 Each entry in `entries` mirrors the `DeadLetterEntry` TypeScript interface defined in [`src/deadLetter.ts`](file:///c:/Users/HP/drips/work/telegram-bot/src/deadLetter.ts):
 
 * `id` (`string`): Stable unique identifier within the queue (see [Entry ID Generation](#entry-id-generation-makeentryid)).
-* `enqueuedAt` (`string`): ISO 8601 timestamp recording when the failure was first enqueued.
+* `enqueuedAt` (`string | null`): ISO 8601 timestamp recording when the failure was first enqueued (`null` for legacy entries loaded without a valid timestamp).
 * `source` (`string`): Originating contract source name (e.g. `market` or `squad`).
 * `ledger` (`number`): Stellar ledger sequence number where the event occurred.
 * `eventName` (`string`): Contract event topic/name (e.g. `MarketCreated`, `BetPlaced`, `Resolved`).
 * `text` (`string`): The formatted Telegram `MarkdownV2` message body. Bounded and truncated to at most 4,000 characters (`TEXT_TRUNCATE`).
 * `attempts` (`number`): The number of delivery attempts made so far (starts at `1` upon initial enqueue and increments on each failed replay).
 * `lastError` (`string | null`): Scrubbed, redacted error message from the most recent send failure, truncated to at most 200 characters (`ERROR_TRUNCATE`). Sensitive secrets like `BOT_TOKEN` are scrubbed via `safeErrorMessage`.
+* `networkPassphrase` (`string`, optional): Stellar network passphrase where the failure originated. When configured on the queue, `flush` compares each entry's `networkPassphrase` against the active network and rejects replay of entries from another network, leaving them unchanged on disk.
 
 ---
 
@@ -69,6 +70,7 @@ Format:
 
 * `shortHash(text)`: A 32-bit non-cryptographic polynomial hash (`h * 31 + charCode`) formatted as an 8-character zero-padded hexadecimal string.
 * **Deduplication**: If an identical event failure is enqueued again while an entry with the same ID is already present in the queue, a duplicate entry is not added. Instead, the existing entry's `attempts` counter increments and `lastError` updates with the latest failure.
+* **Duplicate ID Validation on Load**: Every entry in `dead-letter.json` must have a unique `id`. If a hand-edited or corrupted file contains conflicting entries with the same `id`, validation rejects the file before applying `maxEntries` trimming and preserves the source file untouched on disk for operator inspection rather than silently overwriting it. The offline `dlq` CLI (`list`, `show`, `purge`) exits with status `1` and reports the conflicting IDs.
 
 ---
 
@@ -87,7 +89,10 @@ The queue is strictly bounded across every dimension:
 1. **Depth Limit (`DEAD_LETTER_MAX` / `maxEntries`)**:
    * Configured via `DEAD_LETTER_MAX` (default `100`).
    * When enqueuing a new entry into a queue that has reached `maxEntries`, the **oldest** entry is dropped and counted (`dropped` counter). This prevents permanently failing sends from expanding the file indefinitely.
-2. **Attempt Limit (`DEAD_LETTER_MAX_ATTEMPTS` / `maxAttempts`)**:
+2. **Age Limit (`DEAD_LETTER_MAX_AGE_MS` / `maxAgeMs`)**:
+   * Configured via `DEAD_LETTER_MAX_AGE_MS` (default `604800000` ms / 7 days).
+   * Entries older than `maxAgeMs` are evicted on `load()`, `enqueue()`, and `flush()`, and counted in the `expired` stat (`status.deadLetter.expired` and `dlq list --json`). Expired entries are evicted before capacity checks so newly failed entries are preserved.
+3. **Attempt Limit (`DEAD_LETTER_MAX_ATTEMPTS` / `maxAttempts`)**:
    * Configured via `DEAD_LETTER_MAX_ATTEMPTS` (default `10`).
    * If a message fails replay `maxAttempts` times, it is deemed a "poison entry" (e.g. invalid formatting rejected by Telegram) and is dropped from the queue.
 3. **Payload Truncation**:
@@ -96,9 +101,51 @@ The queue is strictly bounded across every dimension:
 
 ---
 
+## Capacity Utilization Gauge
+
+The queue exposes a bounded capacity gauge for dashboards and alerting. It reports only counts and never message bodies (`text`) or error text, so it is safe to publish to metrics backends.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `used` | `number` | Current number of parked entries. |
+| `max` | `number` | Configured depth limit (`DEAD_LETTER_MAX`, default `100`). |
+| `utilization` | `number` | `used / max`, bounded to the range `0`–`1`. |
+
+* When the queue is **disabled** (`DEAD_LETTER_FILE` unset or empty, or the queue is otherwise turned off), the gauge reports `used: 0`, `max: 0`, and `utilization: 0`. A disabled queue never parks entries, so the gauge reads as idle rather than as an error, and no division by zero occurs.
+* `utilization` is clamped to `1` so that transient overshoot never reports above full capacity.
+
+## Offline Inspection CLI (`src/dlq-cli.ts`)
+
+Operators can inspect and purge `DEAD_LETTER_FILE` offline without contacting Stellar or Telegram:
+
+```bash
+node dist/dlq-cli.js list [--file PATH] [--json]
+node dist/dlq-cli.js show <id> [--file PATH] [--json]
+node dist/dlq-cli.js purge [--older-than <dur>] [--yes] [--file PATH] [--json]
+```
+
+Diagnostics and errors are written to `stderr`, keeping `stdout` clean and machine-readable (for example, valid JSON when `--json` is passed).
+
+### Exit Codes
+
+| Exit Code | Meaning |
+|---|---|
+| `0` | Success (including `list` when `DEAD_LETTER_FILE` does not exist yet) |
+| `1` | Unknown entry (`show <id>` did not match any entry) |
+| `2` | Invalid CLI arguments or usage |
+| `3` | Malformed dead-letter file (invalid JSON, unsupported version, or invalid entry schema) |
+| `4` | Dead-letter file access or I/O failure (e.g. permission denied or directory path) |
+
+---
+
 ## Operator Inspection with `jq`
 
-Because the file contains standard JSON, operators can safely inspect queue status and contents on host or container storage using `jq`.
+Operators can inspect and purge the queue offline with `npm run dlq -- <list|show <id>|purge>`.
+
+* `npm run dlq -- list` computes the queue's age (`age=...`, and `oldestEnqueuedAt` / `oldestAgeMs` / `oldestAge` / `missingTimestamps` under `--json`) from the **oldest retained failure's original `enqueuedAt` timestamp**, not the file's modification time (`mtime`).
+* Legacy entries missing a valid `enqueuedAt` timestamp are preserved with `enqueuedAt: null` and reported explicitly as `unknown` / `missing legacy timestamp` rather than being backfilled with the current time.
+
+Because the file contains standard JSON, operators can also safely inspect queue status and contents on host or container storage using `jq`.
 
 ### 1. Check queue depth and last updated time
 ```bash

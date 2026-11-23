@@ -24,7 +24,7 @@
  * metadata. It never holds signing keys or bot tokens.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { safeErrorMessage } from "./notifications/format.js";
@@ -32,7 +32,8 @@ import { safeErrorMessage } from "./notifications/format.js";
 export interface DeadLetterEntry {
   /** Stable id within the queue (source + ledger + event + short text hash). */
   id: string;
-  enqueuedAt: string;
+  /** ISO 8601 timestamp of the original failure, or `null` for legacy entries missing one. */
+  enqueuedAt: string | null;
   source: string;
   ledger: number;
   eventName: string;
@@ -40,6 +41,14 @@ export interface DeadLetterEntry {
   text: string;
   attempts: number;
   lastError: string | null;
+  /** Stellar network passphrase where the failure originated, if recorded. */
+  networkPassphrase?: string;
+}
+
+export interface DeadLetterAgeSummary {
+  oldestEnqueuedAt: string | null;
+  ageMs: number | null;
+  missingTimestamps: number;
 }
 
 export interface DeadLetterFile {
@@ -53,6 +62,32 @@ export interface DeadLetterStats {
   enqueued: number;
   replayed: number;
   dropped: number;
+  expired: number;
+}
+
+export interface DeadLetterAckResult {
+  acknowledged: DeadLetterEntry[];
+  acknowledgedIds: string[];
+  unmatchedIds: string[];
+  remaining: number;
+}
+
+/**
+ * Bounded, content-free utilization report for the queue. Carries only counts
+ * and capacity — never message bodies, error text, or identifiers — so it is
+ * safe to expose on a gauge or a status endpoint.
+ *
+ * When the queue is disabled (`maxEntries` below 1) `enabled` is `false`,
+ * `maxEntries` is `0`, and `utilization` is `0`: a disabled queue has no
+ * capacity to be utilized, and reporting `0` keeps the gauge bounded in
+ * `[0, 1]` rather than dividing by zero or emitting `NaN`.
+ */
+export interface DeadLetterCapacity {
+  enabled: boolean;
+  used: number;
+  maxEntries: number;
+  /** `used / maxEntries`, clamped to `[0, 1]`; `0` when disabled. */
+  utilization: number;
 }
 
 export interface DeadLetterQueueOptions {
@@ -66,6 +101,11 @@ export interface DeadLetterQueueOptions {
   maxEntries: number;
   maxAttempts: number;
   /**
+   * Maximum retention age in milliseconds (`null` disables age expiry).
+   * Defaults to {@link DEAD_LETTER_MAX_AGE_MS}.
+   */
+  maxAgeMs?: number | null;
+  /**
    * Config secrets to scrub from a recorded error, passed straight to
    * `safeErrorMessage`. The poller hands over its bot token: a Telegram failure
    * routinely embeds the token in the request URL, and main's shape rule
@@ -73,12 +113,87 @@ export interface DeadLetterQueueOptions {
    * a URL, so the value itself is what makes that case safe.
    */
   secrets?: readonly string[];
+  /** Active Stellar network passphrase; replay rejects entries from another network. */
+  networkPassphrase?: string;
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /**
+   * When `true`, validation errors during `load()` (such as duplicate entry
+   * IDs) throw instead of logging a warning and starting empty. The source
+   * file is always preserved untouched in either mode.
+   */
+  strict?: boolean;
+}
+
+export class DeadLetterDuplicateIdError extends Error {
+  readonly filePath: string | null;
+  readonly duplicateIds: string[];
+
+  constructor(filePath: string | null, duplicateIds: readonly string[]) {
+    const location = filePath ? ` in ${filePath}` : "";
+    super(
+      `duplicate dead-letter entry id(s)${location}: ${duplicateIds.join(", ")}; ` +
+        `source file preserved for inspection`,
+    );
+    this.name = "DeadLetterDuplicateIdError";
+    this.filePath = filePath;
+    this.duplicateIds = [...duplicateIds];
+  }
+}
+
+/**
+ * Return any duplicate entry IDs in first-seen conflict order.
+ * An empty array means all entry IDs are unique.
+ */
+export function findDuplicateEntryIds(
+  entries: readonly Pick<DeadLetterEntry, "id">[],
+): string[] {
+  const seen = new Set<string>();
+  const recorded = new Set<string>();
+  const duplicates: string[] = [];
+  for (const entry of entries) {
+    if (seen.has(entry.id)) {
+      if (!recorded.has(entry.id)) {
+        recorded.add(entry.id);
+        duplicates.push(entry.id);
+      }
+    } else {
+      seen.add(entry.id);
+    }
+  }
+  return duplicates;
 }
 
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
+export const DEAD_LETTER_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+
+export class DeadLetterMalformedError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "DeadLetterMalformedError";
+  }
+}
+
+export class DeadLetterAccessError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, code?: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "DeadLetterAccessError";
+    this.code = code;
+  }
+}
+
+export interface DeadLetterLoadOptions {
+  /**
+   * When true, surface malformed files and non-ENOENT access errors instead of
+   * falling back to an empty queue. Used by the offline inspection CLI.
+   */
+  strict?: boolean;
+  /** Suppress informational `loaded ...` stdout logging (keeps CLI stdout machine-readable). */
+  quiet?: boolean;
+}
 
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
@@ -108,15 +223,68 @@ export function makeEntryId(
   return `${source}:${ledger}:${eventName}:${shortHash(text)}`;
 }
 
+/**
+ * Parse an entry's original failed-at timestamp (`enqueuedAt`), returning `null`
+ * for missing or invalid legacy timestamps instead of falling back to `now` or file mtime.
+ */
+export function parseEntryTimestampMs(enqueuedAt: unknown): number | null {
+  if (typeof enqueuedAt !== "string" || enqueuedAt.trim() === "") {
+    return null;
+  }
+  const ms = Date.parse(enqueuedAt);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Compute the dead-letter queue age from the oldest retained failure's original
+ * `enqueuedAt` timestamp, counting entries whose legacy timestamp is missing or invalid.
+ */
+export function summarizeDeadLetterAge(
+  entries: readonly Pick<DeadLetterEntry, "enqueuedAt">[],
+  nowMs: number = Date.now(),
+): DeadLetterAgeSummary {
+  let oldestMs: number | null = null;
+  let oldestEnqueuedAt: string | null = null;
+  let missingTimestamps = 0;
+
+  for (const entry of entries) {
+    const ms = parseEntryTimestampMs(entry.enqueuedAt);
+    if (ms === null) {
+      missingTimestamps += 1;
+      continue;
+    }
+    if (oldestMs === null || ms < oldestMs) {
+      oldestMs = ms;
+      oldestEnqueuedAt = entry.enqueuedAt;
+    }
+  }
+
+  return {
+    oldestEnqueuedAt,
+    ageMs: oldestMs === null ? null : Math.max(0, nowMs - oldestMs),
+    missingTimestamps,
+  };
+}
+
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
   const filePath = options.filePath;
+  const maxAgeMs =
+    options.maxAgeMs === null
+      ? null
+      : options.maxAgeMs !== undefined
+        ? Number.isFinite(options.maxAgeMs) && options.maxAgeMs > 0
+          ? options.maxAgeMs
+          : null
+        : DEAD_LETTER_MAX_AGE_MS;
   let entries: DeadLetterEntry[] = [];
+  let sourcePreserved = false;
   const stats: DeadLetterStats = {
     depth: 0,
     enqueued: 0,
     replayed: 0,
     dropped: 0,
+    expired: 0,
   };
 
   /** Redacted, truncated error text — the only form that may be persisted. */
@@ -129,6 +297,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   }
 
   async function load(): Promise<void> {
+    sourcePreserved = false;
     if (filePath === null) {
       entries = [];
       syncDepth();
@@ -138,7 +307,15 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     let raw: string;
     try {
       raw = await readFile(filePath, "utf8");
-    } catch {
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (strict && code !== "ENOENT") {
+        throw new DeadLetterAccessError(
+          `cannot read dead-letter file ${filePath}: ${safeError(err)}`,
+          code,
+          { cause: err },
+        );
+      }
       // No file yet is the normal first-run case, not a problem to report.
       entries = [];
       syncDepth();
@@ -146,14 +323,25 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     }
 
     try {
-      const parsed = JSON.parse(raw) as DeadLetterFile;
-      if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
+      const parsed = JSON.parse(raw) as unknown;
+      if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        (parsed as DeadLetterFile).version !== 1 ||
+        !Array.isArray((parsed as DeadLetterFile).entries)
+      ) {
+        if (strict) {
+          throw new DeadLetterMalformedError(
+            `malformed dead-letter file at ${filePath}: expected version 1 with entries array`,
+          );
+        }
         console.warn(
           `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
         );
         entries = [];
       } else {
-        entries = parsed.entries
+        const candidateEntries = parsed.entries
           .filter(
             (e) =>
               e &&
@@ -164,34 +352,49 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
           .map((e) => ({
             id: e.id,
             enqueuedAt:
-              typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
+              parseEntryTimestampMs(e.enqueuedAt) !== null ? (e.enqueuedAt as string) : null,
             source: typeof e.source === "string" ? e.source : "unknown",
             ledger: e.ledger,
             eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
             text: truncate(e.text, TEXT_TRUNCATE),
             attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
             lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
+            ...(typeof e.networkPassphrase === "string" && e.networkPassphrase.trim() !== ""
+              ? { networkPassphrase: e.networkPassphrase }
+              : {}),
           }));
-        // Bound on load too: the file may have been edited by hand.
+        // Bound by age first so expired entries do not count against capacity,
+        // then bound by entry count.
+        pruneExpired();
         while (entries.length > options.maxEntries) {
           entries.shift();
           stats.dropped += 1;
         }
       }
     } catch (err) {
+      if (err instanceof DeadLetterDuplicateIdError) {
+        throw err;
+      }
       console.warn(
         `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
       );
       entries = [];
     }
     syncDepth();
-    if (entries.length > 0) {
+    if (!quiet && entries.length > 0) {
       console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
   }
 
   async function persist(): Promise<void> {
     if (filePath === null) {
+      syncDepth();
+      return;
+    }
+    if (sourcePreserved) {
+      console.warn(
+        `[dead-letter] refusing to overwrite ${filePath} while duplicate-id conflict is unresolved`,
+      );
       syncDepth();
       return;
     }
@@ -222,6 +425,10 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     text: string;
     error: unknown;
   }): Promise<DeadLetterEntry> {
+    // Evict expired entries before checking deduplication or capacity so
+    // newly failed entries are always preserved.
+    pruneExpired();
+
     const id = makeEntryId(input.source, input.ledger, input.eventName, input.text);
     const existing = entries.find((e) => e.id === id);
     if (existing) {
@@ -251,6 +458,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       text: truncate(input.text, TEXT_TRUNCATE),
       attempts: 1,
       lastError: safeError(input.error),
+      ...(typeof options.networkPassphrase === "string" && options.networkPassphrase.trim() !== ""
+        ? { networkPassphrase: options.networkPassphrase }
+        : {}),
     };
     entries.push(entry);
     stats.enqueued += 1;
@@ -272,17 +482,38 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   async function flush(
     send: (text: string, entry: DeadLetterEntry) => Promise<void>,
     budget: number,
-  ): Promise<{ sent: number; remaining: number }> {
+  ): Promise<{ sent: number; remaining: number; rejectedNetworkMismatch: number }> {
     if (budget <= 0 || entries.length === 0) {
-      return { sent: 0, remaining: entries.length };
+      return { sent: 0, remaining: entries.length, rejectedNetworkMismatch: 0 };
     }
 
+    const configuredNetwork =
+      typeof options.networkPassphrase === "string" && options.networkPassphrase.trim() !== ""
+        ? options.networkPassphrase
+        : null;
+
     let sent = 0;
+    let rejectedNetworkMismatch = 0;
     const kept: DeadLetterEntry[] = [];
 
     for (const entry of entries) {
       if (sent >= budget) {
         kept.push(entry);
+        continue;
+      }
+
+      if (
+        configuredNetwork !== null &&
+        typeof entry.networkPassphrase === "string" &&
+        entry.networkPassphrase.trim() !== "" &&
+        entry.networkPassphrase !== configuredNetwork
+      ) {
+        rejectedNetworkMismatch += 1;
+        kept.push(entry);
+        console.warn(
+          `[dead-letter] rejected replay for ${entry.source} ${entry.eventName} ` +
+            `@ ledger ${entry.ledger}: entry network does not match current configuration`,
+        );
         continue;
       }
 
@@ -316,15 +547,35 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     entries = kept;
     syncDepth();
     await persist();
-    return { sent, remaining: entries.length };
+    return { sent, remaining: entries.length, rejectedNetworkMismatch };
+  }
+
+  /**
+   * Content-free capacity snapshot. A queue is considered disabled when it has
+   * no capacity (`maxEntries` below 1) — the same condition under which
+   * `enqueue` would otherwise evict on every insert. Disabled reports
+   * `enabled: false`, `maxEntries: 0`, `utilization: 0`.
+   */
+  function capacity(): DeadLetterCapacity {
+    const enabled = options.maxEntries >= 1;
+    if (!enabled) {
+      return { enabled: false, used: 0, maxEntries: 0, utilization: 0 };
+    }
+    const used = entries.length;
+    const utilization = Math.min(1, Math.max(0, used / options.maxEntries));
+    return { enabled: true, used, maxEntries: options.maxEntries, utilization };
   }
 
   return {
     load,
     enqueue,
     flush,
+    capacity,
     stats(): DeadLetterStats {
       return { ...stats, depth: entries.length };
+    },
+    summary(): DeadLetterStatusSummary {
+      return summarizeDeadLetters(entries);
     },
     /** Test helper — snapshot of current entries. */
     snapshot(): DeadLetterEntry[] {

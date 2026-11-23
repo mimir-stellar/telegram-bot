@@ -104,6 +104,24 @@ The scanner handles cursor-paginated event retrieval from Soroban RPC. It is des
 - `readContractEvents()`: High-level scan with event decoding
 - `eventCursorLedger()`: Extracts ledger sequence from opaque cursor
 
+### Event Archive (`src/stellar/archive.ts`, `src/stellar/scan-jsonl.ts`)
+
+The archive persists decoded events as rotating canonical JSONL files for offline analysis and replay, and the scanner's `--jsonl` export adds a trailing `{ "type": "summary" }` metadata line. `compactArchive()` and `compactScanJsonl()` are explicit maintenance operations that reduce a settled capture to an inclusive ledger range.
+
+**Key behaviors:**
+- **Range retention**: Only events with `firstLedger <= ledger <= lastLedger` are kept; both endpoints are inclusive. The range is validated up front (safe integers, `firstLedger >= 1`, not inverted) and invalid input throws `RangeError` without touching the source.
+- **Rebuilt metadata**: A compacted archive rebuilds its rotation layout, and `compactScanJsonl()` regenerates the summary line's `eventCount` and histogram from the retained events. A stale summary is never carried forward.
+- **Verify before replace**: `compactArchive()` writes to a temporary sibling directory, reads it back, and checks the record count, a SHA-256 digest of the canonical JSONL records, and every ledger bound. Only then does it rename the compacted directory into place. A malformed source record, I/O error, or verification failure aborts with the source byte-for-byte unchanged.
+- **Compatible format**: Retained records keep the existing archive/JSONL encoding (canonical LF, bigint values as decimal strings), so `readArchive()` and downstream replay tooling need no changes.
+- **Coverage comparison**: Two captures can be compared by decoded events, archive directories, or canonical scan JSONL. Missing and overlapping ledger runs are returned with per-side event counts and the same ordering regardless of record order, so a count is stable across rotation and compaction. A ledger absent outside the declared filter or expected range is marked `expected` (intentional filtering); one absent inside both is reported as incomplete acquisition.
+
+**API surface:**
+- `compactArchive(dir, range, options?)`: Atomic, verified archive compaction; returns `{ retained, dropped, files, digest }`.
+- `compactScanJsonl(input, range)`: Returns the re-serialized JSONL plus `{ retained, dropped }`.
+- `validateLedgerRange(range)`: Shared inclusive-range validation.
+- `reconcileCompaction(before, after, options?)` (`src/stellar/compaction-reconciliation.ts`): Pure, deterministic comparison of the volume and latency aggregates before and after compaction. Separates range loss (ledgers lost, marked expected when outside `options.range`) from arithmetic mismatch (aggregates that differ over the ledgers present on both sides). `renderReconciliationReport(report)` renders it as byte-stable text. See [analytics-export.md](analytics-export.md#reconciling-aggregates-across-compaction).
+- `compareLedgerCoverage(first, second, options?)` (`src/stellar/scan-jsonl.ts`, re-exported by `src/stellar/archive-coverage.ts`): Pure, deterministic coverage comparison returning `missing` spans (each with an `expected` flag), `filtered` / `incomplete` subsets, `overlap` and `extra` spans, per-ledger count mismatches and stable totals. `options.range` (aliases: `filteredRange`, `intentionalRange`, `retainedRange`) declares an intentional filter; `options.expectedRange` declares the acquisition scope. `compareArchiveCoverage()` accepts archive directories, canonical scan JSONL, raw archive JSONL or JSON event arrays, with `compareArchiveDirCoverage()` and `compareScanJsonlCoverage()` as explicit adapters. `formatArchiveCoverageReport(report)` / `renderArchiveCoverageReport(report)` (and their `formatCoverageReport()` / `renderCoverageReport()` aliases) render byte-stable text.
+
 ### Event Decoder (`src/stellar/decode.ts`)
 
 The decoder converts raw Soroban events into typed TypeScript objects. It handles both `mimir-market` and `mimir-squad` contracts with specific decoders for each event type.
@@ -118,6 +136,16 @@ The decoder converts raw Soroban events into typed TypeScript objects. It handle
 - **Market**: `claim_created`, `claim_challenged`, `claim_resolved`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`
 - **Squad**: `market_created`, `deposited`, `withdrawn`, `resolved`, `claimed`, `fees_claimed`
 - **Admin**: Recognized but not notified (`oracle_changed`, `ownership_transferred`, `fee_policy_*`, etc.)
+
+### Analytical Reducers (`src/stellar/*.ts`)
+
+Pure reducers derive aggregate metrics and reports from observed chain events without holding keys or modifying state:
+- **Volume Series** (`src/stellar/volume-series.ts`): Time-bucketed challenge stakes and squad deposits in UTC intervals.
+- **Resolution Latency** (`src/stellar/resolution-latency.ts`): Duration percentiles (p50, p90, max) for resolved claims.
+- **Closing Soon** (`src/stellar/closing-soon.ts`): Squad markets approaching their deadline within a bounded horizon.
+- **Stale Market Watch** (`src/stellar/stale-market.ts`): Identifies open squad markets and prediction claims exceeding a bounded age threshold, labeling all inferred states and maintaining read-only guarantees (no settlement transactions submitted).
+- **Fee Accrual** (`src/stellar/fee-accrual.ts`): Protocol fee accruals from admin events.
+- **Squad Flows & Payouts** (`src/stellar/squad-flows.ts`, `src/stellar/squad-payouts.ts`): Net liquidity and payout invariant accounting.
 
 ### Notification Formatter (`src/notifications/format.ts`)
 

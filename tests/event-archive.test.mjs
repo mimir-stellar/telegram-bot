@@ -4,10 +4,14 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  ArchiveMetadataConflictError,
   createEventArchive,
   MalformedArchiveRecordError,
   readArchive,
+  writeArchiveManifest,
+  verifyArchiveManifest,
 } from "../dist/stellar/archive.js";
+import { buildPrivacyReviewReport } from "../dist/stellar/privacy-review.js";
 import { withTempDataDir } from "./helpers/temp-data.mjs";
 
 function makeDummyEvent(id, amountBigInt = 10000000n) {
@@ -49,6 +53,7 @@ test("archive creates files with 0o600 permissions and appends events", async ()
     }
 
     assert.equal(readBack.length, 1);
+    assert.equal(readBack[0].schemaVersion, 1);
     assert.equal(readBack[0].eventId, "event-1");
     // Verify bigint round-trip as string
     assert.equal(readBack[0].payload.stake, "5000000000000000000");
@@ -56,8 +61,9 @@ test("archive creates files with 0o600 permissions and appends events", async ()
     // Check mode if on posix
     if (process.platform !== "win32") {
       const files = await import("node:fs/promises").then((fs) => fs.readdir(archiveDir));
-      assert.ok(files.length > 0);
-      const st = await stat(path.join(archiveDir, files[0]));
+      const archiveFiles = files.filter((file) => file.endsWith(".jsonl"));
+      assert.ok(archiveFiles.length > 0);
+      const st = await stat(path.join(archiveDir, archiveFiles[0]));
       assert.equal(st.mode & 0o777, 0o600);
     }
   });
@@ -212,5 +218,124 @@ test("archive reports malformed record line without payload and retains valid pr
     assert.equal(retainedError.lineNumber, 3);
     assert.equal(retainedEvents.length, 1);
     assert.equal(retainedEvents[0].eventId, "event-1");
+  });
+});
+
+test("manifest verification accepts an intact hash-chained archive", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-archive");
+    const archive = createEventArchive({ dir: archiveDir });
+    await archive.append([makeDummyEvent(1), makeDummyEvent(2), makeDummyEvent(3)]);
+    await archive.close();
+
+    const manifest = await writeArchiveManifest(archiveDir, {
+      network: "testnet",
+      ledgerMin: 101,
+      ledgerMax: 103,
+    });
+    assert.equal(manifest.recordCount, 3);
+    assert.equal(manifest.network, "testnet");
+
+    const result = await verifyArchiveManifest(archiveDir);
+    assert.equal(result.ok, true);
+    assert.equal(result.recordCount, 3);
+  });
+});
+
+test("manifest verification rejects altered, reordered and missing records", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-archive");
+    const archive = createEventArchive({ dir: archiveDir });
+    await archive.append([makeDummyEvent(1), makeDummyEvent(2), makeDummyEvent(3)]);
+    await archive.close();
+    await writeArchiveManifest(archiveDir, {
+      network: "testnet",
+      ledgerMin: 101,
+      ledgerMax: 103,
+    });
+
+    const files = (await import("node:fs/promises"))
+      .readdir(archiveDir)
+      .then((names) => names.filter((n) => n.endsWith(".jsonl")));
+    const [fileName] = await files;
+    const filePath = path.join(archiveDir, fileName);
+    const original = (await import("node:fs/promises")).readFile(filePath, "utf8");
+    const lines = (await original).split("\n").filter(Boolean);
+
+    // Altered record
+    await writeFile(filePath, lines.map((l, i) => (i === 1 ? l.replace("event-2", "event-X") : l)).join("\n") + "\n", "utf8");
+    const altered = await verifyArchiveManifest(archiveDir);
+    assert.equal(altered.ok, false);
+
+    // Reordered records
+    await writeFile(filePath, [lines[1], lines[0], lines[2]].join("\n") + "\n", "utf8");
+    const reordered = await verifyArchiveManifest(archiveDir);
+    assert.equal(reordered.ok, false);
+
+    // Missing record
+    await writeFile(filePath, [lines[0], lines[2]].join("\n") + "\n", "utf8");
+    const missing = await verifyArchiveManifest(archiveDir);
+    assert.equal(missing.ok, false);
+  });
+});
+
+test("archive accepts LF and CRLF input without changing record identities and writes canonical LF", async () => {
+  await withTempDataDir(async (tmp) => {
+    const lfDir = tmp.file("events-lf");
+    const crlfDir = tmp.file("events-crlf");
+
+    const archive = createEventArchive({ dir: lfDir });
+    const event1 = makeDummyEvent(1, 1000n);
+    const event2 = makeDummyEvent(2, 2000n);
+    await archive.append([event1, event2]);
+    await archive.close();
+
+    const fs = await import("node:fs/promises");
+    const lfFiles = (await fs.readdir(lfDir)).filter((file) => file.endsWith(".jsonl"));
+    assert.equal(lfFiles.length, 1);
+    const lfRaw = await fs.readFile(path.join(lfDir, lfFiles[0]), "utf8");
+    assert.equal(lfRaw.includes("\r\n"), false, "canonical archive output must use LF, not CRLF");
+    assert.equal(lfRaw.endsWith("\n"), true);
+
+    await mkdir(crlfDir, { recursive: true });
+    // Write same records with CRLF and a blank CRLF line
+    const crlfRaw = lfRaw.replace(/\n/g, "\r\n") + "\r\n";
+    await writeFile(path.join(crlfDir, lfFiles[0]), crlfRaw, "utf8");
+
+    const fromLf = [];
+    for await (const ev of readArchive(lfDir)) fromLf.push(ev);
+
+    const fromCrlf = [];
+    for await (const ev of readArchive(crlfDir)) fromCrlf.push(ev);
+
+    assert.deepEqual(fromCrlf, fromLf);
+    assert.equal(fromCrlf[0].eventId, "event-1");
+    assert.equal(fromCrlf[1].eventId, "event-2");
+  });
+});
+
+test("archive reports exact line number for malformed record in CRLF input", async () => {
+  await withTempDataDir(async (tmp) => {
+    const archiveDir = tmp.file("events-crlf-malformed");
+    await mkdir(archiveDir, { recursive: true });
+    const fileName = "events-2026-01-01T00-00-00-000Z-000001.jsonl";
+    await writeFile(
+      path.join(archiveDir, fileName),
+      `{"eventId":"event-1"}\r\n\r\n{"eventId":bad}\r\n`,
+      "utf8",
+    );
+
+    let caught;
+    try {
+      for await (const _ of readArchive(archiveDir)) {
+        // drain
+      }
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.ok(caught instanceof MalformedArchiveRecordError);
+    assert.equal(caught.fileName, fileName);
+    assert.equal(caught.lineNumber, 3);
   });
 });

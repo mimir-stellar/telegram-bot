@@ -23,6 +23,8 @@ import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
 import type { BroadcastStore } from "./broadcast.js";
+import type { FollowStore } from "../subscriptions/store.js";
+import type { PendingDigestWindow } from "../notifications/digest-preview.js";
 
 /** Everything a command handler may need, supplied once by `createBot`. */
 export interface CommandDeps {
@@ -45,6 +47,18 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /**
+   * Follow store for subscription data. When provided, the operator can use
+   * `/matchpreview` to count how many chats follow a given event reference.
+   * Absent means that command reports zero matches.
+   */
+  follows?: FollowStore | undefined;
+  /**
+   * Optional read-only view of the current pending digest window backing
+   * `/digestpreview`. Absent means `/digestpreview` reports that no pending
+   * digest window is configured.
+   */
+  digestWindow?: PendingDigestWindow | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */
@@ -52,6 +66,21 @@ export type CommandHandler = (
   ctx: CommandContext<Context>,
   deps: CommandDeps,
 ) => Promise<void>;
+
+/** Result of checking whether a command's optional runtime dependencies are satisfied. */
+export interface CommandAvailabilityCheckResult {
+  readonly available: boolean;
+  /** Human-readable explanation when `available` is false. */
+  readonly reason?: string;
+}
+
+/**
+ * Runtime availability predicate for a command that depends on an optional
+ * data source or capability (e.g. log ring, audit log, broadcast store).
+ */
+export type CommandAvailabilityCheck = (
+  deps?: Partial<CommandDeps>,
+) => CommandAvailabilityCheckResult;
 
 /** One self-contained slash command. */
 export interface CommandModule {
@@ -77,6 +106,12 @@ export interface CommandModule {
    * `/help` (e.g. `/export`, an operator recovery tool).
    */
   readonly hidden?: boolean;
+  /**
+   * Optional runtime dependency check. When it reports `available: false`, the
+   * command is excluded from the public menu (when deps are supplied) and
+   * included with its reason in {@link commandAvailabilityReport}.
+   */
+  readonly availability?: CommandAvailabilityCheck;
   readonly handler: CommandHandler;
 }
 
@@ -85,6 +120,23 @@ export interface CommandMetadata {
   readonly command: string;
   readonly description: string;
   readonly operatorOnly: boolean;
+}
+
+/** Availability status for a single registered command. */
+export interface CommandAvailabilityEntry {
+  readonly command: string;
+  readonly available: boolean;
+  readonly hidden: boolean;
+  readonly operatorOnly: boolean;
+  /** Explains why the command is disabled when `available` is false. */
+  readonly reason?: string;
+}
+
+/** Summary report of command availability for a set of runtime dependencies. */
+export interface CommandAvailabilityReport {
+  readonly entries: readonly CommandAvailabilityEntry[];
+  readonly available: readonly CommandAvailabilityEntry[];
+  readonly unavailable: readonly CommandAvailabilityEntry[];
 }
 
 const registered = new Map<string, CommandModule>();
@@ -140,17 +192,96 @@ export function commandMetadata(): CommandMetadata[] {
     }));
 }
 
+const DEFAULT_UNAVAILABLE_REASON = "Required runtime dependency is not configured.";
+
+function evaluateAvailability(
+  module: CommandModule,
+  deps?: Partial<CommandDeps>,
+): CommandAvailabilityEntry {
+  const hidden = module.hidden === true;
+  const operatorOnly = module.operatorOnly === true;
+
+  if (operatorOnly && deps?.config?.operatorTelegramUserId === null) {
+    return {
+      command: module.command,
+      available: false,
+      hidden,
+      operatorOnly,
+      reason: "No operator is configured (OPERATOR_TELEGRAM_USER_ID is unset).",
+    };
+  }
+
+  if (module.availability !== undefined) {
+    const result = module.availability(deps);
+    if (!result.available) {
+      const reason = result.reason?.trim() || DEFAULT_UNAVAILABLE_REASON;
+      return {
+        command: module.command,
+        available: false,
+        hidden,
+        operatorOnly,
+        reason,
+      };
+    }
+  }
+
+  return {
+    command: module.command,
+    available: true,
+    hidden,
+    operatorOnly,
+  };
+}
+
 /**
- * Commands to advertise to this deployment: localized descriptions, and
- * operator-only entries only when an operator is configured (there is no one
- * to run them otherwise).
+ * Report command availability for the supplied runtime dependencies, explaining
+ * why each disabled command cannot run when its optional data source is absent.
  */
-export function visibleCommandMetadata(config?: BotConfig): CommandMetadata[] {
+export function commandAvailabilityReport(
+  deps?: Partial<CommandDeps>,
+): CommandAvailabilityReport {
+  const entries = registeredCommands().map((module) => evaluateAvailability(module, deps));
+  return {
+    entries,
+    available: entries.filter((entry) => entry.available),
+    unavailable: entries.filter((entry) => !entry.available),
+  };
+}
+
+/** Render a concise human-readable summary of a {@link CommandAvailabilityReport}. */
+export function formatCommandAvailabilityReport(report: CommandAvailabilityReport): string {
+  const header = `Command availability: ${report.available.length} available, ${report.unavailable.length} disabled`;
+  if (report.unavailable.length === 0) {
+    return header;
+  }
+  const disabledLines = report.unavailable.map(
+    (entry) => `- /${entry.command}: ${entry.reason ?? DEFAULT_UNAVAILABLE_REASON}`,
+  );
+  return [header, "Disabled:", ...disabledLines].join("\n");
+}
+
+/**
+ * Commands to advertise to this deployment: localized descriptions, operator-only
+ * entries only when an operator is configured, and — when `deps` is supplied —
+ * only commands whose optional runtime dependencies are available.
+ */
+export function visibleCommandMetadata(
+  config?: BotConfig,
+  deps?: Partial<CommandDeps>,
+): CommandMetadata[] {
   const descriptions = messagesFor(config?.locale).commandDescriptions;
   const operatorConfigured = config === undefined || config.operatorTelegramUserId !== null;
+  const effectiveDeps: Partial<CommandDeps> | undefined =
+    deps !== undefined ? (config !== undefined ? { config, ...deps } : deps) : undefined;
   return registeredCommands()
     .filter((module) => module.hidden !== true)
     .filter((module) => operatorConfigured || module.operatorOnly !== true)
+    .filter((module) => {
+      if (effectiveDeps === undefined || module.availability === undefined) {
+        return true;
+      }
+      return module.availability(effectiveDeps).available;
+    })
     .map((module) => ({
       command: module.command,
       description:
@@ -158,4 +289,113 @@ export function visibleCommandMetadata(config?: BotConfig): CommandMetadata[] {
         descriptionFor(module.command),
       operatorOnly: module.operatorOnly === true,
     }));
+}
+
+/**
+ * Inspect the command catalogue, menu descriptions, and `/help` detail entries
+ * for drift — in particular, any advertised command without a live registered
+ * handler.
+ */
+export function findCommandConsistencyIssues(
+  options?: CommandConsistencyOptions,
+): CommandConsistencyIssue[] {
+  const modules = options?.modules ?? registeredCommands();
+  const menuDescriptions =
+    options?.menuDescriptions ?? (COMMAND_DESCRIPTIONS as Readonly<Record<string, string>>);
+  const helpDetails = options?.helpDetails;
+
+  const issues: CommandConsistencyIssue[] = [];
+  const byName = new Map<string, CommandModule>();
+
+  for (const module of modules) {
+    byName.set(module.command, module);
+
+    if (typeof module.handler !== "function") {
+      issues.push({
+        command: module.command,
+        source: "catalogue",
+        message: "registered command has no callable handler",
+      });
+    }
+
+    if (module.hidden !== true) {
+      const description = menuDescriptions[module.command];
+      if (typeof description !== "string" || description.trim().length === 0) {
+        issues.push({
+          command: module.command,
+          source: "menu",
+          message: "advertised command is missing a menu description in COMMAND_DESCRIPTIONS",
+        });
+      }
+
+      if (helpDetails !== undefined) {
+        const detail = helpDetails[module.command];
+        if (detail === undefined) {
+          issues.push({
+            command: module.command,
+            source: "help",
+            message: "advertised command is missing a help entry in COMMAND_DETAILS",
+          });
+        } else if (
+          detail.operatorOnly !== undefined &&
+          Boolean(detail.operatorOnly) !== Boolean(module.operatorOnly)
+        ) {
+          issues.push({
+            command: module.command,
+            source: "help",
+            message: "help entry operatorOnly flag disagrees with registered module",
+          });
+        }
+      }
+    }
+  }
+
+  for (const command of Object.keys(menuDescriptions)) {
+    const module = byName.get(command);
+    if (module === undefined) {
+      issues.push({
+        command,
+        source: "menu",
+        message: "advertised in COMMAND_DESCRIPTIONS without a live registered handler",
+      });
+    } else if (module.hidden === true) {
+      issues.push({
+        command,
+        source: "menu",
+        message: "hidden command must not be advertised in COMMAND_DESCRIPTIONS",
+      });
+    }
+  }
+
+  if (helpDetails !== undefined) {
+    for (const command of Object.keys(helpDetails)) {
+      const module = byName.get(command);
+      if (module === undefined) {
+        issues.push({
+          command,
+          source: "help",
+          message: "advertised in COMMAND_DETAILS without a live registered handler",
+        });
+      } else if (module.hidden === true) {
+        issues.push({
+          command,
+          source: "help",
+          message: "hidden command must not be advertised in COMMAND_DETAILS",
+        });
+      }
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Throw {@link CommandConsistencyError} naming every inconsistent command if
+ * the catalogue, menu, and `/help` tables disagree.
+ */
+export function validateCommandConsistency(options?: CommandConsistencyOptions): void {
+  const issues = findCommandConsistencyIssues(options);
+  if (issues.length > 0) {
+    throw new CommandConsistencyError(issues);
+  }
 }

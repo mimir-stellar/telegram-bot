@@ -13,9 +13,12 @@
  * 2. Every ScVal type maps to a stable, unambiguous textual representation with a type tag.
  * 3. Hostile nesting (deep maps/vectors, excessive keys, oversized strings/bytes) is strictly bounded.
  * 4. Strings are sanitized to prevent newline/control character injection in logs/chat.
+ * 5. Depth truncation is surfaced as the stable `DEPTH_LIMIT_REASON` rather than
+ *    being silently swallowed, so callers can tell a deep payload from a shallow one.
  */
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
+import type { EventQuarantine } from "./quarantine.js";
 
 // ── Bounded Limits ───────────────────────────────────────────────────────────
 
@@ -37,24 +40,46 @@ export const MAX_GENERIC_BYTES_CHARS = 64;
 /** Hard ceiling on total rendered string representation. */
 export const MAX_GENERIC_TOTAL_CHARS = 2048;
 
+/**
+ * Maximum nested vec/map collection depth in an event payload.
+ *
+ * Independent of XDR byte size: a handful of nested collections is a small
+ * wire value but can still exhaust the recursion budget of native conversion.
+ * The typed decoder applies the same bound before `scValToNative` runs.
+ */
+export const MAX_DECODED_COLLECTION_DEPTH = MAX_GENERIC_DEPTH;
+
+/** Stable reason reported when an event's collection depth exceeds the bound. */
+export const DEPTH_LIMIT_REASON = "collection depth limit exceeded";
+
 export interface GenericRenderOptions {
   maxDepth?: number;
   maxKeys?: number;
   maxVecItems?: number;
   maxStringChars?: number;
   maxBytesChars?: number;
+  /**
+   * Optional quarantine instance to preserve undecodable event envelopes.
+   * When provided and an event cannot be decoded cleanly (e.g. malformed XDR or unknown payload),
+   * the raw envelope and source identity are preserved to the quarantine.
+   */
+  quarantine?: EventQuarantine;
 }
 
 export interface GenericEventPayload {
-  name: "generic";
+  name: "generic" | "unknown";
   eventName: string;
   topics: string[];
   value: string;
   summary: string;
   reason?: string;
+  /** Distinguishes an unrecognized event name from a malformed known event. */
+  status?: "ok" | "unknown_event" | "malformed_event";
 }
 
 export interface GenericDecodedEvent {
+  /** Optional archive record schema version, present on archived/migrated records. */
+  schemaVersion?: number;
   source: string;
   contractId: string;
   ledger: number;
@@ -71,7 +96,13 @@ export interface GenericDecodedEvent {
   topicSummary: string;
   valueSummary: string;
   summary: string;
+  /** Set to {@link DEPTH_LIMIT_REASON} when collection depth exceeded the bound. */
+  reason?: string;
   payload: GenericEventPayload;
+  /** Stable status code: `ok`, `unknown_event`, or `malformed_event`. */
+  status: "ok" | "unknown_event" | "malformed_event";
+  /** Human-readable reason when `status` is not `ok`. */
+  reason?: string;
 }
 
 // ── String Sanitization & Clipping ───────────────────────────────────────────
@@ -123,6 +154,114 @@ function scValPayload(val: xdr.ScVal): unknown {
   return typeof raw === "function" ? (raw as () => unknown).call(val) : raw;
 }
 
+// ── Collection Depth Probe ───────────────────────────────────────────────────
+
+/** Upper bound on nodes visited by the depth probe, so wide payloads stay cheap. */
+const MAX_DEPTH_SCAN_NODES = 10_000;
+
+/** Read an ScVal's arm name and payload without trusting getters. */
+function scValArm(val: unknown): { name: string; payload: unknown } | null {
+  if (val === null || typeof val !== "object") return null;
+  try {
+    const raw = val as { switch?: unknown; type?: unknown; value?: unknown };
+    let name: string;
+    if (typeof raw.switch === "function") {
+      const sw = (raw.switch as () => unknown).call(val);
+      name =
+        typeof sw === "object" && sw !== null && "name" in sw
+          ? String((sw as { name: unknown }).name)
+          : String(sw);
+    } else if (typeof raw.type === "string") {
+      name = raw.type;
+    } else {
+      return null;
+    }
+    let payload: unknown = raw.value;
+    if (typeof payload === "function") payload = (payload as () => unknown).call(val);
+    return { name, payload };
+  } catch {
+    return null;
+  }
+}
+
+/** Read one field of an ScMapEntry (method in SDK 16, getter in SDK 17). */
+function mapEntryField(entry: unknown, field: "key" | "val"): unknown {
+  if (entry === null || typeof entry !== "object") return undefined;
+  try {
+    const raw = (entry as Record<string, unknown>)[field];
+    return typeof raw === "function" ? (raw as () => unknown).call(entry) : raw;
+  } catch {
+    return undefined;
+  }
+}
+
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  if (val === null || typeof val !== "object" || Array.isArray(val)) return false;
+  if (val instanceof Map || val instanceof Date || ArrayBuffer.isView(val)) return false;
+  const proto = Object.getPrototypeOf(val);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Children of a collection, plus whether `val` is a collection at all. */
+function collectionChildren(val: unknown): { children: unknown[]; isCollection: boolean } {
+  const arm = scValArm(val);
+  if (arm) {
+    if (arm.name !== "scvVec" && arm.name !== "scvMap") {
+      return { children: [], isCollection: false };
+    }
+    if (!Array.isArray(arm.payload)) return { children: [], isCollection: true };
+    const children: unknown[] = [];
+    for (const entry of arm.payload) {
+      if (scValArm(entry)) children.push(entry);
+      else children.push(mapEntryField(entry, "key"), mapEntryField(entry, "val"));
+    }
+    return { children, isCollection: true };
+  }
+  if (Array.isArray(val)) return { children: val, isCollection: true };
+  try {
+    if (val instanceof Map) {
+      return { children: Array.from(val.entries()).flat(), isCollection: true };
+    }
+    if (isPlainObject(val)) return { children: Object.values(val), isCollection: true };
+  } catch {
+    // A hostile getter must not turn the depth probe into an exception.
+    return { children: [], isCollection: true };
+  }
+  return { children: [], isCollection: false };
+}
+
+/**
+ * Deepest nested vec/map (or native array/object) in `val`, stopping as soon as
+ * `maxDepth` is exceeded. Iterative and exception-safe: it never serializes or
+ * natively converts the payload, so a small but deeply nested value can be
+ * rejected before either operation recurses.
+ */
+export function scValCollectionDepth(
+  val: unknown,
+  maxDepth: number = MAX_DECODED_COLLECTION_DEPTH,
+): number {
+  const pending: Array<{ val: unknown; depth: number }> = [{ val, depth: 0 }];
+  const seen = new WeakSet<object>();
+  let deepest = 0;
+  let scanned = 0;
+
+  while (pending.length > 0) {
+    const item = pending.pop()!;
+    if (++scanned > MAX_DEPTH_SCAN_NODES) break;
+    const { children, isCollection } = collectionChildren(item.val);
+    if (!isCollection) continue;
+    const childDepth = item.depth + 1;
+    if (childDepth > deepest) deepest = childDepth;
+    if (deepest > maxDepth) return deepest;
+    if (typeof item.val === "object" && item.val !== null) {
+      if (seen.has(item.val)) continue;
+      seen.add(item.val);
+    }
+    for (const child of children) pending.push({ val: child, depth: childDepth });
+  }
+  return deepest;
+}
+
 // ── Recursive Renderer ───────────────────────────────────────────────────────
 
 /**
@@ -162,6 +301,22 @@ export function renderGenericScVal(
 
 /** Alias of `renderGenericScVal` */
 export const renderScVal = renderGenericScVal;
+
+function renderIntegerNative(native: unknown, typeName: string): string {
+  if (typeof native === "bigint") {
+    return `${typeName}:${native.toString(10)}`;
+  }
+  if (typeof native === "number") {
+    if (!Number.isSafeInteger(native)) {
+      return `${typeName}:malformed`;
+    }
+    return `${typeName}:${native}`;
+  }
+  if (typeof native === "string" && /^-?\d+$/.test(native.trim())) {
+    return `${typeName}:${native.trim()}`;
+  }
+  return `${typeName}:malformed`;
+}
 
 function renderScValInstance(
   val: xdr.ScVal,
@@ -203,7 +358,7 @@ function renderScValInstance(
     case "scvU32": {
       try {
         const native = scValToNative(val);
-        return `u32:${native}`;
+        return renderIntegerNative(native, "u32");
       } catch {
         return "u32:malformed";
       }
@@ -212,7 +367,7 @@ function renderScValInstance(
     case "scvI32": {
       try {
         const native = scValToNative(val);
-        return `i32:${native}`;
+        return renderIntegerNative(native, "i32");
       } catch {
         return "i32:malformed";
       }
@@ -221,7 +376,7 @@ function renderScValInstance(
     case "scvU64": {
       try {
         const native = scValToNative(val);
-        return `u64:${native}`;
+        return renderIntegerNative(native, "u64");
       } catch {
         return "u64:malformed";
       }
@@ -230,7 +385,7 @@ function renderScValInstance(
     case "scvI64": {
       try {
         const native = scValToNative(val);
-        return `i64:${native}`;
+        return renderIntegerNative(native, "i64");
       } catch {
         return "i64:malformed";
       }
@@ -239,7 +394,7 @@ function renderScValInstance(
     case "scvTimepoint": {
       try {
         const native = scValToNative(val);
-        return `timepoint:${native}`;
+        return renderIntegerNative(native, "timepoint");
       } catch {
         return "timepoint:malformed";
       }
@@ -248,7 +403,7 @@ function renderScValInstance(
     case "scvDuration": {
       try {
         const native = scValToNative(val);
-        return `duration:${native}`;
+        return renderIntegerNative(native, "duration");
       } catch {
         return "duration:malformed";
       }
@@ -257,7 +412,7 @@ function renderScValInstance(
     case "scvU128": {
       try {
         const native = scValToNative(val);
-        return `u128:${native}`;
+        return renderIntegerNative(native, "u128");
       } catch {
         return "u128:malformed";
       }
@@ -266,7 +421,7 @@ function renderScValInstance(
     case "scvI128": {
       try {
         const native = scValToNative(val);
-        return `i128:${native}`;
+        return renderIntegerNative(native, "i128");
       } catch {
         return "i128:malformed";
       }
@@ -275,7 +430,7 @@ function renderScValInstance(
     case "scvU256": {
       try {
         const native = scValToNative(val);
-        return `u256:${native}`;
+        return renderIntegerNative(native, "u256");
       } catch {
         return "u256:malformed";
       }
@@ -284,7 +439,7 @@ function renderScValInstance(
     case "scvI256": {
       try {
         const native = scValToNative(val);
-        return `i256:${native}`;
+        return renderIntegerNative(native, "i256");
       } catch {
         return "i256:malformed";
       }
@@ -362,6 +517,10 @@ function renderScValInstance(
         return "map:{...}";
       }
       try {
+        const collision = findDuplicateMapKey(val, maxDepth - depth);
+        if (collision) {
+          return `map:malformed(${collision.reason})`;
+        }
         const rawEntries = scValPayload(val);
         if (!Array.isArray(rawEntries)) {
           const native = scValToNative(val);
@@ -436,11 +595,14 @@ function renderNativeValue(
   }
 
   if (typeof val === "number") {
-    return Number.isInteger(val) ? `number:${val}` : `number:${val}`;
+    if (!Number.isFinite(val) || (Number.isInteger(val) && !Number.isSafeInteger(val))) {
+      return "number:malformed";
+    }
+    return `number:${val}`;
   }
 
   if (typeof val === "bigint") {
-    return `bigint:${val}`;
+    return `bigint:${val.toString(10)}`;
   }
 
   if (typeof val === "string") {
@@ -542,23 +704,37 @@ export function renderTopics(
 }
 
 function toLedger(value: unknown): number {
-  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
-  if (typeof n !== "number" || !Number.isFinite(n)) return 0;
-  const floored = Math.floor(n);
-  return floored >= 0 ? floored : 0;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) return 0;
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    try {
+      const bn = BigInt(value.trim());
+      if (bn < 0n || bn > BigInt(Number.MAX_SAFE_INTEGER)) return 0;
+      return Number(bn);
+    } catch {
+      return 0;
+    }
+  }
+  return 0;
 }
 
 function toPosition(value: unknown): number | null {
-  let n: number;
   if (typeof value === "number") {
-    n = value;
-  } else if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
-    n = Number(value.trim());
-  } else {
-    return null;
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    return value;
   }
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) return null;
-  return n;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    try {
+      const bn = BigInt(value.trim());
+      if (bn < 0n || bn > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      return Number(bn);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function toTxHash(value: unknown): string {
@@ -592,6 +768,30 @@ function extractEventName(firstTopic: unknown): string {
 }
 
 /**
+ * Classify the decoded event name.
+ *
+ * - `unknown_event`: the first topic is absent or does not yield a usable name.
+ * - `malformed_event`: the first topic looks like a known event name but the
+ *   payload could not be rendered (e.g. the value rendered as `malformed`).
+ * - `ok`: a usable event name was extracted and the payload rendered cleanly.
+ */
+function classifyEventStatus(
+  eventName: string,
+  value: string,
+): { status: "ok" | "unknown_event" | "malformed_event"; reason?: string } {
+  if (eventName === "unknown" || eventName === "") {
+    return { status: "unknown_event", reason: "unrecognized event name" };
+  }
+  if (eventName.startsWith("malformed")) {
+    return { status: "malformed_event", reason: "malformed known event name" };
+  }
+  if (value === "malformed" || value.startsWith("malformed:")) {
+    return { status: "malformed_event", reason: "malformed known event payload" };
+  }
+  return { status: "ok" };
+}
+
+/**
  * Decode any Soroban event into a bounded GenericDecodedEvent.
  *
  * Never throws on malformed XDR, null fields, or oversized payloads.
@@ -615,6 +815,9 @@ export function decodeGenericEvent(
   const inSuccessfulContractCall =
     typeof event.inSuccessfulContractCall === "boolean" ? event.inSuccessfulContractCall : null;
 
+  const maxTopics = options?.maxTopics ?? MAX_GENERIC_TOPICS;
+  const hasTopicArray =
+    Array.isArray(event.topic) || Array.isArray((event as { topics?: unknown }).topics);
   const rawTopics = Array.isArray(event.topic)
     ? event.topic
     : Array.isArray((event as { topics?: unknown }).topics)
@@ -622,12 +825,34 @@ export function decodeGenericEvent(
       : [];
 
   const eventName = rawTopics.length > 0 ? extractEventName(rawTopics[0]) : "unknown";
+  const maxDepth = options?.maxDepth ?? MAX_GENERIC_DEPTH;
+  const depthExceeded =
+    scValCollectionDepth(event.value, maxDepth) > maxDepth ||
+    rawTopics.some((topic) => scValCollectionDepth(topic, maxDepth) > maxDepth);
   const topics = renderTopics(rawTopics, options);
   const value = renderGenericScVal(event.value, 0, options);
+
+  if (options?.quarantine) {
+    const isUndecodable =
+      eventName === "unknown" ||
+      rawTopics.length === 0 ||
+      topics.some((t) => t === "malformed") ||
+      value === "malformed";
+    if (isUndecodable) {
+      const reason =
+        eventName === "unknown"
+          ? "unrecognized event name"
+          : value === "malformed"
+            ? "malformed value"
+            : "malformed topics";
+      void options.quarantine.quarantine(event, source, reason).catch(() => {});
+    }
+  }
 
   const topicSummary = topics.length > 0 ? topics.join(" | ") : "(none)";
   const valueSummary = value;
   const summary = `[${eventName}] ${topicSummary} => ${valueSummary}`;
+  const { status, reason } = classifyEventStatus(eventName, value);
 
   return {
     source,
@@ -646,12 +871,16 @@ export function decodeGenericEvent(
     topicSummary,
     valueSummary,
     summary,
+    ...(depthExceeded ? { reason: DEPTH_LIMIT_REASON } : {}),
     payload: {
       name: "generic",
       eventName,
       topics,
       value,
       summary,
+      ...(depthExceeded ? { reason: DEPTH_LIMIT_REASON } : {}),
     },
   };
 }
+
+export { adaptArchivedGenericEvent } from "./archive.js";

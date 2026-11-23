@@ -1,3 +1,6 @@
+import { defineCommand } from "./registry.js";
+import { TELEGRAM_OPTIONS } from "./runtime.js";
+
 export function menuMessage(): string {
   return [
     "📋 *Menu*",
@@ -18,3 +21,14 @@ export function menuKeyboard() {
     ],
   };
 }
+
+export const menuCommand = defineCommand({
+  command: "menu",
+  chatAllowlist: true,
+  handler: async (ctx) => {
+    await ctx.reply(menuMessage(), {
+      ...TELEGRAM_OPTIONS,
+      reply_markup: menuKeyboard(),
+    });
+  },
+});

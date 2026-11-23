@@ -3,13 +3,24 @@ import test from "node:test";
 
 import {
   EVENT_PAYLOAD_SCHEMAS,
-  FilterDepthLimitError,
+  FILTER_SCHEMA_VERSION,
   FilterParseError,
-  FilterTokenLimitError,
-  MAX_FILTER_DEPTH,
-  MAX_FILTER_TOKENS,
-  countFilterTokens,
+  canonicalizeSchema,
+  checkFilterStaleness,
+  compileFilter,
+  compileFilterExpression,
+  compileFilterRule,
+  computeSchemaDigest,
   evaluateFilterRule,
+  getEventSchemaDigest,
+  getSchemaDigest,
+  isCompiledFilterStale,
+  isFilterRuleStale,
+  normalizeEventSchema,
+  normalizeFieldDefinition,
+  normalizeSchema,
+  normalizeSchemaRegistry,
+  normalizeSchemaVersion,
   parseFilterExpression,
   parseUsdcStringToUnits,
 } from "../dist/notifications/filter-expr.js";
@@ -294,124 +305,330 @@ test("parseUsdcStringToUnits: atomic unit conversion utility", () => {
   assert.equal(parseUsdcStringToUnits("100"), 1_000_000_000n);
   assert.equal(parseUsdcStringToUnits("0.0000001"), 1n);
   assert.equal(parseUsdcStringToUnits("2.5"), 25_000_000n);
+
+  // Canonical equivalent decimal strings normalize identically
+  for (const equivalent of ["10.5", "010.5", "10.50", "10.5000000", " 010.50 "]) {
+    assert.equal(parseUsdcStringToUnits(equivalent), 105_000_000n);
+  }
+
+  // Values exceeding 7 fractional digits (including trailing zeros) are rejected
+  assert.throws(
+    () => parseUsdcStringToUnits("1.00000000"),
+    (err) => err instanceof FilterParseError && /exceeds maximum precision of 7 decimals/.test(err.message),
+  );
 });
 
 // ----------------------------------------------------
-// Bounded Token Count & Nesting Depth Security Limits
+// Schema Normalization and Fingerprinting Tests
 // ----------------------------------------------------
 
-test("countFilterTokens: accurately counts non-EOF tokens in valid expression", () => {
-  const count = countFilterTokens("claim_challenged where stake >= 100");
-  assert.equal(count, 5);
+test("normalizeSchemaVersion: normalizes numbers and string representations", () => {
+  assert.equal(normalizeSchemaVersion(1), 1);
+  assert.equal(normalizeSchemaVersion(2.9), 2);
+  assert.equal(normalizeSchemaVersion("1"), 1);
+  assert.equal(normalizeSchemaVersion("v1"), 1);
+  assert.equal(normalizeSchemaVersion("V3"), 3);
+  assert.equal(normalizeSchemaVersion("  4  "), 4);
+
+  assert.throws(() => normalizeSchemaVersion(0), /Invalid schema version/);
+  assert.throws(() => normalizeSchemaVersion(-1), /Invalid schema version/);
+  assert.throws(() => normalizeSchemaVersion("invalid"), /Invalid schema version string/);
+  assert.throws(() => normalizeSchemaVersion(null), /Schema version must be a number or string/);
 });
 
-test("countFilterTokens: throws FilterTokenLimitError when token count exceeds limit", () => {
-  assert.throws(
-    () => countFilterTokens("claim_challenged where stake >= 100", 4),
-    (err) => {
-      assert.ok(err instanceof FilterTokenLimitError);
-      assert.equal(err.count, 5);
-      assert.equal(err.limit, 4);
-      assert.match(err.message, /exceeds maximum token limit of 4 \(got 5\)/);
-      return true;
-    },
-  );
+test("normalizeFieldDefinition: sets isUsdcAmount boolean and preserves type", () => {
+  assert.deepEqual(normalizeFieldDefinition({ type: "string" }), {
+    isUsdcAmount: false,
+    type: "string",
+  });
+  assert.deepEqual(normalizeFieldDefinition({ type: "bigint", isUsdcAmount: true }), {
+    isUsdcAmount: true,
+    type: "bigint",
+  });
 });
 
-test("parseFilterExpression: accepts expression within MAX_FILTER_TOKENS limit", () => {
-  // Build an expression with exactly MAX_FILTER_TOKENS tokens (100 tokens)
-  // "where category == 'cat'" is 4 tokens ("where", "category", "==", "'cat'")
-  // Each " or category == 'cat'" adds 4 tokens ("or", "category", "==", "'cat'")
-  // 4 + 24 * 4 = 100 tokens
-  const parts = ["where category == 'cat'"];
-  for (let i = 0; i < 24; i++) {
-    parts.push("or category == 'cat'");
-  }
-  const expr = parts.join(" ");
-  assert.equal(countFilterTokens(expr), MAX_FILTER_TOKENS);
-  const rule = parseFilterExpression(expr);
+test("normalizeEventSchema & computeSchemaDigest: order-independent and deterministic", () => {
+  const schemaA = {
+    title: { type: "string" },
+    claimId: { type: "number" },
+    creator: { type: "string" },
+  };
+  const schemaB = {
+    creator: { type: "string" },
+    title: { type: "string" },
+    claimId: { type: "number" },
+  };
+
+  const normA = normalizeEventSchema(schemaA);
+  const normB = normalizeEventSchema(schemaB);
+
+  // Key ordering should be sorted alphabetically
+  assert.deepEqual(Object.keys(normA), ["claimId", "creator", "title"]);
+  assert.deepEqual(Object.keys(normB), ["claimId", "creator", "title"]);
+  assert.deepEqual(normA, normB);
+
+  const digestA = computeSchemaDigest(schemaA, 1);
+  const digestB = computeSchemaDigest(schemaB, 1);
+  assert.equal(digestA, digestB);
+  assert.match(digestA, /^[a-f0-9]{64}$/);
+});
+
+test("computeSchemaDigest: changes on schema modification or version bump", () => {
+  const baseSchema = {
+    claimId: { type: "number" },
+    creator: { type: "string" },
+  };
+  const baseDigest = computeSchemaDigest(baseSchema, 1);
+
+  // 1. Adding a field changes digest
+  const withAdded = {
+    ...baseSchema,
+    extra: { type: "string" },
+  };
+  assert.notEqual(computeSchemaDigest(withAdded, 1), baseDigest);
+
+  // 2. Changing field type changes digest
+  const withTypeChange = {
+    claimId: { type: "string" },
+    creator: { type: "string" },
+  };
+  assert.notEqual(computeSchemaDigest(withTypeChange, 1), baseDigest);
+
+  // 3. Changing isUsdcAmount changes digest
+  const withUsdcChange = {
+    claimId: { type: "number", isUsdcAmount: true },
+    creator: { type: "string" },
+  };
+  assert.notEqual(computeSchemaDigest(withUsdcChange, 1), baseDigest);
+
+  // 4. Version bump changes digest
+  assert.notEqual(computeSchemaDigest(baseSchema, 2), baseDigest);
+});
+
+test("getEventSchemaDigest: computes stable digest for known event schema", () => {
+  const digest1 = getEventSchemaDigest("claim_created");
+  const digest2 = getEventSchemaDigest("claim_created", EVENT_PAYLOAD_SCHEMAS, 1);
+  assert.equal(digest1, digest2);
+  assert.match(digest1, /^[a-f0-9]{64}$/);
+
+  // Different events produce different digests
+  const challengeDigest = getEventSchemaDigest("claim_challenged");
+  assert.notEqual(digest1, challengeDigest);
+
+  assert.throws(() => getEventSchemaDigest("non_existent_event"), /Unknown event schema/);
+});
+
+// ----------------------------------------------------
+// Compilation Tests
+// ----------------------------------------------------
+
+test("compileFilterExpression: attaches normalized schemaVersion and digests", () => {
+  const compiled = compileFilterExpression("claim_challenged where stake >= 100 USDC");
+
+  assert.equal(compiled.eventName, "claim_challenged");
+  assert.equal(compiled.schemaVersion, FILTER_SCHEMA_VERSION);
+  assert.match(compiled.digest, /^[a-f0-9]{64}$/);
+  assert.equal(compiled.schemaDigest, compiled.digest);
+  assert.equal(compiled.fingerprint, compiled.digest);
+  assert.equal(compiled.eventDigest, compiled.digest);
+  assert.match(compiled.registryDigest, /^[a-f0-9]{64}$/);
+
+  // Has evaluate helper
+  const matchingEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "G...",
+    stake: 1_000_000_000n,
+  });
+  const nonMatchingEvent = mockEvent("market", {
+    name: "claim_challenged",
+    claimId: 1,
+    challenger: "G...",
+    stake: 500_000_000n,
+  });
+  assert.equal(compiled.evaluate(matchingEvent), true);
+  assert.equal(compiled.evaluate(nonMatchingEvent), false);
+
+  // Has isStale helper
+  assert.equal(compiled.isStale(), false);
+});
+
+test("compileFilterRule & compileFilter: works with raw FilterRule or string", () => {
+  const rawRule = {
+    eventName: "claim_created",
+    rawExpression: "claim_created",
+  };
+  const compiledFromRule = compileFilterRule(rawRule);
+  assert.equal(compiledFromRule.schemaVersion, FILTER_SCHEMA_VERSION);
+  assert.ok(compiledFromRule.digest);
+
+  const compiledFromString = compileFilter("claim_created");
+  assert.equal(compiledFromString.digest, compiledFromRule.digest);
+
+  const compiledFromCompiled = compileFilter(rawRule);
+  assert.equal(compiledFromCompiled.digest, compiledFromRule.digest);
+});
+
+test("parseFilterExpression: maintains backwards compatibility while attaching compiled metadata", () => {
+  const rule = parseFilterExpression("claim_created where category == 'defi'");
+
+  // Legacy FilterRule properties
+  assert.equal(rule.eventName, "claim_created");
+  assert.equal(rule.rawExpression, "claim_created where category == 'defi'");
   assert.ok(rule.condition);
+
+  // New compiled properties
+  assert.equal(rule.schemaVersion, 1);
+  assert.match(rule.digest, /^[a-f0-9]{64}$/);
+  assert.equal(rule.schemaDigest, rule.digest);
+  assert.equal(typeof rule.evaluate, "function");
+  assert.equal(typeof rule.isStale, "function");
 });
 
-test("parseFilterExpression: rejects expressions exceeding MAX_FILTER_TOKENS before AST parsing", () => {
-  // 101 tokens: 100 tokens + 1 extra
-  const parts = ["where category == 'cat'"];
-  for (let i = 0; i < 32; i++) {
-    parts.push("or category == 'cat'");
-  }
-  parts.push("or true"); // 2 more tokens -> 102 tokens
-  const expr = parts.join(" ");
+// ----------------------------------------------------
+// Staleness Detection Tests
+// ----------------------------------------------------
 
-  assert.throws(
-    () => parseFilterExpression(expr),
-    (err) => {
-      assert.ok(err instanceof FilterTokenLimitError);
-      assert.equal(err.limit, MAX_FILTER_TOKENS);
-      assert.ok(err.count > MAX_FILTER_TOKENS);
-      assert.match(err.message, /exceeds maximum token limit/);
-      return true;
+test("isFilterRuleStale: fresh compiled rule is not stale", () => {
+  const rule = compileFilterExpression("claim_challenged where stake >= 100 USDC");
+  assert.equal(isFilterRuleStale(rule), false);
+  assert.equal(isCompiledFilterStale(rule), false);
+  assert.equal(rule.isStale(), false);
+
+  const check = checkFilterStaleness(rule);
+  assert.equal(check.stale, false);
+});
+
+test("isFilterRuleStale: detects staleness when event schema adds a new field", () => {
+  const rule = compileFilterExpression("claim_challenged where stake >= 100");
+
+  const modifiedSchemas = {
+    ...EVENT_PAYLOAD_SCHEMAS,
+    claim_challenged: {
+      ...EVENT_PAYLOAD_SCHEMAS.claim_challenged,
+      reason: { type: "string" },
     },
-  );
+  };
+
+  assert.equal(isFilterRuleStale(rule, modifiedSchemas), true);
+  assert.equal(rule.isStale(modifiedSchemas), true);
+
+  const check = checkFilterStaleness(rule, modifiedSchemas);
+  assert.equal(check.stale, true);
+  assert.equal(check.reason, "SCHEMA_DIGEST_MISMATCH");
 });
 
-test("parseFilterExpression: respects custom maxTokens option", () => {
-  const expr = "claim_challenged where stake >= 100";
-  // 5 tokens, limit to 4
-  assert.throws(
-    () => parseFilterExpression(expr, { maxTokens: 4 }),
-    (err) => {
-      assert.ok(err instanceof FilterTokenLimitError);
-      assert.equal(err.limit, 4);
-      assert.equal(err.count, 5);
-      return true;
+test("isFilterRuleStale: detects staleness when event schema changes a field type", () => {
+  const rule = compileFilterExpression("claim_challenged where stake >= 100");
+
+  const modifiedSchemas = {
+    ...EVENT_PAYLOAD_SCHEMAS,
+    claim_challenged: {
+      ...EVENT_PAYLOAD_SCHEMAS.claim_challenged,
+      stake: { type: "string" },
     },
-  );
+  };
 
-  // limit to 5 succeeds
-  const rule = parseFilterExpression(expr, { maxTokens: 5 });
-  assert.equal(rule.eventName, "claim_challenged");
+  assert.equal(isFilterRuleStale(rule, modifiedSchemas), true);
+  const check = checkFilterStaleness(rule, modifiedSchemas);
+  assert.equal(check.stale, true);
 });
 
-test("parseFilterExpression: accepts nesting depth up to MAX_FILTER_DEPTH", () => {
-  // Nesting depth 10: ((((((((((active == true))))))))))
-  const leftParens = "(".repeat(MAX_FILTER_DEPTH);
-  const rightParens = ")".repeat(MAX_FILTER_DEPTH);
-  const expr = `where ${leftParens}active == true${rightParens}`;
-  const rule = parseFilterExpression(expr);
-  assert.ok(rule.condition);
+test("isFilterRuleStale: detects staleness when a field used in rule condition is removed", () => {
+  const rule = compileFilterExpression("claim_created where category == 'defi'");
+
+  const { category, ...remainingFields } = EVENT_PAYLOAD_SCHEMAS.claim_created;
+  const modifiedSchemas = {
+    ...EVENT_PAYLOAD_SCHEMAS,
+    claim_created: remainingFields,
+  };
+
+  assert.equal(isFilterRuleStale(rule, modifiedSchemas), true);
+  const check = checkFilterStaleness(rule, modifiedSchemas);
+  assert.equal(check.stale, true);
 });
 
-test("parseFilterExpression: rejects expressions exceeding MAX_FILTER_DEPTH to prevent call stack recursion", () => {
-  // Nesting depth 11: (((((((((((active == true)))))))))))
-  const leftParens = "(".repeat(MAX_FILTER_DEPTH + 1);
-  const rightParens = ")".repeat(MAX_FILTER_DEPTH + 1);
-  const expr = `where ${leftParens}active == true${rightParens}`;
+test("isFilterRuleStale: detects staleness when event is removed from schema registry", () => {
+  const rule = compileFilterExpression("claim_challenged where stake >= 100");
 
-  assert.throws(
-    () => parseFilterExpression(expr),
-    (err) => {
-      assert.ok(err instanceof FilterDepthLimitError);
-      assert.equal(err.limit, MAX_FILTER_DEPTH);
-      assert.equal(err.depth, MAX_FILTER_DEPTH + 1);
-      assert.match(err.message, /exceeds maximum nesting depth of 10/);
-      return true;
+  const { claim_challenged, ...remainingSchemas } = EVENT_PAYLOAD_SCHEMAS;
+
+  assert.equal(isFilterRuleStale(rule, remainingSchemas), true);
+  const check = checkFilterStaleness(rule, remainingSchemas);
+  assert.equal(check.stale, true);
+  assert.equal(check.reason, "UNKNOWN_EVENT");
+});
+
+test("isFilterRuleStale: detects staleness on schema version mismatch", () => {
+  const rule = compileFilterExpression("claim_challenged where stake >= 100");
+
+  // Bump expected version to 2
+  assert.equal(isFilterRuleStale(rule, EVENT_PAYLOAD_SCHEMAS, 2), true);
+  const check = checkFilterStaleness(rule, EVENT_PAYLOAD_SCHEMAS, 2);
+  assert.equal(check.stale, true);
+  assert.equal(check.reason, "VERSION_MISMATCH");
+});
+
+test("isFilterRuleStale: detects staleness on uncompiled / unversioned rule", () => {
+  const uncompiledRule = {
+    rawExpression: "claim_challenged",
+    eventName: "claim_challenged",
+  };
+  assert.equal(isFilterRuleStale(uncompiledRule), true);
+  const check = checkFilterStaleness(uncompiledRule);
+  assert.equal(check.stale, true);
+  assert.equal(check.reason, "UNCOMPILED_RULE");
+});
+
+test("isFilterRuleStale: schema key reordering does not falsely report stale (order-independent)", () => {
+  const rule = compileFilterExpression("claim_challenged where stake >= 100");
+
+  // Reorder the fields of claim_challenged
+  const reorderedClaimChallenged = {
+    stake: EVENT_PAYLOAD_SCHEMAS.claim_challenged.stake,
+    name: EVENT_PAYLOAD_SCHEMAS.claim_challenged.name,
+    claimId: EVENT_PAYLOAD_SCHEMAS.claim_challenged.claimId,
+    challenger: EVENT_PAYLOAD_SCHEMAS.claim_challenged.challenger,
+  };
+
+  const reorderedSchemas = {
+    ...EVENT_PAYLOAD_SCHEMAS,
+    claim_challenged: reorderedClaimChallenged,
+  };
+
+  assert.equal(isFilterRuleStale(rule, reorderedSchemas), false);
+  assert.equal(rule.isStale(reorderedSchemas), false);
+});
+
+test("isFilterRuleStale: changes to unrelated events do not make event-specific rules stale", () => {
+  const rule = compileFilterExpression("claim_challenged where stake >= 100");
+
+  // Modify market_created (unrelated to claim_challenged)
+  const modifiedSchemas = {
+    ...EVENT_PAYLOAD_SCHEMAS,
+    market_created: {
+      ...EVENT_PAYLOAD_SCHEMAS.market_created,
+      newUnrelatedField: { type: "string" },
     },
-  );
+  };
+
+  assert.equal(isFilterRuleStale(rule, modifiedSchemas), false);
 });
 
-test("parseFilterExpression: respects custom maxDepth option", () => {
-  const expr = "where ((active == true))"; // depth 2
-  assert.throws(
-    () => parseFilterExpression(expr, { maxDepth: 1 }),
-    (err) => {
-      assert.ok(err instanceof FilterDepthLimitError);
-      assert.equal(err.limit, 1);
-      assert.equal(err.depth, 2);
-      return true;
+test("isFilterRuleStale: global rules (no eventName) become stale when any registry schema changes", () => {
+  const globalRule = compileFilterExpression("where active == true");
+  assert.equal(isFilterRuleStale(globalRule), false);
+
+  const modifiedSchemas = {
+    ...EVENT_PAYLOAD_SCHEMAS,
+    market_created: {
+      ...EVENT_PAYLOAD_SCHEMAS.market_created,
+      newField: { type: "string" },
     },
-  );
+  };
 
-  const rule = parseFilterExpression(expr, { maxDepth: 2 });
-  assert.ok(rule.condition);
+  assert.equal(isFilterRuleStale(globalRule, modifiedSchemas), true);
+  const check = checkFilterStaleness(globalRule, modifiedSchemas);
+  assert.equal(check.stale, true);
+  assert.equal(check.reason, "SCHEMA_DIGEST_MISMATCH");
 });
-

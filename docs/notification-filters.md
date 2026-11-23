@@ -1,5 +1,17 @@
 # Notification Filters
 
+## Previewing Routing Decisions
+
+Operators can preview how a notification would be routed without calling Telegram `sendMessage`. The preview uses the same decision path as live notification delivery (feature flags, category allowlist, and destination configuration), and returns three buckets for each candidate destination:
+
+- **matched**: destinations that would receive the notification.
+- **filtered**: destinations skipped by a feature flag or category filter, with the reason.
+- **unavailable**: destinations that are not configured or cannot currently receive messages.
+
+No network call to Telegram is made during a preview, and no state is mutated.
+
+---
+
 The Mimir Telegram bot reads eight environment variables that gate or filter outbound Telegram notifications. Because several of their names look similar, this document specifies what each variable filters, its default value, how multiple variables interact, and how to configure common scenarios.
 
 ---
@@ -114,6 +126,12 @@ NOTIFY_CATEGORIES=crypto
 > [!NOTE]
 > Because `eventAllowedByCategory` only inspects `claim_created`, there is no environment variable that suppresses `claim_challenged` or `claim_resolved` while keeping `claim_created` enabled.
 
+### Validation Error Codes and Source Ranges
+
+Filter expression errors (`FilterParseError`, `FilterTokenLimitError`, `FilterDepthLimitError` in `src/notifications/filter-expr.ts`) and USDC threshold errors (`InvalidThresholdError` in `src/notifications/amount-threshold.ts`) expose:
+- `code`: stable machine-readable error code (such as `FILTER_UNKNOWN_EVENT`, `FILTER_UNKNOWN_FIELD`, `FILTER_TYPE_MISMATCH`, `FILTER_OPERATOR_NOT_SUPPORTED`, `FILTER_USDC_PRECISION`, `FILTER_SYNTAX_ERROR`, `FILTER_TOKEN_LIMIT`, `FILTER_DEPTH_LIMIT`, `THRESHOLD_NEGATIVE`, `THRESHOLD_PRECISION_EXCEEDED`, `THRESHOLD_MALFORMED`).
+- `range`: 0-based `{ start, end }` character span identifying the invalid token or slice in the original input without echoing the entire expression.
+
 ---
 
 ### Example 2: Squad notifications only
@@ -153,3 +171,57 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_created` events**: Muted by `eventAllowedByCategory` because `config.notificationCategories` is non-empty (`["__none__"]`) and no real on-chain claim category matches `"__none__"`.
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
+
+---
+
+## 4. Compiled Notification Filters (Schema Versioning & Fingerprinting)
+
+The notification filtering subsystem supports typed filter expressions ([`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts)) and integer USDC amount thresholds ([`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts)). Filter rules can be compiled ahead of time into immutable, versioned, and fingerprinted objects.
+
+### 4.1 Schema Normalization and Fingerprint Digests
+
+Every compiled filter rule attaches a normalized schema version (`FILTER_SCHEMA_VERSION = 1`) and a deterministic SHA-256 fingerprint digest (`schemaDigest` / `digest` / `fingerprint`):
+
+- **Order-Independent Normalization**: Event schemas and field definitions are sorted alphabetically and canonicalized prior to hashing, ensuring that harmless declaration or key reordering does not alter the digest.
+- **Payload Schema Fingerprint**:
+  - Event-specific rules (e.g. `claim_challenged where stake >= 100 USDC`) carry an `eventDigest` fingerprinting the target event payload schema (`EVENT_PAYLOAD_SCHEMAS[eventName]`).
+  - Global rules without an explicit event name carry a `registryDigest` covering the full schema registry.
+
+### 4.2 Detecting Stale Compiled Rules
+
+When contract schemas evolve or new fields/types are introduced, compiled rules can be verified for freshness via `isFilterRuleStale` or `rule.isStale()`:
+
+```ts
+import { compileFilterExpression, isFilterRuleStale } from "./notifications/filter-expr.js";
+
+const rule = compileFilterExpression("claim_challenged where stake >= 100 USDC");
+
+// Check freshness against current schema definitions:
+const isStale = isFilterRuleStale(rule); // false
+
+// If the event schema changes (e.g. fields added, removed, or type modified):
+const modifiedSchemas = { ... };
+isFilterRuleStale(rule, modifiedSchemas); // true (SCHEMA_DIGEST_MISMATCH)
+```
+
+Staleness checks identify:
+- **`UNCOMPILED_RULE`**: Rules lacking version or digest metadata.
+- **`VERSION_MISMATCH`**: Schema version bumped incompatibly.
+- **`UNKNOWN_EVENT`**: Event removed from the schema registry.
+- **`SCHEMA_DIGEST_MISMATCH`**: Payload fields added, removed, or altered.
+- **`CONDITION_VALIDATION_FAILED`**: Fields referenced by the filter condition are no longer compatible.
+
+### 4.3 Amount Threshold Compilation
+
+Configured amount thresholds (`marketChallenge`, `squadDeposit`) can also be compiled into equivalent versioned filter rules using `compileAmountThresholdFilters(thresholds)`:
+
+```ts
+import { compileAmountThresholdFilters } from "./notifications/amount-threshold.js";
+
+const rules = compileAmountThresholdFilters({
+  marketChallenge: 100_000_000n, // 10 USDC
+  squadDeposit: 50_000_000n,     // 5 USDC
+});
+
+// Each returned rule is a CompiledFilterRule with attached schemaVersion, digest, and evaluate() helper.
+```
