@@ -6,6 +6,68 @@ All notable changes to this project are documented here.
 
 ### Added
 
+**Archive coverage comparison**
+
+- `compareLedgerCoverage(first, second, options?)` in
+  `src/stellar/scan-jsonl.ts` (re-exported by `src/stellar/archive-coverage.ts`)
+  compares two ledger captures and reports missing and overlapping ledger spans
+  with stable per-side event counts, per-ledger count drift and spans present
+  only in the second capture.
+- `options.range` declares an intentionally retained/filtered ledger range;
+  `options.expectedRange` declares the acquisition scope. Missing ledgers
+  outside those bounds are reported as intentional filtering (`expected: true`,
+  `filtered`), while ledgers absent inside them are incomplete acquisition
+  (`incomplete`) and fail the comparison.
+- `compareArchiveCoverage()`, `compareArchiveDirCoverage()` and
+  `compareScanJsonlCoverage()` accept archive directories, canonical scan JSONL,
+  raw archive JSONL or JSON event arrays as inputs;
+  `formatArchiveCoverageReport()` (`renderArchiveCoverageReport()`,
+  `formatCoverageReport()`, `renderCoverageReport()`) renders a deterministic
+  text report. Existing archive, compaction and JSONL behavior is unchanged.
+  Documented in `docs/component-architecture.md`; covered by
+  `tests/archive-coverage.test.mjs`.
+
+**Compaction aggregate reconciliation** (#911)
+
+- `reconcileCompaction(before, after, options?)` in `src/stellar/compaction-reconciliation.ts`
+  compares volume and latency aggregates before and after archive compaction and
+  reports range loss separately from arithmetic mismatch;
+  `renderReconciliationReport()` renders the deterministic text report. See
+  `docs/analytics-export.md`.
+
+**Filter explanation tree**
+
+- `explainFilterRule(rule, event, options?)` in `src/notifications/filter-expr.ts`
+  returns a deterministic tree mirroring the filter expression AST (`rule`,
+  `event-name`, `and`/`or`, `comparison`, and an optional `threshold` node), with
+  each node's `matched`, `outcome` and a short reason. Short-circuited branches are
+  reported as `not-evaluated`; the root always agrees with `evaluateFilterRule` /
+  `evaluateFilterDryRun`, whose behavior is unchanged.
+- Reasons never include payload values, and string literals from the rule are shown
+  as `<redacted>`, so addresses, route identities and message text stay out of the
+  output. The tree is bounded by node count, depth and reason length
+  (`MAX_EXPLANATION_NODES`, `MAX_EXPLANATION_DEPTH`,
+  `MAX_EXPLANATION_REASON_LENGTH`); `renderFilterExplanation` renders it as text.
+- Documented in `docs/notification-filters.md` §5; covered by
+  `tests/filter-explanation.test.mjs`.
+
+**Read-only cursor consistency check against scan archives**
+
+- `npm run cursor -- check --archive PATH` compares the persisted cursor
+  (`CURSOR_FILE`) with an event archive directory or a `scan --jsonl` export
+  and reports target-identity mismatches (untracked targets, mixed or
+  unexpected contract ids), observed ledger-range gaps and contradictions
+  (archive ends before the cursor's last event, archived events past the
+  cursor's position, processed event ids missing from the archived span,
+  recorded floor-rewind gaps), and archive self-contradictions (event-id vs
+  ledger, conflicting/exact duplicates, out-of-order records). `--json` prints
+  the report as JSON; `--market-contract` / `--squad-contract` (or
+  `MARKET_CONTRACT_ID` / `SQUAD_CONTRACT_ID`) set the expected contract ids.
+- Strictly read-only: it takes no instance lock and never advances, rewinds or
+  writes a cursor or the archive. Exits `0` when no error finding is reported
+  (warnings allowed) and `1` otherwise. The pure report builder lives in
+  `src/cursor-consistency.ts`; `tests/cursor-consistency.test.mjs` covers it.
+
 **Selectable bot language**
 
 - `src/i18n.ts` now ships a message catalog per locale behind

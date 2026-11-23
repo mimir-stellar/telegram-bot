@@ -11,8 +11,10 @@ Operational reference describing all on-disk state files maintained by the Mimir
 | **Cursor Quarantine Copy** | None (derived from cursor file) | `./data/cursor.json.corrupt.<timestamp>` | `src/poller.ts` | Atomic rename of the live corrupt cursor file | Safe to delete once post-incident forensics and diagnosis are complete. Not loaded by runtime. | N/A (forensic artifact preserved for investigation; runtime ignores quarantine files). |
 | **Dead-Letter Queue File** | `DEAD_LETTER_FILE` | `./data/dead-letter.json` | `src/deadLetter.ts` | Atomic (write temporary file `${DEAD_LETTER_FILE}.tmp` then rename) | Treated as empty queue on boot. If deleted while running, re-created on the next failed send enqueue or persist. Unsent parked messages previously queued are lost unless recovered from backups. | Logged with a warning (`[dead-letter] unreadable queue... starting empty`). Queue initializes empty in memory; subsequent persists overwrite with valid state. |
 | **Audit Trail File** | `AUDIT_FILE` | `./data/audit.jsonl` | `src/audit.ts` | Append (`appendFile` with JSON line per entry) | If absent, automatically created on next append. Historical audit records prior to deletion are lost. | `/audit` skips unreadable/malformed lines (`unreadableLines` count incremented) and processes valid lines. poller append operations continue appending new entries. |
+| **Archive Manifest File** | `ARCHIVE_MANIFEST_FILE` | `./data/archive.manifest.json` | `src/stellar/archive.ts` | Atomic (write temporary file `${ARCHIVE_MANIFEST_FILE}.tmp` then rename) | Archive verification reports the manifest as missing; exported archives without a manifest cannot be verified and must be re-exported. | Verification fails closed with a manifest-parse error; the corrupt manifest is never used to accept records. Re-export to regenerate. |
 | **Status Snapshot File** | `STATUS_FILE` | `./data/status.json` | `src/status.ts` | Atomic (write temporary file `${STATUS_FILE}.tmp` then rename) | Harmless to poller loop. Recreated atomically on the next poll cycle. CLI `--status` command will fail to find status until rewritten. | Overwritten atomically on the next poll cycle. External tools or CLI reading corrupt file before next cycle encounter parse errors. |
 | **Instance Lock File** | `INSTANCE_LOCK_FILE` | `./data/poller.lock` | `src/instanceLock.ts` | Exclusive file creation (`O_EXCL` / `wx` flag via `open`) | Poller will re-acquire lock on next startup if no other instance holds it. During runtime, removal removes concurrency protection against double instances. | Stale or unparseable lock payload (non-JSON, bad schema, or dead PID) is warned and automatically unlinked by next acquiring instance. |
+| **Operational JSONL Log** *(optional)* | `LOG_FILE` (`LOG_FILE_MAX_BYTES`, `LOG_FILE_MAX_FILES`) | Disabled unless `LOG_FILE` is set (10 MiB, 5 files) | `src/logger.ts` | Serialized append with size rotation (`<LOG_FILE>` + `.1`..`.N-1`) | Recreated on the next log emission; rotated history is not restored. | Malformed historical lines are ignored by rotation; disk failures are reported distinctly on stderr and counted in `Logger.getJsonlStats()`. |
 
 ---
 
@@ -23,7 +25,7 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Default Path**: `./data/cursor.json` (configured via `DEFAULTS.cursorFile` in [`src/config.ts`](../src/config.ts))
 - **Write Pattern**: Atomic write-then-rename (`${cursorFile}.tmp` -> `${cursorFile}`) on every successful scan commit, graceful shutdown flush, or schema migration.
 - **Deleted**: Poller logs that no cursor was found and falls back to a cold start lookback `START_LOOKBACK_LEDGERS` (default: 60 ledgers) behind the chain tip.
-- **Corrupt**: If JSON is invalid or fails schema validation (or references an unsupported future schema version), `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>` and starts cold.
+- **Corrupt**: If JSON is invalid, contains duplicate target definitions, fails schema validation, or references an unsupported future schema version, `quarantineCorruptCursorFile` moves the corrupt file aside to `${cursorFile}.corrupt.<timestamp>` without mutating in-memory cursor state and starts cold. Offline `npm run cursor -- backup|restore` commands also reject duplicate target definitions with a specific validation error while preserving the original file.
 
 ### 2. Cursor Backup Copy
 - **Writer Module**: [`src/poller.ts`](../src/poller.ts) (`saveCursors`)
@@ -51,16 +53,32 @@ Operational reference describing all on-disk state files maintained by the Mimir
 - **Deleted**: Missing file is automatically created upon next audit flush.
 - **Corrupt**: Reading via `readAuditFile` counts and skips corrupt lines without aborting. Appending continues normally.
 
-### 6. Status Snapshot File (`STATUS_FILE`)
+### 6. Archive Manifest File (`ARCHIVE_MANIFEST_FILE`)
+- **Writer Module**: [`src/stellar/archive.ts`](../src/stellar/archive.ts) (manifest writer and verifier)
+- **Default Path**: `./data/archive.manifest.json` (configured via `DEFAULTS.archiveManifestFile` in [`src/config.ts`](../src/config.ts))
+- **Write Pattern**: Atomic write-then-rename (`${file}.tmp` -> `${file}`) when an event archive is exported.
+- **Content**: A hash-chained manifest binding each ordered record (by SHA-256 chain link), the network passphrase, and the first/last ledger bounds of the archive to a single root digest.
+- **Verification**: Missing, reordered, or altered records cause verification to fail; the manifest is never trusted to accept records it does not cover.
+- **Deleted**: Archive verification reports the manifest as missing. Exported archives without a manifest cannot be verified and must be re-exported.
+- **Corrupt**: Verification fails closed with a manifest-parse error. Re-export to regenerate.
+
+### 7. Status Snapshot File (`STATUS_FILE`)
 - **Writer Module**: [`src/status.ts`](../src/status.ts) (`writeStatusFile`)
 - **Default Path**: `./data/status.json` (configured via `DEFAULTS.statusFile` in [`src/config.ts`](../src/config.ts))
 - **Write Pattern**: Atomic write-then-rename (`${file}.tmp` -> `${file}`) on each poll cycle.
 - **Deleted**: Recreated on next poll cycle.
 - **Corrupt**: Replaced atomically on next cycle write.
 
-### 7. Instance Lock File (`INSTANCE_LOCK_FILE`)
+### 8. Instance Lock File (`INSTANCE_LOCK_FILE`)
 - **Writer Module**: [`src/instanceLock.ts`](../src/instanceLock.ts) (`acquireInstanceLock`)
 - **Default Path**: `./data/poller.lock` (configured via `DEFAULTS.lockFile` in [`src/config.ts`](../src/config.ts))
 - **Write Pattern**: Exclusive file descriptor open (`open(lockFile, "wx")`).
 - **Deleted**: Frees lock if deleted while stopped. If deleted while running, secondary processes could race.
 - **Corrupt**: Stale lock cleanup checks whether PID is running; if file cannot be parsed or PID is dead/unresponsive, the lock is unlinked and reclaimed.
+
+### 8. Event Archive Files
+- **Writer Module**: [`src/stellar/archive.ts`](../src/stellar/archive.ts) (`createEventArchive`, `readArchive`)
+- **Default Path**: Configured archive directory (`events-<timestamp>-<index>.jsonl`)
+- **Write Pattern**: Rotating JSON Lines (`JSONL`) files with `0o600` permissions. Each record is explicitly stamped with `schemaVersion: 1`.
+- **Deleted**: Directory and files are recreated on subsequent append operations.
+- **Corrupt / Unknown Version**: `readArchive` validates JSON and schema versions using migration adapters (`migrateArchivedRecord`, `adaptArchivedTypedEvent`, `adaptArchivedGenericEvent`). Legacy unversioned formats (including `blockTime`, `txIndex`, and unversioned envelopes) are transparently migrated to schema version 1. Unknown schema versions reject and throw `UnsupportedArchiveVersionError` without leaking payload contents; passing `retainCommitted: true` yields valid preceding records.

@@ -64,7 +64,12 @@ import {
   type ContractSource,
   type DecodedEvent,
 } from "./decode.js";
-import { formatRpcTiming, RpcTiming, type RpcTimingSummary } from "./metrics.js";
+import {
+  formatRpcTiming,
+  RpcTiming,
+  type RpcLatencyObserver,
+  type RpcTimingSummary,
+} from "./metrics.js";
 import { assertEventsResponse } from "./rpc-guard.js";
 import { formatScanJsonl } from "./scan-jsonl.js";
 import { formatScanMarkdown } from "./scan-markdown.js";
@@ -112,6 +117,11 @@ export interface ScanOptions {
    * If `shouldDecode(name)` returns false, value decoding is skipped.
    */
   shouldDecode?: (name: string) => boolean;
+  /**
+   * Optional fixed-bucket latency sink. Every timed RPC await in this walk is
+   * reported with a constant provider identity and a bounded operation class.
+   */
+  rpcLatency?: RpcLatencyObserver | undefined;
 }
 
 export interface RawScan {
@@ -224,7 +234,7 @@ export async function paginatedGetEvents(
   // Time every RPC await in this walk (the health probe + each page) so the
   // scan output can report how long the network cost, not just how many pages
   // it took. Bounded to counts and milliseconds; no payload is retained.
-  const timing = new RpcTiming();
+  const timing = new RpcTiming(undefined, opts.rpcLatency);
   // A caller-cached tip (one per poll cycle) replaces this walk's own health
   // read; a one-shot scan still fetches its own.
   const window = validateLedgerWindow(

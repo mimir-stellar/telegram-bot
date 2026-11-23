@@ -64,20 +64,30 @@ import {
   type ActivityBaselineSnapshot,
 } from "./activity-baseline.js";
 import type { Metrics } from "./metrics.js";
+import {
+  NotificationAge,
+  type NotificationAgeSummary,
+  type NotificationIngestionMark,
+} from "./stellar/metrics.js";
 import type { SendExtra } from "./bot.js";
+import { createCategoryCounter } from "./commands/categories.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
 import { EventDedupWindow } from "./dedup.js";
 import {
   createDeadLetterQueue,
+  DEAD_LETTER_MAX_AGE_MS,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
   type DeadLetterStats,
 } from "./deadLetter.js";
 import {
   createSendJournal,
+  type OrphanDecision,
+  type OrphanedJournalEntry,
   type SendJournal,
 } from "./notifications/send-journal.js";
+import { InvalidDeliveryResultError } from "./notifications/notifier.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -86,16 +96,38 @@ import {
 import {
   clip,
   explorerKeyboard,
+  formatDigestPages,
   formatEvent,
   formatPlainTextEvent,
   safeErrorMessage,
 } from "./notifications/format.js";
+import {
+  createDigestCheckpoint,
+  DEFAULT_DIGEST_MAX_PENDING,
+  type DigestCheckpoint,
+} from "./notifications/digest-checkpoint.js";
+import {
+  createScheduler,
+  type Scheduler,
+  type SchedulerClock,
+} from "./notifications/schedule.js";
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
+import { classifyPermanentSendError } from "./notifications/notifier.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
-import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
+import { normalizeRpcEndpoint, validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
+import {
+  DEFAULT_CIRCUIT_COOLDOWN_MS,
+  DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+  RpcCircuitBreaker,
+  type CircuitBreakerState,
+} from "./stellar/rpc-guard.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
+import {
+  RpcLatencyHistogram,
+  type RpcLatencySnapshot,
+} from "./stellar/metrics.js";
 import {
   eventCursorLedger,
   readContractEvents,
@@ -106,14 +138,20 @@ import {
   isAdminPayload,
   normalizeContractVersion,
   toAdminAuditRecord,
+  isContractVersionSupported,
+  validateDecoderCombinations,
+  getDecoderCapabilityReport,
   type ContractSource,
   type DecodedEvent,
+  type DecoderCapabilityReport,
 } from "./stellar/decode.js";
 
 export interface TargetState {
   source: ContractSource;
   contractId: string;
   version: string;
+  /** Whether the configured contract version is supported by the decoder subsystem. */
+  supportedVersion?: boolean;
   /** Duration of this target's most recent attempted fetch-decode-send cycle. */
   lastCycleMs: number;
   /** Longest attempted cycle for this target since process start. */
@@ -292,6 +330,8 @@ export interface PollerStatus {
   oldestLedger: number | null;
   notificationsSent: number;
   notificationsFailed: number;
+  /** End-to-end notification age (ledger close -> confirmed send) summary. */
+  notificationAge?: NotificationAgeSummary;
   /** Never attempted (unknown, malformed or over the per-cycle cap). */
   eventsSkipped: number;
   /** Counter values accumulated since this process started. */
@@ -344,6 +384,8 @@ export interface PollerStatus {
   suppressedLogs: number;
   /** Dead-letter queue counters (see src/deadLetter.ts). */
   deadLetter: DeadLetterStats;
+  /** Fixed-provider, fixed-bucket RPC latency snapshot for `/metrics`. */
+  rpcLatency?: RpcLatencySnapshot;
   /** Telegram sends abandoned by the per-send timeout, when tracked. */
   sendTimeouts?: number;
   /** Bounded description of the most recent send timeout, when tracked. */
@@ -351,7 +393,11 @@ export interface PollerStatus {
   /** Result of the startup persistent-volume probe, when reported. */
   persistentVolumeAvailable?: boolean;
   persistentVolumeError?: string | null;
+  /** Structured diagnostic for the most recent cursor load failure, if any. */
+  cursorLoadError?: CursorLoadError | null;
   targets: TargetState[];
+  /** Bounded category counts derived from observed claim_created events. */
+  categories?: Record<string, number>;
   /** SHA-256 digest of the SBOM generated for this deployment image. */
   sbomDigest: string | null;
   /** RPC circuit breaker state */
@@ -360,11 +406,44 @@ export interface PollerStatus {
     openedAt: number | null;
     failureCount: number;
     lastFailureAt: number | null;
+    /** Endpoint-specific circuit state (`"closed" | "open" | "half-open"`). */
+    state?: CircuitBreakerState;
+    /** Normalized RPC endpoint key tracked by this circuit breaker. */
+    endpoint?: string;
+    /** Number of bounded half-open recovery probes currently in flight. */
+    probesInFlight?: number;
   };
 }
 
 /** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
 export const CURSOR_SCHEMA_VERSION = 1 as const;
+
+/** Maximum number of cursor recovery records retained in the cursor file. */
+export const MAX_CURSOR_RECOVERY_HISTORY = 20 as const;
+
+/** Bounded set of reasons a cursor recovery record can carry. */
+export type CursorRecoveryReason = "floor_rewind" | "restore" | "quarantine";
+
+/** Minimal cursor position snapshot (never includes event IDs, payloads, or secrets). */
+export interface CursorRecoveryPosition {
+  cursor: string | null;
+  lastEventLedger: number | null;
+  rewindFromLedger?: number | null;
+}
+
+/** One bounded recovery history record persisted in the cursor file. */
+export interface CursorRecoveryRecord {
+  /** ISO-8601 UTC timestamp of when the recovery occurred. */
+  at: string;
+  /** Bounded recovery reason. */
+  reason: CursorRecoveryReason;
+  /** Target source when a single target was recovered (e.g. floor_rewind). */
+  source?: string;
+  /** Target positions before recovery. */
+  before: Record<string, CursorRecoveryPosition>;
+  /** Target positions after recovery. */
+  after: Record<string, CursorRecoveryPosition>;
+}
 
 export interface CursorFile {
   version: typeof CURSOR_SCHEMA_VERSION;
@@ -375,12 +454,23 @@ export interface CursorFile {
    * it, so the on-disk format stays version 1 either way.
    */
   chainClockAt?: number | null;
+  /** Optional network identifier for backup ownership validation. */
+  network?: string;
   targets: Record<string, CursorTarget>;
+  /**
+   * Bounded history of cursor recovery actions (floor rewinds, operator
+   * restores, and corrupt-file quarantines), oldest first. Optional and
+   * additive: files written before this field existed load with an empty
+   * history, and older builds ignore it.
+   */
+  recoveryHistory?: CursorRecoveryRecord[];
 }
 
 interface CursorTarget {
   cursor: string | null;
   lastEventLedger: number | null;
+  /** Optional contract identifier for backup ownership validation. */
+  contractId?: string;
   /**
    * Recently processed event ids, oldest first. Additive and bounded: older
    * cursor files without it load as an empty window, and new files stay small
@@ -393,6 +483,25 @@ interface CursorTarget {
    * malformed value is dropped rather than costing an operator their position.
    */
   rewindFromLedger?: number | null;
+  /**
+   * SHA-256 fingerprint binding this target's cursor to a specific Stellar
+   * network passphrase and contract id. Additive: older cursor files without
+   * it are migrated on startup or via `npm run cursor -- migrate`.
+   */
+  fingerprint?: string;
+}
+
+/**
+ * Compute a deterministic SHA-256 fingerprint binding a persisted cursor target
+ * to its Stellar network passphrase and contract id.
+ */
+export function computeCursorTargetFingerprint(
+  networkPassphrase: string,
+  contractId: string,
+): string {
+  return createHash("sha256")
+    .update(`${networkPassphrase}\0${contractId}`)
+    .digest("hex");
 }
 
 export type CursorTargetEntry = CursorTarget;
@@ -454,6 +563,145 @@ function parseRewindFromLedger(value: unknown): number | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) return null;
   return value;
+}
+
+const VALID_RECOVERY_REASONS = new Set<CursorRecoveryReason>([
+  "floor_rewind",
+  "restore",
+  "quarantine",
+]);
+
+function parseRecoveryPosition(value: unknown): CursorRecoveryPosition | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+
+  let cursor: string | null = null;
+  if (obj.cursor === null || obj.cursor === undefined) {
+    cursor = null;
+  } else if (typeof obj.cursor === "string") {
+    if (obj.cursor.length > 256) return null;
+    cursor = obj.cursor.length > 0 ? obj.cursor : null;
+  } else {
+    return null;
+  }
+
+  let lastEventLedger: number | null = null;
+  if (obj.lastEventLedger === null || obj.lastEventLedger === undefined) {
+    lastEventLedger = null;
+  } else if (
+    typeof obj.lastEventLedger === "number" &&
+    Number.isSafeInteger(obj.lastEventLedger) &&
+    obj.lastEventLedger >= 0
+  ) {
+    lastEventLedger = obj.lastEventLedger;
+  } else {
+    return null;
+  }
+
+  const rewindFromLedger = parseRewindFromLedger(obj.rewindFromLedger);
+  return {
+    cursor,
+    lastEventLedger,
+    ...(rewindFromLedger !== null ? { rewindFromLedger } : {}),
+  };
+}
+
+function parseRecoveryPositionMap(value: unknown): Record<string, CursorRecoveryPosition> | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const out: Record<string, CursorRecoveryPosition> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (key.length === 0 || key.length > 64) return null;
+    const pos = parseRecoveryPosition(entry);
+    if (pos === null) return null;
+    out[key] = pos;
+  }
+  return out;
+}
+
+function sanitizeRecoveryRecord(value: unknown): CursorRecoveryRecord | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+  if (
+    typeof obj.at !== "string" ||
+    obj.at.length === 0 ||
+    obj.at.length > 64 ||
+    Number.isNaN(Date.parse(obj.at))
+  ) {
+    return null;
+  }
+  if (typeof obj.reason !== "string" || !VALID_RECOVERY_REASONS.has(obj.reason as CursorRecoveryReason)) {
+    return null;
+  }
+  if (obj.source !== undefined && (typeof obj.source !== "string" || obj.source.length === 0 || obj.source.length > 64)) {
+    return null;
+  }
+  const before = parseRecoveryPositionMap(obj.before);
+  const after = parseRecoveryPositionMap(obj.after);
+  if (before === null || after === null) return null;
+
+  return {
+    at: obj.at,
+    reason: obj.reason as CursorRecoveryReason,
+    ...(typeof obj.source === "string" ? { source: obj.source } : {}),
+    before,
+    after,
+  };
+}
+
+/**
+ * Parse and bound a persisted `recoveryHistory` array. Malformed entries are
+ * dropped rather than failing cursor load — recovery metadata must never cost
+ * an operator their resume position — and any unknown fields (such as event
+ * payloads or secrets) are stripped.
+ */
+export function parseRecoveryHistory(
+  value: unknown,
+  maxEntries: number = MAX_CURSOR_RECOVERY_HISTORY,
+): CursorRecoveryRecord[] {
+  if (!Array.isArray(value) || maxEntries <= 0) return [];
+  const valid: CursorRecoveryRecord[] = [];
+  for (const item of value) {
+    const clean = sanitizeRecoveryRecord(item);
+    if (clean !== null) valid.push(clean);
+  }
+  return valid.length > maxEntries ? valid.slice(-maxEntries) : valid;
+}
+
+/**
+ * Snapshot only the position metadata (cursor, lastEventLedger, optional
+ * rewindFromLedger) for a map of targets, excluding event IDs, payloads, and
+ * secrets.
+ */
+export function snapshotCursorPositions(
+  targets: Record<string, Pick<CursorTarget, "cursor" | "lastEventLedger" | "rewindFromLedger">>,
+): Record<string, CursorRecoveryPosition> {
+  const out: Record<string, CursorRecoveryPosition> = {};
+  for (const [source, target] of Object.entries(targets)) {
+    out[source] = {
+      cursor: target.cursor ?? null,
+      lastEventLedger: target.lastEventLedger ?? null,
+      ...(typeof target.rewindFromLedger === "number"
+        ? { rewindFromLedger: target.rewindFromLedger }
+        : {}),
+    };
+  }
+  return out;
+}
+
+/**
+ * Append a recovery record to an existing history, sanitizing all fields and
+ * retaining at most `maxEntries` most-recent records.
+ */
+export function appendCursorRecoveryHistory(
+  history: readonly CursorRecoveryRecord[] | undefined,
+  record: CursorRecoveryRecord,
+  maxEntries: number = MAX_CURSOR_RECOVERY_HISTORY,
+): CursorRecoveryRecord[] {
+  const existing = parseRecoveryHistory(history ?? [], maxEntries);
+  const clean = sanitizeRecoveryRecord(record);
+  if (clean === null || maxEntries <= 0) return existing;
+  const combined = [...existing, clean];
+  return combined.length > maxEntries ? combined.slice(-maxEntries) : combined;
 }
 
 /** Tuning knobs for Telegram delivery; defaults suit production, tests shrink them. */
@@ -531,6 +779,14 @@ export interface PollerDeps {
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
   /**
+   * Explicit recovery policy for orphaned send-journal entries whose route was
+   * removed or whose network identity changed. When omitted, orphaned entries
+   * are skipped (never silently replayed).
+   */
+  onOrphanedJournalEntry?: (
+    orphan: OrphanedJournalEntry,
+  ) => OrphanDecision | Promise<OrphanDecision>;
+  /**
    * Tuning for the rolling activity baseline. Defaults are production values;
    * tests can shrink the window to observe a comparison quickly.
    */
@@ -538,11 +794,18 @@ export interface PollerDeps {
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
   now?: () => number;
   /**
+   * Monotonic clock (ms) used to measure in-process duration from event ingestion
+   * to confirmed send. Defaults to `() => performance.now()`.
+   */
+  monotonicNow?: () => number;
+  /**
    * Async delay used for send-spacing and retry back-off.
    * Defaults to a real `setTimeout`-based sleep. Inject a no-op in tests to
    * avoid waiting for real wall-clock time.
    */
   sleep?: (ms: number) => Promise<void>;
+  /** Optional clock for the scheduled digest timer (tests inject a fake clock). */
+  schedulerClock?: SchedulerClock;
 }
 
 export interface ShutdownOptions {
@@ -577,8 +840,10 @@ export interface TargetBackoffOptions {
 export interface CircuitBreakerOptions {
   /** Number of consecutive failures before opening the circuit */
   failureThreshold?: number;
-  /** Milliseconds to wait before attempting to close the circuit */
+  /** Milliseconds to wait before attempting a bounded half-open recovery probe */
   cooldownMs?: number;
+  /** Maximum concurrent recovery probes allowed while half-open (defaults to 1) */
+  maxHalfOpenProbes?: number;
 }
 
 /** Default maximum backoff in milliseconds for per-target RPC backoff. */
@@ -586,12 +851,6 @@ const DEFAULT_TARGET_MAX_BACKOFF_MS = 60_000;
 
 /** Default backoff factor for per-target RPC backoff. */
 const DEFAULT_TARGET_BACKOFF_FACTOR = 2;
-
-/** Default number of consecutive RPC failures before opening the circuit. */
-const DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5;
-
-/** Default cooldown period in milliseconds before attempting to close the circuit. */
-const DEFAULT_CIRCUIT_COOLDOWN_MS = 60_000;
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
 const DEFAULT_SEND_SPACING_MS = 1_500;
@@ -623,34 +882,30 @@ const DEFAULT_MAX_BACKOFF_MS = 10_000;
 /** Maximum time to back off based on Retry-After (1 hour). */
 const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 
-export function extractRetryAfterMs(err: unknown): number | null {
+export function extractRetryAfterMs(
+  err: unknown,
+  maxBackoffMs: number = MAX_RETRY_AFTER_MS,
+): number | null {
   if (!err || typeof err !== "object") return null;
   const e = err as any;
 
-  let seconds: number | null = null;
+  let rawRetryAfter: unknown = null;
 
   if (typeof e.parameters?.retry_after === "number") {
-    seconds = e.parameters.retry_after;
+    rawRetryAfter = e.parameters.retry_after;
   } else {
     const headers = e.response?.headers || e.headers;
     if (headers) {
-      let val: any;
       if (typeof headers.get === "function") {
-        val = headers.get("retry-after") || headers.get("Retry-After");
+        rawRetryAfter = headers.get("retry-after") || headers.get("Retry-After");
       } else {
-        val = headers["retry-after"] || headers["Retry-After"];
-      }
-      if (typeof val === "string" || typeof val === "number") {
-        const parsed = parseInt(String(val), 10);
-        if (!Number.isNaN(parsed)) seconds = parsed;
+        rawRetryAfter = headers["retry-after"] || headers["Retry-After"];
       }
     }
   }
 
-  if (seconds !== null && seconds > 0) {
-    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
-  }
-  return null;
+  const clamped = parseRetryAfterHeaderMs(rawRetryAfter, maxBackoffMs);
+  return clamped !== null && clamped > 0 ? clamped : null;
 }
 /**
  * Consecutive automatic floor rewinds allowed for one target before the poller
@@ -719,10 +974,121 @@ function withinDeadline(promise: Promise<void>, timeoutMs: number): Promise<bool
 }
 
 
+export type CursorLoadErrorKind = "permission" | "io" | "corrupt";
+
+export type CursorDiagnosticCode =
+  | "CURSOR_NOT_FOUND"
+  | "CURSOR_PERMISSION_DENIED"
+  | "CURSOR_IO_ERROR"
+  | "CURSOR_CORRUPT_JSON";
+
+export interface CursorLoadError {
+  kind: CursorLoadErrorKind;
+  code: CursorDiagnosticCode;
+  errno?: string | undefined;
+  message: string;
+}
+
+const PERMISSION_ERRNO_CODES = new Set(["EACCES", "EPERM", "EROFS"]);
+
+export function classifyCursorFsError(err: unknown): {
+  kind: "not_found" | "permission" | "io";
+  errnoCode: string | undefined;
+  diagnosticCode: Exclude<CursorDiagnosticCode, "CURSOR_CORRUPT_JSON">;
+} {
+  const errnoCode =
+    err && typeof err === "object" && "code" in err && typeof (err as { code?: unknown }).code === "string"
+      ? (err as { code: string }).code
+      : undefined;
+  if (errnoCode === "ENOENT") {
+    return { kind: "not_found", errnoCode, diagnosticCode: "CURSOR_NOT_FOUND" };
+  }
+  if (errnoCode && PERMISSION_ERRNO_CODES.has(errnoCode)) {
+    return { kind: "permission", errnoCode, diagnosticCode: "CURSOR_PERMISSION_DENIED" };
+  }
+  return { kind: "io", errnoCode, diagnosticCode: "CURSOR_IO_ERROR" };
+}
+
 /** Stable quarantine path next to the live cursor file (never overwrites). */
 export function cursorQuarantinePath(cursorFile: string, at: Date = new Date()): string {
   const stamp = at.toISOString().replace(/[:.]/g, "-");
   return `${cursorFile}.corrupt.${stamp}`;
+}
+
+/**
+ * Read-only preview of where a cursor recovery would move one target.
+ *
+ * Built only from state the poller already holds (the persisted cursor and the
+ * last retained window it observed). It performs no RPC call and no chain
+ * write, so it is safe to show an operator before they act.
+ */
+export interface CursorRecoveryPreview {
+  source: ContractSource;
+  /** Current persisted position, or `null` when none is held. */
+  oldCursorLedger: number | null;
+  /** Ledger the next scan would resume from if recovery ran now. */
+  proposedLedger: number | null;
+  /** Oldest ledger the RPC was last observed to retain. */
+  retainedFloor: number | null;
+  /** Newest ledger the RPC was last observed to hold. */
+  retainedTip: number | null;
+  /** Estimated unrecoverable ledger range `[from, to)`, or `null` when none. */
+  missedRange: { from: number; to: number } | null;
+  verdict: CursorWindowVerdict["status"];
+}
+
+export function previewCursorRecovery(
+  source: ContractSource,
+  cursor: string | null,
+  window: { oldestLedger: number | null; latestLedger: number | null },
+): CursorRecoveryPreview {
+  const verdict = classifyCursorWindow(cursor, window.oldestLedger);
+  const oldCursorLedger =
+    cursor === null ? null : eventCursorLedger(cursor);
+  const retainedFloor = window.oldestLedger;
+  const retainedTip = window.latestLedger;
+
+  if (verdict.status === "stale") {
+    return {
+      source,
+      oldCursorLedger,
+      proposedLedger: retainedFloor,
+      retainedFloor,
+      retainedTip,
+      missedRange: { from: verdict.cursorLedger, to: verdict.cursorLedger + verdict.missedLedgers },
+      verdict: verdict.status,
+    };
+  }
+
+  return {
+    source,
+    oldCursorLedger,
+    proposedLedger: oldCursorLedger,
+    retainedFloor,
+    retainedTip,
+    missedRange: null,
+    verdict: verdict.status,
+  };
+}
+
+/** Human-readable, bounded preview for the cursor CLI. Never prints raw tokens. */
+export function formatCursorRecoveryPreview(preview: CursorRecoveryPreview): string {
+  const fmt = (n: number | null): string => (n === null ? "unknown" : String(n));
+  const lines = [
+    `[cursor-preview] ${preview.source}: ${preview.verdict}`,
+    `  old position:   ledger ${fmt(preview.oldCursorLedger)}`,
+    `  proposed:       ledger ${fmt(preview.proposedLedger)}`,
+    `  retained window: ${fmt(preview.retainedFloor)}..${fmt(preview.retainedTip)}`,
+  ];
+  if (preview.missedRange !== null) {
+    lines.push(
+      `  estimated missed ledger range: ${preview.missedRange.from}..${preview.missedRange.to} (not recoverable)`,
+    );
+  } else {
+    lines.push("  estimated missed ledger range: none");
+  }
+  lines.push("  no changes were made (preview only)");
+  return lines.join("\n");
 }
 
 function isNullOrString(value: unknown): value is string | null {
@@ -751,8 +1117,185 @@ export function isValidCursorFile(value: unknown): value is CursorFile {
     const saved = entry as Record<string, unknown>;
     if (!isNullOrString(saved.cursor)) return false;
     if (!isNullOrNumber(saved.lastEventLedger)) return false;
+    if (
+      saved.fingerprint !== undefined &&
+      (typeof saved.fingerprint !== "string" || saved.fingerprint.length === 0)
+    ) {
+      return false;
+    }
   }
   return true;
+}
+
+/**
+ * Raised when a raw JSON cursor file defines the same target key more than once.
+ * `JSON.parse()` silently uses last-key-wins semantics, which would otherwise
+ * drop an earlier target's cursor position without warning.
+ */
+export class DuplicateCursorTargetError extends Error {
+  readonly target: string;
+
+  constructor(target: string) {
+    super(`duplicate target definition in cursor file: "${target}"`);
+    this.name = "DuplicateCursorTargetError";
+    this.target = target;
+  }
+}
+
+function skipJsonWhitespace(raw: string, pos: number): number {
+  let i = pos;
+  while (i < raw.length) {
+    const ch = raw.charCodeAt(i);
+    if (ch === 0x20 || ch === 0x09 || ch === 0x0a || ch === 0x0d) {
+      i += 1;
+    } else {
+      break;
+    }
+  }
+  return i;
+}
+
+function readJsonString(raw: string, pos: number): { value: string; nextPos: number } {
+  let i = pos + 1;
+  while (i < raw.length) {
+    const ch = raw.charCodeAt(i);
+    if (ch === 0x5c) {
+      // Backslash escape: skip the escaped character.
+      i += 2;
+      continue;
+    }
+    if (ch === 0x22) {
+      const end = i + 1;
+      return { value: JSON.parse(raw.slice(pos, end)) as string, nextPos: end };
+    }
+    i += 1;
+  }
+  return { value: "", nextPos: i };
+}
+
+function skipJsonValue(raw: string, pos: number): number {
+  let i = skipJsonWhitespace(raw, pos);
+  if (i >= raw.length) return i;
+  const ch = raw[i];
+  if (ch === '"') {
+    return readJsonString(raw, i).nextPos;
+  }
+  if (ch === "{") {
+    i = skipJsonWhitespace(raw, i + 1);
+    if (raw[i] === "}") return i + 1;
+    while (i < raw.length) {
+      i = skipJsonWhitespace(raw, i);
+      i = readJsonString(raw, i).nextPos;
+      i = skipJsonWhitespace(raw, i);
+      if (raw[i] === ":") i += 1;
+      i = skipJsonValue(raw, i);
+      i = skipJsonWhitespace(raw, i);
+      if (raw[i] === ",") {
+        i += 1;
+        continue;
+      }
+      if (raw[i] === "}") return i + 1;
+      break;
+    }
+    return i;
+  }
+  if (ch === "[") {
+    i = skipJsonWhitespace(raw, i + 1);
+    if (raw[i] === "]") return i + 1;
+    while (i < raw.length) {
+      i = skipJsonValue(raw, i);
+      i = skipJsonWhitespace(raw, i);
+      if (raw[i] === ",") {
+        i += 1;
+        continue;
+      }
+      if (raw[i] === "]") return i + 1;
+      break;
+    }
+    return i;
+  }
+  // Number, true, false, or null.
+  while (i < raw.length) {
+    const c = raw[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "," || c === "}" || c === "]") {
+      break;
+    }
+    i += 1;
+  }
+  return i;
+}
+
+function scanJsonObjectEntries(
+  raw: string,
+  startPos: number,
+  onEntry: (key: string, valuePos: number) => void,
+): number {
+  let i = skipJsonWhitespace(raw, startPos);
+  if (raw[i] !== "{") return skipJsonValue(raw, i);
+  i = skipJsonWhitespace(raw, i + 1);
+  if (raw[i] === "}") return i + 1;
+
+  while (i < raw.length) {
+    i = skipJsonWhitespace(raw, i);
+    const { value: key, nextPos } = readJsonString(raw, i);
+    i = skipJsonWhitespace(raw, nextPos);
+    if (raw[i] === ":") i += 1;
+    const valuePos = skipJsonWhitespace(raw, i);
+    onEntry(key, valuePos);
+    i = skipJsonValue(raw, valuePos);
+    i = skipJsonWhitespace(raw, i);
+    if (raw[i] === ",") {
+      i += 1;
+      continue;
+    }
+    if (raw[i] === "}") return i + 1;
+    break;
+  }
+  return i;
+}
+
+/**
+ * Scan a valid JSON cursor document for duplicate target definitions before
+ * trusting the object produced by `JSON.parse()`.
+ *
+ * Covers:
+ * - Duplicate target keys inside the `targets` object (v1 and legacy-unversioned)
+ * - Duplicate `"targets"` blocks at the root object
+ * - Duplicate target keys at the root object in legacy flat / string-map files
+ */
+function assertNoDuplicateCursorTargets(raw: string, parsedRoot: Record<string, unknown>): void {
+  const rootPos = skipJsonWhitespace(raw, 0);
+  if (raw[rootPos] !== "{") return;
+
+  const hasTargetsKey = "targets" in parsedRoot;
+  const hasVersionKey = "version" in parsedRoot;
+  const seenRootKeys = new Set<string>();
+
+  scanJsonObjectEntries(raw, rootPos, (key, valuePos) => {
+    if (key === "targets") {
+      if (seenRootKeys.has("targets")) {
+        throw new DuplicateCursorTargetError("targets");
+      }
+      seenRootKeys.add("targets");
+      if (raw[valuePos] === "{") {
+        const seenTargets = new Set<string>();
+        scanJsonObjectEntries(raw, valuePos, (targetKey) => {
+          if (seenTargets.has(targetKey)) {
+            throw new DuplicateCursorTargetError(targetKey);
+          }
+          seenTargets.add(targetKey);
+        });
+      }
+      return;
+    }
+
+    if (!hasTargetsKey && !hasVersionKey && key !== "updatedAt") {
+      if (seenRootKeys.has(key)) {
+        throw new DuplicateCursorTargetError(key);
+      }
+    }
+    seenRootKeys.add(key);
+  });
 }
 
 /** Parse + validate a cursor file body; throws on JSON or schema failure. */
@@ -766,6 +1309,7 @@ export function parseCursorFile(raw: string): CursorFile {
   if (!isValidCursorFile(parsed)) {
     throw new Error("failed schema validation (expected version 1 with targets map)");
   }
+  assertNoDuplicateCursorTargets(raw, parsed as unknown as Record<string, unknown>);
 
   const targets: Record<string, CursorTarget> = {};
   for (const [source, target] of Object.entries(parsed.targets)) {
@@ -794,8 +1338,16 @@ export function parseCursorFile(raw: string): CursorFile {
       ...(parseRewindFromLedger(target.rewindFromLedger) !== null
         ? { rewindFromLedger: parseRewindFromLedger(target.rewindFromLedger) }
         : {}),
+      ...(typeof target.fingerprint === "string" && target.fingerprint.length > 0
+        ? { fingerprint: target.fingerprint }
+        : {}),
     };
   }
+
+  const recoveryHistory =
+    parsed.recoveryHistory !== undefined
+      ? parseRecoveryHistory(parsed.recoveryHistory)
+      : [];
 
   return {
     version: 1,
@@ -803,6 +1355,7 @@ export function parseCursorFile(raw: string): CursorFile {
     // Additive field: only present when the file carried it.
     ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
     targets,
+    ...(recoveryHistory.length > 0 ? { recoveryHistory } : {}),
   };
 }
 
@@ -880,13 +1433,22 @@ function normalizeTargetEntry(value: unknown, label: string): CursorTargetEntry 
   // only when the file had them.
   const recent = value.recentEventIds;
   const rewindFromLedger = parseRewindFromLedger(value.rewindFromLedger);
+  let fingerprint: string | undefined;
+  if (value.fingerprint !== undefined) {
+    if (typeof value.fingerprint !== "string" || value.fingerprint.length === 0) {
+      throw new Error(`${label}: fingerprint must be a non-empty string`);
+    }
+    fingerprint = value.fingerprint;
+  }
   return {
     cursor,
     lastEventLedger,
+    ...(contractId !== undefined ? { contractId } : {}),
     ...(Array.isArray(recent)
       ? { recentEventIds: recent.filter((id): id is string => typeof id === "string") }
       : {}),
     ...(rewindFromLedger !== null ? { rewindFromLedger } : {}),
+    ...(fingerprint !== undefined ? { fingerprint } : {}),
   };
 }
 
@@ -933,6 +1495,7 @@ export function parseAndMigrateCursorFile(
     throw new Error("cursor file root must be a JSON object");
   }
   const parsed = parsedUnknown;
+  assertNoDuplicateCursorTargets(raw, parsed);
   const nowIso = (options.now ?? (() => new Date()))().toISOString();
 
   // ── Current versioned schema ───────────────────────────────────────────────
@@ -947,6 +1510,10 @@ export function parseAndMigrateCursorFile(
         : nowIso;
     const file: CursorFile = { version: CURSOR_SCHEMA_VERSION, updatedAt, targets };
     if (parsed.chainClockAt !== undefined) file.chainClockAt = parseChainClock(parsed.chainClockAt);
+    if (parsed.recoveryHistory !== undefined) {
+      const recoveryHistory = parseRecoveryHistory(parsed.recoveryHistory);
+      if (recoveryHistory.length > 0) file.recoveryHistory = recoveryHistory;
+    }
     return {
       file,
       migrated: typeof parsed.updatedAt !== "string" || parsed.updatedAt.length === 0,
@@ -987,6 +1554,51 @@ export function parseAndMigrateCursorFile(
   throw new Error("cursor file: unrecognised shape (expected versioned targets map)");
 }
 
+/** Compute a stable SHA-256 hex digest of raw cursor file contents for CAS checks. */
+export function cursorDigest(raw: string): string {
+  return createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
+export type CursorCasResult =
+  | { ok: true; digest: string | null }
+  | {
+      ok: false;
+      conflict: true;
+      expected: string | null;
+      actual: string | null;
+      reason: string;
+    };
+
+/**
+ * Compare-and-swap check for a cursor file against an expected SHA-256 digest
+ * (or `null` when the file is expected to be absent). When `expectedDigest` is
+ * `undefined`, no CAS precondition was requested and the check succeeds.
+ */
+export function checkCursorCas(
+  currentRaw: string | null,
+  expectedDigest: string | null | undefined,
+): CursorCasResult {
+  const actual = currentRaw === null ? null : cursorDigest(currentRaw);
+  if (expectedDigest === undefined) {
+    return { ok: true, digest: actual };
+  }
+  if (actual !== expectedDigest) {
+    return {
+      ok: false,
+      conflict: true,
+      expected: expectedDigest,
+      actual,
+      reason:
+        expectedDigest === null
+          ? "file exists on disk (expected absent)"
+          : actual === null
+            ? "file is missing on disk (expected existing content)"
+            : `digest mismatch (expected ${expectedDigest.slice(0, 12)}…, got ${actual.slice(0, 12)}…)`,
+    };
+  }
+  return { ok: true, digest: actual };
+}
+
 /** Build the on-disk payload the poller always writes. */
 export function buildCursorFile(
   targets: Iterable<{
@@ -995,10 +1607,14 @@ export function buildCursorFile(
     lastEventLedger: number | null;
     recentEventIds?: string[];
     rewindFromLedger?: number | null;
+    fingerprint?: string;
   }>,
   updatedAt: string,
   chainClockAt?: number | null,
+  recoveryHistory?: readonly CursorRecoveryRecord[],
 ): CursorFile {
+  const boundedHistory =
+    recoveryHistory !== undefined ? parseRecoveryHistory(recoveryHistory) : [];
   return {
     version: CURSOR_SCHEMA_VERSION,
     updatedAt,
@@ -1015,9 +1631,11 @@ export function buildCursorFile(
           ...(typeof t.rewindFromLedger === "number"
             ? { rewindFromLedger: t.rewindFromLedger }
             : {}),
+          ...(t.fingerprint !== undefined ? { fingerprint: t.fingerprint } : {}),
         } satisfies CursorTarget,
       ]),
     ),
+    ...(boundedHistory.length > 0 ? { recoveryHistory: boundedHistory } : {}),
   };
 }
 
@@ -1268,10 +1886,13 @@ async function sendWithRetry(
       );
       return;
     } catch (err) {
+      if (classifyPermanentSendError(err) !== null) {
+        throw err; // Permanent Telegram error: bypass transient retry loop
+      }
       attempt++;
       const retryAfterMs = extractRetryAfterMs(err);
-      if (attempt >= maxRetries || !shouldRetry()) {
-        throw err; // Exhausted retries, or a shutdown made waiting pointless
+      if (attempt >= maxRetries || !shouldRetry() || isForumTopicClosed(err)) {
+        throw err; // Exhausted retries, shutdown in progress, or a permanent route failure
       }
 
       const delay = retryAfterMs !== null ? retryAfterMs : backoff;
@@ -1332,6 +1953,9 @@ export function createPoller(deps: PollerDeps) {
   const notifiedGaps = new Set<string>();
   const { config, server, send } = deps;
   const metrics = deps.metrics;
+  // One histogram per poller. When the standalone metrics server is enabled it
+  // owns the same recorder, so both /metrics endpoints report identical data.
+  const rpcLatency = metrics?.rpcLatency ?? new RpcLatencyHistogram();
   const audit: AuditLog = deps.audit ?? createAuditLog();
   const sendSpacing =
     deps.sendOptions?.sendSpacingMs ?? config.interSendDelayMs ?? DEFAULT_SEND_SPACING_MS;
@@ -1346,6 +1970,9 @@ export function createPoller(deps: PollerDeps) {
       DEFAULT_SEND_TIMEOUT_MS,
   };
   const now = deps.now ?? Date.now;
+  const hasCustomWallClock = deps.now !== undefined;
+  const hasCustomMonotonicClock = deps.monotonicNow !== undefined;
+  const notificationAge = new NotificationAge(deps.monotonicNow ?? (() => performance.now()));
   const sleep = deps.sleep ?? defaultSleep;
   const activityBaseline = new ActivityBaseline(deps.activityBaselineOptions);
   const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
@@ -1353,6 +1980,13 @@ export function createPoller(deps: PollerDeps) {
   const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
   const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
   const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
+  const rpcEndpoint = normalizeRpcEndpoint(config.rpcUrl);
+  const circuitBreaker = new RpcCircuitBreaker({
+    failureThreshold: circuitThreshold,
+    cooldownMs: circuitCooldown,
+    maxHalfOpenProbes: deps.circuitBreakerOptions?.maxHalfOpenProbes,
+    now,
+  });
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
 
   // One key per failure source: a broken market contract must not silence the
@@ -1408,6 +2042,7 @@ export function createPoller(deps: PollerDeps) {
         source: t.source,
         contractId: t.contractId,
         version: normalizeContractVersion(t.version),
+        supportedVersion: isContractVersionSupported(t.source, t.version),
         lastCycleMs: 0,
         maxCycleMs: 0,
         cursor: null,
@@ -1434,6 +2069,9 @@ export function createPoller(deps: PollerDeps) {
     targets.map((t) => [t.source, 0]),
   );
 
+  /** Bounded history of cursor recovery actions persisted alongside cursors. */
+  let recoveryHistory: CursorRecoveryRecord[] = [];
+
   // Per-contract redelivery guard. Kept out of `TargetState` so status output
   // stays plain data; the window is internal bookkeeping.
   const dedup = new Map<ContractSource, EventDedupWindow>(
@@ -1449,11 +2087,74 @@ export function createPoller(deps: PollerDeps) {
     filePath: deadLetterEnabled ? (config.deadLetterFile as string) : null,
     maxEntries: config.deadLetterMax ?? DEAD_LETTER_MAX_ENTRIES,
     maxAttempts: config.deadLetterMaxAttempts ?? DEAD_LETTER_MAX_ATTEMPTS,
+    maxAgeMs: config.deadLetterMaxAgeMs ?? DEAD_LETTER_MAX_AGE_MS,
     // A Telegram error embeds the token in its request URL, and the queue is
     // the last place it belongs.
     secrets: [config.botToken],
+    networkPassphrase: config.networkPassphrase,
     now,
   });
+
+  // Scheduled digests are opt-in via DIGEST_SCHEDULE. When unset, the poller
+  // delivers each event immediately with zero digest file I/O.
+  const digestScheduleSpec =
+    typeof config.digestSchedule === "string" && config.digestSchedule.trim().length > 0
+      ? config.digestSchedule.trim()
+      : null;
+  const digestCheckpoint: DigestCheckpoint | null = digestScheduleSpec
+    ? createDigestCheckpoint({
+        filePath:
+          typeof config.digestCheckpointFile === "string" &&
+          config.digestCheckpointFile.length > 0
+            ? config.digestCheckpointFile
+            : null,
+        maxPending: config.digestMaxPending ?? DEFAULT_DIGEST_MAX_PENDING,
+        now,
+      })
+    : null;
+  const digestScheduler: Scheduler | null =
+    digestScheduleSpec && digestCheckpoint
+      ? createScheduler({
+          schedule: digestScheduleSpec,
+          clock: deps.schedulerClock,
+          lastRunStore: digestCheckpoint,
+          run: async () => {
+            const pending = digestCheckpoint.snapshotPending();
+            if (pending.length === 0) return;
+            const chunks = formatDigestPages(pending, { grouped: true });
+            if (chunks.length === 0) return;
+            try {
+              for (const chunk of chunks) {
+                await sendWithRetry(
+                  (message) => send(message, undefined),
+                  chunk,
+                  config.botToken,
+                  sendOptions,
+                  () => !status.stopping,
+                  sleep,
+                );
+                recordSentIncrement();
+                metrics?.notificationsSent.inc();
+              }
+            } catch (err) {
+              recordFailedIncrement();
+              metrics?.notificationsFailed.inc();
+              Logger.error(
+                "poller",
+                `[poller] scheduled digest send failed (${pending.length} pending event(s) kept): ` +
+                  errorMessage(err),
+                {
+                  action: "digest_send_failed",
+                  pendingCount: pending.length,
+                  error: errorMessage(err),
+                },
+              );
+              throw err;
+            }
+            await digestCheckpoint.acknowledgeSent(new Set(pending.map((e) => e.eventId)));
+          },
+        })
+      : null;
 
   /** Crash-safe send journal: intent before a send, done after. */
   const sendJournalEnabled =
@@ -1463,6 +2164,7 @@ export function createPoller(deps: PollerDeps) {
     sendJournal = createSendJournal({
       filePath: config.sendJournalFile,
       now,
+      secrets: config.botToken ? [config.botToken] : [],
     });
   }
 
@@ -1473,6 +2175,8 @@ export function createPoller(deps: PollerDeps) {
   function refreshDeadLetterStatus(): void {
     status.deadLetter = deadLetter.stats();
   }
+
+  const categoryCounter = createCategoryCounter({ config });
 
   const sinceStartCounters: PollerCounters = {
     cycles: 0,
@@ -1495,6 +2199,7 @@ export function createPoller(deps: PollerDeps) {
     oldestLedger: null,
     notificationsSent: 0,
     notificationsFailed: 0,
+    notificationAge: notificationAge.summary(),
     eventsSkipped: 0,
     sinceStart: { ...sinceStartCounters },
     cumulative: {
@@ -1510,6 +2215,7 @@ export function createPoller(deps: PollerDeps) {
     lastCyclePages: 0,
     notificationsDropped: 0,
     deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0 },
+    rpcLatency: rpcLatency.snapshot(),
     eventsDeduplicated: 0,
     cursorRewinds: 0,
     restartGaps: 0,
@@ -1522,6 +2228,12 @@ export function createPoller(deps: PollerDeps) {
     pendingFlush: false,
     lastFlushAt: null,
     suppressedLogs: 0,
+    unsupportedVersions: validateDecoderCombinations(targets).map((f) => ({
+      source: f.source,
+      version: f.version ?? "",
+      fallback: f.fallbackVersion,
+      reason: f.reason,
+    })),
     targets: [],
     sbomDigest: null,
     circuitBreaker: {
@@ -1529,8 +2241,22 @@ export function createPoller(deps: PollerDeps) {
       openedAt: null,
       failureCount: 0,
       lastFailureAt: null,
+      state: "closed",
+      endpoint: rpcEndpoint,
+      probesInFlight: 0,
     },
   };
+
+  function syncCircuitBreakerStatus(): void {
+    const snap = circuitBreaker.snapshot(rpcEndpoint);
+    status.circuitBreaker.open = snap.open;
+    status.circuitBreaker.openedAt = snap.openedAt;
+    status.circuitBreaker.failureCount = snap.failureCount;
+    status.circuitBreaker.lastFailureAt = snap.lastFailureAt;
+    status.circuitBreaker.state = snap.state;
+    status.circuitBreaker.endpoint = snap.endpoint;
+    status.circuitBreaker.probesInFlight = snap.probesInFlight;
+  }
 
   function syncCounterSnapshots(): void {
     status.sinceStart = { ...sinceStartCounters };
@@ -1718,21 +2444,85 @@ export function createPoller(deps: PollerDeps) {
     let raw: string;
     try {
       raw = await readFile(config.cursorFile, "utf8");
-    } catch {
-      console.log(
-        `[poller] no cursor file at ${config.cursorFile}; cold start ` +
-          `${config.startLookbackLedgers} ledgers behind the tip`,
-      );
+    } catch (err) {
+      const classified = classifyCursorFsError(err);
+      if (classified.kind === "not_found") {
+        status.cursorLoadError = null;
+        console.log(
+          `[poller] no cursor file at ${config.cursorFile}; cold start ` +
+            `${config.startLookbackLedgers} ledgers behind the tip`,
+        );
+        return;
+      }
+
+      const detail = errorMessage(err);
+      const isPermission = classified.kind === "permission";
+      const action = isPermission ? "cursor_permission_denied" : "cursor_read_failed";
+      const msg = isPermission
+        ? `[poller] [${classified.diagnosticCode}] cursor directory or file permission failure reading ${config.cursorFile}` +
+          `${classified.errnoCode ? ` (${classified.errnoCode})` : ""}: ${detail}; preserving existing file without quarantine`
+        : `[poller] [${classified.diagnosticCode}] operational error reading cursor ${config.cursorFile}` +
+          `${classified.errnoCode ? ` (${classified.errnoCode})` : ""}: ${detail}; preserving existing file without quarantine`;
+
+      status.cursorLoadError = {
+        kind: classified.kind,
+        code: classified.diagnosticCode,
+        ...(classified.errnoCode ? { errno: classified.errnoCode } : {}),
+        message: msg,
+      };
+
+      Logger.error("poller", msg, {
+        action,
+        diagnosticCode: classified.diagnosticCode,
+        ...(classified.errnoCode ? { errno: classified.errnoCode } : {}),
+        cursorFile: config.cursorFile,
+        error: detail,
+      });
       return;
     }
 
     try {
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
+      status.cursorLoadError = null;
       const parsed = result.file;
+      let fingerprintMigrated = false;
       for (const [source, saved] of Object.entries(parsed.targets)) {
         const key = source as ContractSource;
         const target = state.get(key);
         if (!target) continue;
+        const expectedFingerprint = computeCursorTargetFingerprint(
+          config.networkPassphrase,
+          target.contractId,
+        );
+        if (saved.fingerprint !== undefined && saved.fingerprint !== expectedFingerprint) {
+          // Network or contract configuration changed: never silently reuse an
+          // incompatible cursor. Reset this target to cold start and rewrite
+          // the new fingerprint before the first poll cycle.
+          target.cursor = null;
+          target.lastEventLedger = null;
+          target.rewindFromLedger = null;
+          target.cursorStale = false;
+          dedup.set(key, new EventDedupWindow(config.dedupWindow));
+          fingerprintMigrated = true;
+          Logger.warn(
+            "poller",
+            `[poller] cursor target ${key} fingerprint mismatch ` +
+              `(persisted ${saved.fingerprint.slice(0, 12)} != expected ${expectedFingerprint.slice(0, 12)}); ` +
+              `ignoring incompatible cursor and starting cold (run 'npm run cursor -- migrate' for explicit migration)`,
+            {
+              action: "cursor_fingerprint_mismatch",
+              source: key,
+              contractId: target.contractId,
+              expectedFingerprint,
+              persistedFingerprint: saved.fingerprint,
+              cursorFile: config.cursorFile,
+            },
+          );
+          continue;
+        }
+        if (saved.fingerprint === undefined) {
+          fingerprintMigrated = true;
+        }
         target.cursor = saved.cursor ?? null;
         target.lastEventLedger = saved.lastEventLedger ?? null;
         // A rewind that was still pending when the process stopped resumes from
@@ -1744,20 +2534,30 @@ export function createPoller(deps: PollerDeps) {
         dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
       }
       // Memory now equals the file; nothing is waiting to be flushed — unless
-      // the file was a legacy shape, which start() rewrites before any cycle.
+      // the file was a legacy shape or missing target fingerprints, which
+      // start() rewrites before any cycle.
       status.pendingFlush = false;
-      if (result.migrated) {
+      if (result.migrated || fingerprintMigrated) {
         pendingRewrite = true;
         markDirty();
-        console.log(
-          `[poller] migrated cursor file from ${result.source} → ` +
-            `schema v${CURSOR_SCHEMA_VERSION} at ${config.cursorFile}`,
-        );
+        if (result.migrated) {
+          console.log(
+            `[poller] migrated cursor file from ${result.source} → ` +
+              `schema v${CURSOR_SCHEMA_VERSION} at ${config.cursorFile}`,
+          );
+        } else {
+          Logger.info(
+            "poller",
+            `[poller] bound cursor target fingerprints at ${config.cursorFile}`,
+            { action: "cursor_fingerprint_migrated", cursorFile: config.cursorFile },
+          );
+        }
       }
       // Resume the chain clock alongside the cursors. Without this a restart
       // between two quiet scans would report `unknown` until the next event
       // happened to land, hiding a perfectly healthy (or long-stalled) chain.
       status.chainClockAt = parsed.chainClockAt ?? null;
+      recoveryHistory = parsed.recoveryHistory ? [...parsed.recoveryHistory] : [];
       audit.record(
         auditEntry("cursor_loaded", {
           detail: [...state.values()].map((t) => `${t.source}@${t.cursor ?? "none"}`).join(" "),
@@ -1784,7 +2584,20 @@ export function createPoller(deps: PollerDeps) {
       // Quarantine then cold-start: never wedge on a corrupt state file, and
       // keep the bad bytes for operators instead of overwriting them on save.
       const reason = errorMessage(err);
+      status.cursorLoadError = {
+        kind: "corrupt",
+        code: "CURSOR_CORRUPT_JSON",
+        message: `[poller] [CURSOR_CORRUPT_JSON] cursor file ${config.cursorFile} is corrupt: ${reason}`,
+      };
       await quarantineCorruptCursorFile(config.cursorFile, reason);
+      recoveryHistory = appendCursorRecoveryHistory(recoveryHistory, {
+        at: new Date(now()).toISOString(),
+        reason: "quarantine",
+        before: {},
+        after: snapshotCursorPositions(
+          Object.fromEntries([...state.values()].map((t) => [t.source, t])),
+        ),
+      });
     }
   }
 
@@ -1805,9 +2618,11 @@ export function createPoller(deps: PollerDeps) {
         lastEventLedger: t.lastEventLedger,
         recentEventIds: dedup.get(t.source)?.toJSON() ?? [],
         rewindFromLedger: t.rewindFromLedger,
+        fingerprint: computeCursorTargetFingerprint(config.networkPassphrase, t.contractId),
       })),
       new Date(now()).toISOString(),
       status.chainClockAt,
+      recoveryHistory,
     );
 
     try {
@@ -1997,6 +2812,7 @@ export function createPoller(deps: PollerDeps) {
   async function notify(
     events: DecodedEvent[],
     correlationId: string,
+    ingested: NotificationIngestionMark = notificationAge.markIngested(now()),
   ): Promise<NotificationResult> {
     let sentThisCycle = 0;
     let failed = 0;
@@ -2006,6 +2822,7 @@ export function createPoller(deps: PollerDeps) {
 
     for (const event of events) {
       metrics?.eventsDecoded.inc();
+      categoryCounter.record(event);
 
       if (isAdminPayload(event.payload)) {
         recordSkippedIncrement();
@@ -2046,6 +2863,8 @@ export function createPoller(deps: PollerDeps) {
       if (!isNotificationAllowed(config.featureFlags, event.source, event.payload.name)) {
         recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
+        metrics?.eventsFiltered.inc();
+        metrics?.eventsFilteredFeatureFlag.inc();
         skipped += 1;
         console.log(
           `[poller] feature-flag skipped ${event.source} event "${boundedLabel(event.payload.name, 80)}" ` +
@@ -2078,8 +2897,15 @@ export function createPoller(deps: PollerDeps) {
           // below is unchanged: either path counts as sent, neither as skipped.
           const plainText = formatPlainTextEvent(config, event);
           const eventRef = { eventId: event.eventId, ledger: event.ledger, source: event.source };
+          const eventCategory =
+            "category" in event.payload &&
+            typeof event.payload.category === "string" &&
+            event.payload.category.trim() !== ""
+              ? event.payload.category
+              : undefined;
           extra = {
             eventName: event.payload.name,
+            ...(eventCategory ? { category: eventCategory } : {}),
             ...(reply_markup ? { reply_markup } : {}),
             ...(plainText !== null ? { plainText, eventRef } : {}),
           };
@@ -2105,6 +2931,8 @@ export function createPoller(deps: PollerDeps) {
       if (text === null) {
         recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
+        metrics?.eventsFiltered.inc();
+        metrics?.eventsFilteredRule.inc();
         skipped += 1;
         audit.record(
           auditEntry("event_skipped", {
@@ -2112,6 +2940,13 @@ export function createPoller(deps: PollerDeps) {
             detail: `${event.payload.name} at ledger ${event.ledger}: notifiable text was null`,
           }),
         );
+        continue;
+      }
+
+      // Scheduled digest mode: buffer the event into the bounded checkpoint
+      // instead of sending immediately; the scheduler flushes grouped digests.
+      if (digestCheckpoint !== null) {
+        digestCheckpoint.enqueue(event);
         continue;
       }
 
@@ -2182,6 +3017,8 @@ export function createPoller(deps: PollerDeps) {
             ledger: event.ledger,
             eventName: event.payload.name,
             textHash,
+            chatId: resolveRouteChatId(config, event.source),
+            networkPassphrase: config.networkPassphrase,
             at: now(),
           });
         } catch (err) {
@@ -2203,6 +3040,12 @@ export function createPoller(deps: PollerDeps) {
         );
         recordSentIncrement();
         metrics?.notificationsSent.inc();
+        const ageMs =
+          hasCustomWallClock && !hasCustomMonotonicClock
+            ? notificationAge.record(event.at, Math.max(ingested.wallMs, now()))
+            : notificationAge.recordFromIngestion(event.at, ingested);
+        metrics?.recordNotificationAge(ageMs);
+        status.notificationAge = notificationAge.summary();
         sentThisCycle += 1;
         if (sendJournal) {
           try {
@@ -2217,6 +3060,18 @@ export function createPoller(deps: PollerDeps) {
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
+        if (sendJournal && err instanceof InvalidDeliveryResultError) {
+          try {
+            await sendJournal.recordInvalidResult(
+              event.eventId,
+              safeErrorMessage(err, [config.botToken]),
+            );
+          } catch (journalErr) {
+            console.error(
+              `[poller] send journal diagnostic failed for ${event.eventId}: ${safeErrorMessage(journalErr)}`,
+            );
+          }
+        }
         recordFailedIncrement();
         metrics?.notificationsFailed.inc();
         failed += 1;
@@ -2229,12 +3084,25 @@ export function createPoller(deps: PollerDeps) {
           (event.source === "market" ? config.marketChatId : config.squadChatId) ||
           config.chatId ||
           config.chatIds?.[0];
+        const permanentReason = classifyPermanentSendError(err);
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}` +
-            `${chat ? ` to chat ${chat}` : ""} after retries: ` +
+            `${chat ? ` to chat ${chat}` : ""}` +
+            `${permanentReason ? ` (reason=${permanentReason})` : " after retries"}: ` +
             `${errorMessage(err)} correlation=${correlationId}`,
         );
-        if (deadLetterEnabled) {
+        if (isForumTopicClosed(err)) {
+          // Permanent route failure: the topic is closed or deleted. Retrying
+          // will produce the same 400, so the message is not parked in the DLQ.
+          // The cursor still advances and the failure is counted above. The
+          // operator must re-open the topic (or update the route) to restore
+          // delivery; unrelated topic routes remain operational.
+          console.error(
+            `[poller] permanent route failure for ${event.payload.name} at ledger ${event.ledger}` +
+              `${chat ? ` to chat ${chat}` : ""}: forum topic is closed or not found — ` +
+              `not queuing for retry (update the route to restore delivery)`,
+          );
+        } else if (deadLetterEnabled) {
           await deadLetter.enqueue({
             source: event.source,
             ledger: event.ledger,
@@ -2257,6 +3125,10 @@ export function createPoller(deps: PollerDeps) {
         `[poller] shutdown drain dropped ${droppedForShutdown} unsent notification(s); ` +
           `the cursor still advances so they are not replayed`,
       );
+    }
+
+    if (digestCheckpoint !== null) {
+      await digestCheckpoint.flush();
     }
 
     return { sent: sentThisCycle, failed, skipped };
@@ -2354,9 +3226,29 @@ export function createPoller(deps: PollerDeps) {
     const missed = cursorLedger === null ? 0 : Math.max(0, window.oldestLedger - cursorLedger);
     rewindAttempts.set(target.source, attempts + 1);
     const at = now();
+    const beforePosition: CursorRecoveryPosition = {
+      cursor: current.cursor,
+      lastEventLedger: current.lastEventLedger,
+      ...(typeof current.rewindFromLedger === "number"
+        ? { rewindFromLedger: current.rewindFromLedger }
+        : {}),
+    };
     current.cursor = null;
     current.lastEventLedger = null;
     current.rewindFromLedger = window.oldestLedger;
+    recoveryHistory = appendCursorRecoveryHistory(recoveryHistory, {
+      at: new Date(at).toISOString(),
+      reason: "floor_rewind",
+      source: target.source,
+      before: { [target.source]: beforePosition },
+      after: {
+        [target.source]: {
+          cursor: current.cursor,
+          lastEventLedger: current.lastEventLedger,
+          rewindFromLedger: current.rewindFromLedger,
+        },
+      },
+    });
     // The position becomes a floor walk, so any "could not be read" flag it
     // carried is spent. The gap itself is what an operator needs, and it is
     // recorded once per occurrence: after the rewind the position *is* the
@@ -2459,29 +3351,31 @@ export function createPoller(deps: PollerDeps) {
     ledgerCache.reset();
 
     // ── Circuit breaker check ─────────────────────────────────────────────────────
-    if (status.circuitBreaker.open) {
-      const nowMs = now();
-      const timeSinceOpen = status.circuitBreaker.openedAt ? nowMs - status.circuitBreaker.openedAt : Infinity;
-      
-      if (timeSinceOpen >= circuitCooldown) {
-        // Cooldown elapsed, attempt to close the circuit
+    const probeDecision = circuitBreaker.allowRequest(rpcEndpoint);
+    syncCircuitBreakerStatus();
+    if (!probeDecision.allowed) {
+      if (probeDecision.state === "open") {
+        const elapsedMs = Math.max(0, circuitCooldown - probeDecision.remainingCooldownMs);
         console.log(
-          `[poller] circuit breaker cooldown elapsed (${timeSinceOpen}ms >= ${circuitCooldown}ms), attempting recovery`,
+          `[poller] circuit breaker open for ${probeDecision.endpoint}, skipping RPC calls (${Math.round(elapsedMs / 1000)}s/${Math.round(circuitCooldown / 1000)}s elapsed)`,
         );
-        status.circuitBreaker.open = false;
-        status.circuitBreaker.openedAt = null;
-        status.circuitBreaker.failureCount = 0;
       } else {
-        // Still in cooldown, skip RPC calls
         console.log(
-          `[poller] circuit breaker open, skipping RPC calls (${Math.round(timeSinceOpen / 1000)}s/${Math.round(circuitCooldown / 1000)}s elapsed)`,
+          `[poller] circuit breaker half-open for ${probeDecision.endpoint}, skipping RPC calls (recovery probe already in flight)`,
         );
-        status.targets = [...state.values()].map((t) => ({ ...t }));
-        inFlight = false;
-        endCycleTracking();
-        return;
       }
+      status.targets = [...state.values()].map((t) => ({ ...t }));
+      inFlight = false;
+      endCycleTracking();
+      return;
     }
+    const isHalfOpenProbe = probeDecision.isProbe;
+    if (isHalfOpenProbe) {
+      console.log(
+        `[poller] circuit breaker cooldown elapsed for ${probeDecision.endpoint}, entering half-open state with 1 bounded recovery probe`,
+      );
+    }
+    let probeAttempted = false;
 
     let anyOk = false;
     let cyclePages = 0;
@@ -2538,6 +3432,10 @@ export function createPoller(deps: PollerDeps) {
           continue;
         }
 
+        if (isHalfOpenProbe) {
+          probeAttempted = true;
+        }
+
         const targetStartedAt = now();
         try {
           // Before asking for events, place the resume position against the last
@@ -2567,7 +3465,9 @@ export function createPoller(deps: PollerDeps) {
                 !rewinding && current.cursor === null ? config.startLookbackLedgers : undefined,
               seenEventIds: dedupWindow.toJSON(),
               dedupWindow: config.dedupWindow,
+              maxPages: isHalfOpenProbe ? 1 : undefined,
               shouldDecode: (name) => isNotificationAllowed(config.featureFlags, target.source, name),
+              rpcLatency,
             }),
             SCAN_TIMEOUT_MS,
             "RPC scan",
@@ -2650,14 +3550,18 @@ export function createPoller(deps: PollerDeps) {
             );
           }
 
-          // Reset circuit breaker on success
-          if (status.circuitBreaker.failureCount > 0) {
+          // Reset circuit breaker on success (closes half-open probe or clears closed failures)
+          const prevFailures = status.circuitBreaker.failureCount;
+          const wasHalfOpen = status.circuitBreaker.state === "half-open";
+          if (prevFailures > 0 || wasHalfOpen) {
             console.log(
-              `[poller] RPC succeeded, resetting circuit breaker (was at ${status.circuitBreaker.failureCount} failures)`,
+              wasHalfOpen
+                ? `[poller] half-open recovery probe succeeded for ${rpcEndpoint}, closing circuit breaker`
+                : `[poller] RPC succeeded, resetting circuit breaker (was at ${prevFailures} failures)`,
             );
-            status.circuitBreaker.failureCount = 0;
-            status.circuitBreaker.lastFailureAt = null;
           }
+          circuitBreaker.recordSuccess(rpcEndpoint);
+          syncCircuitBreakerStatus();
 
           if (scan.duplicates > 0) {
             status.eventsDeduplicated += scan.duplicates;
@@ -2677,8 +3581,9 @@ export function createPoller(deps: PollerDeps) {
           // never be recorded.
           for (const id of scan.seenEventIds) dedupWindow.add(id);
           if (scan.events.length > 0) {
+            const ingested = notificationAge.markIngested(now());
             markDirty();
-            delivery = await notify(scan.events, correlationId);
+            delivery = await notify(scan.events, correlationId, ingested);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
             console.log(
               `[poller] ${target.source}: ${scan.events.length} event(s) ` +
@@ -2735,6 +3640,12 @@ export function createPoller(deps: PollerDeps) {
           };
 
           trackCursorAdvance(current, previousCursor, scan.latestLedger);
+
+          if (isHalfOpenProbe) {
+            // Bounded recovery probe succeeded: leave remaining targets for the
+            // next cycle so the recovering endpoint does not receive full load.
+            break;
+          }
         } catch (err) {
           cycleFailures++;
           metrics?.rpcErrors.inc();
@@ -2779,10 +3690,22 @@ export function createPoller(deps: PollerDeps) {
             ? eventCursorLedger(current.cursor)
             : null;
 
-          const retryAfterMs = extractRetryAfterMs(err);
+          const retryAfterMs = extractRetryAfterMs(err, targetMaxBackoff);
           if (retryAfterMs !== null) {
             console.warn(`[poller] RPC requested backoff for ${retryAfterMs}ms`);
             explicitBackoff = retryAfterMs;
+          }
+
+          if (isHalfOpenProbe) {
+            circuitBreaker.recordFailure(rpcEndpoint, 1);
+            syncCircuitBreakerStatus();
+            console.error(
+              `[poller] half-open recovery probe failed for ${rpcEndpoint}, re-opening circuit breaker`,
+            );
+            break;
+          }
+
+          if (retryAfterMs !== null) {
             break; // Stop scanning other targets, they will likely hit the same limit
           }
         } finally {
@@ -2798,15 +3721,17 @@ export function createPoller(deps: PollerDeps) {
       status.lastCycleEmptyPages = cycleEmptyPages;
 
       // ── Circuit breaker state update ─────────────────────────────────────────────
-      if (cycleFailures > 0) {
-        status.circuitBreaker.failureCount += cycleFailures;
-        status.circuitBreaker.lastFailureAt = now();
+      if (isHalfOpenProbe && !probeAttempted) {
+        circuitBreaker.releaseProbe(rpcEndpoint);
+        syncCircuitBreakerStatus();
+      } else if (!isHalfOpenProbe && cycleFailures > 0) {
+        const wasOpen = status.circuitBreaker.open;
+        circuitBreaker.recordFailure(rpcEndpoint, cycleFailures);
+        syncCircuitBreakerStatus();
 
-        if (status.circuitBreaker.failureCount >= circuitThreshold && !status.circuitBreaker.open) {
-          status.circuitBreaker.open = true;
-          status.circuitBreaker.openedAt = now();
+        if (status.circuitBreaker.open && !wasOpen) {
           console.error(
-            `[poller] circuit breaker opened after ${status.circuitBreaker.failureCount} failures (threshold: ${circuitThreshold})`,
+            `[poller] circuit breaker opened for ${rpcEndpoint} after ${status.circuitBreaker.failureCount} failures (threshold: ${circuitThreshold})`,
           );
         }
       }
@@ -2874,6 +3799,7 @@ export function createPoller(deps: PollerDeps) {
       // they run even when the body above threw.
       try {
         status.targets = [...state.values()].map((t) => ({ ...t }));
+        status.rpcLatency = rpcLatency.snapshot();
         await saveCounters("cycle");
         await saveCursors("cycle");
         await persistStatus();
@@ -2992,13 +3918,47 @@ export function createPoller(deps: PollerDeps) {
       await deadLetter.load();
       refreshDeadLetterStatus();
 
+      if (digestCheckpoint && digestScheduler) {
+        await digestCheckpoint.load();
+        await digestScheduler.start();
+      }
+
       // Recover which notifications may already have been sent: an intent
       // without a matching done means a crash happened between sendMessage and
       // the cursor commit. Treat them as committed so a restart never duplicates
       // them (the existing lossy cursor-commit policy).
       if (sendJournal) {
-        for (const entry of await sendJournal.loadPending()) {
+        const recoveryContext = {
+          resolveRouteChatId: (s: string) =>
+            resolveRouteChatId(config, s === "market" || s === "squad" ? s : undefined),
+          networkPassphrase: config.networkPassphrase,
+        };
+        const { valid, orphaned } = await sendJournal.classifyPending(recoveryContext);
+        for (const entry of valid) {
           maybeSent.add(entry.id);
+        }
+        if (orphaned.length > 0) {
+          if (deps.onOrphanedJournalEntry) {
+            const recovered = await sendJournal.recoverOrphans(
+              recoveryContext,
+              deps.onOrphanedJournalEntry,
+            );
+            for (const entry of recovered.reroutedEntries) {
+              maybeSent.add(entry.id);
+            }
+            Logger.warn(
+              "poller",
+              `recovered ${orphaned.length} orphaned send-journal entries ` +
+                `(discarded=${recovered.discarded}, rerouted=${recovered.rerouted})`,
+            );
+          } else {
+            Logger.warn(
+              "poller",
+              `skipped ${orphaned.length} orphaned send-journal entr${orphaned.length === 1 ? "y" : "ies"} ` +
+                `(requires explicit discard or reroute decision): ` +
+                orphaned.map((o) => `${o.entry.id}:${o.reason}`).join(", "),
+            );
+          }
         }
         await sendJournal.compact();
       }
@@ -3028,6 +3988,24 @@ export function createPoller(deps: PollerDeps) {
           pollIntervalMs: config.pollIntervalMs,
         },
       );
+      // Flag unsupported contract version combinations before live polling begins.
+      const unsupported = validateDecoderCombinations(targets);
+      for (const flag of unsupported) {
+        Logger.warn(
+          "poller",
+          `[poller] unsupported contract version combination: source=${flag.source} version=${flag.version} fallback=${flag.fallbackVersion}; ${flag.reason}`,
+          {
+            action: "unsupported_contract_version",
+            source: flag.source,
+            version: flag.version,
+            normalizedVersion: flag.normalizedVersion,
+            contractId: flag.contractId,
+            fallbackVersion: flag.fallbackVersion,
+            reason: flag.reason,
+          },
+        );
+      }
+
       await persistStatus();
       await flushAudit();
       void loop();
@@ -3084,6 +4062,12 @@ export function createPoller(deps: PollerDeps) {
       resumePending = false;
       if (timer) clearTimeout(timer);
       timer = null;
+      if (digestScheduler) {
+        await digestScheduler.stop();
+      }
+      if (digestCheckpoint) {
+        await digestCheckpoint.flush();
+      }
       // Best-effort: the process may be exiting, but a final snapshot that says
       // `running: false` is what tells a supervisor the stop was deliberate.
       void persistStatus();
@@ -3149,6 +4133,13 @@ export function createPoller(deps: PollerDeps) {
         await saveCounters("shutdown");
       }
 
+      if (digestScheduler) {
+        await digestScheduler.stop();
+      }
+      if (digestCheckpoint) {
+        await digestCheckpoint.flush();
+      }
+
       status.running = false;
       await persistStatus();
       await releaseInstanceLock();
@@ -3170,6 +4161,7 @@ export function createPoller(deps: PollerDeps) {
         ledgerCache: ledgerCache.stats(),
         suppressedLogs: errorSampler.suppressedTotal(),
         targets: [...state.values()].map((t) => ({ ...t })),
+        categories: categoryCounter.countsRecord(),
       };
     },
 
@@ -3203,6 +4195,11 @@ export function createPoller(deps: PollerDeps) {
     /** Persist buffered audit entries now (used on shutdown). */
     flushAuditFile(): Promise<void> {
       return flushAudit();
+    },
+
+    /** Return decoder capability reports for each configured watch target. */
+    capabilities(): DecoderCapabilityReport[] {
+      return targets.map((t) => getDecoderCapabilityReport(t.source, t.version, t.contractId));
     },
 
     /** Run one polling cycle directly and await its completion. */

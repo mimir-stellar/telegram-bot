@@ -16,6 +16,7 @@ const PUBLIC_LINES = [
   "/contracts — Contract ids and explorer links",
   "/health — Health assessment and operational readiness",
   "/preview — Preview channel notification formatting",
+  "/categories — Observed claim categories and counts",
 ];
 const ALL_LINES = [
   ...PUBLIC_LINES.slice(0, 5),

@@ -22,9 +22,13 @@ import {
   registerCommandHandlers,
 } from "../dist/bot.js";
 import {
+  CommandConsistencyError,
   commandMetadata,
   defineCommand,
+  findCommandConsistencyIssues,
   registeredCommands,
+  validateCommandCatalogue,
+  validateCommandConsistency,
   visibleCommandMetadata,
 } from "../dist/commands/index.js";
 
@@ -38,6 +42,7 @@ const MENU = [
   "contracts",
   "health",
   "preview",
+  "categories",
   "pause",
   "resume",
 ];
@@ -288,4 +293,85 @@ test("the pause confirmation flow rejects payloads outside its own set", async (
     },
   });
   assert.equal(answered, 0, "navigation payloads are left to the action dispatcher");
+});
+
+// ── Startup consistency validation ───────────────────────────────────────────
+
+test("validateCommandCatalogue succeeds for the live command catalogue", () => {
+  assert.doesNotThrow(() => validateCommandCatalogue());
+});
+
+test("validateCommandConsistency rejects a menu-advertised command without a live handler", () => {
+  const modules = [{ command: "status", handler: async () => undefined }];
+  assert.throws(
+    () =>
+      validateCommandConsistency({
+        modules,
+        menuDescriptions: { status: "Show status", ghost: "Not registered" },
+        helpDetails: { status: { operatorOnly: false } },
+      }),
+    (err) => {
+      assert.ok(err instanceof CommandConsistencyError);
+      assert.match(err.message, /\/ghost/);
+      assert.ok(err.issues.some((i) => i.command === "ghost" && i.source === "menu"));
+      return true;
+    },
+  );
+});
+
+test("validateCommandConsistency rejects a help-advertised command without a live handler", () => {
+  const modules = [{ command: "status", handler: async () => undefined }];
+  assert.throws(
+    () =>
+      validateCommandConsistency({
+        modules,
+        menuDescriptions: { status: "Show status" },
+        helpDetails: { status: { operatorOnly: false }, phantom: { operatorOnly: false } },
+      }),
+    (err) => {
+      assert.ok(err instanceof CommandConsistencyError);
+      assert.match(err.message, /\/phantom/);
+      assert.ok(err.issues.some((i) => i.command === "phantom" && i.source === "help"));
+      return true;
+    },
+  );
+});
+
+test("validateCommandConsistency rejects an advertised module missing menu or help metadata", () => {
+  const modules = [{ command: "orphan", handler: async () => undefined }];
+  const issues = findCommandConsistencyIssues({
+    modules,
+    menuDescriptions: {},
+    helpDetails: {},
+  });
+  assert.ok(issues.some((i) => i.command === "orphan" && i.source === "menu"));
+  assert.ok(issues.some((i) => i.command === "orphan" && i.source === "help"));
+});
+
+test("validateCommandConsistency rejects a hidden command advertised in menu or help", () => {
+  const modules = [{ command: "internal", hidden: true, handler: async () => undefined }];
+  const issues = findCommandConsistencyIssues({
+    modules,
+    menuDescriptions: { internal: "Should not be advertised" },
+    helpDetails: { internal: { operatorOnly: true } },
+  });
+  assert.ok(issues.some((i) => i.command === "internal" && i.source === "menu"));
+  assert.ok(issues.some((i) => i.command === "internal" && i.source === "help"));
+});
+
+test("validateCommandConsistency detects operatorOnly mismatch and non-callable handler", () => {
+  const modules = [
+    { command: "audit", operatorOnly: true, handler: async () => undefined },
+    { command: "broken", handler: /** @type {any} */ (null) },
+  ];
+  const issues = findCommandConsistencyIssues({
+    modules,
+    menuDescriptions: { audit: "Audit report", broken: "Broken command" },
+    helpDetails: {
+      audit: { operatorOnly: false },
+      broken: { operatorOnly: false },
+    },
+  });
+  assert.ok(issues.some((i) => i.command === "audit" && i.source === "help"));
+  assert.ok(issues.some((i) => i.command === "broken" && i.source === "catalogue"));
 });
