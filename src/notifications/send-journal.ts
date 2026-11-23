@@ -24,12 +24,25 @@ import path from "node:path";
 export const DEFAULT_SEND_JOURNAL_MAX_ENTRIES = 1_000;
 export const DEFAULT_SEND_JOURNAL_MAX_BYTES = 1_000_000;
 
+export type DeliveryOutcome = "sent" | "failed" | "skipped";
+
+export interface JournalDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
+
 export interface JournalEntry {
   kind: "intent" | "done";
   id: string;
   source: string;
   ledger: number;
   eventName: string;
+  /** Target Telegram chat id when tracked per-destination. */
+  chatId?: string;
+  /** Target Telegram forum topic / thread id when tracked per-destination. */
+  topicId?: number;
+  /** Persisted delivery outcome on `done` entries. */
+  outcome?: DeliveryOutcome;
   /** Bounded hash of the message body; the body itself is never persisted. */
   textHash?: string;
   /** Resolved Telegram chat route at the time the intent was recorded. */
@@ -87,13 +100,19 @@ export interface SendJournal {
     source: string;
     ledger: number;
     eventName: string;
+    chatId?: string;
+    topicId?: number;
     textHash?: string;
     chatId?: string;
     networkPassphrase?: string;
     at: number;
   }): Promise<void>;
-  recordDone(id: string): Promise<void>;
-  /** Intents with no matching done: notifications that may have been sent. */
+  recordDone(
+    id: string,
+    destination?: JournalDestination,
+    outcome?: DeliveryOutcome,
+  ): Promise<void>;
+  /** Intents with no matching done: notifications/destinations that may have been sent. */
   loadPending(): Promise<JournalEntry[]>;
   /** Partition pending entries into valid vs orphaned (removed route / changed network). */
   classifyPending(context: JournalRecoveryContext): Promise<{
@@ -110,6 +129,11 @@ export interface SendJournal {
   ): Promise<OrphanRecoveryResult>;
   compact(): Promise<void>;
   stats(): Promise<SendJournalStats>;
+}
+
+function entryKey(id: string, chatId?: string, topicId?: number): string {
+  if (chatId === undefined && topicId === undefined) return id;
+  return `${id}\0${chatId ?? ""}\0${topicId !== undefined ? String(topicId) : ""}`;
 }
 
 function line(entry: JournalEntry): string {
@@ -195,6 +219,8 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     source: string;
     ledger: number;
     eventName: string;
+    chatId?: string;
+    topicId?: number;
     textHash?: string;
     chatId?: string;
     networkPassphrase?: string;
@@ -203,8 +229,23 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     await append({ kind: "intent", ...entry });
   }
 
-  async function recordDone(id: string): Promise<void> {
-    await append({ kind: "done", id, source: "", ledger: 0, eventName: "", at: now() });
+  async function recordDone(
+    id: string,
+    destination?: JournalDestination,
+    outcome?: DeliveryOutcome,
+  ): Promise<void> {
+    const doneEntry: JournalEntry = {
+      kind: "done",
+      id,
+      source: "",
+      ledger: 0,
+      eventName: "",
+      ...(destination ? { chatId: destination.chatId } : {}),
+      ...(destination?.topicId !== undefined ? { topicId: destination.topicId } : {}),
+      ...(outcome !== undefined ? { outcome } : destination ? { outcome: "sent" as const } : {}),
+      at: now(),
+    };
+    await append(doneEntry);
     // Once a send is accounted for, compact resolved pairs away when the file
     // has grown past its budget so the journal stays bounded.
     const stats = await journalStats();
@@ -217,9 +258,18 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     const entries = await readLines();
     const done = new Set<string>();
     for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
+      if (entry.kind === "done") {
+        done.add(entryKey(entry.id, entry.chatId, entry.topicId));
+      }
     }
-    return entries.filter((e) => e.kind === "intent" && !done.has(e.id));
+    return entries.filter(
+      (e) => e.kind === "intent" && !done.has(entryKey(e.id, e.chatId, e.topicId)),
+    );
+  }
+
+  async function loadPendingForEvent(id: string): Promise<JournalEntry[]> {
+    const pending = await loadPending();
+    return pending.filter((e) => e.id === id);
   }
 
   async function classifyPending(context: JournalRecoveryContext): Promise<{
@@ -336,11 +386,15 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     const entries = await readLines();
     const done = new Set<string>();
     for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
+      if (entry.kind === "done") {
+        done.add(entryKey(entry.id, entry.chatId, entry.topicId));
+      }
     }
     // A done line settles its intent: both lines can be dropped. Keep only
     // unresolved intents.
-    const unresolved = entries.filter((e) => e.kind === "intent" && !done.has(e.id));
+    const unresolved = entries.filter(
+      (e) => e.kind === "intent" && !done.has(entryKey(e.id, e.chatId, e.topicId)),
+    );
     await persist(unresolved);
   }
 

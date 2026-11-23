@@ -92,7 +92,7 @@ test('enforces per-chat cap', async () => {
     });
     await store.follow('chat:1', 'market:a1');
     await store.follow('chat:1', 'market:a2');
-    assert.throws(() => store.follow('chat:1', 'market:a3'), /per-chat follow limit reached \(2\)/);
+    await assert.rejects(() => store.follow('chat:1', 'market:a3'), /per-chat follow limit reached \(2\)/);
     assert.deepStrictEqual(await store.list('chat:1'), ['market:a1', 'market:a2']);
     // Other chats unaffected.
     await store.follow('chat:2', 'market:a1');
@@ -110,7 +110,7 @@ test('enforces total cap', async () => {
     await store.follow('chat:1', 'market:a1');
     await store.follow('chat:1', 'market:a2');
     await store.follow('chat:2', 'market:a3');
-    assert.throws(() => store.follow('chat:2', 'market:a4'), /total follow limit reached \(3\)/);
+    await assert.rejects(() => store.follow('chat:2', 'market:a4'), /total follow limit reached \(3\)/);
     // Idempotent re-follow of existing entry is allowed even at cap.
     await store.follow('chat:1', 'market:a1');
     assert.deepStrictEqual(await store.list('chat:1'), ['market:a1', 'market:a2']);
@@ -172,8 +172,11 @@ test('retains corrupt follow file bytes and throws redacted actionable error whe
     Date.now = () => ts;
     try {
       const s = createFollowStore({ filePath, now: () => ts });
-      for (const op of [() => s.list('c'), () => s.followersOf('market:a'), () => s.follow('c', 'market:a'), () => s.unfollow('c', 'market:a')]) {
+      for (const op of [() => s.list('c'), () => s.followersOf('market:a')]) {
         assert.throws(op, (e) => e.name === 'FollowStoreError' && /quarantine.*retained in place/i.test(e.message));
+      }
+      for (const op of [() => s.follow('c', 'market:a'), () => s.unfollow('c', 'market:a')]) {
+        await assert.rejects(op, (e) => e.name === 'FollowStoreError' && /quarantine.*retained in place/i.test(e.message));
       }
     } finally {
       Date.now = realNow;
@@ -199,7 +202,7 @@ test('preserves unreadable follow file and redacts credentials when read and qua
         unlinkSync: () => { unlinked = true; },
       },
     });
-    assert.throws(() => s.follow('c', 'market:a'), (e) => e.name === 'FollowStoreError' && !e.message.includes('hunter2secret') && e.message.includes('[REDACTED]') && /EROFS/.test(e.message));
+    await assert.rejects(() => s.follow('c', 'market:a'), (e) => e.name === 'FollowStoreError' && !e.message.includes('hunter2secret') && e.message.includes('[REDACTED]') && /EROFS/.test(e.message));
     assert.strictEqual(unlinked, false);
     assert.strictEqual(Buffer.compare(await fs.promises.readFile(filePath), raw), 0);
   });

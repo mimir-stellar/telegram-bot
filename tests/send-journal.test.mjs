@@ -11,6 +11,7 @@ import test from "node:test";
 
 import { Address, Keypair, nativeToScVal } from "@stellar/stellar-sdk";
 
+import { createNotifier } from "../dist/notifications/notifier.js";
 import { createSendJournal } from "../dist/notifications/send-journal.js";
 import { createPoller } from "../dist/poller.js";
 import { createTempDataDir } from "./helpers/temp-data.mjs";
